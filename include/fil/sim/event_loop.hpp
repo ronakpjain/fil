@@ -85,8 +85,11 @@ public:
     /** @brief Cancels an event if it is still pending. */
     [[nodiscard]] bool cancel(EventId id) noexcept;
 
-    /** @brief Runs all events due at or before the supplied deadline. */
+    /** @brief Runs all events due at or before the supplied global deadline. */
     [[nodiscard]] EventRunResult runDueEvents(SimTimeNs deadline);
+
+    /** @brief Runs only one owner's callbacks and advances that owner's local clock. */
+    [[nodiscard]] EventRunResult runOwnedEvents(EventOwner owner, SimTimeNs deadline);
 
     /** @brief Advances by a relative duration and runs all newly due events. */
     [[nodiscard]] EventRunResult advanceBy(SimTimeNs delta);
@@ -94,8 +97,11 @@ public:
     /** @brief Removes every pending event without changing current time. */
     void clear() noexcept;
 
-    /** @brief Gets the current monotonically increasing simulation time. */
+    /** @brief Gets the active owner's clock, or the shared clock outside an owner scope. */
     [[nodiscard]] SimTimeNs now() const noexcept;
+
+    /** @brief Gets one owner's local clock without changing scheduling context. */
+    [[nodiscard]] SimTimeNs now(EventOwner owner) const noexcept;
 
     /** @brief Gets the number of live, non-cancelled events. */
     [[nodiscard]] std::size_t pending() const noexcept;
