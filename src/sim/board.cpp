@@ -409,6 +409,9 @@ BoardRunResult Board::cpuFailure(const cpu::RunResult& result) const {
     case cpu::StopReason::undefined_instruction: board.reason = BoardStopReason::unimplemented_instruction; break;
     case cpu::StopReason::bus_fault:
     case cpu::StopReason::invalid_state: board.reason = BoardStopReason::architectural_fault; break;
+    case cpu::StopReason::synchronization_required:
+        board.reason = BoardStopReason::host_error;
+        break;
     case cpu::StopReason::instruction_budget: board.reason = BoardStopReason::instruction_budget; break;
     case cpu::StopReason::step_complete: board.reason = BoardStopReason::host_error; break;
     }

@@ -87,6 +87,12 @@ private:
 };
 
 /** @brief Interface implemented by target peripheral register blocks. */
+/** @brief Visibility of an MMIO access to independently executing board lanes. */
+enum class MmioDomain {
+    board_local,
+    shared,
+};
+
 class MmioDevice {
 public:
     /** @brief Allows polymorphic destruction through the interface. */
@@ -122,6 +128,15 @@ public:
 
     /** @brief Gets the device's diagnostic name. @return Static or device-owned name. */
     [[nodiscard]] virtual std::string_view name() const noexcept = 0;
+
+    /** @brief Classifies an access for conservative multi-board synchronization. */
+    [[nodiscard]] virtual MmioDomain domain(
+        std::uint32_t offset, AccessSize size
+    ) const noexcept {
+        static_cast<void>(offset);
+        static_cast<void>(size);
+        return MmioDomain::board_local;
+    }
 };
 
 /**
@@ -218,6 +233,12 @@ public:
     /** @brief Gets mapped ranges sorted by base address. */
     [[nodiscard]] std::vector<MemoryRegionInfo> regions() const;
 
+    /** @brief Makes shared MMIO return a side-effect-free worker synchronization fault. */
+    void setSharedMmioTrapping(bool enabled) noexcept { trap_shared_mmio_ = enabled; }
+
+    /** @brief Whether shared MMIO accesses currently stop before device dispatch. */
+    [[nodiscard]] bool sharedMmioTrapping() const noexcept { return trap_shared_mmio_; }
+
     /**
      * @brief Gets the generation of executable backing storage.
      *
@@ -281,6 +302,7 @@ private:
     std::uint64_t mutation_sequence_{0};
     static constexpr std::size_t mutation_journal_capacity = 8192U;
     std::array<BackedMutation, mutation_journal_capacity> mutation_journal_{};
+    bool trap_shared_mmio_{false};
 };
 
 } // namespace fil::mem

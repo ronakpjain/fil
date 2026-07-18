@@ -261,6 +261,8 @@ FastStepResult CortexM4::stepFast() {
     }
     result.instruction_size = instruction_size;
 
+    std::optional<CpuState> restart_state;
+    if (memory_.sharedMmioTrapping()) restart_state = state_;
     state_.instruction_address = pc;
     state_.r[15] = pc + instruction_size;
     const bool was_in_it = inItBlock(state_.it_state);
@@ -286,7 +288,12 @@ FastStepResult CortexM4::stepFast() {
     result.reason = stop;
     result.instructions = 1;
     result.cycles = 1;
-    if (stop != StopReason::step_complete) {
+    if (stop == StopReason::synchronization_required && restart_state) {
+        state_ = *restart_state;
+        result.instructions = 0;
+        result.cycles = 0;
+        capture(last_diagnostic_);
+    } else if (stop != StopReason::step_complete) {
         capture(last_diagnostic_);
     }
     return result;
@@ -342,6 +349,7 @@ const char* stopReasonName(const StopReason reason) noexcept {
     case StopReason::breakpoint: return "breakpoint";
     case StopReason::halted: return "halted";
     case StopReason::bus_fault: return "bus-fault";
+    case StopReason::synchronization_required: return "synchronization-required";
     case StopReason::undefined_instruction: return "undefined-instruction";
     case StopReason::invalid_state: return "invalid-state";
     }

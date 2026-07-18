@@ -287,9 +287,17 @@ MemoryResult<std::uint64_t> MemoryBus::read(
         return read(translated, size, context, alias_depth + 1U);
     }
     if (region->info.kind == RegionKind::mmio) {
+        const std::uint32_t offset = address - region->info.base;
+        if (trap_shared_mmio_
+            && region->device->domain(offset, size) == MmioDomain::shared) {
+            return makeFault(
+                BusFaultReason::synchronization_required, address, size, context,
+                region->info.name, "shared MMIO access requires coordinator synchronization"
+            );
+        }
         ++side_effect_generation_;
         ++mmio_generation_;
-        auto result = region->device->read(address - region->info.base, size, context);
+        auto result = region->device->read(offset, size, context);
         if (!result && result.fault().region.empty()) {
             result.fault().region = region->info.name;
         }
@@ -349,9 +357,17 @@ MemoryResult<std::uint64_t> MemoryBus::write(
         return write(translated, size, value, context, alias_depth + 1U);
     }
     if (region->info.kind == RegionKind::mmio) {
+        const std::uint32_t offset = address - region->info.base;
+        if (trap_shared_mmio_
+            && region->device->domain(offset, size) == MmioDomain::shared) {
+            return makeFault(
+                BusFaultReason::synchronization_required, address, size, context,
+                region->info.name, "shared MMIO access requires coordinator synchronization"
+            );
+        }
         ++side_effect_generation_;
         ++mmio_generation_;
-        auto result = region->device->write(address - region->info.base, size, value & widthMask(size), context);
+        auto result = region->device->write(offset, size, value & widthMask(size), context);
         if (!result && result.fault().region.empty()) {
             result.fault().region = region->info.name;
         }
