@@ -196,6 +196,9 @@ Result<void> World::initialize(const bool strict_mmio) {
             }
         }
 
+        auto owner_scope = event_loop_.useOwner(
+            static_cast<EventOwner>(boards_.size())
+        );
         auto loaded = Board::load(board_config.value(), strict_mmio, &event_loop_, &trace_);
         if (!loaded) {
             Error error = loaded.error();
@@ -598,6 +601,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                     }
                 }
 
+                auto owner_scope = event_loop_.useOwner(static_cast<EventOwner>(index));
                 state.step = board.beginConcurrentStep(options.trace_instructions);
                 state.ready_time_ns = saturatingAdd(now, state.step->elapsed_ns);
                 state.in_flight = true;
@@ -639,12 +643,15 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
             trace_.record(event_loop_.now(), config_.name, "event_livelock");
         }
         if (events.events_executed != 0U) {
-            // A callback may change peripheral state or pend an interrupt
-            // without touching the CPU-visible memory journal. Discard every
-            // cross-lane lookahead proof before another dispatch.
-            for (SchedulerState& state : states) {
-                state.proven_loop.reset();
-                state.inside_proven_loop = false;
+            // Shared callbacks can affect every lane. Board-owned callbacks only
+            // invalidate their originating lane; ownership is inherited by nested
+            // peripheral scheduling and is a prerequisite for independent workers.
+            for (std::size_t index = 0; index < states.size(); ++index) {
+                const bool local_event = index < 64U
+                    && (events.local_owner_mask & (std::uint64_t{1U} << index)) != 0U;
+                if (!events.shared_event_executed && !local_event) continue;
+                states[index].proven_loop.reset();
+                states[index].inside_proven_loop = false;
             }
         }
     }

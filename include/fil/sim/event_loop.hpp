@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <limits>
 
 namespace fil::sim {
 
@@ -21,11 +22,19 @@ using EventId = std::uint64_t;
 /** @brief Callback executed by the deterministic event loop. */
 using EventCallback = std::function<void()>;
 
+/** @brief Board lane responsible for an event, or the shared simulation domain. */
+using EventOwner = std::uint32_t;
+
+/** @brief Owner used by CAN and other cross-board events. */
+inline constexpr EventOwner shared_event_owner = std::numeric_limits<EventOwner>::max();
+
 /** @brief Outcome of one run through due events. */
 struct EventRunResult {
     std::size_t events_executed{0}; ///< Number of callbacks completed.
     bool same_time_limit_hit{false}; ///< True when zero-delay livelock protection stopped the run.
     SimTimeNs stopped_at{0}; ///< Simulation time reached by the run.
+    std::uint64_t local_owner_mask{0}; ///< Board owners below 64 whose callbacks ran.
+    bool shared_event_executed{false}; ///< Whether a shared or unrepresentable owner ran.
 };
 
 /**
@@ -36,6 +45,22 @@ struct EventRunResult {
  */
 class EventLoop {
 public:
+    /** @brief RAII scope inherited by events scheduled within one board lane. */
+    class OwnerScope {
+    public:
+        ~OwnerScope();
+        OwnerScope(const OwnerScope&) = delete;
+        OwnerScope& operator=(const OwnerScope&) = delete;
+        OwnerScope(OwnerScope&& other) noexcept;
+        OwnerScope& operator=(OwnerScope&&) = delete;
+
+    private:
+        friend class EventLoop;
+        OwnerScope(EventLoop& loop, EventOwner owner) noexcept;
+        EventLoop* loop_{nullptr};
+        EventOwner previous_{shared_event_owner};
+    };
+
     /** @brief Constructs an empty loop with a bounded same-time callback count. */
     explicit EventLoop(std::size_t maximum_same_time_events = 100000);
     ~EventLoop();
@@ -44,6 +69,12 @@ public:
     EventLoop& operator=(const EventLoop&) = delete;
     EventLoop(EventLoop&&) noexcept;
     EventLoop& operator=(EventLoop&&) noexcept;
+
+    /** @brief Makes subsequently scheduled events inherit a board or shared owner. */
+    [[nodiscard]] OwnerScope useOwner(EventOwner owner) noexcept;
+
+    /** @brief Gets the owner inherited by newly scheduled events. */
+    [[nodiscard]] EventOwner activeOwner() const noexcept;
 
     /** @brief Schedules a callback relative to the current simulation time. */
     [[nodiscard]] EventId scheduleAfter(SimTimeNs delta, EventCallback callback);

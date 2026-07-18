@@ -14,6 +14,7 @@ struct EventLoop::Impl {
         SimTimeNs at{0};
         EventId id{0};
         std::uint64_t sequence{0};
+        EventOwner owner{shared_event_owner};
         EventCallback callback;
     };
 
@@ -31,6 +32,7 @@ struct EventLoop::Impl {
     std::uint64_t next_sequence{0};
     std::size_t maximum_same_time_events{100000};
     std::size_t live_events{0};
+    EventOwner active_owner{shared_event_owner};
     std::priority_queue<Event, std::vector<Event>, Later> events;
     std::unordered_set<EventId> cancelled;
 
@@ -49,6 +51,26 @@ EventLoop::EventLoop(const std::size_t maximum_same_time_events)
 EventLoop::~EventLoop() = default;
 EventLoop::EventLoop(EventLoop&&) noexcept = default;
 EventLoop& EventLoop::operator=(EventLoop&&) noexcept = default;
+
+EventLoop::OwnerScope::OwnerScope(EventLoop& loop, const EventOwner owner) noexcept
+    : loop_(&loop), previous_(loop.impl_->active_owner) {
+    loop.impl_->active_owner = owner;
+}
+
+EventLoop::OwnerScope::~OwnerScope() {
+    if (loop_ != nullptr) loop_->impl_->active_owner = previous_;
+}
+
+EventLoop::OwnerScope::OwnerScope(OwnerScope&& other) noexcept
+    : loop_(std::exchange(other.loop_, nullptr)), previous_(other.previous_) {}
+
+EventLoop::OwnerScope EventLoop::useOwner(const EventOwner owner) noexcept {
+    return OwnerScope(*this, owner);
+}
+
+EventOwner EventLoop::activeOwner() const noexcept {
+    return impl_->active_owner;
+}
 
 EventId EventLoop::scheduleAfter(const SimTimeNs delta, EventCallback callback) {
     if (delta > std::numeric_limits<SimTimeNs>::max() - impl_->now) {
@@ -69,7 +91,9 @@ EventId EventLoop::scheduleAt(const SimTimeNs at, EventCallback callback) {
     }
 
     const EventId id = impl_->next_id++;
-    impl_->events.push(Impl::Event{at, id, impl_->next_sequence++, std::move(callback)});
+    impl_->events.push(Impl::Event{
+        at, id, impl_->next_sequence++, impl_->active_owner, std::move(callback),
+    });
     ++impl_->live_events;
     return id;
 }
@@ -133,7 +157,20 @@ EventRunResult EventLoop::runDueEvents(const SimTimeNs deadline) {
         impl_->now = event.at;
         ++events_at_counted_time;
         ++result.events_executed;
-        event.callback();
+        if (event.owner < 64U) {
+            result.local_owner_mask |= std::uint64_t{1U} << event.owner;
+        } else {
+            result.shared_event_executed = true;
+        }
+        const EventOwner previous_owner = impl_->active_owner;
+        impl_->active_owner = event.owner;
+        try {
+            event.callback();
+        } catch (...) {
+            impl_->active_owner = previous_owner;
+            throw;
+        }
+        impl_->active_owner = previous_owner;
     }
 }
 

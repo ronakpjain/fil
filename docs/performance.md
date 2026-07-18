@@ -122,6 +122,7 @@ performance-specific mechanisms currently implemented; ordinary container
 | Build | Release plus IPO/LTO defaults | Unoptimized hot path and translation-unit barriers | Debug and sanitizer builds remain unoptimized/non-IPO |
 | Board/world | Exact-state loop batching | Re-executing proven identical idle iterations | CPU state, reversible RAM journal, MMIO generation, and causal horizon |
 | World | Reused batching planner storage | Per-frontier heap allocation | Storage is sized once per run and cleared before reuse |
+| World | Event ownership provenance | Invalidating unrelated board-local lookahead after a callback | Shared callbacks still invalidate every lane; nested local callbacks inherit their board owner |
 | Diagnostics | Disabled trace/history fast mode | Retaining and serializing unrequested records, ADC samples, and DMA request logs | Any requested observer reenables exact events/data retention |
 | ADC | Lazy unobserved continuous conversion | One callback per conversion period | Only continuous conversions with no interrupt/callback/trace/history observer |
 | DMAMUX | Generation-tagged request-route cache | Scanning all 16 selectors for every ADC conversion | Any selector write invalidates and rebuilds the complete route table |

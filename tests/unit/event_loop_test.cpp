@@ -29,6 +29,35 @@ void ordersEventsDeterministically() {
     fil::test::check(second.events_executed == 1 && order.back() == 3, "event loop advances relative time");
 }
 
+void tracksLocalAndSharedEventOwnership() {
+    fil::sim::EventLoop loop;
+    std::vector<fil::sim::EventOwner> observed;
+    {
+        auto owner = loop.useOwner(3U);
+        static_cast<void>(loop.scheduleAt(5U, [&]() {
+            observed.push_back(loop.activeOwner());
+            static_cast<void>(loop.scheduleAfter(0U, [&]() {
+                observed.push_back(loop.activeOwner());
+            }));
+        }));
+    }
+    fil::test::check(loop.activeOwner() == fil::sim::shared_event_owner,
+                     "event owner scope restores the shared domain");
+    static_cast<void>(loop.scheduleAt(5U, [&]() {
+        observed.push_back(loop.activeOwner());
+    }));
+
+    const auto result = loop.runDueEvents(5U);
+    fil::test::check(result.events_executed == 3U
+                         && result.local_owner_mask == (std::uint64_t{1U} << 3U)
+                         && result.shared_event_executed,
+                     "event runs report local and shared ownership");
+    fil::test::check(observed == std::vector<fil::sim::EventOwner>{
+                         3U, fil::sim::shared_event_owner, 3U,
+                     },
+                     "nested events inherit their callback owner deterministically");
+}
+
 void cancelsAndRejectsInvalidTime() {
     fil::sim::EventLoop loop;
     int calls = 0;
@@ -109,6 +138,7 @@ void disablesTraceCollectionWithoutDisturbingSequence() {
 /** @brief Runs deterministic event-loop and trace unit tests. */
 void runEventLoopTests() {
     ordersEventsDeterministically();
+    tracksLocalAndSharedEventOwnership();
     cancelsAndRejectsInvalidTime();
     detectsZeroDelayLivelock();
     serializesStableTraceRecords();

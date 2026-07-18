@@ -66,6 +66,8 @@ The interpreter currently charges one target cycle per executed instruction. A b
 
 `World` loads boards in network-config order and gives each board an independent virtual CPU timeline. Boards ready at the same timestamp start in configuration order; the shared event loop then advances to the earliest instruction-completion or external-event frontier. The instruction quantum is a same-time fairness cap, not serialized simulated time. All boards share one event loop and one trace recorder, so board dispatch, CAN delivery, and equal-time events remain reproducible without host threads or wall-clock time.
 
+Every scheduled callback carries an inherited event owner: one board lane or the shared domain. Peripheral callbacks created while a board executes remain local through nested scheduling, while FDCAN delivery and externally injected work are explicitly shared. Event execution reports the affected owner mask, allowing local callbacks to invalidate only their lane's lookahead proof. This provenance is also the synchronization boundary for the planned worker-thread scheduler; it does not alter timestamp or insertion-order semantics.
+
 Peripheral trace sources are qualified as `board.device` (for example,
 `dashboard.FDCAN1`) so identical MCU instances remain unambiguous in a shared
 world trace. Virtual CAN fabric records use `bus/node` sources. CAN records expose
