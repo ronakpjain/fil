@@ -204,8 +204,11 @@ with loop batching disabled also skip loop discovery, and checkpoints retain onl
 the loop-observation generation rather than copying all 256 full CPU/FP snapshots;
 the table cannot mutate in that mode, so restoring its generation recreates the
 prior detector state exactly. On the six-board workload this lowers the opt-in
-transactional median from about 1.39 s to 1.36 s, though serial execution remains
-faster because only a small fraction of 256-instruction epochs avoid all MMIO.
+transactional median from about 1.39 s to 1.36 s. The coordinator now samples
+commit profitability online and disables worker epochs after at least 32 attempts
+when fewer than one third commit. It then reenables fused serial bursts, reducing
+the six-board opt-in runtime further to about 0.93 s on this low-commit workload
+while retaining parallel execution for workloads that demonstrate useful epochs.
 
 The first seven techniques preserve one host dispatch per target instruction. Loop
 batching and lazy ADC conversion are conservative event-elision techniques: they
