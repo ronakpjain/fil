@@ -527,13 +527,17 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
         bool burst_eligible = !options.enable_transactional_slices
             && !options.trace_instructions && !options.detect_spin
             && !stop_requested && !time_exhausted && !states.empty();
-        for (std::size_t index = 0; index < states.size() && burst_eligible; ++index) {
-            burst_eligible = states[index].runnable && !states[index].in_flight
-                && !states[index].inside_proven_loop
-                && states[index].ready_time_ns == now
+        bool all_lanes_proven = !states.empty();
+        for (std::size_t index = 0; index < states.size(); ++index) {
+            burst_eligible = burst_eligible && states[index].runnable
+                && !states[index].in_flight && states[index].ready_time_ns == now
                 && output.boards[index].result.instructions + 64U
                     <= options.max_instructions_per_board;
+            all_lanes_proven = all_lanes_proven
+                && states[index].inside_proven_loop
+                && states[index].proven_loop.has_value();
         }
+        burst_eligible = burst_eligible && !all_lanes_proven;
         if (burst_eligible) {
             std::uint64_t completed_rounds = 0U;
             ++output.lockstep_bursts;
@@ -639,9 +643,11 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                         board_output.result.cycles
                     );
                     if (observed && options.enable_loop_batching) {
+                        const bool newly_proven = !states[index].inside_proven_loop
+                            || !states[index].proven_loop;
                         states[index].proven_loop = *observed;
                         states[index].inside_proven_loop = true;
-                        leave_burst = true;
+                        leave_burst = leave_burst || newly_proven;
                     }
                     if (deadline != 0U && completion >= deadline) {
                         states[index].runnable = false;
