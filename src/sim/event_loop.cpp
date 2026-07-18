@@ -40,6 +40,7 @@ struct EventLoop::Impl {
     std::unordered_map<EventOwner, Queue> owner_events;
     std::unordered_map<EventId, EventPtr> live_events;
     std::unordered_map<EventOwner, SimTimeNs> owner_now;
+    std::unordered_map<EventOwner, std::uint64_t> owner_generation;
 
     [[nodiscard]] SimTimeNs timeFor(const EventOwner owner) const noexcept {
         if (owner == shared_event_owner) return shared_now;
@@ -70,6 +71,7 @@ struct EventLoop::Impl {
     void retire(const EventPtr& event) {
         event->live = false;
         live_events.erase(event->id);
+        ++owner_generation[event->owner];
     }
 
     void markOwner(EventRunResult& result, const EventOwner owner) const noexcept {
@@ -152,6 +154,7 @@ EventId EventLoop::scheduleAt(const SimTimeNs at, EventCallback callback) {
     impl_->events.push(event);
     impl_->owner_events[owner].push(event);
     impl_->live_events.emplace(id, std::move(event));
+    ++impl_->owner_generation[owner];
     return id;
 }
 
@@ -160,6 +163,7 @@ bool EventLoop::cancel(const EventId id) noexcept {
     const auto found = impl_->live_events.find(id);
     if (found == impl_->live_events.end()) return false;
     found->second->live = false;
+    ++impl_->owner_generation[found->second->owner];
     impl_->live_events.erase(found);
     return true;
 }
@@ -254,6 +258,7 @@ void EventLoop::clear() noexcept {
     impl_->events = {};
     impl_->owner_events.clear();
     impl_->live_events.clear();
+    impl_->owner_generation.clear();
 }
 
 SimTimeNs EventLoop::now() const noexcept {
@@ -262,6 +267,33 @@ SimTimeNs EventLoop::now() const noexcept {
 
 SimTimeNs EventLoop::now(const EventOwner owner) const noexcept {
     return impl_->timeFor(owner);
+}
+
+EventLoop::OwnerCheckpoint EventLoop::ownerCheckpoint(
+    const EventOwner owner
+) const noexcept {
+    const auto generation = impl_->owner_generation.find(owner);
+    return OwnerCheckpoint{
+        owner,
+        impl_->timeFor(owner),
+        generation == impl_->owner_generation.end() ? 0U : generation->second,
+    };
+}
+
+bool EventLoop::canRestoreOwnerCheckpoint(
+    const OwnerCheckpoint& checkpoint
+) const noexcept {
+    const auto generation = impl_->owner_generation.find(checkpoint.owner);
+    const std::uint64_t current_generation = generation == impl_->owner_generation.end()
+        ? 0U : generation->second;
+    return current_generation == checkpoint.event_generation
+        && checkpoint.time_ns <= impl_->timeFor(checkpoint.owner);
+}
+
+bool EventLoop::restoreOwnerCheckpoint(const OwnerCheckpoint& checkpoint) noexcept {
+    if (!canRestoreOwnerCheckpoint(checkpoint)) return false;
+    impl_->setTime(checkpoint.owner, checkpoint.time_ns);
+    return true;
 }
 
 std::size_t EventLoop::pending() const noexcept {

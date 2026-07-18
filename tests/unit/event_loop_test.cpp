@@ -63,6 +63,13 @@ void tracksLocalAndSharedEventOwnership() {
 }
 
 void advancesOneOwnerIndependently() {
+    fil::sim::EventLoop rewindable;
+    const auto checkpoint = rewindable.ownerCheckpoint(4U);
+    static_cast<void>(rewindable.runOwnedEvents(4U, 10U));
+    fil::test::check(rewindable.restoreOwnerCheckpoint(checkpoint)
+                         && rewindable.now(4U) == 0U,
+                     "untouched owner queues permit transactional clock rewind");
+
     fil::sim::EventLoop loop;
     std::vector<unsigned int> calls;
     {
@@ -75,11 +82,14 @@ void advancesOneOwnerIndependently() {
     }
     static_cast<void>(loop.scheduleAt(7U, [&]() { calls.push_back(3U); }));
 
+    const auto event_checkpoint = loop.ownerCheckpoint(1U);
     const auto local = loop.runOwnedEvents(1U, 7U);
     fil::test::check(local.events_executed == 1U && calls == std::vector<unsigned int>{1U},
                      "owner-local execution drains only the selected lane");
     fil::test::check(loop.now() == 0U && loop.now(1U) == 7U && loop.pending() == 2U,
                      "owner-local execution leaves the shared clock and other lanes untouched");
+    fil::test::check(!loop.restoreOwnerCheckpoint(event_checkpoint),
+                     "executed owner callbacks reject unsafe clock-only rollback");
 
     const auto remaining = loop.runDueEvents(7U);
     fil::test::check(remaining.events_executed == 2U

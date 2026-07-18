@@ -45,6 +45,12 @@ struct EventRunResult {
  */
 class EventLoop {
 public:
+    struct OwnerCheckpoint {
+        EventOwner owner{shared_event_owner};
+        SimTimeNs time_ns{0};
+        std::uint64_t event_generation{0};
+    };
+
     /** @brief RAII scope inherited by events scheduled within one board lane. */
     class OwnerScope {
     public:
@@ -102,6 +108,17 @@ public:
 
     /** @brief Gets one owner's local clock without changing scheduling context. */
     [[nodiscard]] SimTimeNs now(EventOwner owner) const noexcept;
+
+    /** @brief Captures an owner clock plus its queue-mutation generation. */
+    [[nodiscard]] OwnerCheckpoint ownerCheckpoint(EventOwner owner) const noexcept;
+
+    /** @brief Whether an owner clock can be rewound without undoing callbacks. */
+    [[nodiscard]] bool canRestoreOwnerCheckpoint(
+        const OwnerCheckpoint& checkpoint
+    ) const noexcept;
+
+    /** @brief Rewinds an owner clock only when its event queue was untouched. */
+    [[nodiscard]] bool restoreOwnerCheckpoint(const OwnerCheckpoint& checkpoint) noexcept;
 
     /** @brief Gets the number of live, non-cancelled events. */
     [[nodiscard]] std::size_t pending() const noexcept;

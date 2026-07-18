@@ -55,6 +55,17 @@ bool sameCpuState(const cpu::CpuState& left, const cpu::CpuState& right) noexcep
 
 } // namespace
 
+struct Board::TransactionCheckpoint {
+    EventOwner owner{shared_event_owner};
+    cpu::CpuState cpu_state;
+    cortexm::SystemControl system_state;
+    std::vector<std::uint16_t> active_exceptions;
+    mem::MemoryBus::SideEffectCheckpoint memory_checkpoint;
+    EventLoop::OwnerCheckpoint event_checkpoint;
+    std::uint64_t time_fraction{0};
+    std::array<LoopObservation, 256> loop_observations{};
+};
+
 bool BoardRunResult::succeeded() const noexcept {
     return reason == BoardStopReason::target_reached
         || reason == BoardStopReason::breakpoint
@@ -419,20 +430,59 @@ BoardRunResult Board::cpuFailure(const cpu::RunResult& result) const {
     return board;
 }
 
+Board::TransactionCheckpointPtr Board::captureTransaction(
+    const EventOwner owner
+) const {
+    auto checkpoint = std::make_shared<TransactionCheckpoint>();
+    checkpoint->owner = owner;
+    checkpoint->cpu_state = cpu_->state();
+    checkpoint->system_state = *system_;
+    checkpoint->active_exceptions = exceptions_->activeStack();
+    checkpoint->memory_checkpoint = memory_.sideEffectCheckpoint();
+    checkpoint->event_checkpoint = event_loop_->ownerCheckpoint(owner);
+    checkpoint->time_fraction = time_fraction_;
+    checkpoint->loop_observations = loop_observations_;
+    return checkpoint;
+}
+
+bool Board::restoreTransaction(const TransactionCheckpointPtr& checkpoint) {
+    if (!checkpoint || !memory_.canRestoreSideEffects(checkpoint->memory_checkpoint)
+        || !event_loop_->canRestoreOwnerCheckpoint(checkpoint->event_checkpoint)) {
+        return false;
+    }
+    if (!memory_.restoreSideEffects(checkpoint->memory_checkpoint)
+        || !event_loop_->restoreOwnerCheckpoint(checkpoint->event_checkpoint)) {
+        return false;
+    }
+    cpu_->state() = checkpoint->cpu_state;
+    *system_ = checkpoint->system_state;
+    exceptions_->restoreActiveStack(checkpoint->active_exceptions);
+    time_fraction_ = checkpoint->time_fraction;
+    loop_observations_ = checkpoint->loop_observations;
+    return true;
+}
+
 BoardRunResult Board::runWorkerSlice(
     const EventOwner owner,
     const std::uint64_t instruction_budget,
     const SimTimeNs deadline_ns,
-    const bool enable_loop_batching
+    const bool enable_loop_batching,
+    const bool trap_all_mmio
 ) {
     BoardRunResult aggregate;
     aggregate.reason = BoardStopReason::instruction_budget;
     auto owner_scope = event_loop_->useOwner(owner);
-    const bool previous_trapping = memory_.sharedMmioTrapping();
+    const bool previous_shared_trapping = memory_.sharedMmioTrapping();
+    const bool previous_all_trapping = memory_.allMmioTrapping();
     memory_.setSharedMmioTrapping(true);
+    memory_.setAllMmioTrapping(trap_all_mmio);
 
+    const auto restore_trapping = [&]() {
+        memory_.setSharedMmioTrapping(previous_shared_trapping);
+        memory_.setAllMmioTrapping(previous_all_trapping);
+    };
     const auto finish = [&]() {
-        memory_.setSharedMmioTrapping(previous_trapping);
+        restore_trapping();
         aggregate.time_ns = event_loop_->now(owner);
         aggregate.diagnostic.next_pc = cpu_->state().r[15];
         aggregate.diagnostic.registers = cpu_->state().r;
@@ -489,7 +539,7 @@ BoardRunResult Board::runWorkerSlice(
             BoardRunResult stopped = cpuFailure(detailed);
             stopped.instructions = aggregate.instructions;
             stopped.cycles = aggregate.cycles;
-            memory_.setSharedMmioTrapping(previous_trapping);
+            restore_trapping();
             return stopped;
         }
         if (auto boundary = settleInstructionBoundary()) {

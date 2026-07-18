@@ -50,6 +50,28 @@ void workerSliceMatchesStandaloneExecution() {
                      "owner-local slice preserves standalone architectural results");
 }
 
+void restoresTransactionalBoardState() {
+    auto board = fil::sim::Board::load(fixtureBoard());
+    fil::test::check(board.hasValue(), "loads board for transaction rollback");
+    if (!board) return;
+
+    const std::uint32_t original_pc = board.value()->cpu().state().r[15];
+    const auto original_ram = board.value()->memory().read32(0x20000000U);
+    const auto checkpoint = board.value()->captureTransaction(0U);
+    board.value()->cpu().state().r[0] = 0xdeadbeefU;
+    static_cast<void>(board.value()->memory().write32(0x20000000U, 0x12345678U));
+    static_cast<void>(board.value()->eventLoop().runOwnedEvents(0U, 100U));
+    fil::test::check(board.value()->restoreTransaction(checkpoint),
+                     "restores a slice with only CPU RAM and clock mutations");
+    const auto restored_ram = board.value()->memory().read32(0x20000000U);
+    fil::test::check(board.value()->cpu().state().r[0] == 0U
+                         && board.value()->cpu().state().r[15] == original_pc
+                         && original_ram && restored_ram
+                         && restored_ram.value() == original_ram.value()
+                         && board.value()->eventLoop().now(0U) == 0U,
+                     "transaction rollback restores architectural and lane-clock state");
+}
+
 void stopsAtRequestedAddress() {
     auto board = fil::sim::Board::load(fixtureBoard());
     if (!board) {
@@ -92,6 +114,7 @@ void producesByteIdenticalTraceForRepeatedRuns() {
 void runBoardTests() {
     runsBoardToBreakpoint();
     workerSliceMatchesStandaloneExecution();
+    restoresTransactionalBoardState();
     stopsAtRequestedAddress();
     producesByteIdenticalTraceForRepeatedRuns();
 }

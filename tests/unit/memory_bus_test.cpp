@@ -182,11 +182,22 @@ void tracksReversibleLoopMemoryEffects() {
     fil::test::check(bus.sideEffectsRestoredSince(idempotent_checkpoint),
                      "accepts idempotent backed-memory writes");
 
+    const auto rollback_checkpoint = bus.sideEffectCheckpoint();
+    static_cast<void>(bus.write8(0x20000008U, 0x11U));
+    static_cast<void>(bus.write8(0x20000008U, 0x22U));
+    fil::test::check(bus.restoreSideEffects(rollback_checkpoint),
+                     "reverses speculative backed-memory mutations");
+    const auto rolled_back = bus.read8(0x20000008U);
+    fil::test::check(rolled_back && rolled_back.value() == 0U
+                         && bus.sideEffectsRestoredSince(rollback_checkpoint),
+                     "rollback restores bytes and checkpoint sequence");
+
     const auto mmio_checkpoint = bus.sideEffectCheckpoint();
     static_cast<void>(bus.read32(0x40000000U));
     fil::test::check(!bus.sideEffectsRestoredSince(mmio_checkpoint)
-                         && !bus.mmioUnchangedSince(mmio_checkpoint),
-                     "rejects an MMIO access even when CPU and RAM state are unchanged");
+                         && !bus.mmioUnchangedSince(mmio_checkpoint)
+                         && !bus.restoreSideEffects(mmio_checkpoint),
+                     "rejects rollback after an MMIO access");
 }
 
 void trapsSharedMmioBeforeDeviceSideEffects() {
