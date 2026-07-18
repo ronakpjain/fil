@@ -146,6 +146,7 @@ private:
 
     struct LoopObservation {
         bool valid{false};
+        std::uint64_t generation{0};
         std::uint32_t boundary_pc{0};
         cpu::CpuState state{};
         mem::MemoryBus::SideEffectCheckpoint side_effect_checkpoint{};
@@ -187,6 +188,7 @@ private:
     void refreshLoopObservation(
         const ProvenLoop& loop, std::uint64_t logical_instructions, std::uint64_t logical_cycles
     );
+    void invalidateLoopObservations() noexcept;
     [[nodiscard]] BoardRunResult cpuFailure(const cpu::RunResult& result) const;
     [[nodiscard]] SimTimeNs elapsedForCycles(std::uint64_t cycles) const noexcept;
 
@@ -204,6 +206,7 @@ private:
     std::unique_ptr<cortexm::ExceptionController> exceptions_;
     std::uint64_t time_fraction_{0};
     std::array<LoopObservation, 256> loop_observations_{};
+    std::uint64_t loop_observation_generation_{1U};
 };
 
 /** @brief Stable lowercase stop-reason name for CLI/trace output. */

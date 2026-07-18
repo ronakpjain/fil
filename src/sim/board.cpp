@@ -64,6 +64,7 @@ struct Board::TransactionCheckpoint {
     EventLoop::OwnerCheckpoint event_checkpoint;
     std::uint64_t time_fraction{0};
     std::array<LoopObservation, 256> loop_observations{};
+    std::uint64_t loop_observation_generation{1U};
 };
 
 bool BoardRunResult::succeeded() const noexcept {
@@ -146,6 +147,7 @@ Result<void> Board::reset() {
     exceptions_ = std::make_unique<cortexm::ExceptionController>(memory_, *system_);
     time_fraction_ = 0;
     loop_observations_ = {};
+    loop_observation_generation_ = 1U;
     return {};
 }
 
@@ -193,7 +195,7 @@ std::optional<Board::BoundaryStop> Board::settleInstructionBoundary() {
             event_loop_->now(), config_.name, "exception_return",
             {{"exc_return", hex32(exc_return)}}
         );
-        loop_observations_ = {};
+        invalidateLoopObservations();
     }
 
     if (cpu_->state().pending_exception) {
@@ -207,7 +209,7 @@ std::optional<Board::BoundaryStop> Board::settleInstructionBoundary() {
             event_loop_->now(), config_.name, "exception_enter",
             {{"exception", std::to_string(exception_number)}}
         );
-        loop_observations_ = {};
+        invalidateLoopObservations();
     }
 
     if (system_->hasEnabledPending()) {
@@ -220,7 +222,7 @@ std::optional<Board::BoundaryStop> Board::settleInstructionBoundary() {
                 event_loop_->now(), config_.name, "exception_enter",
                 {{"exception", std::to_string(cpu_->state().ipsr())}}
             );
-            loop_observations_ = {};
+            invalidateLoopObservations();
         }
     }
     if (system_->consumeResetRequest() || peripherals_->consumeResetRequest()) {
@@ -245,7 +247,9 @@ std::optional<Board::ProvenLoop> Board::observeLoopBoundary(
     LoopObservation& observation =
         loop_observations_[(boundary_pc >> 1U) % loop_observations_.size()];
     const auto checkpoint = memory_.sideEffectCheckpoint();
-    if (observation.valid && observation.boundary_pc == boundary_pc
+    if (observation.valid
+        && observation.generation == loop_observation_generation_
+        && observation.boundary_pc == boundary_pc
         && memory_.sideEffectsRestoredSince(observation.side_effect_checkpoint)
         && sameCpuState(observation.state, cpu_->state())
         && logical_instructions > observation.instructions
@@ -259,12 +263,12 @@ std::optional<Board::ProvenLoop> Board::observeLoopBoundary(
         };
         observation.instructions = logical_instructions;
         observation.cycles = logical_cycles;
-        observation.state = cpu_->state();
         observation.side_effect_checkpoint = checkpoint;
         return loop;
     }
 
     observation.valid = true;
+    observation.generation = loop_observation_generation_;
     observation.boundary_pc = boundary_pc;
     observation.state = cpu_->state();
     observation.side_effect_checkpoint = checkpoint;
@@ -391,6 +395,14 @@ Board::LoopSkip Board::describeLoopIterations(
     return skip;
 }
 
+void Board::invalidateLoopObservations() noexcept {
+    ++loop_observation_generation_;
+    if (loop_observation_generation_ == 0U) {
+        loop_observations_ = {};
+        loop_observation_generation_ = 1U;
+    }
+}
+
 void Board::refreshLoopObservation(
     const ProvenLoop& loop,
     const std::uint64_t logical_instructions,
@@ -399,6 +411,7 @@ void Board::refreshLoopObservation(
     LoopObservation& observation =
         loop_observations_[(loop.boundary_pc >> 1U) % loop_observations_.size()];
     observation.valid = true;
+    observation.generation = loop_observation_generation_;
     observation.boundary_pc = loop.boundary_pc;
     observation.state = cpu_->state();
     observation.side_effect_checkpoint = memory_.sideEffectCheckpoint();
@@ -444,6 +457,7 @@ Board::TransactionCheckpointPtr Board::captureTransaction(
     checkpoint->event_checkpoint = event_loop_->ownerCheckpoint(owner);
     checkpoint->time_fraction = time_fraction_;
     checkpoint->loop_observations = loop_observations_;
+    checkpoint->loop_observation_generation = loop_observation_generation_;
     return checkpoint;
 }
 
@@ -461,6 +475,7 @@ bool Board::restoreTransaction(const TransactionCheckpointPtr& checkpoint) {
     exceptions_->restoreActiveStack(checkpoint->active_exceptions);
     time_fraction_ = checkpoint->time_fraction;
     loop_observations_ = checkpoint->loop_observations;
+    loop_observation_generation_ = checkpoint->loop_observation_generation;
     return true;
 }
 

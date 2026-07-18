@@ -122,9 +122,11 @@ performance-specific mechanisms currently implemented; ordinary container
 | Memory | Region dispatch cache | Ordered mapping walk for each fetch/data/MMIO access | Full containment check before accepting a hit |
 | Build | Release plus IPO/LTO defaults | Unoptimized hot path and translation-unit barriers | Debug and sanitizer builds remain unoptimized/non-IPO |
 | Board/world | Exact-state loop batching | Re-executing proven identical idle iterations | CPU state, reversible RAM journal, MMIO generation, and causal horizon |
+| Board | Generation-tagged loop observations | Clearing all 256 observation slots on every interrupt boundary | Generation wrap performs the full clear; stale generations never match |
 | World | Reused batching planner storage | Per-frontier heap allocation | Storage is sized once per run and cleared before reuse |
 | World | In-place successful-step accounting | Constructing/copying `BoardRunResult`, register arrays, optional faults, and strings per interpreted instruction | Full result and diagnostic materialization remains on non-success boundaries |
 | World | Event ownership provenance | Invalidating unrelated board-local lookahead after a callback | Shared callbacks still invalidate every lane; nested local callbacks inherit their board owner |
+| Event loop | Serial owner fast path | Thread-local lookup and owner-map probing for every instruction dispatch | Thread-local ownership remains active whenever concurrent lane access is enabled |
 | World | Transactional lane workers | Serial MMIO-free instruction epochs across independent boards | CPU/RAM/system state is checkpointed; any MMIO/event escape rolls every lane back; opt-in while commit rate is tuned |
 | Diagnostics | Disabled trace/history fast mode | Retaining and serializing unrequested records, ADC samples, and DMA request logs | Any requested observer reenables exact events/data retention |
 | ADC | Lazy unobserved continuous conversion | One callback per conversion period | Only continuous conversions with no interrupt/callback/trace/history observer |
