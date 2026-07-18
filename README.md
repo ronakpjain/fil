@@ -99,6 +99,17 @@ mid-scale at the next shared frontier. Boards and ADC instances must exist,
 channels are 0 through 19, and values are 0 through 4095. Applied changes emit an
 `adc_input` trace record.
 
+GPIO inputs can be driven or released through the same pipe:
+
+```text
+gpio BOARD GPIOx PIN 0|1|release
+```
+
+For example, `gpio dashboard GPIOA 3 1` drives PA3 high, while
+`gpio dashboard GPIOA 3 release` returns it to the firmware-controlled input.
+Applied changes emit `gpio_input` records; firmware output changes emit
+`gpio_output` records.
+
 The board and network configs in `configs/` reference firmware under the sibling `PER` checkout. Those external ELFs must exist at the configured paths for these commands; they are optional compatibility inputs and are not embedded into emulator behavior.
 
 ## Current real-firmware acceptance

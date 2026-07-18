@@ -44,6 +44,10 @@ void GpioPeripheral::releaseInput(const unsigned int pin) {
         external_input_mask_ = static_cast<std::uint16_t>(
             external_input_mask_ & static_cast<std::uint16_t>(~(1U << pin))
         );
+        traceEvent("gpio_input", {
+            {"pin", std::to_string(pin)},
+            {"value", "release"},
+        });
     }
 }
 

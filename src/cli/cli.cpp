@@ -619,6 +619,49 @@ ExitCode runNetworkCommand(
         std::thread([controlled_world, state = stdin_control]() {
             std::string line;
             while (std::getline(std::cin, line)) {
+                if (line.starts_with("gpio ")) {
+                    std::istringstream command(line);
+                    std::string kind;
+                    std::string board_name;
+                    std::string gpio_name;
+                    std::string pin_text;
+                    std::string value_text;
+                    std::string trailing;
+                    command >> kind >> board_name >> gpio_name >> pin_text >> value_text;
+                    if (kind != "gpio" || board_name.empty() || gpio_name.empty()
+                        || pin_text.empty() || value_text.empty() || (command >> trailing)) {
+                        std::cerr << "fil: ignored stdin GPIO command; expected "
+                                     "gpio BOARD GPIOx PIN 0|1|release\n";
+                        continue;
+                    }
+                    const auto pin = config::parseUnsigned(pin_text);
+                    if (!pin || pin.value() > 15U
+                        || (value_text != "0" && value_text != "1"
+                            && value_text != "release")) {
+                        std::cerr << "fil: ignored stdin GPIO command; pin must be 0..15 "
+                                     "and value must be 0, 1, or release\n";
+                        continue;
+                    }
+                    std::lock_guard lock(state->mutex);
+                    if (!state->active) return;
+                    sim::Board* const board = controlled_world->board(board_name);
+                    stm32g4::GpioPeripheral* const gpio = board == nullptr
+                        ? nullptr : board->peripherals().gpio(gpio_name);
+                    if (gpio == nullptr) {
+                        std::cerr << "fil: ignored stdin GPIO command for unknown board/port: "
+                                  << board_name << '/' << gpio_name << '\n';
+                        continue;
+                    }
+                    sim::EventLoop* const loop = &controlled_world->eventLoop();
+                    static_cast<void>(loop->scheduleAfter(
+                        0U,
+                        [gpio, pin = static_cast<unsigned int>(pin.value()), value_text]() {
+                            if (value_text == "release") gpio->releaseInput(pin);
+                            else gpio->setInput(pin, value_text == "1");
+                        }
+                    ));
+                    continue;
+                }
                 if (line.starts_with("adc ")) {
                     std::istringstream command(line);
                     std::string kind;
@@ -820,7 +863,7 @@ void printHelp(std::ostream& out) {
         << "  --strict-mmio --trace-instr --detect-spin --no-loop-batching --allow-breakpoint\n"
         << "  --transactional-slices (experimental parallel lane epochs)\n"
         << "  --inject-can BUS[@TIME_MS]:ID:HEXDATA\n"
-        << "  --control-stdin (accept CAN and ADC commands while running)\n";
+        << "  --control-stdin (accept CAN, ADC, and GPIO commands while running)\n";
 }
 
 ExitCode run(
