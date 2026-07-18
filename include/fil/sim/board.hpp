@@ -132,10 +132,11 @@ private:
 
     struct ProvenLoop {
         std::uint32_t boundary_pc{0};
-        cpu::CpuState boundary_state{};
         std::uint64_t instructions_per_iteration{0};
         std::uint64_t cycles_per_iteration{0};
         mem::MemoryBus::SideEffectCheckpoint side_effect_checkpoint{};
+        std::uint16_t observation_index{0};
+        std::uint64_t observation_revision{0};
     };
 
     struct LoopSkip {
@@ -147,6 +148,7 @@ private:
     struct LoopObservation {
         bool valid{false};
         std::uint64_t generation{0};
+        std::uint64_t revision{0};
         std::uint32_t boundary_pc{0};
         cpu::CpuState state{};
         mem::MemoryBus::SideEffectCheckpoint side_effect_checkpoint{};

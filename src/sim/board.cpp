@@ -7,8 +7,8 @@
 
 #include <algorithm>
 #include <iomanip>
-#include <bit>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <sstream>
 #include <utility>
@@ -44,13 +44,7 @@ bool sameCpuState(const cpu::CpuState& left, const cpu::CpuState& right) noexcep
         || left.instruction_address != right.instruction_address) {
         return false;
     }
-    for (std::size_t index = 0; index < left.s.size(); ++index) {
-        if (std::bit_cast<std::uint32_t>(left.s[index])
-            != std::bit_cast<std::uint32_t>(right.s[index])) {
-            return false;
-        }
-    }
-    return true;
+    return std::memcmp(left.s.data(), right.s.data(), sizeof(left.s)) == 0;
 }
 
 } // namespace
@@ -184,6 +178,11 @@ Board::ConcurrentStepResult Board::beginConcurrentStep(const bool trace_instruct
 }
 
 std::optional<Board::BoundaryStop> Board::settleInstructionBoundary() {
+    if (!cpu_->state().pending_exc_return && !cpu_->state().pending_exception
+        && !system_->hasEnabledPending() && !system_->resetRequested()
+        && !peripherals_->resetRequested()) {
+        return std::nullopt;
+    }
     if (cpu_->state().pending_exc_return) {
         const std::uint32_t exc_return = *cpu_->state().pending_exc_return;
         cpu_->state().pending_exc_return.reset();
@@ -244,8 +243,9 @@ std::optional<Board::ProvenLoop> Board::observeLoopBoundary(
         return std::nullopt;
     }
 
-    LoopObservation& observation =
-        loop_observations_[(boundary_pc >> 1U) % loop_observations_.size()];
+    const std::size_t observation_index =
+        (boundary_pc >> 1U) % loop_observations_.size();
+    LoopObservation& observation = loop_observations_[observation_index];
     const auto checkpoint = memory_.sideEffectCheckpoint();
     if (observation.valid
         && observation.generation == loop_observation_generation_
@@ -256,10 +256,11 @@ std::optional<Board::ProvenLoop> Board::observeLoopBoundary(
         && logical_cycles > observation.cycles) {
         ProvenLoop loop{
             boundary_pc,
-            cpu_->state(),
             logical_instructions - observation.instructions,
             logical_cycles - observation.cycles,
             checkpoint,
+            static_cast<std::uint16_t>(observation_index),
+            observation.revision,
         };
         observation.instructions = logical_instructions;
         observation.cycles = logical_cycles;
@@ -269,6 +270,8 @@ std::optional<Board::ProvenLoop> Board::observeLoopBoundary(
 
     observation.valid = true;
     observation.generation = loop_observation_generation_;
+    ++observation.revision;
+    if (observation.revision == 0U) observation.revision = 1U;
     observation.boundary_pc = boundary_pc;
     observation.state = cpu_->state();
     observation.side_effect_checkpoint = checkpoint;
@@ -278,9 +281,15 @@ std::optional<Board::ProvenLoop> Board::observeLoopBoundary(
 }
 
 bool Board::loopProofStillValid(const ProvenLoop& loop) const noexcept {
+    if (loop.observation_index >= loop_observations_.size()) return false;
+    const LoopObservation& observation = loop_observations_[loop.observation_index];
     return loop.instructions_per_iteration != 0U && loop.cycles_per_iteration != 0U
         && cpu_->state().r[15] == loop.boundary_pc
-        && sameCpuState(cpu_->state(), loop.boundary_state)
+        && observation.valid
+        && observation.generation == loop_observation_generation_
+        && observation.revision == loop.observation_revision
+        && observation.boundary_pc == loop.boundary_pc
+        && sameCpuState(cpu_->state(), observation.state)
         && memory_.sideEffectsRestoredSince(loop.side_effect_checkpoint);
 }
 

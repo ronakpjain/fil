@@ -123,6 +123,8 @@ performance-specific mechanisms currently implemented; ordinary container
 | Build | Release plus IPO/LTO defaults | Unoptimized hot path and translation-unit barriers | Debug and sanitizer builds remain unoptimized/non-IPO |
 | Board/world | Exact-state loop batching | Re-executing proven identical idle iterations | CPU state, reversible RAM journal, MMIO generation, and causal horizon |
 | Board | Generation-tagged loop observations | Clearing all 256 observation slots on every interrupt boundary | Generation wrap performs the full clear; stale generations never match |
+| Board | Compact loop proofs | Copying full integer/FP CPU state into every scheduler proof | Proof references a generation/revision-checked observation slot; slot reuse invalidates it conservatively |
+| Board | Bitwise FP-state comparison | Scalar comparison of all 32 FP registers for exact loop matches | `memcmp` compares the complete stored float object representation, including NaN payload bits |
 | World | Reused batching planner storage | Per-frontier heap allocation | Storage is sized once per run and cleared before reuse |
 | World | In-place successful-step accounting | Constructing/copying `BoardRunResult`, register arrays, optional faults, and strings per interpreted instruction | Full result and diagnostic materialization remains on non-success boundaries |
 | World | Event ownership provenance | Invalidating unrelated board-local lookahead after a callback | Shared callbacks still invalidate every lane; nested local callbacks inherit their board owner |
