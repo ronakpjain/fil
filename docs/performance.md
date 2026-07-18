@@ -22,9 +22,9 @@ loop.
 The corrected six-board PER workload runs near real time after making
 continuous ADC sequences and their DMA transfers observable. After scheduler and
 interpreter hot-path restructuring, three consecutive one-second runs on the
-development host took **1.16 s, 1.13 s, and 1.14 s** (median 1.14 s, about **0.88x
+development host took **1.10 s, 1.08 s, and 1.09 s** (median 1.09 s, about **0.92x
 real time**). Disabling loop batching took 3.33 s on the same build, so the
-causality-bounded batching path is about **2.9x faster** for this workload. Both
+causality-bounded batching path is about **3.1x faster** for this workload. Both
 modes reported the same exact result:
 
 ```text
@@ -129,6 +129,7 @@ performance-specific mechanisms currently implemented; ordinary container
 | Board | Compact loop proofs | Copying full integer/FP CPU state into every scheduler proof | Proof references a generation/revision-checked observation slot; slot reuse invalidates it conservatively |
 | Board | Bitwise FP-state comparison | Scalar comparison of all 32 FP registers for exact loop matches | `memcmp` compares the complete stored float object representation, including NaN payload bits |
 | World | Reused batching planner storage | Per-frontier heap allocation | Storage is sized once per run and cleared before reuse |
+| World | Backward-boundary loop gate | Entering loop-proof observation after ordinary forward-flow instructions | Only a completed instruction whose resulting PC is at or below its address can close a candidate loop |
 | World | In-place successful-step accounting | Constructing/copying `BoardRunResult`, register arrays, optional faults, and strings per interpreted instruction | Full result and diagnostic materialization remains on non-success boundaries |
 | World | Exact lockstep bursts | Re-entering the general scheduler around every equal-duration board round | Runs at most 64 rounds; exits on events, exceptions, failures, budgets, clock divergence, or a usable loop proof |
 | World | Event ownership provenance | Invalidating unrelated board-local lookahead after a callback | Shared callbacks still invalidate every lane; nested local callbacks inherit their board owner |
@@ -298,6 +299,16 @@ scheduler chooses the earliest observable time across every lane, the shared eve
 queue, and the run deadline; each board may land on its own loop boundary as long
 as it does not cross that common causal horizon. This avoids requiring different
 clock phases and loop lengths to coincide exactly.
+
+### Backward-boundary loop-observation gate
+
+A loop candidate can only close when a completed instruction leaves the PC at or
+below that instruction's address. Both the general scheduler and fused lockstep
+path test this inexpensive condition before entering `Board::observeLoopBoundary`.
+Ordinary sequential instructions and forward branches therefore avoid observation
+table, memory-checkpoint, and read-footprint work. The board method retains the
+same check as a defensive API boundary, so callers cannot accidentally classify
+forward flow as a loop.
 
 ### Allocation-free loop proof and planning state
 

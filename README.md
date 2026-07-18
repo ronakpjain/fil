@@ -92,8 +92,8 @@ unknown_mmio_addresses: 0
 The count follows the current one-cycle-per-instruction timing model at the 16 MHz reset clock. Zero unknown MMIO means the top-level peripheral router saw no access outside a routed block; it does not imply that every register in those blocks has hardware-complete semantics.
 
 On the development host, three strict-MMIO Release+IPO runs of the corrected
-six-board one-second workload took 1.16 s, 1.13 s, and 1.14 s while preserving the
-exact 96,000,000 logical instruction/cycle total and per-board results—about 0.88x
+six-board one-second workload took 1.10 s, 1.08 s, and 1.09 s while preserving the
+exact 96,000,000 logical instruction/cycle total and per-board results—about 0.92x
 real time with clock-timed ADC sequences and per-rank DMA enabled. See
 [Performance](docs/performance.md) for reproduction commands, the
 unbatched comparison, correctness guards, and explanations of every speedup.
