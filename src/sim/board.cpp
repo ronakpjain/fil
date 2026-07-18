@@ -268,8 +268,8 @@ std::optional<Board::ProvenLoop> Board::observeLoopBoundary(
     if (observation.valid
         && observation.generation == loop_observation_generation_
         && observation.boundary_pc == boundary_pc
-        && memory_.sideEffectsRestoredSince(observation.side_effect_checkpoint)
         && sameCpuState(observation.state, cpu_->state())
+        && memory_.sideEffectsRestoredSince(observation.side_effect_checkpoint)
         && logical_instructions > observation.instructions
         && logical_cycles > observation.cycles) {
         ProvenLoop loop{

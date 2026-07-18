@@ -32,8 +32,8 @@ reported the same exact result:
 
 On battery with macOS Low Power Mode enabled, alternating five-run A/B tests use a
 separate baseline because host power policy materially changes throughput. The
-current portable build runs at a **1.55 s median (0.65x real time)**, while a
-freshly trained PGO build runs at a **1.34 s median (0.75x real time)**. Do not
+current portable build runs at a **1.57 s median (0.64x real time)**, while a
+freshly trained PGO build runs at a **1.33 s median (0.75x real time)**. Do not
 compare these numbers directly with the AC-power results above.
 
 ```text
@@ -179,6 +179,7 @@ performance-specific mechanisms currently implemented; ordinary container
 | Build | Clang profile-guided optimization | Static branch/layout guesses in workload-dependent interpreter and scheduler paths | Explicit two-build workflow; optimized build consumes a checked `.profdata` file |
 | Board/world | Exact-state loop batching | Re-executing proven identical idle iterations | CPU state, reversible RAM journal, MMIO generation, and causal horizon |
 | Board/world | Single loop-proof validation | Repeating full CPU/FP and memory-proof comparisons while applying an already bounded batch | `maximumLoopIterations()` validates and bounds the count immediately before the private apply step |
+| Board | State-first loop rejection | Walking reversible-memory history for unstable active loops | Exact CPU/FP mismatch rejects before the unchanged required memory proof |
 | Board | Closed-form horizon bound | Binary-searching loop counts with repeated virtual-time divisions | Solves the exact integer nanosecond inequality with checked 64-bit arithmetic |
 | Board | Generation-tagged loop observations | Clearing all 256 observation slots on every interrupt boundary | Generation wrap performs the full clear; stale generations never match |
 | Board | Compact loop proofs | Copying full integer/FP CPU state into every scheduler proof | Proof references a generation/revision-checked observation slot; slot reuse invalidates it conservatively |
@@ -437,6 +438,11 @@ Thumb boundary PC. Each observation stores the complete CPU state, logical total
 and a memory side-effect checkpoint. Direct-map collisions merely replace an old
 candidate and delay proof; they cannot create a false match because the boundary
 PC and full state are rechecked.
+
+The observer compares exact CPU/FP state before inspecting reversible-memory
+history. Active direct-branch loops frequently change registers and can therefore
+reject immediately; an equal state still requires the complete memory proof below.
+Reordering these independent required conditions cannot admit a false proof.
 
 Reversible-memory proof uses a fixed 8,192-entry mutation journal in `MemoryBus`.
 A checkpoint is rejected if the candidate spans more writes than the journal can
