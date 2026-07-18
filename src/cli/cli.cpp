@@ -455,6 +455,7 @@ ExitCode runNetworkCommand(
     bool trace_instructions = false;
     bool detect_spin = false;
     bool enable_loop_batching = true;
+    bool enable_transactional_slices = false;
     bool allow_breakpoint = false;
     std::vector<PendingCanInjection> injections;
 
@@ -501,6 +502,8 @@ ExitCode runNetworkCommand(
         else if (option == "--no-detect-spin") detect_spin = false;
         else if (option == "--loop-batching") enable_loop_batching = true;
         else if (option == "--no-loop-batching") enable_loop_batching = false;
+        else if (option == "--transactional-slices") enable_transactional_slices = true;
+        else if (option == "--no-transactional-slices") enable_transactional_slices = false;
         else if (option == "--allow-breakpoint") allow_breakpoint = true;
         else {
             err << "fil: unknown run-network option: " << option << '\n';
@@ -551,6 +554,7 @@ ExitCode runNetworkCommand(
     options.trace_instructions = trace_instructions;
     options.detect_spin = detect_spin;
     options.enable_loop_batching = enable_loop_batching;
+    options.enable_transactional_slices = enable_transactional_slices;
     auto result = world.value()->run(options);
     if (!result) {
         err << "fil: " << formatError(result.error()) << '\n';
@@ -569,7 +573,11 @@ ExitCode runNetworkCommand(
         << "exact_dispatches: " << result.value().exact_dispatches << '\n'
         << "loop_batches: " << result.value().loop_batches << '\n'
         << "batched_instructions: " << result.value().batched_instructions << '\n'
-        << "event_callbacks: " << result.value().event_callbacks << '\n';
+        << "event_callbacks: " << result.value().event_callbacks << '\n'
+        << "transactional_attempts: " << result.value().transactional_attempts << '\n'
+        << "transactional_commits: " << result.value().transactional_commits << '\n'
+        << "transactional_instructions: "
+        << result.value().transactional_instructions << '\n';
     for (const auto& board : result.value().boards) {
         out << "board " << board.name
             << ": stop=" << sim::boardStopReasonName(board.result.reason)
@@ -637,6 +645,7 @@ void printHelp(std::ostream& out) {
         << "Network options:\n"
         << "  --duration-ms N --max-instructions N --quantum N --trace FILE\n"
         << "  --strict-mmio --trace-instr --detect-spin --no-loop-batching --allow-breakpoint\n"
+        << "  --transactional-slices (experimental parallel lane epochs)\n"
         << "  --inject-can BUS[@TIME_MS]:ID:HEXDATA\n";
 }
 

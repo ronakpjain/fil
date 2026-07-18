@@ -1,7 +1,9 @@
 #include "fil/sim/event_loop.hpp"
 #include "fil/sim/trace.hpp"
+#include "fil/sim/worker_pool.hpp"
 #include "../test_support.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -98,6 +100,21 @@ void advancesOneOwnerIndependently() {
                          && calls == std::vector<unsigned int>{1U, 2U, 3U}
                          && loop.pending() == 0U,
                      "global execution skips an owner event already committed locally");
+}
+
+void reusesPersistentLaneWorkers() {
+    fil::sim::LaneWorkerPool workers(4U);
+    std::array<std::atomic<unsigned int>, 4> calls{};
+    const auto task = [&](const std::size_t lane) {
+        calls[lane].fetch_add(1U, std::memory_order_relaxed);
+    };
+    workers.run(task);
+    workers.run(task);
+    bool exact = workers.size() == 4U;
+    for (const auto& count : calls) {
+        exact = exact && count.load(std::memory_order_relaxed) == 2U;
+    }
+    fil::test::check(exact, "persistent worker pool executes every lane once per epoch");
 }
 
 void supportsConcurrentOwnerLanes() {
@@ -206,6 +223,7 @@ void runEventLoopTests() {
     ordersEventsDeterministically();
     tracksLocalAndSharedEventOwnership();
     advancesOneOwnerIndependently();
+    reusesPersistentLaneWorkers();
     supportsConcurrentOwnerLanes();
     cancelsAndRejectsInvalidTime();
     detectsZeroDelayLivelock();

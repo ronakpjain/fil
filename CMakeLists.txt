@@ -95,6 +95,7 @@ add_library(fil_core STATIC
     src/sim/event_loop.cpp
     src/sim/board.cpp
     src/sim/trace.cpp
+    src/sim/worker_pool.cpp
     src/sim/world.cpp
     src/stm32g4/adc.cpp
     src/stm32g4/dma.cpp

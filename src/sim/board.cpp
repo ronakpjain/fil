@@ -476,14 +476,18 @@ BoardRunResult Board::runWorkerSlice(
     const bool previous_all_trapping = memory_.allMmioTrapping();
     memory_.setSharedMmioTrapping(true);
     memory_.setAllMmioTrapping(trap_all_mmio);
+    SimTimeNs local_now = event_loop_->now(owner);
 
     const auto restore_trapping = [&]() {
         memory_.setSharedMmioTrapping(previous_shared_trapping);
         memory_.setAllMmioTrapping(previous_all_trapping);
     };
     const auto finish = [&]() {
+        if (trap_all_mmio) {
+            static_cast<void>(event_loop_->runOwnedEvents(owner, local_now));
+        }
         restore_trapping();
-        aggregate.time_ns = event_loop_->now(owner);
+        aggregate.time_ns = trap_all_mmio ? local_now : event_loop_->now(owner);
         aggregate.diagnostic.next_pc = cpu_->state().r[15];
         aggregate.diagnostic.registers = cpu_->state().r;
         aggregate.diagnostic.xpsr = cpu_->state().xpsr;
@@ -491,21 +495,31 @@ BoardRunResult Board::runWorkerSlice(
     };
 
     while (aggregate.instructions < instruction_budget) {
-        const SimTimeNs now = event_loop_->now(owner);
+        const SimTimeNs now = trap_all_mmio ? local_now : event_loop_->now(owner);
         if (now >= deadline_ns) {
             aggregate.reason = BoardStopReason::time_budget;
             aggregate.message = "worker slice deadline reached";
             break;
         }
-        const auto due = event_loop_->runOwnedEvents(owner, now);
-        if (due.same_time_limit_hit) {
-            aggregate.reason = BoardStopReason::host_error;
-            aggregate.message = "owner-local event livelock";
-            break;
+        if (!trap_all_mmio) {
+            const auto due = event_loop_->runOwnedEvents(owner, now);
+            if (due.same_time_limit_hit) {
+                aggregate.reason = BoardStopReason::host_error;
+                aggregate.message = "owner-local event livelock";
+                break;
+            }
         }
         if (auto boundary = settleInstructionBoundary()) {
             aggregate.reason = boundary->reason;
             aggregate.message = std::move(boundary->message);
+            break;
+        }
+        const SimTimeNs next_elapsed = elapsedForCycles(1U);
+        if (next_elapsed > deadline_ns - now) {
+            if (trap_all_mmio) local_now = deadline_ns;
+            else static_cast<void>(event_loop_->runOwnedEvents(owner, deadline_ns));
+            aggregate.reason = BoardStopReason::time_budget;
+            aggregate.message = "worker slice deadline reached";
             break;
         }
 
@@ -523,12 +537,17 @@ BoardRunResult Board::runWorkerSlice(
         aggregate.instructions += result.instructions;
         aggregate.cycles += result.cycles;
         const SimTimeNs elapsed = accountCycles(result.cycles);
-        const SimTimeNs completion = deadlineAfter(event_loop_->now(owner), elapsed);
-        const auto events = event_loop_->runOwnedEvents(owner, completion);
-        if (events.same_time_limit_hit) {
-            aggregate.reason = BoardStopReason::host_error;
-            aggregate.message = "owner-local event livelock";
-            break;
+        const SimTimeNs completion = deadlineAfter(
+            trap_all_mmio ? local_now : event_loop_->now(owner), elapsed
+        );
+        if (trap_all_mmio) local_now = completion;
+        else {
+            const auto events = event_loop_->runOwnedEvents(owner, completion);
+            if (events.same_time_limit_hit) {
+                aggregate.reason = BoardStopReason::host_error;
+                aggregate.message = "owner-local event livelock";
+                break;
+            }
         }
         if (result.reason != cpu::StopReason::step_complete) {
             cpu::RunResult detailed;
@@ -563,13 +582,19 @@ BoardRunResult Board::runWorkerSlice(
         const LoopSkip skip = applyLoopIterations(*loop, iterations);
         aggregate.instructions += skip.instructions;
         aggregate.cycles += skip.cycles;
-        const auto skipped_events = event_loop_->runOwnedEvents(
-            owner, deadlineAfter(event_loop_->now(owner), skip.elapsed_ns)
+        const SimTimeNs skipped_completion = deadlineAfter(
+            trap_all_mmio ? local_now : event_loop_->now(owner), skip.elapsed_ns
         );
-        if (skipped_events.same_time_limit_hit) {
-            aggregate.reason = BoardStopReason::host_error;
-            aggregate.message = "owner-local event livelock";
-            break;
+        if (trap_all_mmio) local_now = skipped_completion;
+        else {
+            const auto skipped_events = event_loop_->runOwnedEvents(
+                owner, skipped_completion
+            );
+            if (skipped_events.same_time_limit_hit) {
+                aggregate.reason = BoardStopReason::host_error;
+                aggregate.message = "owner-local event livelock";
+                break;
+            }
         }
         refreshLoopObservation(*loop, aggregate.instructions, aggregate.cycles);
         if (auto boundary = settleInstructionBoundary()) {
