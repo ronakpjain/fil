@@ -101,9 +101,17 @@ struct EventLoop::Impl {
         return &found->second;
     }
 
+    void discardDeadOwnerFront(const EventOwner owner) {
+        const auto found = owner_events.find(owner);
+        if (found == owner_events.end()) return;
+        discardDeadFront(found->second);
+        if (found->second.empty()) owner_events.erase(found);
+    }
+
     void retire(const EventPtr& event) {
         event->live = false;
         live_events.erase(event->id);
+        discardDeadOwnerFront(event->owner);
         ++owner_generation[event->owner];
     }
 
@@ -204,8 +212,10 @@ bool EventLoop::cancel(const EventId id) noexcept {
     const auto found = impl_->live_events.find(id);
     if (found == impl_->live_events.end()) return false;
     found->second->live = false;
-    ++impl_->owner_generation[found->second->owner];
+    const EventOwner owner = found->second->owner;
+    ++impl_->owner_generation[owner];
     impl_->live_events.erase(found);
+    impl_->discardDeadOwnerFront(owner);
     return true;
 }
 
