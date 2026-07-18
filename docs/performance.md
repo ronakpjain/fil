@@ -205,9 +205,10 @@ the loop-observation generation rather than copying all 256 full CPU/FP snapshot
 the table cannot mutate in that mode, so restoring its generation recreates the
 prior detector state exactly. On the six-board workload this lowers the opt-in
 transactional median from about 1.39 s to 1.36 s. The coordinator now samples
-commit profitability online and disables worker epochs after at least 32 attempts
-when fewer than one third commit. It then reenables fused serial bursts, reducing
-the six-board opt-in runtime further to about 0.93 s on this low-commit workload
+commit profitability online and disables worker epochs after at least 16 attempts when fewer than three quarters commit. This threshold
+reflects checkpoint and synchronization costs: merely committing more epochs than
+are rejected is not sufficient to amortize them. It then reenables fused serial
+bursts, reducing the six-board combined opt-in runtime to about 0.88 s on this low-commit workload
 while retaining parallel execution for workloads that demonstrate useful epochs.
 
 The first seven techniques preserve one host dispatch per target instruction. Loop

@@ -782,9 +782,9 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                 }
                 transaction_backoff = 4096U;
             }
-            if (output.transactional_attempts >= 32U
-                && output.transactional_commits * 3U
-                    < output.transactional_attempts) {
+            if (output.transactional_attempts >= 16U
+                && output.transactional_commits * 4U
+                    < output.transactional_attempts * 3U) {
                 transactional_active = false;
                 transaction_backoff = 0U;
                 event_loop_.setConcurrentAccess(false);
