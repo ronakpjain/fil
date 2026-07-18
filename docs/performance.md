@@ -24,8 +24,9 @@ continuous ADC sequences and their DMA transfers observable. After scheduler and
 interpreter hot-path restructuring, three consecutive one-second runs on the
 development host took **1.10 s, 1.08 s, and 1.09 s** in the portable Release+IPO
 build (median 1.09 s, about **0.92x real time**). A Clang PGO build trained on the
-same command took **0.87 s, 0.86 s, and 0.87 s** (median 0.87 s, about **1.15x real
-time**) after eliminating redundant loop-proof revalidation. Disabling loop batching took 3.33 s on the portable build, so the
+same command took **0.84 s, 0.83 s, and 0.84 s** (median 0.84 s, about **1.19x real
+time**) after eliminating redundant loop-proof revalidation and binary-search-free
+horizon planning. Disabling loop batching took 3.33 s on the portable build, so the
 causality-bounded batching path is about **3.1x faster** before PGO. Every mode
 reported the same exact result:
 
@@ -167,6 +168,7 @@ performance-specific mechanisms currently implemented; ordinary container
 | Build | Clang profile-guided optimization | Static branch/layout guesses in workload-dependent interpreter and scheduler paths | Explicit two-build workflow; optimized build consumes a checked `.profdata` file |
 | Board/world | Exact-state loop batching | Re-executing proven identical idle iterations | CPU state, reversible RAM journal, MMIO generation, and causal horizon |
 | Board/world | Single loop-proof validation | Repeating full CPU/FP and memory-proof comparisons while applying an already bounded batch | `maximumLoopIterations()` validates and bounds the count immediately before the private apply step |
+| Board | Closed-form horizon bound | Binary-searching loop counts with repeated virtual-time divisions | Solves the exact integer nanosecond inequality with checked 64-bit arithmetic |
 | Board | Generation-tagged loop observations | Clearing all 256 observation slots on every interrupt boundary | Generation wrap performs the full clear; stale generations never match |
 | Board | Compact loop proofs | Copying full integer/FP CPU state into every scheduler proof | Proof references a generation/revision-checked observation slot; slot reuse invalidates it conservatively |
 | Board | Bitwise FP-state comparison | Scalar comparison of all 32 FP registers for exact loop matches | `memcmp` compares the complete stored float object representation, including NaN payload bits |
@@ -341,6 +343,14 @@ scheduler chooses the earliest observable time across every lane, the shared eve
 queue, and the run deadline; each board may land on its own loop boundary as long
 as it does not cross that common causal horizon. This avoids requiring different
 clock phases and loop lengths to coincide exactly.
+
+The planner converts that nanosecond horizon to a maximum cycle count by solving
+`floor((cycles * 1e9 + fraction) / frequency) <= available_ns` directly. Checked
+64-bit multiplication handles the ordinary case in constant time; if the horizon
+product would overflow, the preexisting accountable-cycle limit is necessarily
+stricter. This replaces a binary search that repeatedly performed virtual-time
+divisions while retaining the rule that one iteration may complete exactly at the
+observable frontier.
 
 ### Backward-boundary loop-observation gate
 
