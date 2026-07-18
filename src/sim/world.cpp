@@ -328,6 +328,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
     bool stop_requested = false;
     SimTimeNs dispatch_time = output.start_time_ns;
     std::uint64_t transaction_backoff = 0U;
+    bool transactional_active = worker_pool != nullptr;
 
     for (;;) {
         const SimTimeNs now = event_loop_.now();
@@ -533,7 +534,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
             }
         }
 
-        bool burst_eligible = !options.enable_transactional_slices
+        bool burst_eligible = !transactional_active
             && !options.trace_instructions && !options.detect_spin
             && !stop_requested && !time_exhausted && !states.empty();
         bool all_lanes_proven = !states.empty();
@@ -689,7 +690,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
         }
 
         if (transaction_backoff != 0U) --transaction_backoff;
-        if (options.enable_transactional_slices && transaction_backoff == 0U
+        if (transactional_active && transaction_backoff == 0U
             && !trace_.enabled() && !options.trace_instructions && !options.detect_spin
             && !stop_requested && !time_exhausted) {
             constexpr std::uint64_t slice_instructions = 256U;
@@ -780,6 +781,13 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                     }
                 }
                 transaction_backoff = 4096U;
+            }
+            if (output.transactional_attempts >= 32U
+                && output.transactional_commits * 3U
+                    < output.transactional_attempts) {
+                transactional_active = false;
+                transaction_backoff = 0U;
+                event_loop_.setConcurrentAccess(false);
             }
         }
 

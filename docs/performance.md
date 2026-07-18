@@ -192,9 +192,23 @@ performance-specific mechanisms currently implemented; ordinary container
 | World | Event ownership provenance | Invalidating unrelated board-local lookahead after a callback | Shared callbacks still invalidate every lane; nested local callbacks inherit their board owner |
 | Event loop | Serial owner fast path | Thread-local lookup and owner-map probing for every instruction dispatch | Thread-local ownership remains active whenever concurrent lane access is enabled |
 | World | Transactional lane workers | Serial MMIO-free instruction epochs across independent boards | CPU/RAM/system state is checkpointed; any MMIO/event escape rolls every lane back; opt-in while commit rate is tuned |
+| World | Atomic worker epochs | Mutex/condition-variable dispatch and copying disabled loop observations | Generation/remaining atomics synchronize persistent lanes; rollback restores the unchanged observation generation |
 | Diagnostics | Disabled trace/history fast mode | Retaining and serializing unrequested records, ADC samples, and DMA request logs | Any requested observer reenables exact events/data retention |
 | ADC | Lazy unobserved continuous conversion | One callback per conversion period | Only continuous conversions with no interrupt/callback/trace/history observer |
 | DMAMUX | Generation-tagged request-route cache | Scanning all 16 selectors for every ADC conversion | Any selector write invalidates and rebuilds the complete route table |
+
+The transactional worker path now dispatches persistent lanes through C++20 atomic
+wait/notify counters instead of a mutex-protected task generation. Each lane owns
+its exception slot, so epoch completion needs no shared failure lock. Worker slices
+with loop batching disabled also skip loop discovery, and checkpoints retain only
+the loop-observation generation rather than copying all 256 full CPU/FP snapshots;
+the table cannot mutate in that mode, so restoring its generation recreates the
+prior detector state exactly. On the six-board workload this lowers the opt-in
+transactional median from about 1.39 s to 1.36 s. The coordinator now samples
+commit profitability online and disables worker epochs after at least 32 attempts
+when fewer than one third commit. It then reenables fused serial bursts, reducing
+the six-board opt-in runtime further to about 0.93 s on this low-commit workload
+while retaining parallel execution for workloads that demonstrate useful epochs.
 
 The first seven techniques preserve one host dispatch per target instruction. Loop
 batching and lazy ADC conversion are conservative event-elision techniques: they
