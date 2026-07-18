@@ -310,7 +310,7 @@ FastStepResult CortexM4::stepFast() {
                 if (cache.jit_hits != std::numeric_limits<std::uint16_t>::max()) {
                     ++cache.jit_hits;
                 }
-                if (cache.jit_hits == 128U) {
+                if (cache.jit_hits == std::numeric_limits<std::uint16_t>::max()) {
                     try {
                         if (!jit_) jit_ = std::make_unique<LlvmJitEngine>();
                         const auto compiled = jit_->compile(
