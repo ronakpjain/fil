@@ -29,6 +29,27 @@ void runsBoardToBreakpoint() {
     fil::test::check(result.time_ns > 0, "advances simulated board time from CPU cycles");
 }
 
+void workerSliceMatchesStandaloneExecution() {
+    auto exact = fil::sim::Board::load(fixtureBoard());
+    auto worker = fil::sim::Board::load(fixtureBoard());
+    fil::test::check(exact.hasValue() && worker.hasValue(),
+                     "loads exact and owner-local worker boards");
+    if (!exact || !worker) return;
+
+    fil::sim::BoardRunOptions options;
+    options.max_instructions = 20U;
+    options.duration_ns = 0U;
+    const auto exact_result = exact.value()->run(options);
+    const auto worker_result = worker.value()->runWorkerSlice(0U, 20U, 1'000'000U);
+    fil::test::check(worker_result.reason == exact_result.reason
+                         && worker_result.instructions == exact_result.instructions
+                         && worker_result.cycles == exact_result.cycles
+                         && worker_result.time_ns == exact_result.time_ns
+                         && worker_result.diagnostic.next_pc
+                             == exact_result.diagnostic.next_pc,
+                     "owner-local slice preserves standalone architectural results");
+}
+
 void stopsAtRequestedAddress() {
     auto board = fil::sim::Board::load(fixtureBoard());
     if (!board) {
@@ -70,6 +91,7 @@ void producesByteIdenticalTraceForRepeatedRuns() {
 
 void runBoardTests() {
     runsBoardToBreakpoint();
+    workerSliceMatchesStandaloneExecution();
     stopsAtRequestedAddress();
     producesByteIdenticalTraceForRepeatedRuns();
 }

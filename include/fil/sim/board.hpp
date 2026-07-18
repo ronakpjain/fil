@@ -41,6 +41,7 @@ enum class BoardStopReason : std::uint8_t {
     unimplemented_instruction,
     architectural_fault,
     reset_requested,
+    synchronization_required,
     host_error,
 };
 
@@ -88,6 +89,14 @@ public:
 
     /** @brief Runs until a configured boundary or architectural failure. */
     [[nodiscard]] BoardRunResult run(const BoardRunOptions& options);
+
+    /** @brief Runs one lane using only owner-local events until shared synchronization. */
+    [[nodiscard]] BoardRunResult runWorkerSlice(
+        EventOwner owner,
+        std::uint64_t instruction_budget,
+        SimTimeNs deadline_ns,
+        bool enable_loop_batching = true
+    );
 
     [[nodiscard]] cpu::CortexM4& cpu() noexcept { return *cpu_; }
     [[nodiscard]] const cpu::CortexM4& cpu() const noexcept { return *cpu_; }

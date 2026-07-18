@@ -60,7 +60,8 @@ bool BoardRunResult::succeeded() const noexcept {
         || reason == BoardStopReason::breakpoint
         || reason == BoardStopReason::halted
         || reason == BoardStopReason::instruction_budget
-        || reason == BoardStopReason::time_budget;
+        || reason == BoardStopReason::time_budget
+        || reason == BoardStopReason::synchronization_required;
 }
 
 Board::Board(
@@ -410,12 +411,125 @@ BoardRunResult Board::cpuFailure(const cpu::RunResult& result) const {
     case cpu::StopReason::bus_fault:
     case cpu::StopReason::invalid_state: board.reason = BoardStopReason::architectural_fault; break;
     case cpu::StopReason::synchronization_required:
-        board.reason = BoardStopReason::host_error;
+        board.reason = BoardStopReason::synchronization_required;
         break;
     case cpu::StopReason::instruction_budget: board.reason = BoardStopReason::instruction_budget; break;
     case cpu::StopReason::step_complete: board.reason = BoardStopReason::host_error; break;
     }
     return board;
+}
+
+BoardRunResult Board::runWorkerSlice(
+    const EventOwner owner,
+    const std::uint64_t instruction_budget,
+    const SimTimeNs deadline_ns,
+    const bool enable_loop_batching
+) {
+    BoardRunResult aggregate;
+    aggregate.reason = BoardStopReason::instruction_budget;
+    auto owner_scope = event_loop_->useOwner(owner);
+    const bool previous_trapping = memory_.sharedMmioTrapping();
+    memory_.setSharedMmioTrapping(true);
+
+    const auto finish = [&]() {
+        memory_.setSharedMmioTrapping(previous_trapping);
+        aggregate.time_ns = event_loop_->now(owner);
+        aggregate.diagnostic.next_pc = cpu_->state().r[15];
+        aggregate.diagnostic.registers = cpu_->state().r;
+        aggregate.diagnostic.xpsr = cpu_->state().xpsr;
+        return aggregate;
+    };
+
+    while (aggregate.instructions < instruction_budget) {
+        const SimTimeNs now = event_loop_->now(owner);
+        if (now >= deadline_ns) {
+            aggregate.reason = BoardStopReason::time_budget;
+            aggregate.message = "worker slice deadline reached";
+            break;
+        }
+        const auto due = event_loop_->runOwnedEvents(owner, now);
+        if (due.same_time_limit_hit) {
+            aggregate.reason = BoardStopReason::host_error;
+            aggregate.message = "owner-local event livelock";
+            break;
+        }
+        if (auto boundary = settleInstructionBoundary()) {
+            aggregate.reason = boundary->reason;
+            aggregate.message = std::move(boundary->message);
+            break;
+        }
+
+        const cpu::FastStepResult result = cpu_->stepFast();
+        aggregate.diagnostic.instruction_address = result.instruction_address;
+        aggregate.diagnostic.raw = result.raw;
+        aggregate.diagnostic.instruction_size = result.instruction_size;
+        if (result.reason == cpu::StopReason::synchronization_required) {
+            aggregate.reason = BoardStopReason::synchronization_required;
+            aggregate.message = "shared MMIO requires coordinator commit";
+            aggregate.diagnostic = cpu_->lastDiagnostic();
+            break;
+        }
+
+        aggregate.instructions += result.instructions;
+        aggregate.cycles += result.cycles;
+        const SimTimeNs elapsed = accountCycles(result.cycles);
+        const SimTimeNs completion = deadlineAfter(event_loop_->now(owner), elapsed);
+        const auto events = event_loop_->runOwnedEvents(owner, completion);
+        if (events.same_time_limit_hit) {
+            aggregate.reason = BoardStopReason::host_error;
+            aggregate.message = "owner-local event livelock";
+            break;
+        }
+        if (result.reason != cpu::StopReason::step_complete) {
+            cpu::RunResult detailed;
+            detailed.reason = result.reason;
+            detailed.instructions = result.instructions;
+            detailed.cycles = result.cycles;
+            detailed.diagnostic = cpu_->lastDiagnostic();
+            BoardRunResult stopped = cpuFailure(detailed);
+            stopped.instructions = aggregate.instructions;
+            stopped.cycles = aggregate.cycles;
+            memory_.setSharedMmioTrapping(previous_trapping);
+            return stopped;
+        }
+        if (auto boundary = settleInstructionBoundary()) {
+            aggregate.reason = boundary->reason;
+            aggregate.message = std::move(boundary->message);
+            break;
+        }
+
+        const auto loop = observeLoopBoundary(
+            result, aggregate.instructions, aggregate.cycles
+        );
+        if (!enable_loop_batching || !loop) continue;
+        std::optional<SimTimeNs> horizon = deadline_ns;
+        if (const auto local_event = event_loop_->nextScheduledTime(owner);
+            local_event && *local_event < *horizon) {
+            horizon = *local_event;
+        }
+        const std::uint64_t remaining = instruction_budget - aggregate.instructions;
+        const std::uint64_t iterations = maximumLoopIterations(*loop, remaining, horizon);
+        if (iterations == 0U) continue;
+        const LoopSkip skip = applyLoopIterations(*loop, iterations);
+        aggregate.instructions += skip.instructions;
+        aggregate.cycles += skip.cycles;
+        const auto skipped_events = event_loop_->runOwnedEvents(
+            owner, deadlineAfter(event_loop_->now(owner), skip.elapsed_ns)
+        );
+        if (skipped_events.same_time_limit_hit) {
+            aggregate.reason = BoardStopReason::host_error;
+            aggregate.message = "owner-local event livelock";
+            break;
+        }
+        refreshLoopObservation(*loop, aggregate.instructions, aggregate.cycles);
+        if (auto boundary = settleInstructionBoundary()) {
+            aggregate.reason = boundary->reason;
+            aggregate.message = std::move(boundary->message);
+            break;
+        }
+    }
+
+    return finish();
 }
 
 BoardRunResult Board::run(const BoardRunOptions& options) {
@@ -539,6 +653,7 @@ std::string_view boardStopReasonName(const BoardStopReason reason) noexcept {
     case BoardStopReason::unimplemented_instruction: return "unimplemented-instruction";
     case BoardStopReason::architectural_fault: return "architectural-fault";
     case BoardStopReason::reset_requested: return "reset-requested";
+    case BoardStopReason::synchronization_required: return "synchronization-required";
     case BoardStopReason::host_error: return "host-error";
     }
     return "unknown";
