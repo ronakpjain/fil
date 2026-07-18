@@ -46,6 +46,8 @@ struct EventLoop::Impl {
     std::unordered_map<EventOwner, Queue> owner_events;
     std::unordered_map<EventId, EventPtr> live_events;
     std::unordered_map<EventOwner, SimTimeNs> owner_now;
+    // Completed global frontier applied lazily to materialized owner clocks.
+    SimTimeNs owner_time_floor{0};
     std::unordered_map<EventOwner, std::uint64_t> owner_generation;
 
     struct Lock {
@@ -68,7 +70,8 @@ struct EventLoop::Impl {
     [[nodiscard]] SimTimeNs timeFor(const EventOwner owner) const noexcept {
         if (owner == shared_event_owner) return shared_now;
         const auto found = owner_now.find(owner);
-        return found == owner_now.end() ? shared_now : found->second;
+        return found == owner_now.end()
+            ? shared_now : std::max(found->second, owner_time_floor);
     }
 
     void setTime(const EventOwner owner, const SimTimeNs time) {
@@ -204,10 +207,7 @@ EventRunResult EventLoop::runDueEvents(const SimTimeNs deadline) {
         impl_->discardDeadGlobalFront();
         if (impl_->events.empty() || impl_->events.top()->at > deadline) {
             impl_->shared_now = deadline;
-            for (auto& [owner, time] : impl_->owner_now) {
-                static_cast<void>(owner);
-                time = std::max(time, deadline);
-            }
+            impl_->owner_time_floor = std::max(impl_->owner_time_floor, deadline);
             result.stopped_at = deadline;
             return result;
         }

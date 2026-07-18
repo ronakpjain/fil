@@ -193,6 +193,7 @@ performance-specific mechanisms currently implemented; ordinary container
 | World | In-place successful-step accounting | Constructing/copying `BoardRunResult`, register arrays, optional faults, and strings per interpreted instruction | Full result and diagnostic materialization remains on non-success boundaries |
 | World | Exact lockstep bursts | Re-entering the general scheduler around every equal-duration board round | Runs at most 64 rounds; exits on events, exceptions, failures, budgets, clock divergence, or a usable loop proof |
 | World | Event ownership provenance | Invalidating unrelated board-local lookahead after a callback | Shared callbacks still invalidate every lane; nested local callbacks inherit their board owner |
+| Event loop | Lazy owner-time floor | Walking every remembered board clock after each callback-free scheduler tick | Existing owners observe the prior completed global frontier during callbacks; missing owners still inherit the current shared time; farther-ahead transactional clocks remain ahead |
 | Event loop | Serial owner fast path | Thread-local lookup and owner-map probing for every instruction dispatch | Thread-local ownership remains active whenever concurrent lane access is enabled |
 | World | Transactional lane workers | Serial instruction epochs across independent boards | CPU/RAM/system state and approved local register writes are reversible; shared or callback-producing MMIO still forces rollback |
 | World | Atomic worker epochs | Mutex/condition-variable dispatch and copying disabled loop observations | Generation/remaining atomics synchronize persistent lanes; rollback restores the unchanged observation generation |
@@ -223,6 +224,14 @@ event scheduling still trap. At 1,024 instructions per epoch this commits about
 104,448 target instructions in 17 of 23 sampled epochs. Its 0.88 s Release median
 is neutral on `per_vehicle`, so it is correctness infrastructure rather than a
 claimed speedup.
+
+Global event-loop advancement now records a monotonic owner-time floor instead of
+eagerly walking the owner-clock map after every callback-free lockstep round.
+Owner-clock reads apply that floor lazily, while preserving the prior observable
+behavior inside intermediate callbacks and for transactionally advanced lanes.
+Sixteen counterbalanced Release+IPO runs measured a 0.88 s median with the lazy
+floor versus 0.89 s for the eager walk, with identical workload counters and
+terminal PCs.
 
 The first seven techniques preserve one host dispatch per target instruction. Loop
 batching and lazy ADC conversion are conservative event-elision techniques: they

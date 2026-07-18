@@ -102,6 +102,35 @@ void advancesOneOwnerIndependently() {
                      "global execution skips an owner event already committed locally");
 }
 
+void lazilyAdvancesRememberedOwnerClocks() {
+    fil::sim::EventLoop loop;
+    static_cast<void>(loop.runOwnedEvents(1U, 5U));
+    static_cast<void>(loop.runOwnedEvents(2U, 3U));
+    static_cast<void>(loop.runDueEvents(10U));
+    fil::test::check(loop.now(1U) == 10U && loop.now(2U) == 10U,
+                     "global time advances every remembered owner clock");
+
+    static_cast<void>(loop.runOwnedEvents(1U, 15U));
+    static_cast<void>(loop.runDueEvents(12U));
+    fil::test::check(loop.now(1U) == 15U && loop.now(2U) == 12U,
+                     "global time preserves an owner clock already farther ahead");
+
+    std::array<fil::sim::SimTimeNs, 2> callback_times{};
+    static_cast<void>(loop.scheduleAt(20U, [&]() {
+        callback_times = {loop.now(2U), loop.now(3U)};
+    }));
+    static_cast<void>(loop.runDueEvents(25U));
+    fil::test::check(callback_times == std::array<fil::sim::SimTimeNs, 2>{12U, 20U},
+                     "callbacks observe prior owner time and current time for new owners");
+    fil::test::check(loop.now(1U) == 25U && loop.now(2U) == 25U,
+                     "completed global advancement normalizes owner clocks lazily");
+
+    const auto checkpoint = loop.ownerCheckpoint(2U);
+    static_cast<void>(loop.runOwnedEvents(2U, 30U));
+    fil::test::check(loop.restoreOwnerCheckpoint(checkpoint) && loop.now(2U) == 25U,
+                     "lazy global time preserves reversible owner-local advancement");
+}
+
 void reusesPersistentLaneWorkers() {
     fil::sim::LaneWorkerPool workers(4U);
     std::array<std::atomic<unsigned int>, 4> calls{};
@@ -223,6 +252,7 @@ void runEventLoopTests() {
     ordersEventsDeterministically();
     tracksLocalAndSharedEventOwnership();
     advancesOneOwnerIndependently();
+    lazilyAdvancesRememberedOwnerClocks();
     reusesPersistentLaneWorkers();
     supportsConcurrentOwnerLanes();
     cancelsAndRejectsInvalidTime();
