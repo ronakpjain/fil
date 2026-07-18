@@ -184,10 +184,10 @@ private:
         std::uint64_t instruction_budget,
         std::optional<SimTimeNs> horizon_ns
     ) const;
-    [[nodiscard]] LoopSkip describeLoopIterations(
-        const ProvenLoop& loop, std::uint64_t iterations
-    ) const;
-    [[nodiscard]] LoopSkip applyLoopIterations(const ProvenLoop& loop, std::uint64_t iterations);
+    /** Applies iterations already bounded by maximumLoopIterations(). */
+    [[nodiscard]] LoopSkip applyLoopIterations(
+        const ProvenLoop& loop, std::uint64_t validated_iterations
+    );
     [[nodiscard]] bool loopProofStillValid(const ProvenLoop& loop) const noexcept;
     [[nodiscard]] bool loopHasNoMmioSince(const ProvenLoop& loop) const noexcept;
     [[nodiscard]] std::optional<SimTimeNs> nextObservableTime(SimTimeNs boundary_time) const;

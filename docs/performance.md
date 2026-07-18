@@ -24,8 +24,8 @@ continuous ADC sequences and their DMA transfers observable. After scheduler and
 interpreter hot-path restructuring, three consecutive one-second runs on the
 development host took **1.10 s, 1.08 s, and 1.09 s** in the portable Release+IPO
 build (median 1.09 s, about **0.92x real time**). A Clang PGO build trained on the
-same command took **0.90 s, 0.87 s, and 0.90 s** (median 0.90 s, about **1.11x real
-time**). Disabling loop batching took 3.33 s on the portable build, so the
+same command took **0.87 s, 0.86 s, and 0.87 s** (median 0.87 s, about **1.15x real
+time**) after eliminating redundant loop-proof revalidation. Disabling loop batching took 3.33 s on the portable build, so the
 causality-bounded batching path is about **3.1x faster** before PGO. Every mode
 reported the same exact result:
 
@@ -166,6 +166,7 @@ performance-specific mechanisms currently implemented; ordinary container
 | Build | Release plus IPO/LTO defaults | Unoptimized hot path and translation-unit barriers | Debug and sanitizer builds remain unoptimized/non-IPO |
 | Build | Clang profile-guided optimization | Static branch/layout guesses in workload-dependent interpreter and scheduler paths | Explicit two-build workflow; optimized build consumes a checked `.profdata` file |
 | Board/world | Exact-state loop batching | Re-executing proven identical idle iterations | CPU state, reversible RAM journal, MMIO generation, and causal horizon |
+| Board/world | Single loop-proof validation | Repeating full CPU/FP and memory-proof comparisons while applying an already bounded batch | `maximumLoopIterations()` validates and bounds the count immediately before the private apply step |
 | Board | Generation-tagged loop observations | Clearing all 256 observation slots on every interrupt boundary | Generation wrap performs the full clear; stale generations never match |
 | Board | Compact loop proofs | Copying full integer/FP CPU state into every scheduler proof | Proof references a generation/revision-checked observation slot; slot reuse invalidates it conservatively |
 | Board | Bitwise FP-state comparison | Scalar comparison of all 32 FP registers for exact loop matches | `memcmp` compares the complete stored float object representation, including NaN payload bits |
@@ -371,6 +372,12 @@ The multi-board scheduler likewise allocates its state and planned-iteration arr
 once at the start of `World::run()`, clears the iteration counts at each frontier,
 and reuses the storage. This avoids millions of host heap allocations in long
 network simulations without changing scheduling order.
+
+`maximumLoopIterations()` performs the full proof validation and returns a count
+already bounded by the instruction budget and causal horizon. Every internal
+caller applies that count immediately, before an event or another instruction can
+change the lane. The private apply step therefore accounts the batch directly
+instead of repeating the full CPU/FP-state and memory-proof comparison twice.
 
 If a proof condition is absent or changes, execution continues one instruction at
 a time. `--no-loop-batching` explicitly disables the optimization and is the right

@@ -407,23 +407,13 @@ std::uint64_t Board::maximumLoopIterations(
 
 Board::LoopSkip Board::applyLoopIterations(
     const ProvenLoop& loop,
-    const std::uint64_t iterations
+    const std::uint64_t validated_iterations
 ) {
-    if (iterations == 0U || !loopProofStillValid(loop)) return {};
-    LoopSkip skip = describeLoopIterations(loop, iterations);
-    skip.elapsed_ns = accountCycles(skip.cycles);
-    return skip;
-}
-
-Board::LoopSkip Board::describeLoopIterations(
-    const ProvenLoop& loop,
-    const std::uint64_t iterations
-) const {
-    if (iterations == 0U || !loopProofStillValid(loop)) return {};
+    if (validated_iterations == 0U) return {};
     LoopSkip skip;
-    skip.instructions = iterations * loop.instructions_per_iteration;
-    skip.cycles = iterations * loop.cycles_per_iteration;
-    skip.elapsed_ns = elapsedForCycles(skip.cycles);
+    skip.instructions = validated_iterations * loop.instructions_per_iteration;
+    skip.cycles = validated_iterations * loop.cycles_per_iteration;
+    skip.elapsed_ns = accountCycles(skip.cycles);
     return skip;
 }
 
