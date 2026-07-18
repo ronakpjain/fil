@@ -12,10 +12,14 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <ostream>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fil::cli {
@@ -500,6 +504,7 @@ ExitCode runNetworkCommand(
     bool enable_loop_batching = true;
     bool enable_transactional_slices = false;
     bool allow_breakpoint = false;
+    bool control_stdin = false;
     bool realtime = args.front() == "watch-network";
     bool live = realtime;
     std::uint64_t refresh_ms = 10U;
@@ -561,6 +566,7 @@ ExitCode runNetworkCommand(
         else if (option == "--no-realtime") realtime = false;
         else if (option == "--live") live = true;
         else if (option == "--no-live") live = false;
+        else if (option == "--control-stdin") control_stdin = true;
         else {
             err << "fil: unknown run-network option: " << option << '\n';
             return ExitCode::usage_error;
@@ -595,6 +601,43 @@ ExitCode runNetworkCommand(
     }
     world.value()->eventLoop().setRealtimePacing(realtime, refresh_ms * 1'000'000ULL);
 
+    struct StdinControlState {
+        std::mutex mutex;
+        bool active{true};
+    };
+    std::shared_ptr<StdinControlState> stdin_control;
+    if (control_stdin) {
+        stdin_control = std::make_shared<StdinControlState>();
+        world.value()->eventLoop().setConcurrentAccess(true);
+        sim::World* const controlled_world = world.value().get();
+        std::thread([controlled_world, state = stdin_control]() {
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                auto injection = parseCanInjection(line);
+                if (!injection) {
+                    std::cerr << "fil: ignored stdin CAN command: "
+                              << injection.error().message << '\n';
+                    continue;
+                }
+                std::lock_guard lock(state->mutex);
+                if (!state->active) return;
+                devices::VirtualCanBus* const bus = controlled_world->canBus(injection.value().bus);
+                if (bus == nullptr) {
+                    std::cerr << "fil: ignored stdin CAN command for undeclared bus: "
+                              << injection.value().bus << '\n';
+                    continue;
+                }
+                sim::EventLoop* const loop = &controlled_world->eventLoop();
+                static_cast<void>(loop->scheduleAfter(
+                    0U,
+                    [bus, loop, frame = injection.value().frame]() {
+                        static_cast<void>(bus->inject(frame, loop->now()));
+                    }
+                ));
+            }
+        }).detach();
+    }
+
     for (const PendingCanInjection& injection : injections) {
         devices::VirtualCanBus* bus = world.value()->canBus(injection.bus);
         if (bus == nullptr) {
@@ -623,6 +666,10 @@ ExitCode runNetworkCommand(
     options.enable_loop_batching = enable_loop_batching;
     options.enable_transactional_slices = enable_transactional_slices;
     auto result = world.value()->run(options);
+    if (stdin_control) {
+        std::lock_guard lock(stdin_control->mutex);
+        stdin_control->active = false;
+    }
     if (!result) {
         err << "fil: " << formatError(result.error()) << '\n';
         return result.error().category == ErrorCategory::invalid_argument
@@ -717,7 +764,8 @@ void printHelp(std::ostream& out) {
         << "  --duration-ms N --max-instructions N --quantum N --trace FILE\n"
         << "  --strict-mmio --trace-instr --detect-spin --no-loop-batching --allow-breakpoint\n"
         << "  --transactional-slices (experimental parallel lane epochs)\n"
-        << "  --inject-can BUS[@TIME_MS]:ID:HEXDATA\n";
+        << "  --inject-can BUS[@TIME_MS]:ID:HEXDATA\n"
+        << "  --control-stdin (accept BUS:ID:HEXDATA lines while running)\n";
 }
 
 ExitCode run(

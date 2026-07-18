@@ -83,6 +83,10 @@ fairness quantum:
 
 `--inject-can BUS[@TIME_MS]:ID:HEXDATA` may be repeated. Omitting `@TIME_MS`
 schedules the frame at time zero; identifiers above `0x7ff` are treated as extended.
+Interactive clients may add `--control-stdin` and write one
+`BUS:ID:HEXDATA` command per line. Each valid command is injected at the next safe
+shared simulation frontier, allowing a long-running `watch-network` process to be
+controlled bidirectionally.
 
 The board and network configs in `configs/` reference firmware under the sibling `PER` checkout. Those external ELFs must exist at the configured paths for these commands; they are optional compatibility inputs and are not embedded into emulator behavior.
 
