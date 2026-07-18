@@ -210,16 +210,18 @@ std::optional<Board::BoundaryStop> Board::settleInstructionBoundary() {
         loop_observations_ = {};
     }
 
-    auto pending = exceptions_->enterPending(cpu_->state());
-    if (!pending) {
-        return BoundaryStop{BoardStopReason::architectural_fault, pending.error().message};
-    }
-    if (pending.value()) {
-        trace_->record(
-            event_loop_->now(), config_.name, "exception_enter",
-            {{"exception", std::to_string(cpu_->state().ipsr())}}
-        );
-        loop_observations_ = {};
+    if (system_->hasEnabledPending()) {
+        auto pending = exceptions_->enterPending(cpu_->state());
+        if (!pending) {
+            return BoundaryStop{BoardStopReason::architectural_fault, pending.error().message};
+        }
+        if (pending.value()) {
+            trace_->record(
+                event_loop_->now(), config_.name, "exception_enter",
+                {{"exception", std::to_string(cpu_->state().ipsr())}}
+            );
+            loop_observations_ = {};
+        }
     }
     if (system_->consumeResetRequest() || peripherals_->consumeResetRequest()) {
         return BoundaryStop{

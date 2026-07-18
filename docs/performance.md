@@ -116,7 +116,8 @@ performance-specific mechanisms currently implemented; ordinary container
 | CPU | Decoded instruction cache | Repeated fetch and decode | PC plus executable-memory generation |
 | CPU | Copy-free cache hits | Per-instruction `DecodedInstruction` copies | Stable fixed-size cache entry; IT adjustment still copies |
 | CPU | `stepFast()` | Full register snapshots and diagnostic strings on success | Full diagnostics materialized on stop/fault |
-| Cortex-M | Sparse NVIC scan | Testing all 240 external IRQs after every instruction | Scan only `pending & enabled`; priority rules unchanged |
+| Cortex-M | Pending-interrupt summary | Calling exception selection and scanning NVIC words after every instruction | Recompute the summary only when pending/enable state mutates; full priority selection still runs for every positive summary |
+| Cortex-M | Sparse NVIC scan | Testing all 240 external IRQs for a pending candidate | Scan only `pending & enabled`; priority rules unchanged |
 | Memory | Compact `MemoryResult` | Carrying a large inline `BusFault` on successful accesses | Fault allocation occurs only on failure |
 | Memory | Region dispatch cache | Ordered mapping walk for each fetch/data/MMIO access | Full containment check before accepting a hit |
 | Build | Release plus IPO/LTO defaults | Unoptimized hot path and translation-unit barriers | Debug and sanitizer builds remain unoptimized/non-IPO |

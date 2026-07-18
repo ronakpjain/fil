@@ -95,6 +95,11 @@ public:
     /** @brief Gets the currently active exception number, or zero in thread mode. */
     [[nodiscard]] std::uint16_t activeException() const noexcept { return active_exception_; }
 
+    /** @brief Fast conservative test for any enabled pending exception. */
+    [[nodiscard]] bool hasEnabledPending() const noexcept {
+        return pendsv_pending_ || systick_pending_ || external_pending_enabled_;
+    }
+
     [[nodiscard]] mem::MemoryResult<std::uint64_t> read(
         std::uint32_t offset,
         mem::AccessSize size,
@@ -121,6 +126,7 @@ private:
     );
     [[nodiscard]] bool isPending(std::uint16_t exception_number) const noexcept;
     [[nodiscard]] bool isEnabled(std::uint16_t exception_number) const noexcept;
+    void refreshPendingSummary() noexcept;
 
     std::array<std::uint32_t, 8> nvic_enable_{};
     std::array<std::uint32_t, 8> nvic_pending_{};
@@ -151,6 +157,7 @@ private:
     std::uint16_t active_exception_{0};
     bool pendsv_pending_{false};
     bool systick_pending_{false};
+    bool external_pending_enabled_{false};
     bool reset_requested_{false};
 };
 
