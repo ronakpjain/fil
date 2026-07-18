@@ -19,12 +19,13 @@ instruction-by-instruction path. Exact-state idle-loop batching is an additional
 optimization for firmware that spends substantial time polling in a stable idle
 loop.
 
-The corrected six-board PER workload currently runs below real time after making
-continuous ADC sequences and their DMA transfers observable. Three consecutive
-one-second runs on the development host took **1.82 s, 1.77 s, and 1.85 s**
-(median 1.82 s, about **0.55x real time**). Disabling loop batching took 5.52 s on
-the same build, so the causality-bounded batching path is about **3.0x faster** for
-this workload. Both modes reported the same exact result:
+The corrected six-board PER workload runs near real time after making
+continuous ADC sequences and their DMA transfers observable. After scheduler and
+interpreter hot-path restructuring, three consecutive one-second runs on the
+development host took **1.16 s, 1.13 s, and 1.14 s** (median 1.14 s, about **0.88x
+real time**). Disabling loop batching took 3.33 s on the same build, so the
+causality-bounded batching path is about **2.9x faster** for this workload. Both
+modes reported the same exact result:
 
 ```text
 stop: time-budget
