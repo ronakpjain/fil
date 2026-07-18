@@ -46,6 +46,10 @@ void tracksLocalAndSharedEventOwnership() {
     static_cast<void>(loop.scheduleAt(5U, [&]() {
         observed.push_back(loop.activeOwner());
     }));
+    fil::test::check(loop.nextScheduledTime(3U) == 5U
+                         && loop.nextScheduledTime(fil::sim::shared_event_owner) == 5U
+                         && !loop.nextScheduledTime(4U),
+                     "owner queues expose independent event horizons");
 
     const auto result = loop.runDueEvents(5U);
     fil::test::check(result.events_executed == 3U

@@ -3,6 +3,7 @@
 #include <limits>
 #include <queue>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -18,28 +19,49 @@ struct EventLoop::Impl {
         EventCallback callback;
     };
 
+    struct EventRef {
+        SimTimeNs at{0};
+        EventId id{0};
+        std::uint64_t sequence{0};
+    };
+
     struct Later {
         bool operator()(const Event& left, const Event& right) const noexcept {
-            if (left.at != right.at) {
-                return left.at > right.at;
-            }
+            if (left.at != right.at) return left.at > right.at;
             return left.sequence > right.sequence;
         }
     };
+
+    struct RefLater {
+        bool operator()(const EventRef& left, const EventRef& right) const noexcept {
+            if (left.at != right.at) return left.at > right.at;
+            return left.sequence > right.sequence;
+        }
+    };
+
+    using Queue = std::priority_queue<Event, std::vector<Event>, Later>;
+    using RefQueue = std::priority_queue<EventRef, std::vector<EventRef>, RefLater>;
 
     SimTimeNs now{0};
     EventId next_id{1};
     std::uint64_t next_sequence{0};
     std::size_t maximum_same_time_events{100000};
-    std::size_t live_events{0};
     EventOwner active_owner{shared_event_owner};
-    std::priority_queue<Event, std::vector<Event>, Later> events;
+    Queue events;
+    std::unordered_map<EventOwner, RefQueue> owner_events;
+    std::unordered_map<EventId, EventOwner> live_owners;
     std::unordered_set<EventId> cancelled;
 
     void discardCancelledFront() {
-        while (!events.empty() && cancelled.erase(events.top().id) != 0U) {
-            events.pop();
-        }
+        while (!events.empty() && cancelled.erase(events.top().id) != 0U) events.pop();
+    }
+
+    [[nodiscard]] RefQueue* ownerQueue(const EventOwner owner) {
+        const auto found = owner_events.find(owner);
+        if (found == owner_events.end()) return nullptr;
+        RefQueue& queue = found->second;
+        while (!queue.empty() && !live_owners.contains(queue.top().id)) queue.pop();
+        return &queue;
     }
 };
 
@@ -80,45 +102,29 @@ EventId EventLoop::scheduleAfter(const SimTimeNs delta, EventCallback callback) 
 }
 
 EventId EventLoop::scheduleAt(const SimTimeNs at, EventCallback callback) {
-    if (!callback) {
-        throw std::invalid_argument("simulation event callback is empty");
-    }
+    if (!callback) throw std::invalid_argument("simulation event callback is empty");
     if (at < impl_->now) {
         throw std::invalid_argument("cannot schedule a simulation event in the past");
     }
-    if (impl_->next_id == 0) {
+    if (impl_->next_id == 0U) {
         throw std::overflow_error("simulation event identifier space exhausted");
     }
 
     const EventId id = impl_->next_id++;
-    impl_->events.push(Impl::Event{
-        at, id, impl_->next_sequence++, impl_->active_owner, std::move(callback),
-    });
-    ++impl_->live_events;
+    const std::uint64_t sequence = impl_->next_sequence++;
+    const EventOwner owner = impl_->active_owner;
+    impl_->events.push(Impl::Event{at, id, sequence, owner, std::move(callback)});
+    impl_->owner_events[owner].push(Impl::EventRef{at, id, sequence});
+    impl_->live_owners.emplace(id, owner);
     return id;
 }
 
 bool EventLoop::cancel(const EventId id) noexcept {
-    if (id == 0 || impl_->cancelled.contains(id)) {
-        return false;
-    }
-
-    // The queue is intentionally not searched. A stale identifier is harmless;
-    // live_events is decremented only if the id is found while compacting below.
-    bool found = false;
-    auto copy = impl_->events;
-    while (!copy.empty()) {
-        if (copy.top().id == id) {
-            found = true;
-            break;
-        }
-        copy.pop();
-    }
-    if (!found) {
-        return false;
-    }
+    if (id == 0U) return false;
+    const auto found = impl_->live_owners.find(id);
+    if (found == impl_->live_owners.end()) return false;
+    impl_->live_owners.erase(found);
     impl_->cancelled.insert(id);
-    --impl_->live_events;
     return true;
 }
 
@@ -128,8 +134,8 @@ EventRunResult EventLoop::runDueEvents(const SimTimeNs deadline) {
     }
 
     EventRunResult result{0, false, impl_->now};
-    SimTimeNs counted_time = 0;
-    std::size_t events_at_counted_time = 0;
+    SimTimeNs counted_time = 0U;
+    std::size_t events_at_counted_time = 0U;
 
     for (;;) {
         impl_->discardCancelledFront();
@@ -140,9 +146,9 @@ EventRunResult EventLoop::runDueEvents(const SimTimeNs deadline) {
         }
 
         const SimTimeNs next_time = impl_->events.top().at;
-        if (events_at_counted_time == 0 || next_time != counted_time) {
+        if (events_at_counted_time == 0U || next_time != counted_time) {
             counted_time = next_time;
-            events_at_counted_time = 0;
+            events_at_counted_time = 0U;
         }
         if (events_at_counted_time >= impl_->maximum_same_time_events) {
             impl_->now = next_time;
@@ -153,7 +159,7 @@ EventRunResult EventLoop::runDueEvents(const SimTimeNs deadline) {
 
         Impl::Event event = impl_->events.top();
         impl_->events.pop();
-        --impl_->live_events;
+        impl_->live_owners.erase(event.id);
         impl_->now = event.at;
         ++events_at_counted_time;
         ++result.events_executed;
@@ -162,6 +168,7 @@ EventRunResult EventLoop::runDueEvents(const SimTimeNs deadline) {
         } else {
             result.shared_event_executed = true;
         }
+
         const EventOwner previous_owner = impl_->active_owner;
         impl_->active_owner = event.owner;
         try {
@@ -183,8 +190,9 @@ EventRunResult EventLoop::advanceBy(const SimTimeNs delta) {
 
 void EventLoop::clear() noexcept {
     impl_->events = {};
+    impl_->owner_events.clear();
+    impl_->live_owners.clear();
     impl_->cancelled.clear();
-    impl_->live_events = 0;
 }
 
 SimTimeNs EventLoop::now() const noexcept {
@@ -192,13 +200,19 @@ SimTimeNs EventLoop::now() const noexcept {
 }
 
 std::size_t EventLoop::pending() const noexcept {
-    return impl_->live_events;
+    return impl_->live_owners.size();
 }
 
 std::optional<SimTimeNs> EventLoop::nextScheduledTime() {
     impl_->discardCancelledFront();
     if (impl_->events.empty()) return std::nullopt;
     return impl_->events.top().at;
+}
+
+std::optional<SimTimeNs> EventLoop::nextScheduledTime(const EventOwner owner) {
+    Impl::RefQueue* const queue = impl_->ownerQueue(owner);
+    if (queue == nullptr || queue->empty()) return std::nullopt;
+    return queue->top().at;
 }
 
 void EventLoop::setMaximumSameTimeEvents(const std::size_t maximum) noexcept {

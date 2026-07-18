@@ -100,8 +100,11 @@ public:
     /** @brief Gets the number of live, non-cancelled events. */
     [[nodiscard]] std::size_t pending() const noexcept;
 
-    /** @brief Gets the earliest live event timestamp, ignoring cancelled entries. */
+    /** @brief Gets the earliest live event timestamp across every owner queue. */
     [[nodiscard]] std::optional<SimTimeNs> nextScheduledTime();
+
+    /** @brief Gets the earliest live timestamp for one board or the shared queue. */
+    [[nodiscard]] std::optional<SimTimeNs> nextScheduledTime(EventOwner owner);
 
     /** @brief Changes zero-delay livelock protection; zero disables callbacks. */
     void setMaximumSameTimeEvents(std::size_t maximum) noexcept;
