@@ -1,12 +1,17 @@
 #include "fil/cpu/cortex_m4.hpp"
 
 #include "fil/cpu/decoder.hpp"
+#if defined(FIL_HAS_LLVM_JIT)
+#include "fil/cpu/jit_llvm.hpp"
+#endif
 #include "fil/elf/elf_loader.hpp"
 #include "fil/mem/memory_bus.hpp"
 
 #include <cassert>
+#include <exception>
 #include <iomanip>
 #include <limits>
+#include <span>
 #include <sstream>
 
 namespace fil::cpu {
@@ -139,6 +144,8 @@ CortexM4::CortexM4(mem::MemoryBus& memory) noexcept : memory_(memory) {
     assert(decoderTablesHaveNoOverlaps());
 }
 
+CortexM4::~CortexM4() = default;
+
 bool CortexM4::reset(const elf::ElfImage& image) noexcept {
     return state_.reset(image);
 }
@@ -257,6 +264,11 @@ FastStepResult CortexM4::stepFast() {
         cache.raw = result.raw;
         cache.decoded = *newly_decoded;
         cache.size = instruction_size;
+#if defined(FIL_HAS_LLVM_JIT)
+        cache.jit_function = nullptr;
+        cache.jit_hits = 0U;
+        cache.jit_rejected = false;
+#endif
         decoded = &cache.decoded;
     }
     result.instruction_size = instruction_size;
@@ -287,7 +299,33 @@ FastStepResult CortexM4::stepFast() {
 
     StopReason stop = StopReason::step_complete;
     if (conditionPasses(effective_condition, state_.xpsr)) [[likely]] {
+#if defined(FIL_HAS_LLVM_JIT)
+        if (!was_in_it && decoded == &cache.decoded && cache.jit_function != nullptr) {
+            static_cast<void>(cache.jit_function(state_.r.data(), &state_.xpsr));
+        } else {
+            stop = execute(*decoded, last_diagnostic_);
+            if (stop == StopReason::step_complete && !was_in_it
+                && decoded == &cache.decoded && !cache.jit_rejected
+                && cache.jit_function == nullptr) {
+                if (cache.jit_hits != std::numeric_limits<std::uint16_t>::max()) {
+                    ++cache.jit_hits;
+                }
+                if (cache.jit_hits == std::numeric_limits<std::uint16_t>::max()) {
+                    try {
+                        if (!jit_) jit_ = std::make_unique<LlvmJitEngine>();
+                        const auto compiled = jit_->compile(
+                            std::span<const DecodedInstruction>(&cache.decoded, 1U)
+                        );
+                        cache.jit_function = compiled.function;
+                    } catch (const std::exception&) {
+                        cache.jit_rejected = true;
+                    }
+                }
+            }
+        }
+#else
         stop = execute(*decoded, last_diagnostic_);
+#endif
     }
     if (decoded->kind != InstrKind::it && was_in_it) state_.advanceIt();
 

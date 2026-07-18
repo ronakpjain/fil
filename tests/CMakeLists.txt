@@ -28,6 +28,7 @@ add_executable(fil_cpu_tests
     unit/alu_test.cpp
     unit/cpu_step_test.cpp
     unit/decoder_test.cpp
+    unit/jit_test.cpp
 )
 target_include_directories(fil_cpu_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(fil_cpu_tests PRIVATE fil_core)
