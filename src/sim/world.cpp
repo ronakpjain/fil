@@ -995,10 +995,15 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
     return output;
 }
 
-void World::setDiagnosticsEnabled(const bool enabled) {
+void World::setDiagnosticsEnabled(
+    const bool enabled,
+    const bool retain_passive_history
+) {
     trace_.setEnabled(enabled);
     for (auto& entry : boards_) {
-        entry->board->peripherals().setAdcDiagnosticsEnabled(enabled);
+        entry->board->peripherals().setAdcDiagnosticsEnabled(
+            enabled && retain_passive_history
+        );
     }
 }
 

@@ -107,8 +107,8 @@ public:
     [[nodiscard]] std::size_t boardCount() const noexcept { return boards_.size(); }
     [[nodiscard]] std::size_t canBusCount() const noexcept { return buses_.size(); }
 
-    /** @brief Enables/disables shared trace history and passive ADC diagnostics. */
-    void setDiagnosticsEnabled(bool enabled);
+    /** @brief Enables trace emission and optionally retains passive peripheral histories. */
+    void setDiagnosticsEnabled(bool enabled, bool retain_passive_history = true);
 
     /** @brief Finds a board by its configuration name. */
     [[nodiscard]] Board* board(std::string_view name) noexcept;
