@@ -48,6 +48,7 @@ std::uint64_t TraceRecorder::record(
     records_.push_back(TraceRecord{
         time_ns, sequence, std::move(source), std::move(type), std::move(fields),
     });
+    if (observer_) observer_(records_.back());
     return sequence;
 }
 

@@ -1,10 +1,12 @@
 #include "fil/sim/event_loop.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <mutex>
 #include <queue>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -49,6 +51,11 @@ struct EventLoop::Impl {
     // Completed global frontier applied lazily to materialized owner clocks.
     SimTimeNs owner_time_floor{0};
     std::unordered_map<EventOwner, std::uint64_t> owner_generation;
+    bool realtime_pacing{false};
+    SimTimeNs realtime_origin_ns{0};
+    SimTimeNs next_realtime_sync_ns{0};
+    SimTimeNs realtime_refresh_ns{10'000'000U};
+    std::chrono::steady_clock::time_point realtime_wall_origin{};
 
     struct Lock {
         explicit Lock(Impl& impl)
@@ -120,6 +127,15 @@ struct EventLoop::Impl {
             throw;
         }
         setCurrentOwner(previous_owner);
+    }
+
+    void pace(const SimTimeNs time_ns) {
+        if (!realtime_pacing || time_ns < next_realtime_sync_ns) return;
+        const SimTimeNs elapsed = time_ns - realtime_origin_ns;
+        const auto target = realtime_wall_origin + std::chrono::nanoseconds(elapsed);
+        std::this_thread::sleep_until(target);
+        next_realtime_sync_ns = time_ns > std::numeric_limits<SimTimeNs>::max() - realtime_refresh_ns
+            ? std::numeric_limits<SimTimeNs>::max() : time_ns + realtime_refresh_ns;
     }
 };
 
@@ -208,6 +224,7 @@ EventRunResult EventLoop::runDueEvents(const SimTimeNs deadline) {
         if (impl_->events.empty() || impl_->events.top()->at > deadline) {
             impl_->shared_now = deadline;
             impl_->owner_time_floor = std::max(impl_->owner_time_floor, deadline);
+            impl_->pace(deadline);
             result.stopped_at = deadline;
             return result;
         }
@@ -227,6 +244,7 @@ EventRunResult EventLoop::runDueEvents(const SimTimeNs deadline) {
 
         impl_->events.pop();
         impl_->shared_now = event->at;
+        impl_->pace(event->at);
         ++events_at_counted_time;
         impl_->invoke(event, result);
     }
@@ -277,6 +295,18 @@ EventRunResult EventLoop::advanceBy(const SimTimeNs delta) {
         throw std::overflow_error("simulation clock overflow");
     }
     return runDueEvents(impl_->shared_now + delta);
+}
+
+void EventLoop::setRealtimePacing(const bool enabled, const SimTimeNs refresh_interval_ns) {
+    Impl::Lock lock(*impl_);
+    if (enabled && refresh_interval_ns == 0U) {
+        throw std::invalid_argument("real-time refresh interval must be nonzero");
+    }
+    impl_->realtime_pacing = enabled;
+    impl_->realtime_refresh_ns = refresh_interval_ns;
+    impl_->realtime_origin_ns = impl_->shared_now;
+    impl_->next_realtime_sync_ns = impl_->shared_now;
+    impl_->realtime_wall_origin = std::chrono::steady_clock::now();
 }
 
 void EventLoop::clear() noexcept {

@@ -128,6 +128,23 @@ void requiresExplicitBreakpointAcceptance() {
     );
     fil::test::check(allowed_err.str().empty(),
                      "an explicitly accepted BKPT has no error diagnostic");
+
+    const std::string_view watch_args[]{
+        "watch", config_text, "--duration-ms", "0", "--max-instructions", "20",
+        "--trace-instr", "--no-realtime", "--allow-breakpoint",
+    };
+    std::ostringstream watch_out;
+    std::ostringstream watch_err;
+    fil::test::check(
+        fil::cli::run(watch_args, watch_out, watch_err) == fil::cli::ExitCode::success,
+        "watch executes a board through the regular CLI"
+    );
+    fil::test::check(
+        watch_out.str().find("watching board cli-breakpoint") != std::string::npos
+            && watch_out.str().find(" ms] cli-breakpoint  instr pc=") != std::string::npos,
+        "watch prints live timestamped trace records"
+    );
+    fil::test::check(watch_err.str().empty(), "successful watch has no error output");
     std::error_code remove_error;
     std::filesystem::remove(config_path, remove_error);
 }

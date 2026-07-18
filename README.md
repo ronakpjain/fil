@@ -45,6 +45,26 @@ Run a single configured board:
   --trace-instr
 ```
 
+Watch firmware execute at wall-clock speed with semantic events printed as they
+happen:
+
+```bash
+./build/fil watch configs/boards/g4_testing.json --duration-ms 10000
+./build/fil watch-network configs/networks/per_vehicle.json \
+  --duration-ms 10000 \
+  --inject-can vehicle@500:0x123:01020304 \
+  --live-filter can_tx --live-filter can_rx
+```
+
+`watch` and `watch-network` enable both `--realtime` pacing and `--live` event
+output. They show CAN traffic, exceptions, peripheral activity, resets, and other
+semantic trace records with simulated timestamps. Add `--trace-instr` only when
+every instruction is useful; it is intentionally off by default. `--refresh-ms N`
+controls the wall-clock synchronization interval (10 ms by default). The same
+features can be composed independently with ordinary `run` commands via
+`--realtime` or `--live`. Repeat `--live-filter TYPE` to select event types in
+noisy firmware while preserving the complete trace collected by `--trace`.
+
 Useful single-board controls include `--max-instructions`, `--stop-address`, `--stop-at-symbol`, `--strict-mmio`, `--lenient-mmio`, `--detect-spin`, and `--no-loop-batching`.
 Reaching a target `BKPT` is a CLI error unless `--allow-breakpoint` is supplied;
 use the flag only when the breakpoint is an intended success boundary.

@@ -5,6 +5,13 @@
 Without `--trace`, the CLI disables trace collection to avoid retaining diagnostic
 history. Add `--trace-instr` when instruction records are also required.
 
+For interactive use, `fil watch` and `fil watch-network` pace simulated time to
+wall time and print each semantic record immediately. `--live` enables the same
+stream on a normal run without pacing; `--realtime` enables pacing without live
+output. Live observation does not change record ordering or the JSONL trace saved
+with `--trace`. Repeat `--live-filter TYPE` to print only selected record types;
+filtering affects the terminal view, not trace collection.
+
 ## Common fields and ordering
 
 Every record begins with these fields in this serialized order:

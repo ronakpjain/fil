@@ -24,6 +24,26 @@ namespace {
 
 constexpr std::string_view version = "0.1.0";
 
+void printLiveRecord(std::ostream& out, const sim::TraceRecord& record) {
+    const double milliseconds = static_cast<double>(record.time_ns) / 1'000'000.0;
+    out << '[' << std::fixed << std::setprecision(3) << milliseconds << " ms] "
+        << record.source << "  " << record.type;
+    for (const auto& [key, value] : record.fields) out << ' ' << key << '=' << value;
+    out << std::defaultfloat << '\n';
+    out.flush();
+}
+
+bool liveTypeSelected(
+    const sim::TraceRecord& record,
+    const std::vector<std::string>& filters
+) {
+    if (filters.empty()) return true;
+    for (const std::string& filter : filters) {
+        if (record.type == filter) return true;
+    }
+    return false;
+}
+
 struct PendingCanInjection {
     std::string bus;
     std::uint64_t at_ms{0};
@@ -304,6 +324,10 @@ ExitCode runBoardCommand(
     bool detect_spin = false;
     bool enable_loop_batching = true;
     bool allow_breakpoint = false;
+    bool realtime = args.front() == "watch";
+    bool live = realtime;
+    std::uint64_t refresh_ms = 10U;
+    std::vector<std::string> live_filters;
 
     for (std::size_t index = 2; index < args.size(); ++index) {
         const std::string_view option = args[index];
@@ -311,7 +335,8 @@ ExitCode runBoardCommand(
             if (index + 1 >= args.size()) return std::nullopt;
             return args[++index];
         };
-        if (option == "--duration-ms" || option == "--max-instructions" || option == "--stop-address") {
+        if (option == "--duration-ms" || option == "--max-instructions"
+            || option == "--stop-address" || option == "--refresh-ms") {
             const auto value = valueAfter();
             if (!value) {
                 err << "fil: " << option << " requires a value\n";
@@ -324,6 +349,7 @@ ExitCode runBoardCommand(
             }
             if (option == "--duration-ms") duration_ms = parsed.value();
             else if (option == "--max-instructions") max_instructions = parsed.value();
+            else if (option == "--refresh-ms") refresh_ms = parsed.value();
             else {
                 if (parsed.value() > std::numeric_limits<std::uint32_t>::max()) {
                     err << "fil: --stop-address exceeds 32-bit target address space\n";
@@ -331,14 +357,16 @@ ExitCode runBoardCommand(
                 }
                 stop_address = static_cast<std::uint32_t>(parsed.value());
             }
-        } else if (option == "--stop-at-symbol" || option == "--trace") {
+        } else if (option == "--stop-at-symbol" || option == "--trace"
+                   || option == "--live-filter") {
             const auto value = valueAfter();
             if (!value) {
                 err << "fil: " << option << " requires a value\n";
                 return ExitCode::usage_error;
             }
             if (option == "--stop-at-symbol") stop_symbol = std::string(*value);
-            else trace_path = std::filesystem::path(*value);
+            else if (option == "--trace") trace_path = std::filesystem::path(*value);
+            else live_filters.emplace_back(*value);
         } else if (option == "--strict-mmio") strict_mmio = true;
         else if (option == "--lenient-mmio") strict_mmio = false;
         else if (option == "--trace-instr") trace_instructions = true;
@@ -347,6 +375,10 @@ ExitCode runBoardCommand(
         else if (option == "--loop-batching") enable_loop_batching = true;
         else if (option == "--no-loop-batching") enable_loop_batching = false;
         else if (option == "--allow-breakpoint") allow_breakpoint = true;
+        else if (option == "--realtime") realtime = true;
+        else if (option == "--no-realtime") realtime = false;
+        else if (option == "--live") live = true;
+        else if (option == "--no-live") live = false;
         else {
             err << "fil: unknown run option: " << option << '\n';
             return ExitCode::usage_error;
@@ -363,9 +395,20 @@ ExitCode runBoardCommand(
         err << "fil: " << formatError(board.error()) << '\n';
         return board.error().category == ErrorCategory::config ? ExitCode::config_error : ExitCode::runtime_error;
     }
-    const bool diagnostics_enabled = trace_path.has_value();
+    if (refresh_ms == 0U || refresh_ms > std::numeric_limits<std::uint64_t>::max() / 1'000'000ULL) {
+        err << "fil: --refresh-ms must be a positive representable duration\n";
+        return ExitCode::usage_error;
+    }
+    const bool diagnostics_enabled = trace_path.has_value() || live;
     board.value()->trace().setEnabled(diagnostics_enabled);
     board.value()->peripherals().setAdcDiagnosticsEnabled(diagnostics_enabled);
+    if (live) {
+        out << "watching board " << board_config.value().name << " (Ctrl-C to stop)\n";
+        board.value()->trace().setObserver([&out, &live_filters](const sim::TraceRecord& record) {
+            if (liveTypeSelected(record, live_filters)) printLiveRecord(out, record);
+        });
+    }
+    board.value()->eventLoop().setRealtimePacing(realtime, refresh_ms * 1'000'000ULL);
 
     sim::BoardRunOptions options;
     options.max_instructions = max_instructions.value_or(board_config.value().run.max_instructions);
@@ -457,6 +500,10 @@ ExitCode runNetworkCommand(
     bool enable_loop_batching = true;
     bool enable_transactional_slices = false;
     bool allow_breakpoint = false;
+    bool realtime = args.front() == "watch-network";
+    bool live = realtime;
+    std::uint64_t refresh_ms = 10U;
+    std::vector<std::string> live_filters;
     std::vector<PendingCanInjection> injections;
 
     for (std::size_t index = 2; index < args.size(); ++index) {
@@ -465,7 +512,8 @@ ExitCode runNetworkCommand(
             if (index + 1 >= args.size()) return std::nullopt;
             return args[++index];
         };
-        if (option == "--duration-ms" || option == "--max-instructions" || option == "--quantum") {
+        if (option == "--duration-ms" || option == "--max-instructions"
+            || option == "--quantum" || option == "--refresh-ms") {
             const auto value = valueAfter();
             if (!value) {
                 err << "fil: " << option << " requires a value\n";
@@ -478,8 +526,10 @@ ExitCode runNetworkCommand(
             }
             if (option == "--duration-ms") duration_ms = parsed.value();
             else if (option == "--max-instructions") max_instructions = parsed.value();
+            else if (option == "--refresh-ms") refresh_ms = parsed.value();
             else quantum = parsed.value();
-        } else if (option == "--trace" || option == "--inject-can") {
+        } else if (option == "--trace" || option == "--inject-can"
+                   || option == "--live-filter") {
             const auto value = valueAfter();
             if (!value) {
                 err << "fil: " << option << " requires a value\n";
@@ -487,6 +537,8 @@ ExitCode runNetworkCommand(
             }
             if (option == "--trace") {
                 trace_path = std::filesystem::path(*value);
+            } else if (option == "--live-filter") {
+                live_filters.emplace_back(*value);
             } else {
                 auto injection = parseCanInjection(*value);
                 if (!injection) {
@@ -505,6 +557,10 @@ ExitCode runNetworkCommand(
         else if (option == "--transactional-slices") enable_transactional_slices = true;
         else if (option == "--no-transactional-slices") enable_transactional_slices = false;
         else if (option == "--allow-breakpoint") allow_breakpoint = true;
+        else if (option == "--realtime") realtime = true;
+        else if (option == "--no-realtime") realtime = false;
+        else if (option == "--live") live = true;
+        else if (option == "--no-live") live = false;
         else {
             err << "fil: unknown run-network option: " << option << '\n';
             return ExitCode::usage_error;
@@ -512,6 +568,10 @@ ExitCode runNetworkCommand(
     }
     if (duration_ms > std::numeric_limits<std::uint64_t>::max() / 1'000'000ULL) {
         err << "fil: duration is too large\n";
+        return ExitCode::usage_error;
+    }
+    if (refresh_ms == 0U || refresh_ms > std::numeric_limits<std::uint64_t>::max() / 1'000'000ULL) {
+        err << "fil: --refresh-ms must be a positive representable duration\n";
         return ExitCode::usage_error;
     }
 
@@ -526,7 +586,14 @@ ExitCode runNetworkCommand(
         return world.error().category == ErrorCategory::config
             ? ExitCode::config_error : ExitCode::runtime_error;
     }
-    world.value()->setDiagnosticsEnabled(trace_path.has_value());
+    world.value()->setDiagnosticsEnabled(trace_path.has_value() || live);
+    if (live) {
+        out << "watching network " << network_config.value().name << " (Ctrl-C to stop)\n";
+        world.value()->trace().setObserver([&out, &live_filters](const sim::TraceRecord& record) {
+            if (liveTypeSelected(record, live_filters)) printLiveRecord(out, record);
+        });
+    }
+    world.value()->eventLoop().setRealtimePacing(realtime, refresh_ms * 1'000'000ULL);
 
     for (const PendingCanInjection& injection : injections) {
         devices::VirtualCanBus* bus = world.value()->canBus(injection.bus);
@@ -638,11 +705,14 @@ void printHelp(std::ostream& out) {
         << "  inspect-elf <firmware.elf>     Inspect an ELF32 ARM firmware image\n"
         << "  disasm-window <firmware.elf>   Decode a bounded Thumb instruction window\n"
         << "  run <board.json> [options]     Execute one firmware board deterministically\n"
-        << "  run-network <network.json>     Execute a deterministic multi-board CAN network\n\n"
+        << "  watch <board.json> [options]   Run in real time and print events as they occur\n"
+        << "  run-network <network.json>     Execute a deterministic multi-board CAN network\n"
+        << "  watch-network <network.json>   Watch a CAN network in real time\n\n"
         << "Run options:\n"
         << "  --duration-ms N --max-instructions N --trace FILE --trace-instr\n"
         << "  --strict-mmio --stop-address ADDR --stop-at-symbol NAME --allow-breakpoint\n"
-        << "  --detect-spin --no-loop-batching\n\n"
+        << "  --detect-spin --no-loop-batching\n"
+        << "  --realtime --live --refresh-ms N --live-filter TYPE (repeatable)\n\n"
         << "Network options:\n"
         << "  --duration-ms N --max-instructions N --quantum N --trace FILE\n"
         << "  --strict-mmio --trace-instr --detect-spin --no-loop-batching --allow-breakpoint\n"
@@ -714,11 +784,11 @@ ExitCode run(
         return ExitCode::config_error;
     }
 
-    if (args.front() == "run") {
+    if (args.front() == "run" || args.front() == "watch") {
         return runBoardCommand(args, out, err);
     }
 
-    if (args.front() == "run-network") {
+    if (args.front() == "run-network" || args.front() == "watch-network") {
         return runNetworkCommand(args, out, err);
     }
 

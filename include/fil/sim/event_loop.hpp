@@ -138,6 +138,9 @@ public:
     /** @brief Gets the current zero-delay callback limit. */
     [[nodiscard]] std::size_t maximumSameTimeEvents() const noexcept;
 
+    /** @brief Paces simulated time against wall time for interactive execution. */
+    void setRealtimePacing(bool enabled, SimTimeNs refresh_interval_ns = 10'000'000U);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
