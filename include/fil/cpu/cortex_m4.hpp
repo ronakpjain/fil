@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -21,6 +22,10 @@ class MemoryBus;
 }
 
 namespace fil::cpu {
+
+#if defined(FIL_HAS_LLVM_JIT)
+class LlvmJitEngine;
+#endif
 
 inline constexpr std::uint32_t xpsr_n = 1U << 31U;
 inline constexpr std::uint32_t xpsr_z = 1U << 30U;
@@ -140,6 +145,7 @@ struct FastStepResult {
 class CortexM4 {
 public:
     explicit CortexM4(mem::MemoryBus& memory) noexcept;
+    ~CortexM4();
 
     /** @brief Gets mutable architectural state for inspection or setup. */
     [[nodiscard]] CpuState& state() noexcept { return state_; }
@@ -175,6 +181,11 @@ private:
         std::uint32_t raw{0};
         DecodedInstruction decoded{};
         std::uint8_t size{0};
+#if defined(FIL_HAS_LLVM_JIT)
+        std::uint64_t (*jit_function)(std::uint32_t*, std::uint32_t*){nullptr};
+        std::uint16_t jit_hits{0};
+        bool jit_rejected{false};
+#endif
     };
 
     static constexpr std::size_t instruction_cache_entries = 16384U;
@@ -189,6 +200,9 @@ private:
     CpuState state_{};
     std::array<InstructionCacheEntry, instruction_cache_entries> instruction_cache_{};
     DiagnosticSnapshot last_diagnostic_{};
+#if defined(FIL_HAS_LLVM_JIT)
+    std::unique_ptr<LlvmJitEngine> jit_;
+#endif
 };
 
 /** @brief Stable lowercase name for diagnostics and tests. */

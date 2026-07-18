@@ -22,10 +22,17 @@ state plus exact instruction count.
 
 Configure with `-DFIL_ENABLE_LLVM_JIT=ON` and an LLVM package path such as
 `-DLLVM_DIR=/opt/homebrew/opt/llvm/lib/cmake/llvm`. Builds without LLVM remain the
-default. The next integration step is a hot block cache keyed by guest PC,
-executable-memory generation, and IT state, followed by event-horizon dispatch
-from `CortexM4`.
+default. `CortexM4` now counts executions per decoded-cache PC, compiles eligible hot
+instructions after 128 hits, and stores the resulting native function in the same
+execution-generation-tagged cache entry. IT-block instructions and active-SP/PC
+writes remain interpreted. Compilation failures mark only that cache entry as
+rejected, preserving deterministic fallback.
 
-This backend stage is correctness groundwork, not a claimed simulator speedup. Unit tests cover
+The integrated six-board run reaches the exact one-second boundary with identical
+96M instruction/cycle totals and terminal PCs. The initial single-instruction tier
+takes about 1.25 s in a non-IPO LLVM build, so it is functionally complete but not
+yet faster: ORC startup and one native call per target instruction dominate. The
+next performance stage must compile and dispatch multi-instruction plans up to the
+world event horizon. Unit tests cover
 pure ALU acceptance, PC-writing rejection, every major boundary class, maximal
 prefix selection, and the compilation cap.

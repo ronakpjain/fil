@@ -91,9 +91,15 @@ LlvmJitEngine::CompiledBlock LlvmJitEngine::compile(
     for (const DecodedInstruction& instruction : instructions) {
         switch (instruction.kind) {
         case InstrKind::movw:
+            if (instruction.rd == 13U || instruction.rd == 15U) {
+                throw std::invalid_argument("LLVM initial tier leaves active-SP writes to the interpreter");
+            }
             storeRegister(instruction.rd, llvm::ConstantInt::get(i32, instruction.imm));
             break;
         case InstrKind::movt: {
+            if (instruction.rd == 13U || instruction.rd == 15U) {
+                throw std::invalid_argument("LLVM initial tier leaves active-SP writes to the interpreter");
+            }
             llvm::Value* const old = loadRegister(instruction.rd);
             llvm::Value* const low = builder.CreateAnd(old, 0xffffU);
             storeRegister(
@@ -105,7 +111,8 @@ LlvmJitEngine::CompiledBlock LlvmJitEngine::compile(
         case InstrKind::add:
         case InstrKind::sub: {
             if (instruction.form != OperandForm::immediate || instruction.set_flags
-                || instruction.rd == 15U || instruction.rn == 15U) {
+                || instruction.rd == 13U || instruction.rd == 15U
+                || instruction.rn == 13U || instruction.rn == 15U) {
                 throw std::invalid_argument("LLVM initial tier supports only flag-free immediate ADD/SUB");
             }
             llvm::Value* const left = loadRegister(instruction.rn);

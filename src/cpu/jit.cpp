@@ -15,6 +15,7 @@ JitBoundary classifyJitBoundary(const DecodedInstruction& instruction) noexcept 
         return instruction.rd == 15U ? JitBoundary::control_flow : JitBoundary::none;
     case InstrKind::movw:
     case InstrKind::movt:
+        return instruction.rd == 15U ? JitBoundary::control_flow : JitBoundary::none;
     case InstrKind::rsb:
     case InstrKind::cmp:
     case InstrKind::cmn:
