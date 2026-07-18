@@ -165,6 +165,7 @@ performance-specific mechanisms currently implemented; ordinary container
 | Layer | Technique | Avoided work | Correctness boundary |
 |---|---|---|---|
 | CPU | Decoded instruction cache | Repeated fetch and decode | PC plus executable-memory generation |
+| CPU | Sparse register-list traversal | Testing all 16 register bits for PUSH/POP/LDM/STM transfers and again for load commit | `countr_zero` visits set bits in ascending register order; loads remain staged until every memory access succeeds; PC and writeback handling are unchanged |
 | CPU | Copy-free cache hits | Per-instruction `DecodedInstruction` copies | Stable fixed-size cache entry; IT adjustment still copies |
 | CPU | `stepFast()` | Full register snapshots and diagnostic strings on success | Full diagnostics materialized on stop/fault |
 | CPU | Dedicated hot `LDR` execution | Rechecking load/store width and signedness in the grouped memory dispatcher | Preserves shared address, writeback, fault, and PC-load semantics |
@@ -224,6 +225,13 @@ event scheduling still trap. At 1,024 instructions per epoch this commits about
 104,448 target instructions in 17 of 23 sampled epochs. Its 0.88 s Release median
 is neutral on `per_vehicle`, so it is correctness infrastructure rather than a
 claimed speedup.
+
+PUSH, POP, LDM, and STM now traverse only set bits in their decoded register list.
+This preserves ascending transfer order and retains the temporary load array, so a
+later memory fault still commits neither earlier register loads nor writeback.
+Sixteen counterbalanced Release+IPO runs measured a 0.86 s median for sparse
+traversal versus 0.88 s for the fixed 16-slot scans, again with identical counters
+and terminal PCs.
 
 Global event-loop advancement now records a monotonic owner-time floor instead of
 eagerly walking the owner-clock map after every callback-free lockstep round.

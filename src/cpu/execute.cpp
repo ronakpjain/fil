@@ -615,8 +615,14 @@ StopReason CortexM4::execute(
         };
         std::array<std::uint32_t, 16> loaded{};
         std::uint32_t address = start;
-        for (std::uint8_t reg = 0; reg < 16U; ++reg) {
-            if ((instruction.register_list & (std::uint16_t{1} << reg)) == 0U) continue;
+        std::uint16_t pending_registers = instruction.register_list;
+        while (pending_registers != 0U) {
+            const auto reg = static_cast<std::uint8_t>(
+                std::countr_zero(pending_registers)
+            );
+            pending_registers = static_cast<std::uint16_t>(
+                pending_registers & static_cast<std::uint16_t>(pending_registers - 1U)
+            );
             if (load) {
                 const auto value = memory_.read32(address, context);
                 if (!value) return failBus(value.fault(), "multiple-register load failed");
@@ -629,10 +635,15 @@ StopReason CortexM4::execute(
         }
 
         if (load) {
-            for (std::uint8_t reg = 0; reg < 15U; ++reg) {
-                if ((instruction.register_list & (std::uint16_t{1} << reg)) != 0U) {
-                    state_.writeRegister(reg, loaded[reg]);
-                }
+            pending_registers = instruction.register_list & 0x7fffU;
+            while (pending_registers != 0U) {
+                const auto reg = static_cast<std::uint8_t>(
+                    std::countr_zero(pending_registers)
+                );
+                pending_registers = static_cast<std::uint16_t>(
+                    pending_registers & static_cast<std::uint16_t>(pending_registers - 1U)
+                );
+                state_.writeRegister(reg, loaded[reg]);
             }
         }
         if (instruction.writeback) {

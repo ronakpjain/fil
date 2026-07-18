@@ -267,6 +267,28 @@ void executesLoadStoreWidthsAndPcPop() {
     fil::test::check(cpu.state().r[15] == 0x08000020U, "POP PC validates and clears target Thumb bit");
 }
 
+void multipleLoadFaultDoesNotCommitPartialRegisters() {
+    auto bus = basicBus();
+    fil::test::check(
+        bus.loadBytes(flash_base, halfwords({0xc882U})).hasValue()
+            && bus.write32(ram_base + 252U, 0x11223344U).hasValue(),
+        "loads sparse LDM fault fixture"
+    );
+    fil::cpu::CortexM4 cpu(bus);
+    prepare(cpu);
+    cpu.state().r[0] = ram_base + 252U;
+    cpu.state().r[1] = 0xaaaa5555U;
+    cpu.state().r[7] = 0xbbbb6666U;
+
+    const auto result = cpu.step();
+    fil::test::check(result.reason == fil::cpu::StopReason::bus_fault,
+                     "sparse LDM reports a later transfer fault");
+    fil::test::check(cpu.state().r[0] == ram_base + 252U
+                         && cpu.state().r[1] == 0xaaaa5555U
+                         && cpu.state().r[7] == 0xbbbb6666U,
+                     "faulting LDM commits neither earlier loads nor writeback");
+}
+
 void boundedRunAndDataFaultsAreStructured() {
     {
         auto bus = basicBus();
@@ -612,6 +634,7 @@ void runCpuStepTests() {
     reportsDecoderAndFetchFailuresWithoutLosingPc();
     runsSyntheticStartupSliceToBreakpoint();
     executesLoadStoreWidthsAndPcPop();
+    multipleLoadFaultDoesNotCommitPartialRegisters();
     boundedRunAndDataFaultsAreStructured();
     itAlwaysInstallsConditionBeforeConditionalVfpContextTransfer();
     executesRealWideAluMultiplyAndBitfieldEncodings();
