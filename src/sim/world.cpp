@@ -693,7 +693,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
         if (transactional_active && transaction_backoff == 0U
             && !trace_.enabled() && !options.trace_instructions && !options.detect_spin
             && !stop_requested && !time_exhausted) {
-            constexpr std::uint64_t slice_instructions = 256U;
+            constexpr std::uint64_t slice_instructions = 1024U;
             bool eligible = !states.empty();
             for (std::size_t index = 0; index < states.size() && eligible; ++index) {
                 eligible = states[index].runnable && !states[index].in_flight
@@ -751,6 +751,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                         output.event_callbacks, events.events_executed
                     );
                     for (std::size_t index = 0; index < boards_.size(); ++index) {
+                        boards_[index]->board->commitTransaction();
                         accumulate(output.boards[index], slices[index], output);
                         states[index].ready_time_ns = committed_time;
                         states[index].proven_loop.reset();

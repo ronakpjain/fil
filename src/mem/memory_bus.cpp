@@ -290,15 +290,19 @@ MemoryResult<std::uint64_t> MemoryBus::read(
     }
     if (region->info.kind == RegionKind::mmio) {
         const std::uint32_t offset = address - region->info.base;
-        if (trap_all_mmio_ || (trap_shared_mmio_
+        const bool transaction_safe = trap_all_mmio_
+            && region->device->transactionalAccessSafe(offset, size, false);
+        if ((trap_all_mmio_ && !transaction_safe) || (trap_shared_mmio_
             && region->device->domain(offset, size) == MmioDomain::shared)) {
             return makeFault(
                 BusFaultReason::synchronization_required, address, size, context,
                 region->info.name, "MMIO access requires coordinator synchronization"
             );
         }
-        ++side_effect_generation_;
-        ++mmio_generation_;
+        if (!transaction_safe) {
+            ++side_effect_generation_;
+            ++mmio_generation_;
+        }
         auto result = region->device->read(offset, size, context);
         if (!result && result.fault().region.empty()) {
             result.fault().region = region->info.name;
@@ -363,15 +367,19 @@ MemoryResult<std::uint64_t> MemoryBus::write(
     }
     if (region->info.kind == RegionKind::mmio) {
         const std::uint32_t offset = address - region->info.base;
-        if (trap_all_mmio_ || (trap_shared_mmio_
+        const bool transaction_safe = trap_all_mmio_
+            && region->device->transactionalAccessSafe(offset, size, true);
+        if ((trap_all_mmio_ && !transaction_safe) || (trap_shared_mmio_
             && region->device->domain(offset, size) == MmioDomain::shared)) {
             return makeFault(
                 BusFaultReason::synchronization_required, address, size, context,
                 region->info.name, "MMIO access requires coordinator synchronization"
             );
         }
-        ++side_effect_generation_;
-        ++mmio_generation_;
+        if (!transaction_safe) {
+            ++side_effect_generation_;
+            ++mmio_generation_;
+        }
         auto result = region->device->write(offset, size, value & widthMask(size), context);
         if (!result && result.fault().region.empty()) {
             result.fault().region = region->info.name;

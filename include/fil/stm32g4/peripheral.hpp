@@ -59,6 +59,13 @@ public:
     [[nodiscard]] std::string_view name() const noexcept override { return name_; }
     [[nodiscard]] std::uint32_t size() const noexcept { return block_size_; }
 
+    /** Starts a register-level copy-on-write transaction. */
+    void beginTransaction();
+    /** Keeps journaled writes and releases transaction storage. */
+    void commitTransaction() noexcept;
+    /** Restores journaled registers in reverse write order. */
+    void rollbackTransaction() noexcept;
+
     /** @brief Restores every register to its configured reset value. */
     void reset();
 
@@ -108,12 +115,20 @@ private:
         const mem::AccessContext& context,
         std::string message
     ) const;
+    void journalRegister(std::size_t index) noexcept;
+
+    struct RegisterMutation {
+        std::size_t index{0};
+        std::uint32_t previous{0};
+    };
 
     std::string name_;
     std::string trace_source_;
     std::uint32_t block_size_{0};
     std::vector<std::uint32_t> registers_;
     std::vector<std::uint32_t> reset_values_;
+    std::vector<RegisterMutation> transaction_journal_;
+    bool transaction_active_{false};
     sim::EventLoop* event_loop_{nullptr};
     sim::TraceRecorder* trace_{nullptr};
 };
@@ -192,6 +207,9 @@ public:
     );
 
     [[nodiscard]] std::uint64_t systemClockHz() const noexcept { return system_clock_hz_; }
+    [[nodiscard]] bool transactionalAccessSafe(
+        std::uint32_t, mem::AccessSize, bool write
+    ) const noexcept override { return !write; }
     void setClockChangedCallback(std::function<void(std::uint64_t)> callback);
 
 protected:

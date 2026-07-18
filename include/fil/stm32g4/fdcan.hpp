@@ -118,12 +118,18 @@ static_assert(FdcanMessageRam::txFifoOffset
 /** @brief Register-level model of one of the three STM32G4 FDCAN cores. */
 class FdcanPeripheral final : public RegisterPeripheral {
 public:
+    [[nodiscard]] bool transactionalAccessSafe(
+        std::uint32_t offset, mem::AccessSize size, bool
+    ) const noexcept override {
+        return offset == 0x01cU && mem::byteCount(size) <= 4U;
+    }
+
     [[nodiscard]] mem::MmioDomain domain(
         std::uint32_t offset, mem::AccessSize size
     ) const noexcept override {
-        static_cast<void>(offset);
         static_cast<void>(size);
-        return mem::MmioDomain::shared;
+        return offset == 0x01cU
+            ? mem::MmioDomain::board_local : mem::MmioDomain::shared;
     }
 
     enum class Instance : unsigned int {

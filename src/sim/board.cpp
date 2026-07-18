@@ -464,7 +464,8 @@ BoardRunResult Board::cpuFailure(const cpu::RunResult& result) const {
 
 Board::TransactionCheckpointPtr Board::captureTransaction(
     const EventOwner owner
-) const {
+) {
+    peripherals_->beginTransaction();
     auto checkpoint = std::make_shared<TransactionCheckpoint>();
     checkpoint->owner = owner;
     checkpoint->cpu_state = cpu_->state();
@@ -479,6 +480,10 @@ Board::TransactionCheckpointPtr Board::captureTransaction(
     return checkpoint;
 }
 
+void Board::commitTransaction() noexcept {
+    peripherals_->commitTransaction();
+}
+
 bool Board::restoreTransaction(const TransactionCheckpointPtr& checkpoint) {
     if (!checkpoint || !memory_.canRestoreSideEffects(checkpoint->memory_checkpoint)
         || !event_loop_->canRestoreOwnerCheckpoint(checkpoint->event_checkpoint)) {
@@ -488,6 +493,7 @@ bool Board::restoreTransaction(const TransactionCheckpointPtr& checkpoint) {
         || !event_loop_->restoreOwnerCheckpoint(checkpoint->event_checkpoint)) {
         return false;
     }
+    peripherals_->rollbackTransaction();
     cpu_->state() = checkpoint->cpu_state;
     *system_ = checkpoint->system_state;
     exceptions_->restoreActiveStack(checkpoint->active_exceptions);

@@ -30,6 +30,32 @@ void storesRegistersAndUnknownMmio() {
     fil::test::check(!strict && strict.fault().address == 0x40000000U, "strict unknown MMIO returns an absolute device fault");
 }
 
+void journalsTransactionalRegisters() {
+    fil::stm32g4::PwrPeripheral pwr;
+    fil::test::check(
+        pwr.write(0, fil::mem::AccessSize::word, 0x11U, write_context).hasValue(),
+        "seeds transactional register state"
+    );
+    pwr.beginTransaction();
+    static_cast<void>(pwr.write(0, fil::mem::AccessSize::word, 0x22U, write_context));
+    static_cast<void>(pwr.write(0, fil::mem::AccessSize::word, 0x33U, write_context));
+    pwr.rollbackTransaction();
+    const auto rolled_back = pwr.read(0, fil::mem::AccessSize::word, read_context);
+    fil::test::check(
+        rolled_back && rolled_back.value() == 0x11U,
+        "register COW restores the first pre-transaction value"
+    );
+
+    pwr.beginTransaction();
+    static_cast<void>(pwr.write(0, fil::mem::AccessSize::word, 0x44U, write_context));
+    pwr.commitTransaction();
+    const auto committed = pwr.read(0, fil::mem::AccessSize::word, read_context);
+    fil::test::check(
+        committed && committed.value() == 0x44U,
+        "register COW retains committed mutations"
+    );
+}
+
 void modelsClockFlashAndGpioStartup() {
     fil::stm32g4::RccPeripheral rcc;
     fil::test::check(rcc.write(0, fil::mem::AccessSize::word, (1U << 16U) | (1U << 24U), write_context).hasValue(), "writes RCC CR");
@@ -289,6 +315,7 @@ void completesDmaAndWatchdogSideEffects() {
 /** @brief Runs STM32G4 peripheral foundation unit tests. */
 void runPeripheralTests() {
     storesRegistersAndUnknownMmio();
+    journalsTransactionalRegisters();
     modelsClockFlashAndGpioStartup();
     modelsUsartAndSpiDataPaths();
     drivesTimerAndAdcFromSimulatedTime();

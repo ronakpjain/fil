@@ -194,7 +194,7 @@ performance-specific mechanisms currently implemented; ordinary container
 | World | Exact lockstep bursts | Re-entering the general scheduler around every equal-duration board round | Runs at most 64 rounds; exits on events, exceptions, failures, budgets, clock divergence, or a usable loop proof |
 | World | Event ownership provenance | Invalidating unrelated board-local lookahead after a callback | Shared callbacks still invalidate every lane; nested local callbacks inherit their board owner |
 | Event loop | Serial owner fast path | Thread-local lookup and owner-map probing for every instruction dispatch | Thread-local ownership remains active whenever concurrent lane access is enabled |
-| World | Transactional lane workers | Serial MMIO-free instruction epochs across independent boards | CPU/RAM/system state is checkpointed; any MMIO/event escape rolls every lane back; opt-in while commit rate is tuned |
+| World | Transactional lane workers | Serial instruction epochs across independent boards | CPU/RAM/system state and approved local register writes are reversible; shared or callback-producing MMIO still forces rollback |
 | World | Atomic worker epochs | Mutex/condition-variable dispatch and copying disabled loop observations | Generation/remaining atomics synchronize persistent lanes; rollback restores the unchanged observation generation |
 | Diagnostics | Disabled trace/history fast mode | Retaining and serializing unrequested records, ADC samples, and DMA request logs | Any requested observer reenables exact events/data retention |
 | ADC | Lazy unobserved continuous conversion | One callback per conversion period | Only continuous conversions with no interrupt/callback/trace/history observer |
@@ -213,6 +213,16 @@ reflects checkpoint and synchronization costs: merely committing more epochs tha
 are rejected is not sufficient to amortize them. It then reenables fused serial
 bursts, reducing the six-board combined opt-in runtime to about 0.88 s on this low-commit workload
 while retaining parallel execution for workloads that demonstrate useful epochs.
+
+Register-backed peripherals now provide an opt-in copy-on-write journal: the first
+mutation of each touched register records its prior value, successful epochs drop
+the journal, and failed epochs restore it in reverse order. The current safety map
+allows the already-checkpointed Cortex-M system block, read-only RCC accesses, and
+FDCAN NBTP configuration; shared FDCAN status/data and devices with callbacks or
+event scheduling still trap. At 1,024 instructions per epoch this commits about
+104,448 target instructions in 17 of 23 sampled epochs. Its 0.88 s Release median
+is neutral on `per_vehicle`, so it is correctness infrastructure rather than a
+claimed speedup.
 
 The first seven techniques preserve one host dispatch per target instruction. Loop
 batching and lazy ADC conversion are conservative event-elision techniques: they

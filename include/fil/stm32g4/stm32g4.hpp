@@ -64,6 +64,11 @@ public:
     /** @brief Qualifies every peripheral trace source as `prefix.device`. */
     void setTraceSourcePrefix(std::string_view prefix);
 
+    /** Starts copy-on-write journals on every register-backed peripheral. */
+    void beginTransaction();
+    void commitTransaction() noexcept;
+    void rollbackTransaction() noexcept;
+
     /** @brief Resets register-backed devices while retaining host attachments. */
     void reset();
 

@@ -121,6 +121,16 @@ public:
     /** @brief Gets the device's diagnostic name. @return Static or device-owned name. */
     [[nodiscard]] virtual std::string_view name() const noexcept = 0;
 
+    /** Whether a board-local transaction journal covers this access. */
+    [[nodiscard]] virtual bool transactionalAccessSafe(
+        std::uint32_t offset, AccessSize size, bool write
+    ) const noexcept {
+        static_cast<void>(offset);
+        static_cast<void>(size);
+        static_cast<void>(write);
+        return false;
+    }
+
     /** @brief Classifies an access for conservative multi-board synchronization. */
     [[nodiscard]] virtual MmioDomain domain(
         std::uint32_t offset, AccessSize size

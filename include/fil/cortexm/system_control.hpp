@@ -114,6 +114,9 @@ public:
     ) override;
 
     [[nodiscard]] std::string_view name() const noexcept override { return "cortexm-system"; }
+    [[nodiscard]] bool transactionalAccessSafe(
+        std::uint32_t, mem::AccessSize, bool
+    ) const noexcept override { return true; }
 
 private:
     [[nodiscard]] std::uint32_t readWord(std::uint32_t aligned_offset);

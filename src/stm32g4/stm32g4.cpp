@@ -96,7 +96,10 @@ Result<std::unique_ptr<Stm32G4>> Stm32G4::create(
 }
 
 Result<void> Stm32G4::map(const std::uint32_t absolute_address, RegisterPeripheral& device) {
-    return router_.map(absolute_address - peripheral_base, device.size(), device, std::string(device.name()));
+    return router_.map(
+        absolute_address - peripheral_base, device.size(), device,
+        std::string(device.name())
+    );
 }
 
 Result<void> Stm32G4::mapDevices() {
@@ -345,6 +348,18 @@ void Stm32G4::setTraceSourcePrefix(const std::string_view prefix) {
     qualify(spi_);
     qualify(fdcan_);
     qualify(stubs_);
+}
+
+void Stm32G4::beginTransaction() {
+    for (auto& device : fdcan_) device->beginTransaction();
+}
+
+void Stm32G4::commitTransaction() noexcept {
+    for (auto& device : fdcan_) device->commitTransaction();
+}
+
+void Stm32G4::rollbackTransaction() noexcept {
+    for (auto& device : fdcan_) device->rollbackTransaction();
 }
 
 void Stm32G4::reset() {

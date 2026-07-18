@@ -155,13 +155,35 @@ mem::MemoryResult<std::uint64_t> RegisterPeripheral::write(
         const std::size_t register_index = word_offset / 4U;
         const std::uint32_t previous = registers_[register_index];
         const std::uint32_t merged = (previous & ~masks[index]) | bits[index];
+        journalRegister(register_index);
         registers_[register_index] = merged;
         storeRegister(word_offset, previous, merged, masks[index], context);
     }
     return std::uint64_t{0};
 }
 
+void RegisterPeripheral::beginTransaction() {
+    transaction_journal_.clear();
+    transaction_journal_.reserve(registers_.size());
+    transaction_active_ = true;
+}
+
+void RegisterPeripheral::commitTransaction() noexcept {
+    transaction_journal_.clear();
+    transaction_active_ = false;
+}
+
+void RegisterPeripheral::rollbackTransaction() noexcept {
+    for (auto mutation = transaction_journal_.rbegin();
+         mutation != transaction_journal_.rend(); ++mutation) {
+        registers_[mutation->index] = mutation->previous;
+    }
+    transaction_journal_.clear();
+    transaction_active_ = false;
+}
+
 void RegisterPeripheral::reset() {
+    commitTransaction();
     registers_ = reset_values_;
     onReset();
 }
@@ -208,8 +230,18 @@ void RegisterPeripheral::setRegister(
     const std::uint32_t value
 ) noexcept {
     if ((word_offset & 3U) == 0U && word_offset < block_size_) {
-        registers_[word_offset / 4U] = value;
+        const std::size_t index = word_offset / 4U;
+        journalRegister(index);
+        registers_[index] = value;
     }
+}
+
+void RegisterPeripheral::journalRegister(const std::size_t index) noexcept {
+    if (!transaction_active_) return;
+    for (const RegisterMutation& mutation : transaction_journal_) {
+        if (mutation.index == index) return;
+    }
+    transaction_journal_.push_back(RegisterMutation{index, registers_[index]});
 }
 
 std::uint32_t RegisterPeripheral::registerValue(const std::uint32_t word_offset) const noexcept {

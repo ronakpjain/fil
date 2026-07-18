@@ -67,6 +67,17 @@ const MmioRouter::Route* MmioRouter::find(
     return nullptr;
 }
 
+bool MmioRouter::transactionalAccessSafe(
+    const std::uint32_t offset, const AccessSize size, const bool write
+) const noexcept {
+    const std::uint32_t width = byteCount(size);
+    if (!validRange(offset, width, window_size_)) return false;
+    const Route* const route = find(offset, width);
+    return route != nullptr && route->device->transactionalAccessSafe(
+        offset - route->offset, size, write
+    );
+}
+
 MmioDomain MmioRouter::domain(
     const std::uint32_t offset, const AccessSize size
 ) const noexcept {

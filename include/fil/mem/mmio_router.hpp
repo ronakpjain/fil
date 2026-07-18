@@ -75,6 +75,10 @@ public:
 
     [[nodiscard]] std::string_view name() const noexcept override { return name_; }
 
+    [[nodiscard]] bool transactionalAccessSafe(
+        std::uint32_t offset, AccessSize size, bool write
+    ) const noexcept override;
+
     [[nodiscard]] MmioDomain domain(
         std::uint32_t offset, AccessSize size
     ) const noexcept override;

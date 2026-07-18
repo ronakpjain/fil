@@ -103,7 +103,10 @@ public:
     );
 
     /** @brief Captures reversible CPU, RAM, system, scheduler, and lane-clock state. */
-    [[nodiscard]] TransactionCheckpointPtr captureTransaction(EventOwner owner) const;
+    [[nodiscard]] TransactionCheckpointPtr captureTransaction(EventOwner owner);
+
+    /** Keeps copy-on-write peripheral mutations after a successful epoch. */
+    void commitTransaction() noexcept;
 
     /** @brief Restores a checkpoint when no MMIO or owner event escaped the slice. */
     [[nodiscard]] bool restoreTransaction(const TransactionCheckpointPtr& checkpoint);
