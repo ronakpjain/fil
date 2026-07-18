@@ -245,6 +245,23 @@ void disablesTraceCollectionWithoutDisturbingSequence() {
                      "reenabling trace preserves contiguous sequence numbering");
 }
 
+void streamsTraceWithoutRetainingHistory() {
+    fil::sim::TraceRecorder trace;
+    std::vector<fil::sim::TraceRecord> observed;
+    trace.setRetainRecords(false);
+    trace.setObserver([&observed](const fil::sim::TraceRecord& record) {
+        observed.push_back(record);
+    });
+
+    static_cast<void>(trace.record(10U, "board", "can_tx", {{"id", "0x12"}}));
+    static_cast<void>(trace.record(20U, "board", "can_tx", {{"id", "0x13"}}));
+
+    fil::test::check(trace.records().empty(),
+                     "streaming trace does not retain in-memory history");
+    fil::test::check(observed.size() == 2U && observed.back().sequence == 1U,
+                     "streaming trace still notifies observers in sequence");
+}
+
 } // namespace
 
 /** @brief Runs deterministic event-loop and trace unit tests. */
@@ -259,4 +276,5 @@ void runEventLoopTests() {
     detectsZeroDelayLivelock();
     serializesStableTraceRecords();
     disablesTraceCollectionWithoutDisturbingSequence();
+    streamsTraceWithoutRetainingHistory();
 }

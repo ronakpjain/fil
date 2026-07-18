@@ -54,6 +54,9 @@ public:
     /** @brief Observes each newly appended record without changing stored JSONL output. */
     void setObserver(Observer observer) { observer_ = std::move(observer); }
 
+    /** @brief Controls in-memory retention while keeping observers active. */
+    void setRetainRecords(bool retain) noexcept { retain_records_ = retain; }
+
     /**
      * @brief Appends one trace record and returns its assigned sequence.
      * @return Assigned sequence, or the unconsumed next sequence while disabled.
@@ -93,6 +96,7 @@ public:
 
 private:
     bool enabled_{true};
+    bool retain_records_{true};
     std::uint64_t next_sequence_{0};
     std::vector<TraceRecord> records_;
     Observer observer_;

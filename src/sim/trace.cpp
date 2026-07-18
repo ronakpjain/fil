@@ -45,10 +45,11 @@ std::uint64_t TraceRecorder::record(
 ) {
     if (!enabled_) return next_sequence_;
     const std::uint64_t sequence = next_sequence_++;
-    records_.push_back(TraceRecord{
+    TraceRecord record{
         time_ns, sequence, std::move(source), std::move(type), std::move(fields),
-    });
-    if (observer_) observer_(records_.back());
+    };
+    if (observer_) observer_(record);
+    if (retain_records_) records_.push_back(std::move(record));
     return sequence;
 }
 

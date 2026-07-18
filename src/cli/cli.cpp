@@ -406,6 +406,7 @@ ExitCode runBoardCommand(
     }
     const bool diagnostics_enabled = trace_path.has_value() || live;
     board.value()->trace().setEnabled(diagnostics_enabled);
+    board.value()->trace().setRetainRecords(trace_path.has_value());
     board.value()->peripherals().setAdcDiagnosticsEnabled(diagnostics_enabled);
     if (live) {
         out << "watching board " << board_config.value().name << " (Ctrl-C to stop)\n";
@@ -594,6 +595,7 @@ ExitCode runNetworkCommand(
             ? ExitCode::config_error : ExitCode::runtime_error;
     }
     world.value()->setDiagnosticsEnabled(trace_path.has_value() || live);
+    world.value()->trace().setRetainRecords(trace_path.has_value());
     if (live) {
         out << "watching network " << network_config.value().name << " (Ctrl-C to stop)\n";
         world.value()->trace().setObserver([&out, &live_filters](const sim::TraceRecord& record) {
