@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "name": "rear_driveline",
+  "mcu": "../mcus/stm32g474retx.json",
+  "elf": "../../../../PER/Projects/firmware/output/rear_driveline/rear_driveline.elf",
+  "vector_base": "0x08000000",
+  "run": {"default_duration_ms": 1000, "max_instructions": 50000000},
+  "gpio": {}, "can": {"FDCAN2": {"bus": "vehicle", "loopback": false}},
+  "usart": {}, "adc": {}, "spi": {}
+}
