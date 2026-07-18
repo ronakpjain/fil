@@ -141,6 +141,7 @@ xcrun llvm-profdata merge -output=/tmp/fil-per.profdata /tmp/fil-per.profraw
 cmake -S . -B build-pgo -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DFIL_ENABLE_IPO=ON \
+  -DFIL_ENABLE_NATIVE_ARCH=ON \
   -DFIL_BUILD_TESTS=ON \
   -DFIL_PGO_PROFILE=/tmp/fil-per.profdata
 cmake --build build-pgo
@@ -148,9 +149,11 @@ ctest --test-dir build-pgo --output-on-failure
 ```
 
 On non-Apple Clang installations, invoke `llvm-profdata` directly instead of
-`xcrun llvm-profdata`. Profiles are compiler- and binary-specific optimization
-inputs, not repository artifacts; retrain after material source or toolchain
-changes. Training on additional representative commands before merging multiple
+`xcrun llvm-profdata`. `FIL_ENABLE_NATIVE_ARCH` adds `-mcpu=native`; it improves
+the fresh combined PGO median from about 0.75 s to 0.74 s on the development
+Apple Silicon host (best observed 0.73 s), but the resulting binary is not portable
+to older CPUs. Profiles are compiler- and binary-specific optimization inputs,
+not repository artifacts; retrain after material source or toolchain changes. Training on additional representative commands before merging multiple
 `.profraw` files can produce a less workload-specific build.
 
 ## Technique inventory
