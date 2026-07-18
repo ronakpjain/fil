@@ -24,8 +24,9 @@ continuous ADC sequences and their DMA transfers observable. After scheduler and
 interpreter hot-path restructuring, three consecutive one-second runs on the
 development host took **0.87 s, 0.87 s, and 0.88 s** in the portable Release+IPO
 build (median 0.87 s, about **1.15x real time**). A Clang PGO build trained on the
-same command took **0.75 s, 0.74 s, and 0.75 s** (median 0.75 s, about **1.33x real
-time**) after the scheduler, memory, branch, and hot-lane data-layout improvements. Disabling loop batching took 3.33 s on the portable build, so the
+same command took **0.73 s, 0.73 s, and 0.74 s** (median 0.73 s, about **1.37x real
+time**) after the scheduler, memory, branch, cache, and hot-lane data-layout
+improvements. Disabling loop batching took 3.33 s on the portable build, so the
 causality-bounded batching path is about **3.1x faster** before PGO. Every mode
 reported the same exact result:
 
@@ -208,9 +209,11 @@ The following optimizations do not skip target instructions.
 
 Previously, every step fetched instruction halfwords through `MemoryBus` and ran
 the decoder even when a loop had executed the same PC thousands of times.
-`CortexM4` now has an 8,192-entry direct-mapped cache indexed by Thumb PC. An entry
-stores the PC, instruction width, raw encoding, and decoded instruction, so a hit
-avoids both memory fetch and decode.
+`CortexM4` now has a 16,384-entry direct-mapped cache indexed by Thumb PC. An
+entry stores the PC, instruction width, raw encoding, and decoded instruction, so
+a hit avoids both memory fetch and decode. This removes conflicts between Thumb
+PCs separated by 16 KiB in the larger PER images; a measured 32,768-entry variant
+was slower from host cache pressure, so capacity is intentionally bounded at 16K.
 
 Every entry is tagged with `MemoryBus::executionGeneration()`. Adding a mapping,
 loading executable bytes, or writing executable backing storage advances that

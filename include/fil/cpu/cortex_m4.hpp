@@ -177,7 +177,7 @@ private:
         std::uint8_t size{0};
     };
 
-    static constexpr std::size_t instruction_cache_entries = 8192U;
+    static constexpr std::size_t instruction_cache_entries = 16384U;
 
     [[nodiscard]] StopReason execute(
         const DecodedInstruction& instruction,
