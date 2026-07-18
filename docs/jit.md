@@ -22,7 +22,9 @@ state plus exact instruction count.
 
 Configure with `-DFIL_ENABLE_LLVM_JIT=ON` and an LLVM package path such as
 `-DLLVM_DIR=/opt/homebrew/opt/llvm/lib/cmake/llvm`. Builds without LLVM remain the
-default. `CortexM4` now counts executions per decoded-cache PC, compiles only saturated
+default. The measured-losing single-instruction integration is independently
+available through `FIL_ENABLE_SINGLE_INSTRUCTION_JIT`; it is off by default so an
+LLVM-capable build does not enlarge the decoded cache or initialize ORC at run time. `CortexM4` now counts executions per decoded-cache PC, compiles only saturated
 hot entries after 65,535 hits, and stores the resulting native function in the same
 execution-generation-tagged cache entry. IT-block instructions and active-SP/PC
 writes remain interpreted. Compilation failures mark only that cache entry as

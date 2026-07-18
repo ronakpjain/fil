@@ -1,7 +1,7 @@
 #include "fil/cpu/cortex_m4.hpp"
 
 #include "fil/cpu/decoder.hpp"
-#if defined(FIL_HAS_LLVM_JIT)
+#if defined(FIL_ENABLE_SINGLE_INSTRUCTION_JIT)
 #include "fil/cpu/jit_llvm.hpp"
 #endif
 #include "fil/elf/elf_loader.hpp"
@@ -264,7 +264,7 @@ FastStepResult CortexM4::stepFast() {
         cache.raw = result.raw;
         cache.decoded = *newly_decoded;
         cache.size = instruction_size;
-#if defined(FIL_HAS_LLVM_JIT)
+#if defined(FIL_ENABLE_SINGLE_INSTRUCTION_JIT)
         cache.jit_function = nullptr;
         cache.jit_hits = 0U;
         cache.jit_rejected = false;
@@ -299,7 +299,7 @@ FastStepResult CortexM4::stepFast() {
 
     StopReason stop = StopReason::step_complete;
     if (conditionPasses(effective_condition, state_.xpsr)) [[likely]] {
-#if defined(FIL_HAS_LLVM_JIT)
+#if defined(FIL_ENABLE_SINGLE_INSTRUCTION_JIT)
         if (!was_in_it && decoded == &cache.decoded && cache.jit_function != nullptr) {
             static_cast<void>(cache.jit_function(state_.r.data(), &state_.xpsr));
         } else {

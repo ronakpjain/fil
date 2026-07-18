@@ -23,7 +23,7 @@ class MemoryBus;
 
 namespace fil::cpu {
 
-#if defined(FIL_HAS_LLVM_JIT)
+#if defined(FIL_ENABLE_SINGLE_INSTRUCTION_JIT)
 class LlvmJitEngine;
 #endif
 
@@ -181,7 +181,7 @@ private:
         std::uint32_t raw{0};
         DecodedInstruction decoded{};
         std::uint8_t size{0};
-#if defined(FIL_HAS_LLVM_JIT)
+#if defined(FIL_ENABLE_SINGLE_INSTRUCTION_JIT)
         std::uint64_t (*jit_function)(std::uint32_t*, std::uint32_t*){nullptr};
         std::uint16_t jit_hits{0};
         bool jit_rejected{false};
@@ -200,7 +200,7 @@ private:
     CpuState state_{};
     std::array<InstructionCacheEntry, instruction_cache_entries> instruction_cache_{};
     DiagnosticSnapshot last_diagnostic_{};
-#if defined(FIL_HAS_LLVM_JIT)
+#if defined(FIL_ENABLE_SINGLE_INSTRUCTION_JIT)
     std::unique_ptr<LlvmJitEngine> jit_;
 #endif
 };
