@@ -22,8 +22,8 @@ loop.
 The corrected six-board PER workload runs near real time after making
 continuous ADC sequences and their DMA transfers observable. After scheduler and
 interpreter hot-path restructuring, three consecutive one-second runs on the
-development host took **1.02 s, 1.00 s, and 1.01 s** in the portable Release+IPO
-build (median 1.01 s, about **0.99x real time**). A Clang PGO build trained on the
+development host took **0.99 s, 0.98 s, and 0.99 s** in the portable Release+IPO
+build (median 0.99 s, about **1.01x real time**). A Clang PGO build trained on the
 same command took **0.80 s, 0.80 s, and 0.81 s** (median 0.80 s, about **1.25x real
 time**) after the scheduler improvements and a guarded directly-backed 32-bit read
 path. Disabling loop batching took 3.33 s on the portable build, so the
@@ -158,6 +158,7 @@ performance-specific mechanisms currently implemented; ordinary container
 | CPU | Decoded instruction cache | Repeated fetch and decode | PC plus executable-memory generation |
 | CPU | Copy-free cache hits | Per-instruction `DecodedInstruction` copies | Stable fixed-size cache entry; IT adjustment still copies |
 | CPU | `stepFast()` | Full register snapshots and diagnostic strings on success | Full diagnostics materialized on stop/fault |
+| CPU | Dedicated hot `LDR` execution | Rechecking load/store width and signedness in the grouped memory dispatcher | Preserves shared address, writeback, fault, and PC-load semantics |
 | Cortex-M | Pending-interrupt summary | Calling exception selection and scanning NVIC words after every instruction | Recompute the summary only when pending/enable state mutates; full priority selection still runs for every positive summary |
 | Board | Split instruction-boundary settlement | Entering the large exception/reset slow path and probing its stack on every instruction | A compact predicate calls the non-inlined slow path only for pending exception/reset work |
 | Cortex-M | Sparse NVIC scan | Testing all 240 external IRQs for a pending candidate | Scan only `pending & enabled`; priority rules unchanged |
@@ -236,6 +237,17 @@ instruction, breakpoint, or other stop obtains the full structured snapshot from
 traditional full result when a caller requests one. Thus the optimization changes
 result materialization, not execution semantics or failure detail. The CPU, board,
 startup, exception, and scheduler fixture tests all pass through this fast path.
+
+### Dedicated hot `LDR` execution
+
+Dynamic PER instruction counts show word `LDR` represents roughly 25% of the
+instructions that still enter the interpreter. It now has a dedicated switch arm
+instead of sharing the eight-kind byte/halfword/load/store handler. Address
+formation, shifted register offsets, indexing, writeback, structured bus faults,
+and loads to PC retain the same logic; the common word-load path avoids repeated
+kind tests for store direction, width, and sign extension. PGO already predicts the
+grouped branch effectively, so this primarily improves the portable Release+IPO
+build.
 
 ### Sparse NVIC pending-interrupt bit scanning
 
