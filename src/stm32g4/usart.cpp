@@ -100,7 +100,7 @@ void UsartPeripheral::storeRegister(
     if (word_offset == tdr) {
         const std::uint8_t byte = static_cast<std::uint8_t>(value & 0xffU);
         const UsartTxByte output{currentTime(), byte};
-        tx_log_.push_back(output);
+        if (tx_history_enabled_) tx_log_.push_back(output);
         traceEvent("uart_tx", {{"byte", std::to_string(byte)}});
         if (tx_callback_) {
             tx_callback_(byte, output.time_ns);

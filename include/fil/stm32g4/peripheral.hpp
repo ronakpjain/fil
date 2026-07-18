@@ -169,6 +169,7 @@ public:
     [[nodiscard]] std::string_view name() const noexcept override { return name_; }
 
     void setStrict(bool strict) noexcept { strict_ = strict; }
+    void setAccessHistoryEnabled(bool enabled) noexcept { access_history_enabled_ = enabled; }
     [[nodiscard]] bool strict() const noexcept { return strict_; }
     [[nodiscard]] const std::vector<PeripheralAccess>& accesses() const noexcept { return accesses_; }
     /** @brief Qualifies future trace sources as `prefix.device`; empty restores the device name. */
@@ -194,6 +195,7 @@ private:
     sim::TraceRecorder* trace_{nullptr};
     std::map<std::uint32_t, std::uint8_t> bytes_;
     std::vector<PeripheralAccess> accesses_;
+    bool access_history_enabled_{true};
 };
 
 /** @brief STM32G4 reset-and-clock-control startup model. */
@@ -291,6 +293,7 @@ public:
     void releaseInput(unsigned int pin);
     [[nodiscard]] bool output(unsigned int pin) const noexcept;
     void setOutputCallback(OutputCallback callback);
+    void setTransitionHistoryEnabled(bool enabled) noexcept { transition_history_enabled_ = enabled; }
     [[nodiscard]] const std::vector<GpioTransition>& transitions() const noexcept { return transitions_; }
     void clearTransitions() noexcept { transitions_.clear(); }
 
@@ -315,6 +318,7 @@ private:
     std::uint16_t external_input_value_{0};
     OutputCallback output_callback_;
     std::vector<GpioTransition> transitions_;
+    bool transition_history_enabled_{true};
 };
 
 /** @brief Timestamped byte emitted by a USART. */
@@ -342,6 +346,7 @@ public:
     void setTxCallback(TxCallback callback);
     void setRxProvider(RxProvider provider);
     void setInterruptCallback(InterruptCallback callback);
+    void setTxHistoryEnabled(bool enabled) noexcept { tx_history_enabled_ = enabled; }
     void setIdleGap(sim::SimTimeNs idle_gap_ns) noexcept { idle_gap_ns_ = idle_gap_ns; }
     [[nodiscard]] const std::vector<UsartTxByte>& txLog() const noexcept { return tx_log_; }
     void clearTxLog() noexcept { tx_log_.clear(); }
@@ -369,6 +374,7 @@ private:
 
     std::deque<std::uint8_t> rx_queue_;
     std::vector<UsartTxByte> tx_log_;
+    bool tx_history_enabled_{true};
     TxCallback tx_callback_;
     RxProvider rx_provider_;
     InterruptCallback interrupt_callback_;
@@ -400,6 +406,7 @@ public:
     [[nodiscard]] std::uint64_t inputClockHz() const noexcept { return input_clock_hz_; }
     void setInterruptCallback(InterruptCallback callback);
     void setUpdateCallback(UpdateCallback callback);
+    void setUpdateHistoryEnabled(bool enabled) noexcept { update_history_enabled_ = enabled; }
     [[nodiscard]] const std::vector<TimerUpdate>& updates() const noexcept { return updates_; }
 
 protected:
@@ -430,6 +437,7 @@ private:
     InterruptCallback interrupt_callback_;
     UpdateCallback update_callback_;
     std::vector<TimerUpdate> updates_;
+    bool update_history_enabled_{true};
 };
 
 /** @brief ADC conversion result with selected channel metadata. */
@@ -556,6 +564,7 @@ public:
     void setInterruptCallback(InterruptCallback callback);
     void setDmaRequestCallback(DmaRequestCallback callback);
     void setEcho(bool enabled) noexcept { echo_ = enabled; }
+    void setTransferHistoryEnabled(bool enabled) noexcept { transfer_history_enabled_ = enabled; }
     [[nodiscard]] const std::vector<SpiTransfer>& transferLog() const noexcept { return transfers_; }
     void clearTransferLog() noexcept { transfers_.clear(); }
 
@@ -584,6 +593,7 @@ private:
     DmaRequestCallback dma_request_callback_;
     bool echo_{false};
     std::vector<SpiTransfer> transfers_;
+    bool transfer_history_enabled_{true};
 };
 
 /** @brief One serviced DMA peripheral request. */

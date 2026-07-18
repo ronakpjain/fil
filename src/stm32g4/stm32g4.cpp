@@ -327,7 +327,12 @@ Result<void> Stm32G4::configure(const config::BoardConfig& board) {
 }
 
 void Stm32G4::setAdcDiagnosticsEnabled(const bool enabled) {
+    for (auto& device : gpio_) device->setTransitionHistoryEnabled(enabled);
+    for (auto& device : usart_) device->setTxHistoryEnabled(enabled);
+    for (auto& device : timers_) device->setUpdateHistoryEnabled(enabled);
     for (auto& device : adc_) device->setSampleHistoryEnabled(enabled);
+    for (auto& device : spi_) device->setTransferHistoryEnabled(enabled);
+    for (auto& device : stubs_) device->setAccessHistoryEnabled(enabled);
     dma1_.setTransferHistoryEnabled(enabled);
     dma2_.setTransferHistoryEnabled(enabled);
 }

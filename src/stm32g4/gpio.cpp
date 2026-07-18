@@ -110,7 +110,7 @@ void GpioPeripheral::applyOutput(const std::uint32_t new_output) {
         }
         const bool high = (next & mask) != 0U;
         const GpioTransition transition{currentTime(), pin, high};
-        transitions_.push_back(transition);
+        if (transition_history_enabled_) transitions_.push_back(transition);
         traceEvent("gpio_output", {
             {"pin", std::to_string(pin)},
             {"value", high ? "1" : "0"},

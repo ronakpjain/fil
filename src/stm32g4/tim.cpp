@@ -179,7 +179,7 @@ void TimerPeripheral::fireUpdate(const bool forced) {
     counter_epoch_value_ = 0;
     setRegister(cnt, 0);
     setRegister(sr, registerValue(sr) | 1U);
-    updates_.push_back(TimerUpdate{currentTime(), before});
+    if (update_history_enabled_) updates_.push_back(TimerUpdate{currentTime(), before});
     traceEvent("timer_update", {{"forced", forced ? "true" : "false"}});
     if ((registerValue(dier) & 1U) != 0U && interrupt_callback_) {
         interrupt_callback_();

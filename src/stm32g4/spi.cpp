@@ -114,7 +114,9 @@ void SpiPeripheral::transferWord(const std::uint32_t value, const std::uint32_t 
         receive_bytes_.push_back(byte);
     }
 
-    transfers_.push_back(SpiTransfer{currentTime(), transmitted, received});
+    if (transfer_history_enabled_) {
+        transfers_.push_back(SpiTransfer{currentTime(), transmitted, received});
+    }
     traceEvent("spi_transfer", {
         {"tx", sim::TraceRecorder::hexBytes(transmitted)},
         {"rx", sim::TraceRecorder::hexBytes(received)},

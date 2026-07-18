@@ -344,7 +344,7 @@ mem::MemoryResult<std::uint64_t> UnknownMmioDevice::read(
         value |= static_cast<std::uint64_t>(byte) << (index * 8U);
     }
     const PeripheralAccess access{currentTime(), false, offset, size, value, context.pc};
-    accesses_.push_back(access);
+    if (access_history_enabled_) accesses_.push_back(access);
     traceAccess(access);
     if (strict_) {
         return fault(offset, size, context, "read from unknown MMIO register");
@@ -367,7 +367,7 @@ mem::MemoryResult<std::uint64_t> UnknownMmioDevice::write(
     }
 
     const PeripheralAccess access{currentTime(), true, offset, size, value & widthMask(size), context.pc};
-    accesses_.push_back(access);
+    if (access_history_enabled_) accesses_.push_back(access);
     traceAccess(access);
     if (strict_) {
         return fault(offset, size, context, "write to unknown MMIO register");
