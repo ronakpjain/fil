@@ -188,7 +188,7 @@ bool Board::boundaryWorkPending() const noexcept {
 }
 
 std::optional<Board::BoundaryStop> Board::settleInstructionBoundary() {
-    if (!boundaryWorkPending()) return std::nullopt;
+    if (!boundaryWorkPending()) [[likely]] return std::nullopt;
     return settleInstructionBoundarySlow();
 }
 

@@ -396,7 +396,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
             state.step.reset();
             state.in_flight = false;
 
-            if (completed.cpu_result.reason != cpu::StopReason::step_complete) {
+            if (completed.cpu_result.reason != cpu::StopReason::step_complete) [[unlikely]] {
                 cpu::RunResult detailed;
                 detailed.reason = completed.cpu_result.reason;
                 detailed.instructions = completed.cpu_result.instructions;
@@ -571,7 +571,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                     output.event_callbacks, events.events_executed
                 );
 
-                if (events.events_executed != 0U) {
+                if (events.events_executed != 0U) [[unlikely]] {
                     for (std::size_t index = 0; index < states.size(); ++index) {
                         const bool local_event = index < 64U
                             && (events.local_owner_mask
@@ -587,7 +587,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                     Board& board = *boards_[index]->board;
                     WorldBoardRunResult& board_output = output.boards[index];
                     const cpu::FastStepResult& step = burst_steps[index].cpu_result;
-                    if (step.reason != cpu::StopReason::step_complete) {
+                    if (step.reason != cpu::StopReason::step_complete) [[unlikely]] {
                         cpu::RunResult detailed;
                         detailed.reason = step.reason;
                         detailed.instructions = step.instructions;
@@ -924,7 +924,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
         if (events.same_time_limit_hit) {
             trace_.record(event_loop_.now(), config_.name, "event_livelock");
         }
-        if (events.events_executed != 0U) {
+        if (events.events_executed != 0U) [[unlikely]] {
             // Shared callbacks can affect every lane. Board-owned callbacks only
             // invalidate their originating lane; ownership is inherited by nested
             // peripheral scheduling and is a prerequisite for independent workers.

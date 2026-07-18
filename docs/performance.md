@@ -32,7 +32,7 @@ reported the same exact result:
 
 On battery with macOS Low Power Mode enabled, alternating five-run A/B tests use a
 separate baseline because host power policy materially changes throughput. The
-current portable build runs at a **1.68 s median (0.60x real time)**, while a
+current portable build runs at a **1.64 s median (0.61x real time)**, while a
 freshly trained PGO build runs at a **1.40 s median (0.71x real time)**. Do not
 compare these numbers directly with the AC-power results above.
 
@@ -165,7 +165,8 @@ performance-specific mechanisms currently implemented; ordinary container
 | CPU | Copy-free cache hits | Per-instruction `DecodedInstruction` copies | Stable fixed-size cache entry; IT adjustment still copies |
 | CPU | `stepFast()` | Full register snapshots and diagnostic strings on success | Full diagnostics materialized on stop/fault |
 | CPU | Dedicated hot `LDR` execution | Rechecking load/store width and signedness in the grouped memory dispatcher | Preserves shared address, writeback, fault, and PC-load semantics |
-| CPU | C++20 hot-path branch guidance | Poor static layout for cache hits, successful execution, and ordinary conditional execution | Hints only architectural invariants; PGO remains authoritative for workload-dependent branches |
+| CPU | C++20 hot-path branch guidance | Poor static layout for cache hits, successful execution, and ordinary conditional execution | Hints only stable measured invariants; PGO remains authoritative for workload-dependent branches |
+| Board/world | C++20 success/event branch guidance | Poor static layout around rare boundary work, failed steps, and event-bearing rounds | Hints preserve both branches and affect host layout only |
 | Cortex-M | Pending-interrupt summary | Calling exception selection and scanning NVIC words after every instruction | Recompute the summary only when pending/enable state mutates; full priority selection still runs for every positive summary |
 | Board | Split instruction-boundary settlement | Entering the large exception/reset slow path and probing its stack on every instruction | A compact predicate calls the non-inlined slow path only for pending exception/reset work |
 | Cortex-M | Sparse NVIC scan | Testing all 240 external IRQs for a pending candidate | Scan only `pending & enabled`; priority rules unchanged |
@@ -260,12 +261,14 @@ build.
 
 The decoded-cache hit, valid running Thumb state, successful instruction result,
 and ordinary condition-pass paths dominate normal execution. C++20
-`[[likely]]`/`[[unlikely]]` attributes mark only those stable architectural
-invariants inside `stepFast()`. Scheduler, event, MMIO, and loop-planner branches
-remain unannotated because their probabilities depend strongly on firmware and
-power-sensitive code layout; Clang PGO supplies measured weights for those paths.
-Battery Low Power Mode A/B measurements show a larger benefit in the portable
-build and a smaller but consistent gain after fresh PGO training.
+`[[likely]]`/`[[unlikely]]` attributes mark those stable architectural invariants
+inside `stepFast()`. The board boundary fast return and the world's successful
+step/no-event paths are similarly dominant in measured network runs and carry
+focused guidance. MMIO and loop-planner branches remain unannotated because their
+probabilities depend strongly on firmware and power-sensitive code layout; Clang
+PGO supplies measured weights for those paths. Battery Low Power Mode A/B
+measurements show the largest benefit in the portable build; PGO already predicts
+most board/world outcomes and remains at the same 1.40 s median.
 
 These are host compiler hints only. They do not model a Cortex-M pipeline or alter
 target cycle accounting, branch semantics, or deterministic scheduling.
