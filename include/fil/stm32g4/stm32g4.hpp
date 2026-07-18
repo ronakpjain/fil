@@ -111,6 +111,8 @@ private:
     std::uint64_t dma_route_generation_{0U};
     IwdgPeripheral iwdg_;
     WwdgPeripheral wwdg_;
+    RegisterPeripheral syscfg_;
+    ExtiPeripheral exti_;
     FdcanMessageRam fdcan_message_ram_;
     std::vector<std::unique_ptr<GpioPeripheral>> gpio_;
     std::vector<std::unique_ptr<UsartPeripheral>> usart_;

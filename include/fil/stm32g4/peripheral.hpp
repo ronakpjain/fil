@@ -282,6 +282,7 @@ struct GpioTransition {
 class GpioPeripheral final : public RegisterPeripheral {
 public:
     using OutputCallback = std::function<void(unsigned int pin, bool high, sim::SimTimeNs time_ns)>;
+    using InputCallback = std::function<void(unsigned int pin, bool previous, bool high)>;
 
     explicit GpioPeripheral(
         std::string name = "GPIO",
@@ -293,6 +294,7 @@ public:
     void releaseInput(unsigned int pin);
     [[nodiscard]] bool output(unsigned int pin) const noexcept;
     void setOutputCallback(OutputCallback callback);
+    void setInputCallback(InputCallback callback);
     void setTransitionHistoryEnabled(bool enabled) noexcept { transition_history_enabled_ = enabled; }
     [[nodiscard]] const std::vector<GpioTransition>& transitions() const noexcept { return transitions_; }
     void clearTransitions() noexcept { transitions_.clear(); }
@@ -317,8 +319,37 @@ private:
     std::uint16_t external_input_mask_{0};
     std::uint16_t external_input_value_{0};
     OutputCallback output_callback_;
+    InputCallback input_callback_;
     std::vector<GpioTransition> transitions_;
     bool transition_history_enabled_{true};
+};
+
+/** @brief STM32G4 EXTI edge detector backed by SYSCFG pin routing. */
+class ExtiPeripheral final : public RegisterPeripheral {
+public:
+    using InterruptCallback = std::function<void(unsigned int line)>;
+
+    explicit ExtiPeripheral(
+        RegisterPeripheral& syscfg,
+        sim::EventLoop* event_loop = nullptr,
+        sim::TraceRecorder* trace = nullptr
+    );
+
+    void onGpioEdge(unsigned int port, unsigned int pin, bool previous, bool high);
+    void setInterruptCallback(InterruptCallback callback);
+
+protected:
+    void storeRegister(
+        std::uint32_t word_offset,
+        std::uint32_t previous,
+        std::uint32_t value,
+        std::uint32_t write_mask,
+        const mem::AccessContext& context
+    ) override;
+
+private:
+    RegisterPeripheral& syscfg_;
+    InterruptCallback interrupt_callback_;
 };
 
 /** @brief Timestamped byte emitted by a USART. */

@@ -94,6 +94,45 @@ void modelsClockFlashAndGpioStartup() {
     fil::test::check(callbacks.size() == 1 && callbacks.front().pin == 13U, "GPIO reports output transitions once");
 }
 
+void routesPulledGpioEdgesThroughExti() {
+    fil::stm32g4::RegisterPeripheral syscfg("SYSCFG", 0x400);
+    fil::stm32g4::ExtiPeripheral exti(syscfg);
+    fil::stm32g4::GpioPeripheral gpio("GPIOA");
+    constexpr std::uint32_t line5 = 1U << 5U;
+    int interrupts = 0;
+    exti.setInterruptCallback([&](const unsigned int line) {
+        if (line == 5U) ++interrupts;
+    });
+    gpio.setInputCallback([&](const unsigned int pin, const bool previous, const bool high) {
+        exti.onGpioEdge(0U, pin, previous, high);
+    });
+
+    fil::test::check(
+        gpio.write(0x00, fil::mem::AccessSize::word,
+                   0xffffffffU & ~(3U << (5U * 2U)), write_context).hasValue()
+            && gpio.write(0x0c, fil::mem::AccessSize::word,
+                          1U << (5U * 2U), write_context).hasValue(),
+        "configures PA5 pull-up"
+    );
+    const auto released = gpio.read(0x10, fil::mem::AccessSize::word, read_context);
+    fil::test::check(released && (released.value() & line5) != 0U,
+                     "released GPIO input reflects its configured pull-up");
+    fil::test::check(
+        exti.write(0x00, fil::mem::AccessSize::word, line5, write_context).hasValue()
+            && exti.write(0x0c, fil::mem::AccessSize::word, line5, write_context).hasValue(),
+        "unmasks EXTI5 falling edges"
+    );
+    gpio.setInput(5U, false);
+    const auto pending = exti.read(0x14, fil::mem::AccessSize::word, read_context);
+    fil::test::check(interrupts == 1 && pending && (pending.value() & line5) != 0U,
+                     "PA5 falling edge pends EXTI5");
+    fil::test::check(
+        exti.write(0x14, fil::mem::AccessSize::word, line5, write_context).hasValue()
+            && exti.peekRegister(0x14) == 0U,
+        "EXTI pending register clears written flags"
+    );
+}
+
 void modelsUsartAndSpiDataPaths() {
     fil::sim::EventLoop loop;
     fil::sim::TraceRecorder trace;
@@ -337,6 +376,7 @@ void runPeripheralTests() {
     storesRegistersAndUnknownMmio();
     journalsTransactionalRegisters();
     modelsClockFlashAndGpioStartup();
+    routesPulledGpioEdgesThroughExti();
     modelsUsartAndSpiDataPaths();
     drivesTimerAndAdcFromSimulatedTime();
     sequencesAdcChannelsWithRegisterDerivedTiming();

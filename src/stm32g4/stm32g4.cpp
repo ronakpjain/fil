@@ -46,7 +46,9 @@ Stm32G4::Stm32G4(
     dma2_("DMA2", 8, nullptr, &event_loop, &trace),
     dmamux_("DMAMUX", 16, &event_loop, &trace),
     iwdg_(false, &event_loop, &trace),
-    wwdg_(false, 16000000U, &event_loop, &trace) {
+    wwdg_(false, 16000000U, &event_loop, &trace),
+    syscfg_("SYSCFG", 0x400, &event_loop, &trace),
+    exti_(syscfg_, &event_loop, &trace) {
     constexpr std::array<std::string_view, 7> gpio_names{
         "GPIOA", "GPIOB", "GPIOC", "GPIOD", "GPIOE", "GPIOF", "GPIOG",
     };
@@ -71,8 +73,6 @@ Stm32G4::Stm32G4(
         fdcan_.push_back(std::make_unique<FdcanPeripheral>(instance, fdcan_message_ram_, &event_loop, &trace));
     }
 
-    stubs_.push_back(std::make_unique<UnknownMmioDevice>("SYSCFG", 0x40010000U, false, 0, &event_loop, &trace));
-    stubs_.push_back(std::make_unique<UnknownMmioDevice>("EXTI", 0x40010400U, false, 0, &event_loop, &trace));
     stubs_.push_back(std::make_unique<UnknownMmioDevice>("ADC12_COMMON", 0x50000300U, false, 0, &event_loop, &trace));
     stubs_.push_back(std::make_unique<UnknownMmioDevice>("ADC345_COMMON", 0x50000700U, false, 0, &event_loop, &trace));
 }
@@ -119,6 +119,12 @@ Result<void> Stm32G4::mapDevices() {
         auto result = checked(entry.first, *entry.second);
         if (!result) return result.error();
     }
+    for (auto entry : std::array<std::pair<std::uint32_t, RegisterPeripheral*>, 2>{
+        std::pair{0x40010000U, &syscfg_}, {0x40010400U, &exti_},
+    }) {
+        auto result = checked(entry.first, *entry.second);
+        if (!result) return result.error();
+    }
 
     for (std::size_t index = 0; index < gpio_.size(); ++index) {
         auto result = checked(0x48000000U + static_cast<std::uint32_t>(index) * 0x400U, *gpio_[index]);
@@ -161,9 +167,8 @@ Result<void> Stm32G4::mapDevices() {
         );
         if (!result) return result.error();
     }
-    constexpr std::array<std::pair<std::uint32_t, std::uint32_t>, 4> stub_ranges{
-        std::pair{0x40010000U, 0x400U}, {0x40010400U, 0x400U},
-        {0x50000300U, 0x100U}, {0x50000700U, 0x100U},
+    constexpr std::array<std::pair<std::uint32_t, std::uint32_t>, 2> stub_ranges{
+        std::pair{0x50000300U, 0x100U}, {0x50000700U, 0x100U},
     };
     for (std::size_t index = 0; index < stubs_.size(); ++index) {
         auto result = router_.map(
@@ -177,6 +182,16 @@ Result<void> Stm32G4::mapDevices() {
 }
 
 void Stm32G4::wireInterrupts() {
+    for (std::size_t port = 0; port < gpio_.size(); ++port) {
+        gpio_[port]->setInputCallback([this, port](const unsigned int pin, const bool previous, const bool high) {
+            exti_.onGpioEdge(static_cast<unsigned int>(port), pin, previous, high);
+        });
+    }
+    exti_.setInterruptCallback([this](const unsigned int line) {
+        const std::uint16_t irq = line <= 4U ? static_cast<std::uint16_t>(6U + line)
+            : line <= 9U ? 23U : 40U;
+        system_.pend(static_cast<std::uint16_t>(irq + 16U));
+    });
     constexpr std::array<std::uint16_t, 3> usart_irqs{37, 38, 39};
     for (std::size_t index = 0; index < usart_.size(); ++index) {
         usart_[index]->setInterruptCallback([this, irq = usart_irqs[index]] { system_.pend(irq + 16U); });
