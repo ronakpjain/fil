@@ -92,10 +92,10 @@ unknown_mmio_addresses: 0
 The count follows the current one-cycle-per-instruction timing model at the 16 MHz reset clock. Zero unknown MMIO means the top-level peripheral router saw no access outside a routed block; it does not imply that every register in those blocks has hardware-complete semantics.
 
 On the development host, a Clang PGO build trained on the strict-MMIO six-board
-command ran the corrected one-second workload in 0.80 s, 0.80 s, and 0.81 s while
+command ran the corrected one-second workload in 0.75 s, 0.74 s, and 0.75 s while
 preserving the exact 96,000,000 logical instruction/cycle total and per-board
-results—about 1.25x real time with clock-timed ADC sequences and per-rank DMA
-enabled. The portable Release+IPO build is about 1.01x real time. On battery with
+results—about 1.33x real time with clock-timed ADC sequences and per-rank DMA
+enabled. The portable Release+IPO build is about 1.15x real time. On battery with
 macOS Low Power Mode enabled, the latest separately measured medians are 1.57 s
 portable and 1.33 s with freshly trained PGO. See
 [Performance](docs/performance.md) for reproduction commands, the

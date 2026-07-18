@@ -278,6 +278,9 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
         std::uint64_t same_time_dispatches{0};
     };
     std::vector<SchedulerState> states(boards_.size());
+    std::vector<Board*> lane_boards;
+    lane_boards.reserve(boards_.size());
+    for (const auto& entry : boards_) lane_boards.push_back(entry->board.get());
     std::vector<std::uint64_t> planned_iterations(boards_.size(), 0U);
     std::vector<Board::ConcurrentStepResult> burst_steps(boards_.size());
     std::unique_ptr<LaneWorkerPool> worker_pool;
@@ -549,20 +552,19 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
             ++output.lockstep_bursts;
             for (; completed_rounds < 64U; ++completed_rounds) {
                 const SimTimeNs round_start = event_loop_.now();
-                const SimTimeNs elapsed = boards_.front()->board->nextInstructionElapsedNs();
+                const SimTimeNs elapsed = lane_boards.front()->nextInstructionElapsedNs();
                 if (elapsed == 0U
                     || (deadline != 0U && elapsed > deadline - round_start)) break;
                 bool same_elapsed = true;
                 for (std::size_t index = 1; index < boards_.size(); ++index) {
                     same_elapsed = same_elapsed
-                        && boards_[index]->board->nextInstructionElapsedNs() == elapsed;
+                        && lane_boards[index]->nextInstructionElapsedNs() == elapsed;
                 }
                 if (!same_elapsed) break;
 
                 for (std::size_t index = 0; index < boards_.size(); ++index) {
                     auto owner_scope = event_loop_.useOwner(static_cast<EventOwner>(index));
-                    burst_steps[index] =
-                        boards_[index]->board->beginConcurrentStep(false);
+                    burst_steps[index] = lane_boards[index]->beginConcurrentStep(false);
                     ++output.dispatches;
                     ++output.exact_dispatches;
                 }
@@ -585,7 +587,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
 
                 bool leave_burst = events.events_executed != 0U;
                 for (std::size_t index = 0; index < boards_.size(); ++index) {
-                    Board& board = *boards_[index]->board;
+                    Board& board = *lane_boards[index];
                     WorldBoardRunResult& board_output = output.boards[index];
                     const cpu::FastStepResult& step = burst_steps[index].cpu_result;
                     if (step.reason != cpu::StopReason::step_complete) [[unlikely]] {

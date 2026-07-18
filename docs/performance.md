@@ -22,11 +22,10 @@ loop.
 The corrected six-board PER workload runs near real time after making
 continuous ADC sequences and their DMA transfers observable. After scheduler and
 interpreter hot-path restructuring, three consecutive one-second runs on the
-development host took **0.99 s, 0.98 s, and 0.99 s** in the portable Release+IPO
-build (median 0.99 s, about **1.01x real time**). A Clang PGO build trained on the
-same command took **0.80 s, 0.80 s, and 0.81 s** (median 0.80 s, about **1.25x real
-time**) after the scheduler improvements and a guarded directly-backed 32-bit read
-path. Disabling loop batching took 3.33 s on the portable build, so the
+development host took **0.87 s, 0.87 s, and 0.88 s** in the portable Release+IPO
+build (median 0.87 s, about **1.15x real time**). A Clang PGO build trained on the
+same command took **0.75 s, 0.74 s, and 0.75 s** (median 0.75 s, about **1.33x real
+time**) after the scheduler, memory, branch, and hot-lane data-layout improvements. Disabling loop batching took 3.33 s on the portable build, so the
 causality-bounded batching path is about **3.1x faster** before PGO. Every mode
 reported the same exact result:
 
@@ -185,6 +184,7 @@ performance-specific mechanisms currently implemented; ordinary container
 | Board | Compact loop proofs | Copying full integer/FP CPU state into every scheduler proof | Proof references a generation/revision-checked observation slot; slot reuse invalidates it conservatively |
 | Board | Bitwise FP-state comparison | Scalar comparison of all 32 FP registers for exact loop matches | `memcmp` compares the complete stored float object representation, including NaN payload bits |
 | World | Reused batching planner storage | Per-frontier heap allocation | Storage is sized once per run and cleared before reuse |
+| World | Contiguous hot lane view | Repeated `BoardEntry` and nested `unique_ptr` traversal in lockstep rounds | Raw pointers are derived once from world-owned boards and never outlive the run |
 | CPU/world | Backedge loop gate | Entering loop-proof observation after forward flow, calls, or standard returns | Resulting PC must move backward; decoded BL/BLX, BX LR, MOV PC/LR, and stack returns are excluded |
 | World | In-place successful-step accounting | Constructing/copying `BoardRunResult`, register arrays, optional faults, and strings per interpreted instruction | Full result and diagnostic materialization remains on non-success boundaries |
 | World | Exact lockstep bursts | Re-entering the general scheduler around every equal-duration board round | Runs at most 64 rounds; exits on events, exceptions, failures, budgets, clock divergence, or a usable loop proof |
@@ -454,8 +454,11 @@ fail closed when their evidence is insufficient.
 
 The multi-board scheduler likewise allocates its state and planned-iteration arrays
 once at the start of `World::run()`, clears the iteration counts at each frontier,
-and reuses the storage. This avoids millions of host heap allocations in long
-network simulations without changing scheduling order.
+and reuses the storage. It also derives a contiguous `Board*` lane view once and
+uses it in the fused lockstep hot path, avoiding repeated traversal through
+`BoardEntry` and nested `unique_ptr` ownership. The world remains the sole owner;
+the raw pointers cannot outlive the run. These changes avoid allocation and pointer
+chasing in long network simulations without changing scheduling order.
 
 `maximumLoopIterations()` performs the full proof validation and returns a count
 already bounded by the instruction budget and causal horizon. Every internal
