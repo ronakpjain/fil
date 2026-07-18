@@ -224,6 +224,26 @@ void lazilySynchronizesUnobservedContinuousAdc() {
                      "newly enabled ADC history begins with future conversions only");
 }
 
+void overridesConfiguredAdcProvider() {
+    fil::sim::EventLoop loop;
+    fil::sim::TraceRecorder trace;
+    fil::stm32g4::AdcPeripheral adc("ADC1", &loop, &trace);
+    adc.setChannelProvider([](const unsigned int, const fil::sim::SimTimeNs) {
+        return std::uint16_t{1000U};
+    });
+    adc.overrideChannelValue(0, 2345U);
+    adc.setConversionDelay(1U);
+
+    fil::test::check(adc.write(0x08, fil::mem::AccessSize::word,
+                               1U | (1U << 2U), write_context).hasValue(),
+                     "starts ADC conversion with a live override");
+    fil::test::check(loop.runDueEvents(1U).events_executed == 1,
+                     "completes ADC conversion with a live override");
+    const auto result = adc.read(0x40, fil::mem::AccessSize::word, read_context);
+    fil::test::check(result && result.value() == 2345U,
+                     "live ADC override takes precedence over configured provider");
+}
+
 void preservesObservableAndSingleShotAdcEvents() {
     fil::sim::EventLoop interrupt_loop;
     fil::sim::TraceRecorder interrupt_trace;
@@ -321,6 +341,7 @@ void runPeripheralTests() {
     drivesTimerAndAdcFromSimulatedTime();
     sequencesAdcChannelsWithRegisterDerivedTiming();
     lazilySynchronizesUnobservedContinuousAdc();
+    overridesConfiguredAdcProvider();
     preservesObservableAndSingleShotAdcEvents();
     completesDmaAndWatchdogSideEffects();
 }

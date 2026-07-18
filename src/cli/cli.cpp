@@ -18,6 +18,7 @@
 #include <mutex>
 #include <ostream>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -613,6 +614,55 @@ ExitCode runNetworkCommand(
         std::thread([controlled_world, state = stdin_control]() {
             std::string line;
             while (std::getline(std::cin, line)) {
+                if (line.starts_with("adc ")) {
+                    std::istringstream command(line);
+                    std::string kind;
+                    std::string board_name;
+                    std::string adc_name;
+                    std::string channel_text;
+                    std::string value_text;
+                    std::string trailing;
+                    command >> kind >> board_name >> adc_name >> channel_text >> value_text;
+                    if (kind != "adc" || board_name.empty() || adc_name.empty()
+                        || channel_text.empty() || value_text.empty() || (command >> trailing)) {
+                        std::cerr << "fil: ignored stdin ADC command; expected "
+                                     "adc BOARD ADCx CHANNEL VALUE\n";
+                        continue;
+                    }
+                    const auto channel = config::parseUnsigned(channel_text);
+                    const auto value = config::parseUnsigned(value_text);
+                    if (!channel || channel.value() > 19U || !value || value.value() > 4095U) {
+                        std::cerr << "fil: ignored stdin ADC command; channel must be 0..19 "
+                                     "and value must be 0..4095\n";
+                        continue;
+                    }
+                    std::lock_guard lock(state->mutex);
+                    if (!state->active) return;
+                    sim::Board* const board = controlled_world->board(board_name);
+                    stm32g4::AdcPeripheral* const adc = board == nullptr
+                        ? nullptr : board->peripherals().adc(adc_name);
+                    if (adc == nullptr) {
+                        std::cerr << "fil: ignored stdin ADC command for unknown board/ADC: "
+                                  << board_name << '/' << adc_name << '\n';
+                        continue;
+                    }
+                    sim::EventLoop* const loop = &controlled_world->eventLoop();
+                    sim::TraceRecorder* const trace = &controlled_world->trace();
+                    static_cast<void>(loop->scheduleAfter(
+                        0U,
+                        [adc, loop, trace, board_name, adc_name,
+                         channel = static_cast<unsigned int>(channel.value()),
+                         value = static_cast<std::uint16_t>(value.value())]() {
+                            adc->overrideChannelValue(channel, value);
+                            trace->record(
+                                loop->now(), board_name + "." + adc_name, "adc_input",
+                                {{"channel", std::to_string(channel)},
+                                 {"value", std::to_string(value)}}
+                            );
+                        }
+                    ));
+                    continue;
+                }
                 auto injection = parseCanInjection(line);
                 if (!injection) {
                     std::cerr << "fil: ignored stdin CAN command: "
@@ -765,7 +815,7 @@ void printHelp(std::ostream& out) {
         << "  --strict-mmio --trace-instr --detect-spin --no-loop-batching --allow-breakpoint\n"
         << "  --transactional-slices (experimental parallel lane epochs)\n"
         << "  --inject-can BUS[@TIME_MS]:ID:HEXDATA\n"
-        << "  --control-stdin (accept BUS:ID:HEXDATA lines while running)\n";
+        << "  --control-stdin (accept CAN and ADC commands while running)\n";
 }
 
 ExitCode run(

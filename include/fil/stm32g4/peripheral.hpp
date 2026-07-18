@@ -466,6 +466,8 @@ public:
     ) override;
 
     void setChannelValue(unsigned int channel, std::uint16_t value);
+    /** Overrides a configured channel provider for one channel until replaced. */
+    void overrideChannelValue(unsigned int channel, std::uint16_t value);
     void setChannelProvider(ChannelProvider provider);
     void setSampleCallback(SampleCallback callback);
     void setInterruptCallback(InterruptCallback callback);
@@ -508,6 +510,7 @@ private:
     void cancelConversion() noexcept;
 
     std::array<std::uint16_t, 20> channel_values_{};
+    std::array<std::optional<std::uint16_t>, 20> channel_overrides_{};
     ChannelProvider channel_provider_;
     SampleCallback sample_callback_;
     InterruptCallback interrupt_callback_;

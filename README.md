@@ -88,6 +88,17 @@ Interactive clients may add `--control-stdin` and write one
 shared simulation frontier, allowing a long-running `watch-network` process to be
 controlled bidirectionally.
 
+The same private control pipe accepts live 12-bit ADC overrides:
+
+```text
+adc BOARD ADCx CHANNEL VALUE
+```
+
+For example, `adc dashboard ADC1 3 2048` sets dashboard ADC1 channel 3 to
+mid-scale at the next shared frontier. Boards and ADC instances must exist,
+channels are 0 through 19, and values are 0 through 4095. Applied changes emit an
+`adc_input` trace record.
+
 The board and network configs in `configs/` reference firmware under the sibling `PER` checkout. Those external ELFs must exist at the configured paths for these commands; they are optional compatibility inputs and are not embedded into emulator behavior.
 
 ## Current real-firmware acceptance
