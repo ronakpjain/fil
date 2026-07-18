@@ -1,4 +1,7 @@
 #include "fil/cpu/jit.hpp"
+#if defined(FIL_HAS_LLVM_JIT)
+#include "fil/cpu/jit_llvm.hpp"
+#endif
 #include "../test_support.hpp"
 
 #include <array>
@@ -63,4 +66,25 @@ void runJitTests() {
         planJitBlock(sequence, 2U).translated_instructions == 2U,
         "JIT planner honors its compilation cap"
     );
+
+#if defined(FIL_HAS_LLVM_JIT)
+    std::array<DecodedInstruction, 2> native{};
+    native[0].kind = InstrKind::movw;
+    native[0].rd = 0U;
+    native[0].imm = 5U;
+    native[1].kind = InstrKind::add;
+    native[1].form = fil::cpu::OperandForm::immediate;
+    native[1].rd = 1U;
+    native[1].rn = 0U;
+    native[1].imm = 7U;
+    fil::cpu::LlvmJitEngine engine;
+    const auto compiled = engine.compile(native);
+    std::array<std::uint32_t, 16> registers{};
+    std::uint32_t xpsr = 0U;
+    fil::test::check(
+        compiled.function(registers.data(), &xpsr) == 2U
+            && registers[0] == 5U && registers[1] == 12U,
+        "LLVM ORC executes a compiled pure-integer block"
+    );
+#endif
 }

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(fil VERSION 0.1.0 LANGUAGES CXX)
+project(fil VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -18,6 +18,7 @@ option(FIL_BUILD_DOCS "Add the Doxygen HTML documentation target" ON)
 option(FIL_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(FIL_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
 option(FIL_ENABLE_IPO "Enable supported interprocedural optimization in non-sanitized builds" ON)
+option(FIL_ENABLE_LLVM_JIT "Build the optional LLVM ORC native block backend" OFF)
 option(FIL_PGO_GENERATE "Instrument a Clang build to generate a PGO profile" OFF)
 set(FIL_PGO_PROFILE "" CACHE FILEPATH "Clang PGO profile (.profdata) to use when optimizing fil")
 set(FIL_PER_FIRMWARE_DIR "" CACHE PATH "Optional PER firmware output directory for compatibility tests")
@@ -130,6 +131,21 @@ add_library(fil_core STATIC
 )
 target_include_directories(fil_core PUBLIC include)
 fil_set_project_options(fil_core)
+
+if(FIL_ENABLE_LLVM_JIT)
+    find_package(LLVM CONFIG REQUIRED)
+    target_sources(fil_core PRIVATE src/cpu/jit_llvm.cpp)
+    target_include_directories(fil_core SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
+    target_compile_definitions(fil_core PUBLIC FIL_HAS_LLVM_JIT=1)
+    llvm_map_components_to_libnames(FIL_LLVM_LIBS
+        Core
+        OrcJIT
+        ExecutionEngine
+        Support
+        nativecodegen
+    )
+    target_link_libraries(fil_core PRIVATE ${FIL_LLVM_LIBS})
+endif()
 
 add_executable(fil src/main.cpp)
 target_link_libraries(fil PRIVATE fil_core)

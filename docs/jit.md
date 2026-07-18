@@ -13,12 +13,19 @@ block, so target-PC validation and deterministic world scheduling remain unchang
 FP and system instructions also remain interpreted until dedicated equivalence
 tests exist.
 
-LLVM ORC headers are available on the development host through Homebrew LLVM 22.
-The next implementation step is an optional `FIL_ENABLE_LLVM_JIT` backend that
-lowers a `JitBlockPlan` to a function operating on `CpuState`, returns exact
-instruction/cycle counts, and exits before the world's event horizon. The block
-cache must be keyed by guest PC, executable-memory generation, and IT state.
+The optional `FIL_ENABLE_LLVM_JIT` backend uses LLVM ORC to lower accepted blocks
+to native functions operating on the integer register file and xPSR pointer. The
+first executable lowering supports MOVW, MOVT, flag-free immediate ADD/SUB, and
+NOP; unsupported pure instructions fail closed before module installation. ORC
+unit coverage compiles and executes a two-instruction block and verifies register
+state plus exact instruction count.
 
-This commit is correctness groundwork, not a claimed speedup. Unit tests cover
+Configure with `-DFIL_ENABLE_LLVM_JIT=ON` and an LLVM package path such as
+`-DLLVM_DIR=/opt/homebrew/opt/llvm/lib/cmake/llvm`. Builds without LLVM remain the
+default. The next integration step is a hot block cache keyed by guest PC,
+executable-memory generation, and IT state, followed by event-horizon dispatch
+from `CortexM4`.
+
+This backend stage is correctness groundwork, not a claimed simulator speedup. Unit tests cover
 pure ALU acceptance, PC-writing rejection, every major boundary class, maximal
 prefix selection, and the compilation cap.
