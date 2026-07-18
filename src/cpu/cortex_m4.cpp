@@ -277,9 +277,6 @@ FastStepResult CortexM4::stepFast() {
     }
 
     StopReason stop = StopReason::step_complete;
-    last_diagnostic_.instruction_address = pc;
-    last_diagnostic_.raw = result.raw;
-    last_diagnostic_.instruction_size = instruction_size;
     if (conditionPasses(effective_condition, state_.xpsr)) {
         stop = execute(*decoded, last_diagnostic_);
     }
@@ -288,12 +285,15 @@ FastStepResult CortexM4::stepFast() {
     result.reason = stop;
     result.instructions = 1;
     result.cycles = 1;
-    if (stop == StopReason::synchronization_required && restart_state) {
-        state_ = *restart_state;
-        result.instructions = 0;
-        result.cycles = 0;
-        capture(last_diagnostic_);
-    } else if (stop != StopReason::step_complete) {
+    if (stop != StopReason::step_complete) {
+        last_diagnostic_.instruction_address = pc;
+        last_diagnostic_.raw = result.raw;
+        last_diagnostic_.instruction_size = instruction_size;
+        if (stop == StopReason::synchronization_required && restart_state) {
+            state_ = *restart_state;
+            result.instructions = 0;
+            result.cycles = 0;
+        }
         capture(last_diagnostic_);
     }
     return result;

@@ -395,28 +395,15 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
             state.step.reset();
             state.in_flight = false;
 
-            BoardRunResult slice;
-            if (completed.cpu_result.reason == cpu::StopReason::step_complete) {
-                slice.reason = BoardStopReason::instruction_budget;
-                slice.instructions = completed.cpu_result.instructions;
-                slice.cycles = completed.cpu_result.cycles;
-                slice.diagnostic.instruction_address =
-                    completed.cpu_result.instruction_address;
-                slice.diagnostic.raw = completed.cpu_result.raw;
-                slice.diagnostic.instruction_size = completed.cpu_result.instruction_size;
-                slice.time_ns = now;
-            } else {
+            if (completed.cpu_result.reason != cpu::StopReason::step_complete) {
                 cpu::RunResult detailed;
                 detailed.reason = completed.cpu_result.reason;
                 detailed.instructions = completed.cpu_result.instructions;
                 detailed.cycles = completed.cpu_result.cycles;
                 detailed.diagnostic = board.cpu().lastDiagnostic();
-                slice = board.cpuFailure(detailed);
+                BoardRunResult slice = board.cpuFailure(detailed);
                 slice.time_ns = now;
-            }
-            accumulate(board_output, slice, output);
-
-            if (completed.cpu_result.reason != cpu::StopReason::step_complete) {
+                accumulate(board_output, slice, output);
                 state.runnable = false;
                 board_output.terminal = true;
                 state.proven_loop.reset();
@@ -427,6 +414,24 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                 }
                 continue;
             }
+
+            board_output.result.reason = BoardStopReason::instruction_budget;
+            board_output.result.instructions = saturatingAdd(
+                board_output.result.instructions, completed.cpu_result.instructions
+            );
+            board_output.result.cycles = saturatingAdd(
+                board_output.result.cycles, completed.cpu_result.cycles
+            );
+            board_output.result.time_ns = now;
+            board_output.result.diagnostic.instruction_address =
+                completed.cpu_result.instruction_address;
+            board_output.result.diagnostic.raw = completed.cpu_result.raw;
+            board_output.result.diagnostic.instruction_size =
+                completed.cpu_result.instruction_size;
+            output.instructions = saturatingAdd(
+                output.instructions, completed.cpu_result.instructions
+            );
+            output.cycles = saturatingAdd(output.cycles, completed.cpu_result.cycles);
 
             const std::uint32_t pc_before_settle = board.cpu().state().r[15];
             const std::uint16_t ipsr_before_settle = board.cpu().state().ipsr();
