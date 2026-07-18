@@ -5,6 +5,7 @@
 
 void runAluTests();
 void runCpuStepTests();
+void runJitTests();
 
 namespace {
 
@@ -252,6 +253,7 @@ int main() {
     rejectsPrefixesAndReservedEncodings();
     runAluTests();
     runCpuStepTests();
+    runJitTests();
 
     if (fil::test::failures != 0) {
         std::cerr << fil::test::failures << " CPU test(s) failed\n";

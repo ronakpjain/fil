@@ -100,6 +100,7 @@ add_library(fil_core STATIC
     src/cpu/cortex_m4.cpp
     src/cpu/decoder.cpp
     src/cpu/execute.cpp
+    src/cpu/jit.cpp
     src/cortexm/exceptions.cpp
     src/cortexm/system_control.cpp
     src/devices/can_bus.cpp
