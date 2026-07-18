@@ -57,7 +57,6 @@ struct Board::TransactionCheckpoint {
     mem::MemoryBus::SideEffectCheckpoint memory_checkpoint;
     EventLoop::OwnerCheckpoint event_checkpoint;
     std::uint64_t time_fraction{0};
-    std::array<LoopObservation, 256> loop_observations{};
     std::uint64_t loop_observation_generation{1U};
     std::optional<std::uint32_t> read_footprint_boundary;
     mem::MemoryBus::ReadFootprint read_footprint;
@@ -474,7 +473,6 @@ Board::TransactionCheckpointPtr Board::captureTransaction(
     checkpoint->memory_checkpoint = memory_.sideEffectCheckpoint();
     checkpoint->event_checkpoint = event_loop_->ownerCheckpoint(owner);
     checkpoint->time_fraction = time_fraction_;
-    checkpoint->loop_observations = loop_observations_;
     checkpoint->loop_observation_generation = loop_observation_generation_;
     checkpoint->read_footprint_boundary = read_footprint_boundary_;
     checkpoint->read_footprint = memory_.readFootprint();
@@ -494,7 +492,6 @@ bool Board::restoreTransaction(const TransactionCheckpointPtr& checkpoint) {
     *system_ = checkpoint->system_state;
     exceptions_->restoreActiveStack(checkpoint->active_exceptions);
     time_fraction_ = checkpoint->time_fraction;
-    loop_observations_ = checkpoint->loop_observations;
     loop_observation_generation_ = checkpoint->loop_observation_generation;
     read_footprint_boundary_ = checkpoint->read_footprint_boundary;
     memory_.restoreReadFootprint(checkpoint->read_footprint);
@@ -606,10 +603,11 @@ BoardRunResult Board::runWorkerSlice(
             break;
         }
 
+        if (!enable_loop_batching) continue;
         const auto loop = observeLoopBoundary(
             result, aggregate.instructions, aggregate.cycles
         );
-        if (!enable_loop_batching || !loop) continue;
+        if (!loop) continue;
         std::optional<SimTimeNs> horizon = deadline_ns;
         if (const auto local_event = event_loop_->nextScheduledTime(owner);
             local_event && *local_event < *horizon) {
