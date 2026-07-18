@@ -67,6 +67,7 @@ struct WorldRunResult {
     std::uint64_t transactional_attempts{0}; ///< Reversible multi-lane epochs attempted.
     std::uint64_t transactional_commits{0}; ///< MMIO-free epochs committed without rollback.
     std::uint64_t transactional_instructions{0}; ///< Instructions committed by lane epochs.
+    std::uint64_t lockstep_bursts{0}; ///< Tight exact multi-board dispatch loops entered.
     std::vector<WorldBoardRunResult> boards; ///< Outcomes in network configuration order.
     std::string message;
 

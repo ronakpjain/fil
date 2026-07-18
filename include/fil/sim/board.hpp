@@ -189,6 +189,9 @@ private:
     [[nodiscard]] bool loopProofStillValid(const ProvenLoop& loop) const noexcept;
     [[nodiscard]] bool loopHasNoMmioSince(const ProvenLoop& loop) const noexcept;
     [[nodiscard]] std::optional<SimTimeNs> nextObservableTime(SimTimeNs boundary_time) const;
+    [[nodiscard]] SimTimeNs nextInstructionElapsedNs() const noexcept {
+        return elapsedForCycles(1U);
+    }
     void refreshLoopObservation(
         const ProvenLoop& loop, std::uint64_t logical_instructions, std::uint64_t logical_cycles
     );

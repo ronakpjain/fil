@@ -128,6 +128,7 @@ performance-specific mechanisms currently implemented; ordinary container
 | Board | Bitwise FP-state comparison | Scalar comparison of all 32 FP registers for exact loop matches | `memcmp` compares the complete stored float object representation, including NaN payload bits |
 | World | Reused batching planner storage | Per-frontier heap allocation | Storage is sized once per run and cleared before reuse |
 | World | In-place successful-step accounting | Constructing/copying `BoardRunResult`, register arrays, optional faults, and strings per interpreted instruction | Full result and diagnostic materialization remains on non-success boundaries |
+| World | Exact lockstep bursts | Re-entering the general scheduler around every equal-duration board round | Runs at most 64 rounds; exits on events, exceptions, failures, budgets, clock divergence, or a usable loop proof |
 | World | Event ownership provenance | Invalidating unrelated board-local lookahead after a callback | Shared callbacks still invalidate every lane; nested local callbacks inherit their board owner |
 | Event loop | Serial owner fast path | Thread-local lookup and owner-map probing for every instruction dispatch | Thread-local ownership remains active whenever concurrent lane access is enabled |
 | World | Transactional lane workers | Serial MMIO-free instruction epochs across independent boards | CPU/RAM/system state is checkpointed; any MMIO/event escape rolls every lane back; opt-in while commit rate is tuned |
