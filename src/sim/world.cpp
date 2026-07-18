@@ -1,0 +1,732 @@
+#include "fil/sim/world.hpp"
+
+#include "fil/devices/can_bus.hpp"
+#include "fil/stm32g4/fdcan.hpp"
+#include "fil/stm32g4/stm32g4.hpp"
+
+#include <algorithm>
+#include <limits>
+#include <utility>
+
+namespace fil::sim {
+namespace {
+
+Error configError(std::string message, const std::filesystem::path& source = {}) {
+    std::optional<SourceContext> context;
+    if (!source.empty()) context = SourceContext{source, 0, 0};
+    return Error{ErrorCategory::config, std::move(message), std::move(context)};
+}
+
+Error argumentError(std::string message) {
+    return Error{ErrorCategory::invalid_argument, std::move(message), std::nullopt};
+}
+
+std::uint64_t saturatingAdd(const std::uint64_t left, const std::uint64_t right) noexcept {
+    if (right > std::numeric_limits<std::uint64_t>::max() - left) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return left + right;
+}
+
+void initializeSnapshot(WorldBoardRunResult& output, const Board& board, const SimTimeNs now) {
+    output.name = board.config().name;
+    output.result.reason = BoardStopReason::instruction_budget;
+    output.result.time_ns = now;
+    output.result.diagnostic.next_pc = board.cpu().state().r[15];
+    output.result.diagnostic.registers = board.cpu().state().r;
+    output.result.diagnostic.xpsr = board.cpu().state().xpsr;
+}
+
+void stopBoard(
+    WorldBoardRunResult& output,
+    const Board& board,
+    const BoardStopReason reason,
+    std::string message,
+    const SimTimeNs now
+) {
+    output.result.reason = reason;
+    output.result.time_ns = now;
+    output.result.message = std::move(message);
+    output.result.diagnostic.next_pc = board.cpu().state().r[15];
+    output.result.diagnostic.registers = board.cpu().state().r;
+    output.result.diagnostic.xpsr = board.cpu().state().xpsr;
+    output.terminal = true;
+}
+
+void accumulate(
+    WorldBoardRunResult& aggregate,
+    const BoardRunResult& slice,
+    WorldRunResult& world
+) {
+    aggregate.result.reason = slice.reason;
+    aggregate.result.instructions = saturatingAdd(
+        aggregate.result.instructions, slice.instructions
+    );
+    aggregate.result.cycles = saturatingAdd(aggregate.result.cycles, slice.cycles);
+    aggregate.result.time_ns = slice.time_ns;
+    aggregate.result.diagnostic = slice.diagnostic;
+    aggregate.result.message = slice.message;
+    world.instructions = saturatingAdd(world.instructions, slice.instructions);
+    world.cycles = saturatingAdd(world.cycles, slice.cycles);
+}
+
+} // namespace
+
+struct World::BusEntry {
+    std::string name;
+    std::unique_ptr<devices::VirtualCanBus> bus;
+};
+
+struct World::BoardEntry {
+    std::string name;
+    std::unique_ptr<Board> board;
+};
+
+bool WorldRunResult::succeeded() const noexcept {
+    return reason != WorldStopReason::board_failure;
+}
+
+World::World(config::NetworkConfig config) : config_(std::move(config)) {}
+
+World::~World() = default;
+
+Result<std::unique_ptr<World>> World::load(
+    const config::NetworkConfig& config,
+    const bool strict_mmio
+) {
+    auto world = std::unique_ptr<World>(new World(config));
+    auto initialized = world->initialize(strict_mmio);
+    if (!initialized) return initialized.error();
+    return world;
+}
+
+Result<void> World::initialize(const bool strict_mmio) {
+    if (config_.schema_version != config::current_schema_version) {
+        return configError("unsupported network schema version", config_.source_path);
+    }
+    if (config_.name.empty()) {
+        return configError("network name is empty", config_.source_path);
+    }
+    if (config_.board_paths.empty()) {
+        return configError("network must contain at least one board", config_.source_path);
+    }
+
+    buses_.reserve(config_.buses.size());
+    for (const config::CanBusConfig& bus_config : config_.buses) {
+        if (bus_config.name.empty()) {
+            return configError("CAN bus name is empty", config_.source_path);
+        }
+        if (bus_config.bitrate == 0U) {
+            return configError(
+                "CAN bus '" + bus_config.name + "' has a zero bitrate", config_.source_path
+            );
+        }
+        if (canBus(bus_config.name) != nullptr) {
+            return configError(
+                "duplicate CAN bus name '" + bus_config.name + "'", config_.source_path
+            );
+        }
+
+        auto entry = std::make_unique<BusEntry>();
+        entry->name = bus_config.name;
+        entry->bus = std::make_unique<devices::VirtualCanBus>(
+            bus_config.name, bus_config.bitrate
+        );
+        entry->bus->setTraceCallback(
+            [this, bus_name = bus_config.name](const devices::CanTraceRecord& record) {
+                CanTraceFrame frame;
+                frame.id = record.frame.id;
+                frame.extended = record.frame.extended;
+                frame.fd = record.frame.fd;
+                frame.brs = record.frame.brs;
+                frame.dlc = record.frame.dlc;
+                const std::size_t length = devices::dlcToLength(record.frame.dlc);
+                frame.data.assign(record.frame.data.begin(), record.frame.data.begin() + length);
+                static_cast<void>(trace_.recordCanFrame(
+                    record.time_ns,
+                    bus_name + "/" + record.node,
+                    record.direction == devices::CanTraceRecord::Direction::transmit,
+                    frame
+                ));
+            }
+        );
+        buses_.push_back(std::move(entry));
+    }
+
+    boards_.reserve(config_.board_paths.size());
+    for (const std::filesystem::path& path : config_.board_paths) {
+        auto board_config = config::loadBoardConfig(path);
+        if (!board_config) {
+            Error error = board_config.error();
+            error.message = "cannot load network board '" + path.string() + "': " + error.message;
+            return error;
+        }
+        if (board_config.value().name.empty()) {
+            return configError("board name is empty", path);
+        }
+        if (board(board_config.value().name) != nullptr) {
+            return configError(
+                "duplicate board name '" + board_config.value().name + "'", path
+            );
+        }
+
+        for (std::size_t index = 0; index < board_config.value().can.size(); ++index) {
+            const config::CanControllerConfig& attachment = board_config.value().can[index];
+            if (canBus(attachment.bus) == nullptr) {
+                return configError(
+                    "board '" + board_config.value().name + "' attaches "
+                    + attachment.instance + " to undeclared CAN bus '" + attachment.bus + "'",
+                    path
+                );
+            }
+            const auto duplicate = std::find_if(
+                board_config.value().can.begin(),
+                board_config.value().can.begin() + static_cast<std::ptrdiff_t>(index),
+                [&](const config::CanControllerConfig& prior) {
+                    return prior.instance == attachment.instance;
+                }
+            );
+            if (duplicate != board_config.value().can.begin()
+                + static_cast<std::ptrdiff_t>(index)) {
+                return configError(
+                    "board '" + board_config.value().name
+                    + "' attaches FDCAN instance '" + attachment.instance + "' more than once",
+                    path
+                );
+            }
+        }
+
+        auto loaded = Board::load(board_config.value(), strict_mmio, &event_loop_, &trace_);
+        if (!loaded) {
+            Error error = loaded.error();
+            error.message = "cannot initialize network board '" + board_config.value().name
+                + "': " + error.message;
+            return error;
+        }
+
+        auto entry = std::make_unique<BoardEntry>();
+        entry->name = board_config.value().name;
+        entry->board = std::move(loaded).value();
+        Board* loaded_board = entry->board.get();
+        boards_.push_back(std::move(entry));
+
+        for (const config::CanControllerConfig& attachment : board_config.value().can) {
+            devices::VirtualCanBus* bus = canBus(attachment.bus);
+            stm32g4::FdcanPeripheral* controller =
+                loaded_board->peripherals().fdcan(attachment.instance);
+            if (controller == nullptr) {
+                return configError(
+                    "board '" + board_config.value().name + "' names unknown FDCAN instance '"
+                    + attachment.instance + "'",
+                    path
+                );
+            }
+            auto attached = controller->attachBus(
+                *bus,
+                board_config.value().name + "." + attachment.instance,
+                attachment.loopback
+            );
+            if (!attached) {
+                Error error = attached.error();
+                error.message = "cannot attach board '" + board_config.value().name + "' "
+                    + attachment.instance + " to bus '" + attachment.bus + "': " + error.message;
+                return error;
+            }
+        }
+    }
+    return {};
+}
+
+Result<WorldRunResult> World::run(const WorldRunOptions& options) {
+    if (options.instruction_quantum == 0U) {
+        return argumentError("world instruction quantum must be nonzero");
+    }
+    if (options.detect_spin && options.spin_threshold == 0U) {
+        return argumentError("world spin threshold must be nonzero when spin detection is enabled");
+    }
+
+    WorldRunResult output;
+    output.start_time_ns = event_loop_.now();
+    output.end_time_ns = output.start_time_ns;
+    output.boards.resize(boards_.size());
+
+    struct SchedulerState {
+        bool runnable{true};
+        bool in_flight{false};
+        bool loop_skip_in_flight{false};
+        SimTimeNs ready_time_ns{0};
+        std::optional<Board::ConcurrentStepResult> step;
+        std::optional<Board::ProvenLoop> proven_loop;
+        bool inside_proven_loop{false};
+        Board::LoopSkip loop_skip;
+        std::uint64_t proven_loop_instructions{0};
+        std::uint64_t same_time_dispatches{0};
+    };
+    std::vector<SchedulerState> states(boards_.size());
+    std::vector<std::uint64_t> planned_iterations(boards_.size(), 0U);
+    for (std::size_t index = 0; index < boards_.size(); ++index) {
+        initializeSnapshot(output.boards[index], *boards_[index]->board, output.start_time_ns);
+        states[index].ready_time_ns = output.start_time_ns;
+        if (options.max_instructions_per_board == 0U) {
+            states[index].runnable = false;
+            stopBoard(
+                output.boards[index], *boards_[index]->board,
+                BoardStopReason::instruction_budget, "instruction budget exhausted",
+                output.start_time_ns
+            );
+        }
+    }
+
+    const SimTimeNs deadline = options.duration_ns == 0U
+        ? 0U : saturatingAdd(output.start_time_ns, options.duration_ns);
+    static_cast<void>(trace_.record(
+        output.start_time_ns,
+        config_.name,
+        "world_start",
+        {
+            {"boards", std::to_string(boards_.size())},
+            {"quantum", std::to_string(options.instruction_quantum)},
+        }
+    ));
+    const auto initial_events = event_loop_.runDueEvents(output.start_time_ns);
+    output.event_callbacks = saturatingAdd(
+        output.event_callbacks, initial_events.events_executed
+    );
+    if (initial_events.same_time_limit_hit) {
+        trace_.record(event_loop_.now(), config_.name, "event_livelock");
+    }
+
+    bool time_exhausted = false;
+    bool board_failed = false;
+    bool stop_requested = false;
+    SimTimeNs dispatch_time = output.start_time_ns;
+
+    for (;;) {
+        const SimTimeNs now = event_loop_.now();
+        if (now != dispatch_time) {
+            dispatch_time = now;
+            for (SchedulerState& state : states) state.same_time_dispatches = 0;
+        }
+
+        // All events through `now` have fired. Complete every CPU instruction
+        // ending at this frontier before allowing any board to start another.
+        for (std::size_t index = 0; index < boards_.size(); ++index) {
+            SchedulerState& state = states[index];
+            if (!state.in_flight || state.ready_time_ns != now) continue;
+
+            Board& board = *boards_[index]->board;
+            WorldBoardRunResult& board_output = output.boards[index];
+            if (state.loop_skip_in_flight) {
+                state.loop_skip_in_flight = false;
+                state.in_flight = false;
+                board_output.result.time_ns = now;
+                board_output.result.diagnostic.next_pc = board.cpu().state().r[15];
+                board_output.result.diagnostic.registers = board.cpu().state().r;
+                board_output.result.diagnostic.xpsr = board.cpu().state().xpsr;
+                if (state.inside_proven_loop && state.proven_loop) {
+                    board.refreshLoopObservation(
+                        *state.proven_loop,
+                        board_output.result.instructions,
+                        board_output.result.cycles
+                    );
+                }
+                const std::uint32_t pc_before_settle = board.cpu().state().r[15];
+                const std::uint16_t ipsr_before_settle = board.cpu().state().ipsr();
+                if (auto boundary = board.settleInstructionBoundary()) {
+                    state.runnable = false;
+                    stopBoard(
+                        board_output, board, boundary->reason, std::move(boundary->message), now
+                    );
+                    state.proven_loop.reset();
+                    state.inside_proven_loop = false;
+                    board_failed = true;
+                    stop_requested = stop_requested || options.stop_on_board_failure;
+                    continue;
+                }
+                if (board.cpu().state().r[15] != pc_before_settle
+                    || board.cpu().state().ipsr() != ipsr_before_settle
+                    || (state.proven_loop
+                        && !board.loopProofStillValid(*state.proven_loop))) {
+                    state.proven_loop.reset();
+                    state.inside_proven_loop = false;
+                }
+                if (deadline != 0U && now >= deadline) {
+                    state.runnable = false;
+                    stopBoard(
+                        board_output, board, BoardStopReason::time_budget,
+                        "simulated-time budget exhausted", now
+                    );
+                    time_exhausted = true;
+                } else if (board_output.result.instructions
+                           >= options.max_instructions_per_board) {
+                    state.runnable = false;
+                    stopBoard(
+                        board_output, board, BoardStopReason::instruction_budget,
+                        "instruction budget exhausted", now
+                    );
+                }
+                continue;
+            }
+            Board::ConcurrentStepResult completed = std::move(*state.step);
+            state.step.reset();
+            state.in_flight = false;
+
+            BoardRunResult slice;
+            if (completed.cpu_result.reason == cpu::StopReason::step_complete) {
+                slice.reason = BoardStopReason::instruction_budget;
+                slice.instructions = completed.cpu_result.instructions;
+                slice.cycles = completed.cpu_result.cycles;
+                slice.diagnostic.instruction_address =
+                    completed.cpu_result.instruction_address;
+                slice.diagnostic.raw = completed.cpu_result.raw;
+                slice.diagnostic.instruction_size = completed.cpu_result.instruction_size;
+                slice.time_ns = now;
+            } else {
+                cpu::RunResult detailed;
+                detailed.reason = completed.cpu_result.reason;
+                detailed.instructions = completed.cpu_result.instructions;
+                detailed.cycles = completed.cpu_result.cycles;
+                detailed.diagnostic = board.cpu().lastDiagnostic();
+                slice = board.cpuFailure(detailed);
+                slice.time_ns = now;
+            }
+            accumulate(board_output, slice, output);
+
+            if (completed.cpu_result.reason != cpu::StopReason::step_complete) {
+                state.runnable = false;
+                board_output.terminal = true;
+                state.proven_loop.reset();
+                state.inside_proven_loop = false;
+                if (!slice.succeeded()) {
+                    board_failed = true;
+                    stop_requested = stop_requested || options.stop_on_board_failure;
+                }
+                continue;
+            }
+
+            const std::uint32_t pc_before_settle = board.cpu().state().r[15];
+            const std::uint16_t ipsr_before_settle = board.cpu().state().ipsr();
+            if (auto boundary = board.settleInstructionBoundary()) {
+                state.runnable = false;
+                stopBoard(
+                    board_output, board, boundary->reason, std::move(boundary->message), now
+                );
+                board_failed = true;
+                state.proven_loop.reset();
+                state.inside_proven_loop = false;
+                stop_requested = stop_requested || options.stop_on_board_failure;
+                continue;
+            }
+            if (board.cpu().state().r[15] != pc_before_settle
+                || board.cpu().state().ipsr() != ipsr_before_settle) {
+                state.proven_loop.reset();
+                state.inside_proven_loop = false;
+            }
+            if (state.inside_proven_loop && state.proven_loop
+                && !board.loopHasNoMmioSince(*state.proven_loop)) {
+                state.proven_loop.reset();
+                state.inside_proven_loop = false;
+            }
+
+            const auto observed_loop = board.observeLoopBoundary(
+                    completed.cpu_result,
+                    board_output.result.instructions,
+                    board_output.result.cycles);
+            if (observed_loop) {
+                const auto& loop = *observed_loop;
+                if (state.proven_loop
+                    && state.proven_loop->boundary_pc == loop.boundary_pc
+                    && state.proven_loop->instructions_per_iteration
+                        == loop.instructions_per_iteration) {
+                    state.proven_loop_instructions += loop.instructions_per_iteration;
+                } else {
+                    state.proven_loop_instructions = loop.instructions_per_iteration;
+                }
+                state.proven_loop = loop;
+                state.inside_proven_loop = true;
+                if (options.detect_spin
+                    && state.proven_loop_instructions >= options.spin_threshold) {
+                    state.runnable = false;
+                    stopBoard(
+                        board_output, board, BoardStopReason::spin_detected,
+                        "exact-state loop period_instructions="
+                            + std::to_string(loop.instructions_per_iteration)
+                            + " period_cycles=" + std::to_string(loop.cycles_per_iteration),
+                        now
+                    );
+                    board_failed = true;
+                    stop_requested = stop_requested || options.stop_on_board_failure;
+                    continue;
+                }
+            } else if (state.inside_proven_loop && state.proven_loop
+                       && board.cpu().state().r[15] == state.proven_loop->boundary_pc) {
+                state.proven_loop.reset();
+                state.inside_proven_loop = false;
+            }
+
+            if (deadline != 0U && now >= deadline) {
+                state.runnable = false;
+                stopBoard(
+                    board_output, board, BoardStopReason::time_budget,
+                    "simulated-time budget exhausted", now
+                );
+                time_exhausted = true;
+                continue;
+            }
+            if (board_output.result.instructions >= options.max_instructions_per_board) {
+                state.runnable = false;
+                stopBoard(
+                    board_output, board, BoardStopReason::instruction_budget,
+                    "instruction budget exhausted", now
+                );
+            }
+        }
+
+        if (deadline != 0U && now >= deadline) {
+            time_exhausted = true;
+            for (std::size_t index = 0; index < boards_.size(); ++index) {
+                if (!states[index].runnable || states[index].in_flight) continue;
+                states[index].runnable = false;
+                stopBoard(
+                    output.boards[index], *boards_[index]->board,
+                    BoardStopReason::time_budget, "simulated-time budget exhausted", now
+                );
+            }
+        }
+
+        bool dispatched = false;
+        if (!stop_requested && !time_exhausted) {
+            // A zero-duration clock configuration could otherwise let one board
+            // monopolize a timestamp. The user quantum caps each same-time burst;
+            // ordinary positive-duration instructions naturally yield every step.
+            std::fill(planned_iterations.begin(), planned_iterations.end(), 0U);
+            bool safe_loop_mode = options.enable_loop_batching
+                && !options.trace_instructions && !options.detect_spin;
+            bool saw_runnable = false;
+            std::optional<SimTimeNs> safe_horizon;
+            if (deadline != 0U) safe_horizon = deadline;
+            if (const auto event_time = event_loop_.nextScheduledTime()) {
+                if (!safe_horizon || *event_time < *safe_horizon) {
+                    safe_horizon = *event_time;
+                }
+            }
+
+            // A proven loop supplies conservative lookahead: until its next
+            // serviceable interrupt or shared event, the lane cannot affect a
+            // different board. Lanes need not land on the same loop boundary;
+            // they only need to stay behind the earliest observable frontier.
+            for (std::size_t index = 0; index < boards_.size() && safe_loop_mode; ++index) {
+                SchedulerState& state = states[index];
+                if (!state.runnable) continue;
+                saw_runnable = true;
+                Board& board = *boards_[index]->board;
+                if (!state.inside_proven_loop || !state.proven_loop
+                    || !board.loopHasNoMmioSince(*state.proven_loop)) {
+                    safe_loop_mode = false;
+                    break;
+                }
+
+                const SimTimeNs lane_boundary = state.in_flight
+                    ? state.ready_time_ns : now;
+                if (const auto observable = board.nextObservableTime(lane_boundary)) {
+                    if (!safe_horizon || *observable < *safe_horizon) {
+                        safe_horizon = *observable;
+                    }
+                }
+            }
+            safe_loop_mode = safe_loop_mode && saw_runnable
+                && (!safe_horizon || *safe_horizon > now);
+
+            if (safe_loop_mode) {
+                for (std::size_t index = 0; index < boards_.size(); ++index) {
+                    SchedulerState& state = states[index];
+                    if (!state.runnable || state.in_flight || !state.proven_loop) continue;
+                    Board& board = *boards_[index]->board;
+                    if (!board.loopProofStillValid(*state.proven_loop)) continue;
+                    const std::uint64_t remaining = options.max_instructions_per_board
+                        - output.boards[index].result.instructions;
+                    planned_iterations[index] = board.maximumLoopIterations(
+                        *state.proven_loop, remaining, safe_horizon
+                    );
+                }
+            }
+
+            for (std::size_t index = 0; index < boards_.size(); ++index) {
+                SchedulerState& state = states[index];
+                if (!state.runnable || state.in_flight) continue;
+                if (state.same_time_dispatches >= options.instruction_quantum) {
+                    continue;
+                }
+
+                Board& board = *boards_[index]->board;
+                WorldBoardRunResult& board_output = output.boards[index];
+                if (board_output.result.instructions >= options.max_instructions_per_board) {
+                    state.runnable = false;
+                    stopBoard(
+                        board_output, board, BoardStopReason::instruction_budget,
+                        "instruction budget exhausted", now
+                    );
+                    continue;
+                }
+
+                if (planned_iterations[index] != 0U && state.proven_loop) {
+                    const std::uint64_t iterations = planned_iterations[index];
+                    state.loop_skip = board.applyLoopIterations(
+                        *state.proven_loop, iterations
+                    );
+                    if (state.loop_skip.instructions != 0U) {
+                        board_output.result.instructions = saturatingAdd(
+                            board_output.result.instructions, state.loop_skip.instructions
+                        );
+                        board_output.result.cycles = saturatingAdd(
+                            board_output.result.cycles, state.loop_skip.cycles
+                        );
+                        output.instructions = saturatingAdd(
+                            output.instructions, state.loop_skip.instructions
+                        );
+                        output.cycles = saturatingAdd(output.cycles, state.loop_skip.cycles);
+                        state.ready_time_ns = saturatingAdd(now, state.loop_skip.elapsed_ns);
+                        state.loop_skip_in_flight = true;
+                        state.in_flight = true;
+                        ++output.dispatches;
+                        ++output.loop_batches;
+                        output.batched_instructions = saturatingAdd(
+                            output.batched_instructions, state.loop_skip.instructions
+                        );
+                        dispatched = true;
+                        continue;
+                    }
+                }
+
+                state.step = board.beginConcurrentStep(options.trace_instructions);
+                state.ready_time_ns = saturatingAdd(now, state.step->elapsed_ns);
+                state.in_flight = true;
+                ++state.same_time_dispatches;
+                ++output.dispatches;
+                ++output.exact_dispatches;
+                dispatched = true;
+            }
+            if (dispatched) ++output.rounds;
+
+        }
+
+        const bool any_in_flight = std::any_of(
+            states.begin(), states.end(), [](const SchedulerState& state) {
+                return state.in_flight;
+            }
+        );
+        const bool any_runnable = std::any_of(
+            states.begin(), states.end(), [](const SchedulerState& state) {
+                return state.runnable;
+            }
+        );
+        if (!any_in_flight) {
+            if (!any_runnable || stop_requested || time_exhausted) break;
+            // All runnable CPUs have zero-duration work and consumed their
+            // same-time quantum. Begin the next deterministic fairness pass.
+            for (SchedulerState& state : states) state.same_time_dispatches = 0;
+            // Every runnable board was stopped while examining this frontier.
+            continue;
+        }
+
+        SimTimeNs next_completion = std::numeric_limits<SimTimeNs>::max();
+        for (const SchedulerState& state : states) {
+            if (state.in_flight) next_completion = std::min(next_completion, state.ready_time_ns);
+        }
+        const auto events = event_loop_.runDueEvents(next_completion);
+        output.event_callbacks = saturatingAdd(output.event_callbacks, events.events_executed);
+        if (events.same_time_limit_hit) {
+            trace_.record(event_loop_.now(), config_.name, "event_livelock");
+        }
+        if (events.events_executed != 0U) {
+            // A callback may change peripheral state or pend an interrupt
+            // without touching the CPU-visible memory journal. Discard every
+            // cross-lane lookahead proof before another dispatch.
+            for (SchedulerState& state : states) {
+                state.proven_loop.reset();
+                state.inside_proven_loop = false;
+            }
+        }
+    }
+
+    output.end_time_ns = event_loop_.now();
+    if (board_failed) {
+        output.reason = WorldStopReason::board_failure;
+        output.message = "one or more boards stopped on an emulation failure";
+    } else if (time_exhausted) {
+        output.reason = WorldStopReason::time_budget;
+        output.message = "shared simulated-time budget exhausted";
+    } else {
+        const bool only_instruction_budgets = std::all_of(
+            output.boards.begin(), output.boards.end(), [](const WorldBoardRunResult& board_result) {
+                return board_result.result.reason == BoardStopReason::instruction_budget;
+            }
+        );
+        if (only_instruction_budgets) {
+            output.reason = WorldStopReason::instruction_budget;
+            output.message = "per-board instruction budgets exhausted";
+        } else {
+            output.reason = WorldStopReason::all_boards_stopped;
+            output.message = "all boards reached terminal execution boundaries";
+        }
+    }
+
+    static_cast<void>(trace_.record(
+        output.end_time_ns,
+        config_.name,
+        "world_stop",
+        {
+            {"reason", std::string(worldStopReasonName(output.reason))},
+            {"instructions", std::to_string(output.instructions)},
+            {"cycles", std::to_string(output.cycles)},
+        }
+    ));
+    return output;
+}
+
+void World::setDiagnosticsEnabled(const bool enabled) {
+    trace_.setEnabled(enabled);
+    for (auto& entry : boards_) {
+        entry->board->peripherals().setAdcDiagnosticsEnabled(enabled);
+    }
+}
+
+Board* World::board(const std::string_view name) noexcept {
+    for (auto& entry : boards_) {
+        if (entry->name == name) return entry->board.get();
+    }
+    return nullptr;
+}
+
+const Board* World::board(const std::string_view name) const noexcept {
+    for (const auto& entry : boards_) {
+        if (entry->name == name) return entry->board.get();
+    }
+    return nullptr;
+}
+
+devices::VirtualCanBus* World::canBus(const std::string_view name) noexcept {
+    for (auto& entry : buses_) {
+        if (entry->name == name) return entry->bus.get();
+    }
+    return nullptr;
+}
+
+const devices::VirtualCanBus* World::canBus(const std::string_view name) const noexcept {
+    for (const auto& entry : buses_) {
+        if (entry->name == name) return entry->bus.get();
+    }
+    return nullptr;
+}
+
+std::string_view worldStopReasonName(const WorldStopReason reason) noexcept {
+    switch (reason) {
+    case WorldStopReason::all_boards_stopped: return "all-boards-stopped";
+    case WorldStopReason::instruction_budget: return "instruction-budget";
+    case WorldStopReason::time_budget: return "time-budget";
+    case WorldStopReason::board_failure: return "board-failure";
+    }
+    return "unknown";
+}
+
+} // namespace fil::sim
