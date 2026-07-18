@@ -22,10 +22,12 @@ loop.
 The corrected six-board PER workload runs near real time after making
 continuous ADC sequences and their DMA transfers observable. After scheduler and
 interpreter hot-path restructuring, three consecutive one-second runs on the
-development host took **1.10 s, 1.08 s, and 1.09 s** (median 1.09 s, about **0.92x
-real time**). Disabling loop batching took 3.33 s on the same build, so the
-causality-bounded batching path is about **3.1x faster** for this workload. Both
-modes reported the same exact result:
+development host took **1.10 s, 1.08 s, and 1.09 s** in the portable Release+IPO
+build (median 1.09 s, about **0.92x real time**). A Clang PGO build trained on the
+same command took **0.90 s, 0.87 s, and 0.90 s** (median 0.90 s, about **1.11x real
+time**). Disabling loop batching took 3.33 s on the portable build, so the
+causality-bounded batching path is about **3.1x faster** before PGO. Every mode
+reported the same exact result:
 
 ```text
 stop: time-budget
@@ -106,6 +108,44 @@ For the six-board workload, use the same measurement wrapper around:
   --strict-mmio
 ```
 
+### Clang profile-guided build
+
+PGO lets Clang optimize the interpreter dispatch, code layout, and scheduler
+branches using the observed PER workload. Generation and use are separate build
+directories; `FIL_PGO_GENERATE` and `FIL_PGO_PROFILE` are mutually exclusive and
+cannot be combined with sanitizer builds.
+
+```bash
+cmake -S . -B build-pgo-generate -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DFIL_ENABLE_IPO=OFF \
+  -DFIL_BUILD_TESTS=OFF \
+  -DFIL_PGO_GENERATE=ON
+cmake --build build-pgo-generate
+
+LLVM_PROFILE_FILE=/tmp/fil-per.profraw \
+  ./build-pgo-generate/fil run-network configs/networks/per_vehicle.json \
+    --duration-ms 1000 \
+    --max-instructions 50000000 \
+    --quantum 1024 \
+    --strict-mmio
+xcrun llvm-profdata merge -output=/tmp/fil-per.profdata /tmp/fil-per.profraw
+
+cmake -S . -B build-pgo -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DFIL_ENABLE_IPO=ON \
+  -DFIL_BUILD_TESTS=ON \
+  -DFIL_PGO_PROFILE=/tmp/fil-per.profdata
+cmake --build build-pgo
+ctest --test-dir build-pgo --output-on-failure
+```
+
+On non-Apple Clang installations, invoke `llvm-profdata` directly instead of
+`xcrun llvm-profdata`. Profiles are compiler- and binary-specific optimization
+inputs, not repository artifacts; retrain after material source or toolchain
+changes. Training on additional representative commands before merging multiple
+`.profraw` files can produce a less workload-specific build.
+
 ## Technique inventory
 
 The speedups fall into three layers. This table is the complete inventory of
@@ -124,6 +164,7 @@ performance-specific mechanisms currently implemented; ordinary container
 | Memory | Region dispatch cache | Ordered mapping walk for each fetch/data/MMIO access | Full containment check before accepting a hit |
 | Memory/board | Conservative loop read footprint | Invalidating a loop for unrelated external DMA writes | Two-hash Bloom collisions only reject acceleration; nested/ambiguous loop boundaries use full invalidation |
 | Build | Release plus IPO/LTO defaults | Unoptimized hot path and translation-unit barriers | Debug and sanitizer builds remain unoptimized/non-IPO |
+| Build | Clang profile-guided optimization | Static branch/layout guesses in workload-dependent interpreter and scheduler paths | Explicit two-build workflow; optimized build consumes a checked `.profdata` file |
 | Board/world | Exact-state loop batching | Re-executing proven identical idle iterations | CPU state, reversible RAM journal, MMIO generation, and causal horizon |
 | Board | Generation-tagged loop observations | Clearing all 256 observation slots on every interrupt boundary | Generation wrap performs the full clear; stale generations never match |
 | Board | Compact loop proofs | Copying full integer/FP CPU state into every scheduler proof | Proof references a generation/revision-checked observation slot; slot reuse invalidates it conservatively |
