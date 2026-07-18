@@ -1,0 +1,173 @@
+/* fil documentation palette: derived from ronakpjain.com. */
+@font-face {
+    font-family: "Hack";
+    src: url("Hack-Regular.woff2") format("woff2");
+    font-weight: 400;
+    font-style: normal;
+    font-display: swap;
+}
+
+@font-face {
+    font-family: "Hack";
+    src: url("Hack-Bold.woff2") format("woff2");
+    font-weight: 700;
+    font-style: normal;
+    font-display: swap;
+}
+
+/* Doxygen Awesome applies system dark-mode variables through html:not(.light-mode).
+ * Match that selector so its defaults cannot override the fil palette. */
+html,
+html:not(.light-mode),
+html.dark-mode {
+    --primary-color: #fab387;
+    --primary-dark-color: #f38ba8;
+    --primary-light-color: #f9e2af;
+    --on-primary-color: #1e1e2e;
+    --link-color: #fab387;
+
+    --page-background-color: #1e1e2e;
+    --page-foreground-color: #f5e0dc;
+    --page-secondary-foreground-color: #cdd6f4;
+    --separator-color: #45475a;
+    --odd-color: #252537;
+    --box-shadow: none;
+
+    --font-family: "Hack", monospace;
+    --font-family-monospace: "Hack", monospace;
+    --page-font-size: 15px;
+    --navigation-font-size: 14px;
+    --code-font-size: 14px;
+    --content-line-height: 1.8;
+    --content-maxwidth: 1100px;
+    --border-radius-small: 2px;
+    --border-radius-medium: 4px;
+    --border-radius-large: 6px;
+
+    --header-background: #1e1e2e;
+    --header-foreground: #fab387;
+    --side-nav-background: #181825;
+    --side-nav-foreground: #f5e0dc;
+    --searchbar-background: #313244;
+    --searchbar-foreground: #f5e0dc;
+    --searchbar-border-color: #585b70;
+
+    --code-background: #181825;
+    --code-foreground: #f5e0dc;
+    --fragment-background: #181825;
+    --fragment-foreground: #f5e0dc;
+    --fragment-keyword: #cba6f7;
+    --fragment-keywordtype: #89b4fa;
+    --fragment-keywordflow: #f38ba8;
+    --fragment-token: #a6e3a1;
+    --fragment-comment: #a6adc8;
+    --fragment-link: #fab387;
+    --fragment-preprocessor: #94e2d5;
+    --fragment-linenumber-color: #a6adc8;
+    --fragment-linenumber-background: #181825;
+    --fragment-linenumber-border: #313244;
+
+    --tablehead-background: #313244;
+    --tablehead-foreground: #f9e2af;
+    --blockquote-background: #252537;
+    --blockquote-foreground: #cdd6f4;
+    --warning-color: #3b2d20;
+    --warning-color-dark: #fab387;
+    --warning-color-darker: #f9e2af;
+    --note-color: #203044;
+    --note-color-dark: #89b4fa;
+    --note-color-darker: #b4befe;
+}
+
+html,
+body,
+#top,
+#doc-content,
+.contents {
+    background-color: #1e1e2e !important;
+}
+
+body {
+    color: #f5e0dc;
+    letter-spacing: 0.01em;
+}
+
+#side-nav,
+#nav-tree,
+#nav-tree-contents {
+    background-color: #181825;
+}
+
+#projectname,
+#projectbrief,
+.title,
+h1,
+h2,
+h3,
+h4 {
+    color: #fab387;
+}
+
+#projectname {
+    font-weight: 700;
+}
+
+a:hover,
+.contents a:hover {
+    color: #f9e2af;
+    opacity: 0.85;
+}
+
+.fragment,
+div.fragment,
+pre.fragment,
+.memproto,
+.memdoc,
+.contents code {
+    border-color: #45475a;
+}
+
+.memproto,
+.memdoc,
+.contents blockquote,
+table.memberdecls,
+table.fieldtable {
+    background: #252537;
+}
+
+.memitem,
+.memtitle,
+.memname,
+.memdoc {
+    border-color: #45475a;
+}
+
+#nav-tree .selected,
+#nav-tree .selected a,
+#nav-tree .selected span,
+#nav-tree .selected a span {
+    color: #1e1e2e !important;
+    background: #fab387;
+}
+
+#nav-tree a:hover,
+#nav-tree a:hover span {
+    color: #fab387 !important;
+    background: #313244;
+}
+
+#nav-tree .selected a:hover,
+#nav-tree .selected a:hover span {
+    color: #1e1e2e !important;
+    background: #fab387;
+}
+
+#nav-tree a {
+    color: #f5e0dc;
+}
+
+@media (max-width: 767px) {
+    html {
+        --page-font-size: 14px;
+    }
+}
