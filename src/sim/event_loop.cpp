@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <mutex>
 #include <queue>
 #include <stdexcept>
 #include <unordered_map>
@@ -9,6 +10,9 @@
 #include <vector>
 
 namespace fil::sim {
+namespace {
+thread_local EventOwner active_event_owner = shared_event_owner;
+}
 
 struct EventLoop::Impl {
     struct Event {
@@ -35,12 +39,21 @@ struct EventLoop::Impl {
     EventId next_id{1};
     std::uint64_t next_sequence{0};
     std::size_t maximum_same_time_events{100000};
-    EventOwner active_owner{shared_event_owner};
+    mutable std::recursive_mutex mutex;
+    bool concurrent_access{false};
     Queue events;
     std::unordered_map<EventOwner, Queue> owner_events;
     std::unordered_map<EventId, EventPtr> live_events;
     std::unordered_map<EventOwner, SimTimeNs> owner_now;
     std::unordered_map<EventOwner, std::uint64_t> owner_generation;
+
+    struct Lock {
+        explicit Lock(Impl& impl)
+            : lock(impl.mutex, std::defer_lock) {
+            if (impl.concurrent_access) lock.lock();
+        }
+        std::unique_lock<std::recursive_mutex> lock;
+    };
 
     [[nodiscard]] SimTimeNs timeFor(const EventOwner owner) const noexcept {
         if (owner == shared_event_owner) return shared_now;
@@ -85,15 +98,15 @@ struct EventLoop::Impl {
         ++result.events_executed;
         retire(event);
 
-        const EventOwner previous_owner = active_owner;
-        active_owner = event->owner;
+        const EventOwner previous_owner = active_event_owner;
+        active_event_owner = event->owner;
         try {
             event->callback();
         } catch (...) {
-            active_owner = previous_owner;
+            active_event_owner = previous_owner;
             throw;
         }
-        active_owner = previous_owner;
+        active_event_owner = previous_owner;
     }
 };
 
@@ -107,15 +120,16 @@ EventLoop::EventLoop(EventLoop&&) noexcept = default;
 EventLoop& EventLoop::operator=(EventLoop&&) noexcept = default;
 
 EventLoop::OwnerScope::OwnerScope(EventLoop& loop, const EventOwner owner) noexcept
-    : loop_(&loop), previous_(loop.impl_->active_owner) {
-    loop.impl_->active_owner = owner;
+    : loop_(&loop), previous_(active_event_owner) {
+    Impl::Lock lock(*loop.impl_);
+    active_event_owner = owner;
     if (owner != shared_event_owner && !loop.impl_->owner_now.contains(owner)) {
         loop.impl_->owner_now.emplace(owner, loop.impl_->shared_now);
     }
 }
 
 EventLoop::OwnerScope::~OwnerScope() {
-    if (loop_ != nullptr) loop_->impl_->active_owner = previous_;
+    if (loop_ != nullptr) active_event_owner = previous_;
 }
 
 EventLoop::OwnerScope::OwnerScope(OwnerScope&& other) noexcept
@@ -126,7 +140,7 @@ EventLoop::OwnerScope EventLoop::useOwner(const EventOwner owner) noexcept {
 }
 
 EventOwner EventLoop::activeOwner() const noexcept {
-    return impl_->active_owner;
+    return active_event_owner;
 }
 
 EventId EventLoop::scheduleAfter(const SimTimeNs delta, EventCallback callback) {
@@ -138,6 +152,7 @@ EventId EventLoop::scheduleAfter(const SimTimeNs delta, EventCallback callback) 
 }
 
 EventId EventLoop::scheduleAt(const SimTimeNs at, EventCallback callback) {
+    Impl::Lock lock(*impl_);
     if (!callback) throw std::invalid_argument("simulation event callback is empty");
     if (at < now()) {
         throw std::invalid_argument("cannot schedule a simulation event in the past");
@@ -147,7 +162,7 @@ EventId EventLoop::scheduleAt(const SimTimeNs at, EventCallback callback) {
     }
 
     const EventId id = impl_->next_id++;
-    const EventOwner owner = impl_->active_owner;
+    const EventOwner owner = active_event_owner;
     auto event = std::make_shared<Impl::Event>(Impl::Event{
         at, id, impl_->next_sequence++, owner, std::move(callback), true,
     });
@@ -159,6 +174,7 @@ EventId EventLoop::scheduleAt(const SimTimeNs at, EventCallback callback) {
 }
 
 bool EventLoop::cancel(const EventId id) noexcept {
+    Impl::Lock lock(*impl_);
     if (id == 0U) return false;
     const auto found = impl_->live_events.find(id);
     if (found == impl_->live_events.end()) return false;
@@ -169,6 +185,7 @@ bool EventLoop::cancel(const EventId id) noexcept {
 }
 
 EventRunResult EventLoop::runDueEvents(const SimTimeNs deadline) {
+    Impl::Lock lock(*impl_);
     if (deadline < impl_->shared_now) {
         throw std::invalid_argument("cannot run the simulation clock backwards");
     }
@@ -212,6 +229,7 @@ EventRunResult EventLoop::runDueEvents(const SimTimeNs deadline) {
 EventRunResult EventLoop::runOwnedEvents(
     const EventOwner owner, const SimTimeNs deadline
 ) {
+    Impl::Lock lock(*impl_);
     const SimTimeNs current = impl_->timeFor(owner);
     if (deadline < current) {
         throw std::invalid_argument("cannot run an owner clock backwards");
@@ -248,6 +266,7 @@ EventRunResult EventLoop::runOwnedEvents(
 }
 
 EventRunResult EventLoop::advanceBy(const SimTimeNs delta) {
+    Impl::Lock lock(*impl_);
     if (delta > std::numeric_limits<SimTimeNs>::max() - impl_->shared_now) {
         throw std::overflow_error("simulation clock overflow");
     }
@@ -255,6 +274,7 @@ EventRunResult EventLoop::advanceBy(const SimTimeNs delta) {
 }
 
 void EventLoop::clear() noexcept {
+    Impl::Lock lock(*impl_);
     impl_->events = {};
     impl_->owner_events.clear();
     impl_->live_events.clear();
@@ -262,16 +282,19 @@ void EventLoop::clear() noexcept {
 }
 
 SimTimeNs EventLoop::now() const noexcept {
-    return impl_->timeFor(impl_->active_owner);
+    Impl::Lock lock(*impl_);
+    return impl_->timeFor(active_event_owner);
 }
 
 SimTimeNs EventLoop::now(const EventOwner owner) const noexcept {
+    Impl::Lock lock(*impl_);
     return impl_->timeFor(owner);
 }
 
 EventLoop::OwnerCheckpoint EventLoop::ownerCheckpoint(
     const EventOwner owner
 ) const noexcept {
+    Impl::Lock lock(*impl_);
     const auto generation = impl_->owner_generation.find(owner);
     return OwnerCheckpoint{
         owner,
@@ -283,6 +306,7 @@ EventLoop::OwnerCheckpoint EventLoop::ownerCheckpoint(
 bool EventLoop::canRestoreOwnerCheckpoint(
     const OwnerCheckpoint& checkpoint
 ) const noexcept {
+    Impl::Lock lock(*impl_);
     const auto generation = impl_->owner_generation.find(checkpoint.owner);
     const std::uint64_t current_generation = generation == impl_->owner_generation.end()
         ? 0U : generation->second;
@@ -291,32 +315,43 @@ bool EventLoop::canRestoreOwnerCheckpoint(
 }
 
 bool EventLoop::restoreOwnerCheckpoint(const OwnerCheckpoint& checkpoint) noexcept {
+    Impl::Lock lock(*impl_);
     if (!canRestoreOwnerCheckpoint(checkpoint)) return false;
     impl_->setTime(checkpoint.owner, checkpoint.time_ns);
     return true;
 }
 
 std::size_t EventLoop::pending() const noexcept {
+    Impl::Lock lock(*impl_);
     return impl_->live_events.size();
 }
 
 std::optional<SimTimeNs> EventLoop::nextScheduledTime() {
+    Impl::Lock lock(*impl_);
     impl_->discardDeadGlobalFront();
     if (impl_->events.empty()) return std::nullopt;
     return impl_->events.top()->at;
 }
 
 std::optional<SimTimeNs> EventLoop::nextScheduledTime(const EventOwner owner) {
+    Impl::Lock lock(*impl_);
     Impl::Queue* const queue = impl_->ownerQueue(owner);
     if (queue == nullptr || queue->empty()) return std::nullopt;
     return queue->top()->at;
 }
 
+void EventLoop::setConcurrentAccess(const bool enabled) noexcept {
+    std::lock_guard lock(impl_->mutex);
+    impl_->concurrent_access = enabled;
+}
+
 void EventLoop::setMaximumSameTimeEvents(const std::size_t maximum) noexcept {
+    Impl::Lock lock(*impl_);
     impl_->maximum_same_time_events = maximum;
 }
 
 std::size_t EventLoop::maximumSameTimeEvents() const noexcept {
+    Impl::Lock lock(*impl_);
     return impl_->maximum_same_time_events;
 }
 

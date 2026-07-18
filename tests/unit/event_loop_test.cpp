@@ -2,10 +2,12 @@
 #include "fil/sim/trace.hpp"
 #include "../test_support.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -98,6 +100,30 @@ void advancesOneOwnerIndependently() {
                      "global execution skips an owner event already committed locally");
 }
 
+void supportsConcurrentOwnerLanes() {
+    fil::sim::EventLoop loop;
+    loop.setConcurrentAccess(true);
+    std::atomic<unsigned int> calls{0U};
+    const auto worker = [&](const fil::sim::EventOwner owner) {
+        auto scope = loop.useOwner(owner);
+        for (unsigned int index = 0U; index < 100U; ++index) {
+            static_cast<void>(loop.scheduleAt(0U, [&]() {
+                calls.fetch_add(1U, std::memory_order_relaxed);
+            }));
+        }
+        const auto result = loop.runOwnedEvents(owner, 0U);
+        fil::test::check(result.events_executed == 100U,
+                         "worker drains its concurrently scheduled owner queue");
+    };
+    std::thread first(worker, 1U);
+    std::thread second(worker, 2U);
+    first.join();
+    second.join();
+    fil::test::check(calls.load(std::memory_order_relaxed) == 200U
+                         && loop.pending() == 0U && loop.now() == 0U,
+                     "concurrent owner lanes preserve exactly-once callback execution");
+}
+
 void cancelsAndRejectsInvalidTime() {
     fil::sim::EventLoop loop;
     int calls = 0;
@@ -180,6 +206,7 @@ void runEventLoopTests() {
     ordersEventsDeterministically();
     tracksLocalAndSharedEventOwnership();
     advancesOneOwnerIndependently();
+    supportsConcurrentOwnerLanes();
     cancelsAndRejectsInvalidTime();
     detectsZeroDelayLivelock();
     serializesStableTraceRecords();

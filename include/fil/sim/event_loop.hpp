@@ -129,6 +129,9 @@ public:
     /** @brief Gets the earliest live timestamp for one board or the shared queue. */
     [[nodiscard]] std::optional<SimTimeNs> nextScheduledTime(EventOwner owner);
 
+    /** @brief Enables locking for concurrent owner-lane access. Set before workers start. */
+    void setConcurrentAccess(bool enabled) noexcept;
+
     /** @brief Changes zero-delay livelock protection; zero disables callbacks. */
     void setMaximumSameTimeEvents(std::size_t maximum) noexcept;
 
