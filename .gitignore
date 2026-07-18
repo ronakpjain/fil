@@ -1,0 +1,9 @@
+/build/
+/build-*/
+/.cache/
+/compile_commands.json
+.DS_Store
+*.jsonl
+*.log
+/docs/html/
+/docs/doxygen-warnings.log
