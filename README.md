@@ -95,7 +95,9 @@ On the development host, a Clang PGO build trained on the strict-MMIO six-board
 command ran the corrected one-second workload in 0.80 s, 0.80 s, and 0.81 s while
 preserving the exact 96,000,000 logical instruction/cycle total and per-board
 results—about 1.25x real time with clock-timed ADC sequences and per-rank DMA
-enabled. The portable Release+IPO build is about 1.01x real time. See
+enabled. The portable Release+IPO build is about 1.01x real time. On battery with
+macOS Low Power Mode enabled, the separately measured medians are 1.68 s portable
+and 1.40 s with freshly trained PGO. See
 [Performance](docs/performance.md) for reproduction commands, the
 unbatched comparison, correctness guards, and explanations of every speedup.
 
