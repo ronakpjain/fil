@@ -459,8 +459,9 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
             }
 
             std::optional<Board::ProvenLoop> observed_loop;
-            if (board.cpu().state().r[15]
-                <= completed.cpu_result.instruction_address) {
+            if (!completed.cpu_result.suppress_loop_observation
+                && board.cpu().state().r[15]
+                    <= completed.cpu_result.instruction_address) {
                 observed_loop = board.observeLoopBoundary(
                     completed.cpu_result,
                     board_output.result.instructions,
@@ -644,7 +645,8 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                     }
 
                     std::optional<Board::ProvenLoop> observed;
-                    if (board.cpu().state().r[15] <= step.instruction_address) {
+                    if (!step.suppress_loop_observation
+                        && board.cpu().state().r[15] <= step.instruction_address) {
                         observed = board.observeLoopBoundary(
                             step, board_output.result.instructions,
                             board_output.result.cycles

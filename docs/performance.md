@@ -32,8 +32,8 @@ reported the same exact result:
 
 On battery with macOS Low Power Mode enabled, alternating five-run A/B tests use a
 separate baseline because host power policy materially changes throughput. The
-current portable build runs at a **1.61 s median (0.62x real time)**, while a
-freshly trained PGO build runs at a **1.39 s median (0.72x real time)**. Do not
+current portable build runs at a **1.55 s median (0.65x real time)**, while a
+freshly trained PGO build runs at a **1.34 s median (0.75x real time)**. Do not
 compare these numbers directly with the AC-power results above.
 
 ```text
@@ -184,7 +184,7 @@ performance-specific mechanisms currently implemented; ordinary container
 | Board | Compact loop proofs | Copying full integer/FP CPU state into every scheduler proof | Proof references a generation/revision-checked observation slot; slot reuse invalidates it conservatively |
 | Board | Bitwise FP-state comparison | Scalar comparison of all 32 FP registers for exact loop matches | `memcmp` compares the complete stored float object representation, including NaN payload bits |
 | World | Reused batching planner storage | Per-frontier heap allocation | Storage is sized once per run and cleared before reuse |
-| World | Backward-boundary loop gate | Entering loop-proof observation after ordinary forward-flow instructions | Only a completed instruction whose resulting PC is at or below its address can close a candidate loop |
+| CPU/world | Backedge loop gate | Entering loop-proof observation after forward flow, calls, or standard returns | Resulting PC must move backward; decoded BL/BLX, BX LR, MOV PC/LR, and stack returns are excluded |
 | World | In-place successful-step accounting | Constructing/copying `BoardRunResult`, register arrays, optional faults, and strings per interpreted instruction | Full result and diagnostic materialization remains on non-success boundaries |
 | World | Exact lockstep bursts | Re-entering the general scheduler around every equal-duration board round | Runs at most 64 rounds; exits on events, exceptions, failures, budgets, clock divergence, or a usable loop proof |
 | World | Event ownership provenance | Invalidating unrelated board-local lookahead after a callback | Shared callbacks still invalidate every lane; nested local callbacks inherit their board owner |
@@ -411,15 +411,24 @@ stricter. This replaces a binary search that repeatedly performed virtual-time
 divisions while retaining the rule that one iteration may complete exactly at the
 observable frontier.
 
-### Backward-boundary loop-observation gate
+### Backedge loop-observation gate
 
 A loop candidate can only close when a completed instruction leaves the PC at or
 below that instruction's address. Both the general scheduler and fused lockstep
 path test this inexpensive condition before entering `Board::observeLoopBoundary`.
 Ordinary sequential instructions and forward branches therefore avoid observation
-table, memory-checkpoint, and read-footprint work. The board method retains the
-same check as a defensive API boundary, so callers cannot accidentally classify
-forward flow as a loop.
+table, memory-checkpoint, and read-footprint work.
+
+Decoded call and standard return instructions carry an additional conservative
+suppression bit: `BL`/`BLX`, `BX LR`, `MOV PC, LR`, and `POP`/`LDM` including PC do
+not enter loop observation. They represent roughly 22.7% of interpreted PER
+instructions and frequently move to a lower address without closing an idle-loop
+backedge. Non-return indirect branches remain eligible. Excluding these candidates
+can only delay or forgo acceleration; it cannot skip unproven target execution.
+The battery A/B run consequently interprets about 1.14M more logical instructions
+but finishes faster by avoiding much more call/return proof work. Target totals,
+simulated time, event count, and terminal board PCs remain identical; acceleration
+and scheduler diagnostic counters intentionally differ.
 
 ### Allocation-free loop proof and planning state
 

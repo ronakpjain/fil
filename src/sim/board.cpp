@@ -252,6 +252,7 @@ std::optional<Board::ProvenLoop> Board::observeLoopBoundary(
 ) {
     const std::uint32_t boundary_pc = cpu_->state().r[15];
     if (step.reason != cpu::StopReason::step_complete
+        || step.suppress_loop_observation
         || boundary_pc > step.instruction_address) {
         return std::nullopt;
     }

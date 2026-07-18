@@ -260,6 +260,15 @@ FastStepResult CortexM4::stepFast() {
         decoded = &cache.decoded;
     }
     result.instruction_size = instruction_size;
+    const bool stack_return =
+        (decoded->kind == InstrKind::pop || decoded->kind == InstrKind::ldm)
+        && (decoded->register_list & (std::uint16_t{1U} << 15U)) != 0U;
+    result.suppress_loop_observation = decoded->kind == InstrKind::bl
+        || decoded->kind == InstrKind::blx
+        || (decoded->kind == InstrKind::bx && decoded->rm == 14U)
+        || (decoded->kind == InstrKind::mov
+            && decoded->rd == 15U && decoded->rm == 14U)
+        || stack_return;
 
     std::optional<CpuState> restart_state;
     if (memory_.mmioTrapping()) restart_state = state_;
