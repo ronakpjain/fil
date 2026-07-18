@@ -22,11 +22,11 @@ loop.
 The corrected six-board PER workload runs near real time after making
 continuous ADC sequences and their DMA transfers observable. After scheduler and
 interpreter hot-path restructuring, three consecutive one-second runs on the
-development host took **1.08 s, 1.04 s, and 1.04 s** in the portable Release+IPO
-build (median 1.04 s, about **0.96x real time**). A Clang PGO build trained on the
-same command took **0.84 s, 0.83 s, and 0.84 s** (median 0.84 s, about **1.19x real
-time**) after eliminating redundant loop-proof revalidation and binary-search-free
-horizon planning. Disabling loop batching took 3.33 s on the portable build, so the
+development host took **1.02 s, 1.00 s, and 1.01 s** in the portable Release+IPO
+build (median 1.01 s, about **0.99x real time**). A Clang PGO build trained on the
+same command took **0.80 s, 0.80 s, and 0.81 s** (median 0.80 s, about **1.25x real
+time**) after the scheduler improvements and a guarded directly-backed 32-bit read
+path. Disabling loop batching took 3.33 s on the portable build, so the
 causality-bounded batching path is about **3.1x faster** before PGO. Every mode
 reported the same exact result:
 
@@ -163,6 +163,7 @@ performance-specific mechanisms currently implemented; ordinary container
 | Cortex-M | Sparse NVIC scan | Testing all 240 external IRQs for a pending candidate | Scan only `pending & enabled`; priority rules unchanged |
 | Memory | Pointer-tagged `MemoryResult` | Carrying a large inline fault or invoking `variant` machinery on successful accesses | Inline value plus nullable fault pointer; allocation occurs only on failure |
 | Memory | Region dispatch cache | Ordered mapping walk for each fetch/data/MMIO access | Full containment check before accepting a hit |
+| Memory | Direct backed `read32` | Generic width/alias/MMIO dispatch for common RAM/ROM word loads | Cached region plus full permission/range checks; all other accesses fall back |
 | Memory/board | Conservative loop read footprint | Invalidating a loop for unrelated external DMA writes | Two-hash Bloom collisions only reject acceleration; nested/ambiguous loop boundaries use full invalidation |
 | Build | Release plus IPO/LTO defaults | Unoptimized hot path and translation-unit barriers | Debug and sanitizer builds remain unoptimized/non-IPO |
 | Build | Clang profile-guided optimization | Static branch/layout guesses in workload-dependent interpreter and scheduler paths | Explicit two-build workflow; optimized build consumes a checked `.profdata` file |
@@ -277,6 +278,21 @@ one high-byte slot. Cache misses still use the authoritative ordered map, and th
 subsequent access retains all permission, whole-range, alias-depth, and MMIO-width
 validation. Memory map tests cover overlapping and wrapping map rejection,
 cross-region accesses, aliases, and routed MMIO.
+
+### Guarded directly-backed 32-bit reads
+
+Dynamic instruction counts show `LDR` accounts for roughly one quarter of the
+remaining interpreted PER instructions. `MemoryBus::read32()` therefore tests the
+common directly-backed RAM/ROM case before entering generic width, alias, and MMIO
+dispatch. A hit still requires a readable region containing the complete four-byte
+range and, for instruction fetches, execute permission. Data reads update the same
+loop read footprint. An unaligned-safe `memcpy` performs the host load, with an
+explicit byte swap on big-endian hosts to retain little-endian target semantics.
+
+Missing, protected, cross-region, aliased, and MMIO accesses all fall through to
+the authoritative generic implementation, which produces the same structured
+faults and side effects as before. Memory-bus tests cover the fallback boundaries;
+the full PER A/B run preserves every scheduler counter and terminal board PC.
 
 ### Release IPO/LTO defaults without changing Debug or sanitizers
 

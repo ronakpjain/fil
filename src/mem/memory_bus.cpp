@@ -3,6 +3,8 @@
 #include "fil/elf/elf_loader.hpp"
 
 #include <algorithm>
+#include <bit>
+#include <cstring>
 #include <limits>
 
 namespace fil::mem {
@@ -418,6 +420,29 @@ MemoryResult<std::uint32_t> MemoryBus::read32(
     const std::uint32_t address,
     const AccessContext context
 ) const {
+    const Region* region = find(address);
+    if (region != nullptr
+        && (region->info.kind == RegionKind::ram
+            || region->info.kind == RegionKind::rom)
+        && region->info.readable
+        && region->containsRange(address, sizeof(std::uint32_t))
+        && (context.type != AccessType::instruction_fetch
+            || region->info.executable)) {
+        if (context.type == AccessType::data_read && context.pc != 0U) {
+            addReadFootprint(read_footprint_, address);
+        }
+        std::uint32_t value = 0U;
+        const std::size_t offset = address - region->info.base;
+        std::memcpy(&value, region->bytes.data() + offset, sizeof(value));
+        if constexpr (std::endian::native == std::endian::big) {
+            value = ((value & 0x000000ffU) << 24U)
+                | ((value & 0x0000ff00U) << 8U)
+                | ((value & 0x00ff0000U) >> 8U)
+                | ((value & 0xff000000U) >> 24U);
+        }
+        return value;
+    }
+
     auto result = read(address, AccessSize::word, context, 0);
     if (!result) return result.fault();
     return static_cast<std::uint32_t>(result.value());
