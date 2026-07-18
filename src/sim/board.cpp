@@ -59,6 +59,8 @@ struct Board::TransactionCheckpoint {
     std::uint64_t time_fraction{0};
     std::array<LoopObservation, 256> loop_observations{};
     std::uint64_t loop_observation_generation{1U};
+    std::optional<std::uint32_t> read_footprint_boundary;
+    mem::MemoryBus::ReadFootprint read_footprint;
 };
 
 bool BoardRunResult::succeeded() const noexcept {
@@ -142,6 +144,8 @@ Result<void> Board::reset() {
     time_fraction_ = 0;
     loop_observations_ = {};
     loop_observation_generation_ = 1U;
+    read_footprint_boundary_.reset();
+    static_cast<void>(memory_.takeReadFootprint());
     return {};
 }
 
@@ -246,6 +250,10 @@ std::optional<Board::ProvenLoop> Board::observeLoopBoundary(
     const std::size_t observation_index =
         (boundary_pc >> 1U) % loop_observations_.size();
     LoopObservation& observation = loop_observations_[observation_index];
+    const auto read_footprint = memory_.takeReadFootprint();
+    const bool read_footprint_complete = read_footprint_boundary_
+        && *read_footprint_boundary_ == boundary_pc;
+    read_footprint_boundary_ = boundary_pc;
     const auto checkpoint = memory_.sideEffectCheckpoint();
     if (observation.valid
         && observation.generation == loop_observation_generation_
@@ -261,6 +269,8 @@ std::optional<Board::ProvenLoop> Board::observeLoopBoundary(
             checkpoint,
             static_cast<std::uint16_t>(observation_index),
             observation.revision,
+            read_footprint,
+            read_footprint_complete,
         };
         observation.instructions = logical_instructions;
         observation.cycles = logical_cycles;
@@ -290,7 +300,11 @@ bool Board::loopProofStillValid(const ProvenLoop& loop) const noexcept {
         && observation.revision == loop.observation_revision
         && observation.boundary_pc == loop.boundary_pc
         && sameCpuState(cpu_->state(), observation.state)
-        && memory_.sideEffectsRestoredSince(loop.side_effect_checkpoint);
+        && (loop.read_footprint_complete
+            ? memory_.sideEffectsCompatibleSince(
+                loop.side_effect_checkpoint, loop.read_footprint
+            )
+            : memory_.sideEffectsRestoredSince(loop.side_effect_checkpoint));
 }
 
 bool Board::loopHasNoMmioSince(const ProvenLoop& loop) const noexcept {
@@ -406,6 +420,8 @@ Board::LoopSkip Board::describeLoopIterations(
 
 void Board::invalidateLoopObservations() noexcept {
     ++loop_observation_generation_;
+    read_footprint_boundary_.reset();
+    static_cast<void>(memory_.takeReadFootprint());
     if (loop_observation_generation_ == 0U) {
         loop_observations_ = {};
         loop_observation_generation_ = 1U;
@@ -467,6 +483,8 @@ Board::TransactionCheckpointPtr Board::captureTransaction(
     checkpoint->time_fraction = time_fraction_;
     checkpoint->loop_observations = loop_observations_;
     checkpoint->loop_observation_generation = loop_observation_generation_;
+    checkpoint->read_footprint_boundary = read_footprint_boundary_;
+    checkpoint->read_footprint = memory_.readFootprint();
     return checkpoint;
 }
 
@@ -485,6 +503,8 @@ bool Board::restoreTransaction(const TransactionCheckpointPtr& checkpoint) {
     time_fraction_ = checkpoint->time_fraction;
     loop_observations_ = checkpoint->loop_observations;
     loop_observation_generation_ = checkpoint->loop_observation_generation;
+    read_footprint_boundary_ = checkpoint->read_footprint_boundary;
+    memory_.restoreReadFootprint(checkpoint->read_footprint);
     return true;
 }
 

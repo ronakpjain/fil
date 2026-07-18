@@ -205,7 +205,7 @@ Result<void> MemoryBus::loadBytes(
             ++mutation_sequence_;
             mutation_journal_[(mutation_sequence_ - 1U) % mutation_journal_capacity] = BackedMutation{
                 mutation_sequence_, address + static_cast<std::uint32_t>(index),
-                region->bytes[offset + index],
+                region->bytes[offset + index], true,
             };
             ++side_effect_generation_;
         }
@@ -307,6 +307,9 @@ MemoryResult<std::uint64_t> MemoryBus::read(
         return result;
     }
 
+    if (context.type == AccessType::data_read && context.pc != 0U) {
+        addReadFootprint(read_footprint_, address);
+    }
     const std::size_t offset = address - region->info.base;
     std::uint64_t value = 0;
     for (std::uint32_t index = 0; index < width; ++index) {
@@ -381,6 +384,7 @@ MemoryResult<std::uint64_t> MemoryBus::write(
             ++mutation_sequence_;
             mutation_journal_[(mutation_sequence_ - 1U) % mutation_journal_capacity] = BackedMutation{
                 mutation_sequence_, address + index, region->bytes[offset + index],
+                context.pc == 0U,
             };
             ++side_effect_generation_;
         }
@@ -467,6 +471,41 @@ std::vector<MemoryRegionInfo> MemoryBus::regions() const {
     return result;
 }
 
+void MemoryBus::addReadFootprint(
+    ReadFootprint& footprint, const std::uint32_t address
+) noexcept {
+    const std::uint32_t word = address >> 2U;
+    const std::uint32_t first = word * 0x9e3779b1U;
+    const std::uint32_t second = (word ^ (word >> 16U)) * 0x85ebca6bU;
+    constexpr std::size_t bit_count = ReadFootprint::word_count * 64U;
+    for (const std::uint32_t mixed : {first, second}) {
+        const std::size_t bit = mixed & (bit_count - 1U);
+        footprint.words[bit >> 6U] |= std::uint64_t{1U} << (bit & 63U);
+    }
+}
+
+bool MemoryBus::footprintContains(
+    const ReadFootprint& footprint, const std::uint32_t address
+) noexcept {
+    const std::uint32_t word = address >> 2U;
+    const std::uint32_t first = word * 0x9e3779b1U;
+    const std::uint32_t second = (word ^ (word >> 16U)) * 0x85ebca6bU;
+    constexpr std::size_t bit_count = ReadFootprint::word_count * 64U;
+    for (const std::uint32_t mixed : {first, second}) {
+        const std::size_t bit = mixed & (bit_count - 1U);
+        if ((footprint.words[bit >> 6U] & (std::uint64_t{1U} << (bit & 63U))) == 0U) {
+            return false;
+        }
+    }
+    return true;
+}
+
+MemoryBus::ReadFootprint MemoryBus::takeReadFootprint() noexcept {
+    ReadFootprint result = read_footprint_;
+    read_footprint_ = {};
+    return result;
+}
+
 MemoryBus::SideEffectCheckpoint MemoryBus::sideEffectCheckpoint() const noexcept {
     return SideEffectCheckpoint{mutation_sequence_, mmio_generation_};
 }
@@ -501,6 +540,50 @@ bool MemoryBus::sideEffectsRestoredSince(const SideEffectCheckpoint checkpoint) 
         }
         const std::size_t offset = current.address - region->info.base;
         if (region->bytes[offset] != current.old_value) return false;
+    }
+    return true;
+}
+
+bool MemoryBus::sideEffectsCompatibleSince(
+    const SideEffectCheckpoint checkpoint, const ReadFootprint& footprint
+) const {
+    if (checkpoint.mmio_generation != mmio_generation_) return false;
+    if (checkpoint.mutation_sequence == mutation_sequence_) return true;
+    if (checkpoint.mutation_sequence > mutation_sequence_
+        || mutation_sequence_ - checkpoint.mutation_sequence
+            > mutation_journal_capacity) {
+        return false;
+    }
+
+    for (std::uint64_t sequence = checkpoint.mutation_sequence + 1U;
+         sequence <= mutation_sequence_; ++sequence) {
+        const BackedMutation& first =
+            mutation_journal_[(sequence - 1U) % mutation_journal_capacity];
+        if (first.sequence != sequence) return false;
+        bool first_for_address = true;
+        bool only_external = first.external;
+        for (std::uint64_t prior = checkpoint.mutation_sequence + 1U;
+             prior < sequence; ++prior) {
+            if (mutation_journal_[(prior - 1U) % mutation_journal_capacity].address
+                == first.address) {
+                first_for_address = false;
+                break;
+            }
+        }
+        if (!first_for_address) continue;
+        for (std::uint64_t later = sequence + 1U; later <= mutation_sequence_; ++later) {
+            const BackedMutation& mutation =
+                mutation_journal_[(later - 1U) % mutation_journal_capacity];
+            if (mutation.address == first.address) only_external &= mutation.external;
+        }
+        const Region* const region = find(first.address);
+        if (region == nullptr || region->info.kind == RegionKind::mmio
+            || region->info.kind == RegionKind::alias) return false;
+        const std::size_t offset = first.address - region->info.base;
+        if (region->bytes[offset] != first.old_value
+            && (!only_external || footprintContains(footprint, first.address))) {
+            return false;
+        }
     }
     return true;
 }

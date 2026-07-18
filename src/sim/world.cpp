@@ -771,6 +771,14 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                 const bool local_event = index < 64U
                     && (events.local_owner_mask & (std::uint64_t{1U} << index)) != 0U;
                 if (!events.shared_event_executed && !local_event) continue;
+                if (!events.shared_event_executed && local_event
+                    && states[index].loop_skip_in_flight
+                    && states[index].proven_loop
+                    && boards_[index]->board->loopProofStillValid(
+                        *states[index].proven_loop
+                    )) {
+                    continue;
+                }
                 states[index].proven_loop.reset();
                 states[index].inside_proven_loop = false;
             }

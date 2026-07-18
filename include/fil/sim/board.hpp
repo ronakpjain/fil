@@ -137,6 +137,8 @@ private:
         mem::MemoryBus::SideEffectCheckpoint side_effect_checkpoint{};
         std::uint16_t observation_index{0};
         std::uint64_t observation_revision{0};
+        mem::MemoryBus::ReadFootprint read_footprint{};
+        bool read_footprint_complete{false};
     };
 
     struct LoopSkip {
@@ -209,6 +211,7 @@ private:
     std::uint64_t time_fraction_{0};
     std::array<LoopObservation, 256> loop_observations_{};
     std::uint64_t loop_observation_generation_{1U};
+    std::optional<std::uint32_t> read_footprint_boundary_;
 };
 
 /** @brief Stable lowercase stop-reason name for CLI/trace output. */

@@ -152,6 +152,10 @@ public:
         std::uint64_t mutation_sequence{0};
         std::uint64_t mmio_generation{0};
     };
+    struct ReadFootprint {
+        static constexpr std::size_t word_count = 4U;
+        std::array<std::uint64_t, word_count> words{};
+    };
     /** @brief Constructs an empty address map. */
     MemoryBus();
 
@@ -278,6 +282,18 @@ public:
     /** @brief True when no MMIO occurred and all changed backed bytes were restored. */
     [[nodiscard]] bool sideEffectsRestoredSince(SideEffectCheckpoint checkpoint) const;
 
+    /** @brief Returns and clears CPU backed-memory reads since the previous take. */
+    [[nodiscard]] ReadFootprint takeReadFootprint() noexcept;
+    [[nodiscard]] ReadFootprint readFootprint() const noexcept { return read_footprint_; }
+    void restoreReadFootprint(const ReadFootprint& footprint) noexcept {
+        read_footprint_ = footprint;
+    }
+
+    /** @brief Checks restored CPU writes and external writes against a read footprint. */
+    [[nodiscard]] bool sideEffectsCompatibleSince(
+        SideEffectCheckpoint checkpoint, const ReadFootprint& footprint
+    ) const;
+
     /** @brief Whether backed-memory state can be transactionally restored. */
     [[nodiscard]] bool canRestoreSideEffects(SideEffectCheckpoint checkpoint) const noexcept;
 
@@ -295,7 +311,13 @@ private:
         std::uint64_t sequence{0};
         std::uint32_t address{0};
         std::uint8_t old_value{0};
+        bool external{false};
     };
+
+    static void addReadFootprint(ReadFootprint& footprint, std::uint32_t address) noexcept;
+    [[nodiscard]] static bool footprintContains(
+        const ReadFootprint& footprint, std::uint32_t address
+    ) noexcept;
 
     [[nodiscard]] MemoryResult<std::uint64_t> read(
         std::uint32_t address, AccessSize size, const AccessContext& context, unsigned int alias_depth
@@ -319,6 +341,7 @@ private:
     std::uint64_t mutation_sequence_{0};
     static constexpr std::size_t mutation_journal_capacity = 8192U;
     std::array<BackedMutation, mutation_journal_capacity> mutation_journal_{};
+    mutable ReadFootprint read_footprint_{};
     bool trap_shared_mmio_{false};
     bool trap_all_mmio_{false};
 };
