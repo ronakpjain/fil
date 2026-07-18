@@ -22,8 +22,8 @@ loop.
 The corrected six-board PER workload runs near real time after making
 continuous ADC sequences and their DMA transfers observable. After scheduler and
 interpreter hot-path restructuring, three consecutive one-second runs on the
-development host took **1.10 s, 1.08 s, and 1.09 s** in the portable Release+IPO
-build (median 1.09 s, about **0.92x real time**). A Clang PGO build trained on the
+development host took **1.08 s, 1.04 s, and 1.04 s** in the portable Release+IPO
+build (median 1.04 s, about **0.96x real time**). A Clang PGO build trained on the
 same command took **0.84 s, 0.83 s, and 0.84 s** (median 0.84 s, about **1.19x real
 time**) after eliminating redundant loop-proof revalidation and binary-search-free
 horizon planning. Disabling loop batching took 3.33 s on the portable build, so the
@@ -161,7 +161,7 @@ performance-specific mechanisms currently implemented; ordinary container
 | Cortex-M | Pending-interrupt summary | Calling exception selection and scanning NVIC words after every instruction | Recompute the summary only when pending/enable state mutates; full priority selection still runs for every positive summary |
 | Board | Split instruction-boundary settlement | Entering the large exception/reset slow path and probing its stack on every instruction | A compact predicate calls the non-inlined slow path only for pending exception/reset work |
 | Cortex-M | Sparse NVIC scan | Testing all 240 external IRQs for a pending candidate | Scan only `pending & enabled`; priority rules unchanged |
-| Memory | Compact `MemoryResult` | Carrying a large inline `BusFault` on successful accesses | Fault allocation occurs only on failure |
+| Memory | Pointer-tagged `MemoryResult` | Carrying a large inline fault or invoking `variant` machinery on successful accesses | Inline value plus nullable fault pointer; allocation occurs only on failure |
 | Memory | Region dispatch cache | Ordered mapping walk for each fetch/data/MMIO access | Full containment check before accepting a hit |
 | Memory/board | Conservative loop read footprint | Invalidating a loop for unrelated external DMA writes | Two-hash Bloom collisions only reject acceleration; nested/ambiguous loop boundaries use full invalidation |
 | Build | Release plus IPO/LTO defaults | Unoptimized hot path and translation-unit barriers | Debug and sanitizer builds remain unoptimized/non-IPO |
@@ -251,12 +251,13 @@ not sufficient unless the matching enable bit is also set.
 ### Compact `MemoryResult` success representation
 
 Previously, every successful fetch or data access carried storage large enough for
-the complete structured `BusFault`. Successful `MemoryResult<T>` values now stay
-inline in a small variant. The much larger structured `BusFault` is held behind a
-`unique_ptr` and is allocated only
-on the uncommon failure path. Copying remains supported; a copied fault is deep
-copied. Normal instruction fetches and data accesses therefore avoid carrying a
-large fault object through every successful return. Callers still receive the same
+the complete structured `BusFault`; an initial compact representation then used a
+small `variant`. `MemoryResult<T>` now stores the successful value inline and uses
+a nullable `unique_ptr<BusFault>` as the status tag. The fault is allocated only on
+the uncommon failure path, while successful checks and destruction avoid variant
+visitation. Copying remains supported; a copied fault is deep copied. Normal
+instruction fetches and data accesses therefore avoid both a large inline fault
+object and generic sum-type machinery. Callers still receive the same
 typed fault fields on failure; memory-bus tests exercise successful values and
 unmapped, permission, overflow, and cross-region faults, and sanitizers cover the
 failure-only ownership path.
