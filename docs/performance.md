@@ -32,8 +32,8 @@ reported the same exact result:
 
 On battery with macOS Low Power Mode enabled, alternating five-run A/B tests use a
 separate baseline because host power policy materially changes throughput. The
-current portable build runs at a **1.64 s median (0.61x real time)**, while a
-freshly trained PGO build runs at a **1.40 s median (0.71x real time)**. Do not
+current portable build runs at a **1.61 s median (0.62x real time)**, while a
+freshly trained PGO build runs at a **1.39 s median (0.72x real time)**. Do not
 compare these numbers directly with the AC-power results above.
 
 ```text
@@ -173,6 +173,7 @@ performance-specific mechanisms currently implemented; ordinary container
 | Memory | Pointer-tagged `MemoryResult` | Carrying a large inline fault or invoking `variant` machinery on successful accesses | Inline value plus nullable fault pointer; allocation occurs only on failure |
 | Memory | Region dispatch cache | Ordered mapping walk for each fetch/data/MMIO access | Full containment check before accepting a hit |
 | Memory | Direct backed `read32` | Generic width/alias/MMIO dispatch for common RAM/ROM word loads | Cached region plus full permission/range checks; all other accesses fall back |
+| Memory | Direct backed `write32` | Generic alias/MMIO dispatch for common SRAM word and stack stores | Preserves byte mutation journal, DMA provenance, and executable generation; all other accesses fall back |
 | Memory/board | Conservative loop read footprint | Invalidating a loop for unrelated external DMA writes | Two-hash Bloom collisions only reject acceleration; nested/ambiguous loop boundaries use full invalidation |
 | Build | Release plus IPO/LTO defaults | Unoptimized hot path and translation-unit barriers | Debug and sanitizer builds remain unoptimized/non-IPO |
 | Build | Clang profile-guided optimization | Static branch/layout guesses in workload-dependent interpreter and scheduler paths | Explicit two-build workflow; optimized build consumes a checked `.profdata` file |
@@ -315,7 +316,7 @@ subsequent access retains all permission, whole-range, alias-depth, and MMIO-wid
 validation. Memory map tests cover overlapping and wrapping map rejection,
 cross-region accesses, aliases, and routed MMIO.
 
-### Guarded directly-backed 32-bit reads
+### Guarded directly-backed 32-bit reads and writes
 
 Dynamic instruction counts show `LDR` accounts for roughly one quarter of the
 remaining interpreted PER instructions. `MemoryBus::read32()` therefore tests the
@@ -324,6 +325,11 @@ dispatch. A hit still requires a readable region containing the complete four-by
 range and, for instruction fetches, execute permission. Data reads update the same
 loop read footprint. An unaligned-safe `memcpy` performs the host load, with an
 explicit byte swap on big-endian hosts to retain little-endian target semantics.
+
+`write32()` uses the same full-range, writable, directly-backed guard for common
+SRAM word and stack stores. It retains byte-granular mutation journal entries,
+external/DMA provenance, side-effect generations, and executable-memory cache
+invalidation exactly as the generic path requires.
 
 Missing, protected, cross-region, aliased, and MMIO accesses all fall through to
 the authoritative generic implementation, which produces the same structured

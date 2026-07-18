@@ -476,6 +476,28 @@ MemoryResult<std::uint64_t> MemoryBus::write32(
     const std::uint32_t value,
     const AccessContext context
 ) {
+    Region* region = find(address);
+    if (region != nullptr
+        && (region->info.kind == RegionKind::ram
+            || region->info.kind == RegionKind::rom)
+        && region->info.writable
+        && region->containsRange(address, sizeof(value))) {
+        const std::size_t offset = address - region->info.base;
+        for (std::uint32_t index = 0U; index < sizeof(value); ++index) {
+            const auto byte = static_cast<std::uint8_t>(value >> (index * 8U));
+            if (region->bytes[offset + index] == byte) continue;
+            ++mutation_sequence_;
+            mutation_journal_[(mutation_sequence_ - 1U) % mutation_journal_capacity] =
+                BackedMutation{
+                    mutation_sequence_, address + index,
+                    region->bytes[offset + index], context.pc == 0U,
+                };
+            ++side_effect_generation_;
+            region->bytes[offset + index] = byte;
+        }
+        if (region->info.executable) ++execution_generation_;
+        return std::uint64_t{0};
+    }
     return write(address, AccessSize::word, value, context, 0);
 }
 
