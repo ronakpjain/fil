@@ -171,7 +171,9 @@ private:
     /** Executes one instruction and accrues board-local cycles without moving shared time. */
     [[nodiscard]] ConcurrentStepResult beginConcurrentStep(bool trace_instructions);
     /** Applies exception/reset effects due at the just-completed instruction boundary. */
+    [[nodiscard]] bool boundaryWorkPending() const noexcept;
     [[nodiscard]] std::optional<BoundaryStop> settleInstructionBoundary();
+    [[nodiscard]] std::optional<BoundaryStop> settleInstructionBoundarySlow();
     [[nodiscard]] std::optional<ProvenLoop> observeLoopBoundary(
         const cpu::FastStepResult& step,
         std::uint64_t logical_instructions,

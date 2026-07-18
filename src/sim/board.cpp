@@ -181,12 +181,21 @@ Board::ConcurrentStepResult Board::beginConcurrentStep(const bool trace_instruct
     return ConcurrentStepResult{result, accountCycles(result.cycles)};
 }
 
+bool Board::boundaryWorkPending() const noexcept {
+    return cpu_->state().pending_exc_return || cpu_->state().pending_exception
+        || system_->hasEnabledPending() || system_->resetRequested()
+        || peripherals_->resetRequested();
+}
+
 std::optional<Board::BoundaryStop> Board::settleInstructionBoundary() {
-    if (!cpu_->state().pending_exc_return && !cpu_->state().pending_exception
-        && !system_->hasEnabledPending() && !system_->resetRequested()
-        && !peripherals_->resetRequested()) {
-        return std::nullopt;
-    }
+    if (!boundaryWorkPending()) return std::nullopt;
+    return settleInstructionBoundarySlow();
+}
+
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((noinline))
+#endif
+std::optional<Board::BoundaryStop> Board::settleInstructionBoundarySlow() {
     if (cpu_->state().pending_exc_return) {
         const std::uint32_t exc_return = *cpu_->state().pending_exc_return;
         cpu_->state().pending_exc_return.reset();

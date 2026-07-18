@@ -926,10 +926,11 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                 if (!events.shared_event_executed && !local_event) continue;
                 if (!events.shared_event_executed && local_event
                     && states[index].loop_skip_in_flight
-                    && states[index].proven_loop
-                    && boards_[index]->board->loopProofStillValid(
-                        *states[index].proven_loop
-                    )) {
+                    && states[index].proven_loop) {
+                    // Keep the prior proof only as a revalidation template. The
+                    // completion path refreshes its observation at post-event
+                    // memory state; maximumLoopIterations still rejects the stale
+                    // checkpoint until one exact iteration proves it again.
                     continue;
                 }
                 states[index].proven_loop.reset();
