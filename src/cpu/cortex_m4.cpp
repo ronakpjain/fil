@@ -152,7 +152,7 @@ void CortexM4::capture(DiagnosticSnapshot& diagnostic) const {
 
 FastStepResult CortexM4::stepFast() {
     FastStepResult result;
-    if (state_.halted) {
+    if (state_.halted) [[unlikely]] {
         result.reason = StopReason::halted;
         result.instruction_address = state_.r[15];
         last_diagnostic_.instruction_address = state_.r[15];
@@ -164,7 +164,7 @@ FastStepResult CortexM4::stepFast() {
 
     const std::uint32_t pc = state_.r[15];
     result.instruction_address = pc;
-    if (!state_.thumb || (state_.xpsr & xpsr_t) == 0U || (pc & 1U) != 0U) {
+    if (!state_.thumb || (state_.xpsr & xpsr_t) == 0U || (pc & 1U) != 0U) [[unlikely]] {
         state_.halted = true;
         result.reason = StopReason::invalid_state;
         last_diagnostic_.instruction_address = pc;
@@ -178,7 +178,7 @@ FastStepResult CortexM4::stepFast() {
     const std::uint64_t execution_generation = memory_.executionGeneration();
     std::uint8_t instruction_size = 0;
     const DecodedInstruction* decoded = nullptr;
-    if (cache.generation == execution_generation && cache.pc == pc) {
+    if (cache.generation == execution_generation && cache.pc == pc) [[likely]] {
         instruction_size = cache.size;
         result.raw = cache.raw;
         decoded = &cache.decoded;
@@ -277,7 +277,7 @@ FastStepResult CortexM4::stepFast() {
     }
 
     StopReason stop = StopReason::step_complete;
-    if (conditionPasses(effective_condition, state_.xpsr)) {
+    if (conditionPasses(effective_condition, state_.xpsr)) [[likely]] {
         stop = execute(*decoded, last_diagnostic_);
     }
     if (decoded->kind != InstrKind::it && was_in_it) state_.advanceIt();
@@ -285,7 +285,7 @@ FastStepResult CortexM4::stepFast() {
     result.reason = stop;
     result.instructions = 1;
     result.cycles = 1;
-    if (stop != StopReason::step_complete) {
+    if (stop != StopReason::step_complete) [[unlikely]] {
         last_diagnostic_.instruction_address = pc;
         last_diagnostic_.raw = result.raw;
         last_diagnostic_.instruction_size = instruction_size;

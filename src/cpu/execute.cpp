@@ -477,7 +477,37 @@ StopReason CortexM4::execute(
         if (instruction.set_flags) setNzc(state_, result.value, result.carry);
         return StopReason::step_complete;
     }
-    case InstrKind::ldr:
+    case InstrKind::ldr: {
+        const std::uint32_t base = instruction.rn == 15U
+            ? state_.architecturalPcForRead() & ~std::uint32_t{3}
+            : state_.readRegister(instruction.rn);
+        std::uint32_t offset = instruction.imm;
+        if (instruction.form == OperandForm::register_value) {
+            offset = shiftC(
+                state_.readRegister(instruction.rm), instruction.shift_type,
+                instruction.shift_amount, carryFlag(state_)
+            ).value;
+        }
+        const std::uint32_t offset_address = instruction.add
+            ? base + offset : base - offset;
+        const std::uint32_t address = instruction.index ? offset_address : base;
+        const mem::AccessContext context{
+            mem::AccessType::data_read, state_.currentInstrAddr()
+        };
+        const auto result = memory_.read32(address, context);
+        if (!result) return failBus(result.fault(), "word load failed");
+        if (instruction.rd == 15U) {
+            if (!state_.branchWritePc(result.value())) {
+                return failInvalid("load to PC selected non-Thumb state");
+            }
+        } else {
+            state_.writeRegister(instruction.rd, result.value());
+        }
+        if (instruction.writeback) {
+            state_.writeRegister(instruction.rn, offset_address);
+        }
+        return StopReason::step_complete;
+    }
     case InstrKind::str:
     case InstrKind::ldrb:
     case InstrKind::strb:
@@ -516,11 +546,8 @@ StopReason CortexM4::execute(
             }
         } else {
             std::uint32_t value = 0;
-            if (instruction.kind == InstrKind::ldr) {
-                const auto result = memory_.read32(address, context);
-                if (!result) return failBus(result.fault(), "word load failed");
-                value = result.value();
-            } else if (instruction.kind == InstrKind::ldrb || instruction.kind == InstrKind::ldrsb) {
+            if (instruction.kind == InstrKind::ldrb
+                || instruction.kind == InstrKind::ldrsb) {
                 const auto result = memory_.read8(address, context);
                 if (!result) return failBus(result.fault(), "byte load failed");
                 value = result.value();

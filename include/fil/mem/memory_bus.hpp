@@ -15,7 +15,6 @@
 #include <span>
 #include <string>
 #include <utility>
-#include <variant>
 #include <vector>
 
 namespace fil::elf {
@@ -32,58 +31,51 @@ template <typename T>
 class [[nodiscard]] MemoryResult {
 public:
     /** @brief Constructs a successful access result. @param value Access value. */
-    MemoryResult(T value) : storage_(std::move(value)) {}
+    MemoryResult(T value) : value_(std::move(value)) {}
 
     /** @brief Constructs a failed access result. @param fault Bus fault details. */
     MemoryResult(BusFault fault)
-        : storage_(std::make_unique<BusFault>(std::move(fault))) {}
+        : fault_(std::make_unique<BusFault>(std::move(fault))) {}
 
-    MemoryResult(const MemoryResult& other) : storage_(copyStorage(other)) {}
+    MemoryResult(const MemoryResult& other)
+        : value_(other.value_),
+          fault_(other.fault_ ? std::make_unique<BusFault>(*other.fault_) : nullptr) {}
     MemoryResult& operator=(const MemoryResult& other) {
-        if (this != &other) storage_ = copyStorage(other);
+        if (this == &other) return *this;
+        value_ = other.value_;
+        fault_ = other.fault_ ? std::make_unique<BusFault>(*other.fault_) : nullptr;
         return *this;
     }
     MemoryResult(MemoryResult&&) noexcept = default;
     MemoryResult& operator=(MemoryResult&&) noexcept = default;
 
     /** @brief Tests whether the access succeeded. @return True when a value is present. */
-    [[nodiscard]] bool hasValue() const noexcept { return std::holds_alternative<T>(storage_); }
+    [[nodiscard]] bool hasValue() const noexcept { return fault_ == nullptr; }
 
     /** @brief Tests whether the access succeeded. @return True when a value is present. */
     [[nodiscard]] explicit operator bool() const noexcept { return hasValue(); }
 
     /** @brief Gets the successful value. @return Mutable value reference. */
-    [[nodiscard]] T& value() & { assert(hasValue()); return std::get<T>(storage_); }
+    [[nodiscard]] T& value() & { assert(hasValue()); return value_; }
 
     /** @brief Gets the successful value. @return Const value reference. */
-    [[nodiscard]] const T& value() const& { assert(hasValue()); return std::get<T>(storage_); }
+    [[nodiscard]] const T& value() const& { assert(hasValue()); return value_; }
 
     /** @brief Gets the access fault. @return Mutable fault reference. */
     [[nodiscard]] BusFault& fault() & {
-        assert(!hasValue());
-        return *std::get<std::unique_ptr<BusFault>>(storage_);
+        assert(fault_ != nullptr);
+        return *fault_;
     }
 
     /** @brief Gets the access fault. @return Const fault reference. */
     [[nodiscard]] const BusFault& fault() const& {
-        assert(!hasValue());
-        return *std::get<std::unique_ptr<BusFault>>(storage_);
+        assert(fault_ != nullptr);
+        return *fault_;
     }
 
 private:
-    using Storage = std::variant<T, std::unique_ptr<BusFault>>;
-
-    [[nodiscard]] static Storage copyStorage(const MemoryResult& other) {
-        if (other.hasValue()) {
-            return Storage(std::in_place_index<0>, other.value());
-        }
-        return Storage(
-            std::in_place_index<1>,
-            std::make_unique<BusFault>(other.fault())
-        );
-    }
-
-    Storage storage_;
+    T value_{};
+    std::unique_ptr<BusFault> fault_;
 };
 
 /** @brief Interface implemented by target peripheral register blocks. */
