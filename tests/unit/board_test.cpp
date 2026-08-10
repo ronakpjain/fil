@@ -3,6 +3,7 @@
 
 #include <filesystem>
 #include <sstream>
+#include <vector>
 
 namespace {
 
@@ -72,6 +73,75 @@ void restoresTransactionalBoardState() {
                      "transaction rollback restores architectural and lane-clock state");
 }
 
+bool installIdleLoop(fil::sim::Board& board) {
+    const std::uint32_t start = board.cpu().state().r[15] & ~1U;
+    const std::vector<std::uint8_t> code{
+        0x00U, 0xbfU, // nop
+        0xfdU, 0xe7U, // b start
+    };
+    return board.memory().loadBytes(start, code).hasValue();
+}
+
+void loopBatchingMatchesExactBoardExecution() {
+    auto exact = fil::sim::Board::load(fixtureBoard());
+    auto batched = fil::sim::Board::load(fixtureBoard());
+    fil::test::check(exact.hasValue() && batched.hasValue(),
+                     "loads boards for standalone batching equivalence");
+    if (!exact || !batched) return;
+    fil::test::check(installIdleLoop(*exact.value()) && installIdleLoop(*batched.value()),
+                     "installs standalone idle loops");
+    exact.value()->trace().setEnabled(false);
+    batched.value()->trace().setEnabled(false);
+
+    fil::sim::BoardRunOptions exact_options;
+    exact_options.max_instructions = 10'000U;
+    exact_options.duration_ns = 0U;
+    exact_options.detect_spin = false;
+    exact_options.enable_loop_batching = false;
+    auto batched_options = exact_options;
+    batched_options.enable_loop_batching = true;
+
+    const auto exact_result = exact.value()->run(exact_options);
+    const auto batched_result = batched.value()->run(batched_options);
+    const auto& exact_state = exact.value()->cpu().state();
+    const auto& batched_state = batched.value()->cpu().state();
+    fil::test::check(exact_result.reason == fil::sim::BoardStopReason::instruction_budget
+                         && batched_result.reason == exact_result.reason
+                         && batched_result.instructions == exact_result.instructions
+                         && batched_result.cycles == exact_result.cycles
+                         && batched_result.time_ns == exact_result.time_ns,
+                     "standalone batching preserves limits and logical time");
+    fil::test::check(batched_state.r == exact_state.r
+                         && batched_state.xpsr == exact_state.xpsr
+                         && batched_state.s == exact_state.s
+                         && batched_state.instruction_address
+                             == exact_state.instruction_address,
+                     "standalone batching preserves final CPU state");
+}
+
+void spinDetectionTakesPriorityOverBatching() {
+    auto board = fil::sim::Board::load(fixtureBoard());
+    if (!board) {
+        fil::test::check(false, "loads board for spin detection");
+        return;
+    }
+    fil::test::check(installIdleLoop(*board.value()),
+                     "installs idle loop for spin detection");
+    board.value()->trace().setEnabled(false);
+
+    fil::sim::BoardRunOptions options;
+    options.max_instructions = 1'000U;
+    options.duration_ns = 0U;
+    options.detect_spin = true;
+    options.spin_threshold = 20U;
+    options.enable_loop_batching = true;
+    const auto result = board.value()->run(options);
+    fil::test::check(result.reason == fil::sim::BoardStopReason::spin_detected
+                         && result.instructions >= options.spin_threshold
+                         && result.instructions < options.max_instructions,
+                     "spin diagnosis stops instead of batching through the loop");
+}
+
 void stopsAtRequestedAddress() {
     auto board = fil::sim::Board::load(fixtureBoard());
     if (!board) {
@@ -115,6 +185,8 @@ void runBoardTests() {
     runsBoardToBreakpoint();
     workerSliceMatchesStandaloneExecution();
     restoresTransactionalBoardState();
+    loopBatchingMatchesExactBoardExecution();
+    spinDetectionTakesPriorityOverBatching();
     stopsAtRequestedAddress();
     producesByteIdenticalTraceForRepeatedRuns();
 }

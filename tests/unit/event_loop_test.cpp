@@ -117,6 +117,41 @@ void reusesPersistentLaneWorkers() {
     fil::test::check(exact, "persistent worker pool executes every lane once per epoch");
 }
 
+void validatesWorkerPoolFailuresAndRecovery() {
+    bool rejected_zero_lanes = false;
+    try {
+        fil::sim::LaneWorkerPool invalid(0U);
+    } catch (const std::invalid_argument&) {
+        rejected_zero_lanes = true;
+    }
+    fil::test::check(rejected_zero_lanes,
+                     "worker pool rejects an empty lane set");
+
+    fil::sim::LaneWorkerPool workers(2U);
+    bool rejected_empty_task = false;
+    try {
+        workers.run({});
+    } catch (const std::invalid_argument&) {
+        rejected_empty_task = true;
+    }
+    fil::test::check(rejected_empty_task, "worker pool rejects an empty task");
+
+    bool propagated = false;
+    try {
+        workers.run([](const std::size_t lane) {
+            if (lane == 1U) throw std::runtime_error("lane failed");
+        });
+    } catch (const std::runtime_error&) {
+        propagated = true;
+    }
+    std::atomic<unsigned int> recovered{0U};
+    workers.run([&](std::size_t) {
+        recovered.fetch_add(1U, std::memory_order_relaxed);
+    });
+    fil::test::check(propagated && recovered.load(std::memory_order_relaxed) == 2U,
+                     "worker pool propagates failures and remains reusable");
+}
+
 void supportsConcurrentOwnerLanes() {
     fil::sim::EventLoop loop;
     loop.setConcurrentAccess(true);
@@ -224,6 +259,7 @@ void runEventLoopTests() {
     tracksLocalAndSharedEventOwnership();
     advancesOneOwnerIndependently();
     reusesPersistentLaneWorkers();
+    validatesWorkerPoolFailuresAndRecovery();
     supportsConcurrentOwnerLanes();
     cancelsAndRejectsInvalidTime();
     detectsZeroDelayLivelock();

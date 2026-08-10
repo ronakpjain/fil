@@ -241,6 +241,34 @@ void runsSyntheticStartupSliceToBreakpoint() {
     fil::test::check(cpu.state().it_state == 0U, "IT state advances after its controlled instruction");
 }
 
+void marksCallsAndReturnsAsLoopProofBarriers() {
+    auto bus = basicBus();
+    const auto code = halfwords({
+        0xf000U, 0xf801U, // bl subroutine (+2)
+        0xbe00U,          // bkpt #0
+        0x3001U,          // subroutine: adds r0, #1
+        0x4770U,          // bx lr
+    });
+    fil::test::check(bus.loadBytes(flash_base, code).hasValue(),
+                     "loads call/return loop-proof fixture");
+    fil::cpu::CortexM4 cpu(bus);
+    prepare(cpu);
+
+    const auto call = cpu.stepFast();
+    const auto body = cpu.stepFast();
+    const auto return_step = cpu.stepFast();
+    fil::test::check(call.reason == fil::cpu::StopReason::step_complete
+                         && call.suppress_loop_observation,
+                     "suppresses loop observation after a direct call");
+    fil::test::check(body.reason == fil::cpu::StopReason::step_complete
+                         && !body.suppress_loop_observation,
+                     "keeps ordinary instructions eligible for loop observation");
+    fil::test::check(return_step.reason == fil::cpu::StopReason::step_complete
+                         && return_step.suppress_loop_observation
+                         && cpu.state().r[15] == flash_base + 4U,
+                     "suppresses loop observation after a standard return");
+}
+
 void executesLoadStoreWidthsAndPcPop() {
     auto bus = basicBus();
     const auto code = halfwords({
@@ -263,8 +291,13 @@ void executesLoadStoreWidthsAndPcPop() {
     fil::test::check(cpu.step().reason == fil::cpu::StopReason::step_complete, "executes STRH");
     fil::test::check(cpu.step().reason == fil::cpu::StopReason::step_complete, "executes LDRH");
     fil::test::check(cpu.state().r[3] == 0xcdU && cpu.state().r[4] == 0xabcdU, "byte and halfword loads zero-extend correctly");
-    fil::test::check(cpu.step().reason == fil::cpu::StopReason::step_complete, "executes POP PC with Thumb target");
-    fil::test::check(cpu.state().r[15] == 0x08000020U, "POP PC validates and clears target Thumb bit");
+    const auto pop_pc = cpu.stepFast();
+    fil::test::check(pop_pc.reason == fil::cpu::StopReason::step_complete,
+                     "executes POP PC with Thumb target");
+    fil::test::check(cpu.state().r[15] == 0x08000020U,
+                     "POP PC validates and clears target Thumb bit");
+    fil::test::check(pop_pc.suppress_loop_observation,
+                     "suppresses loop observation after a stack return");
 }
 
 void boundedRunAndDataFaultsAreStructured() {
@@ -611,6 +644,7 @@ void runCpuStepTests() {
     yieldsAndRestartsBeforeSharedMmio();
     reportsDecoderAndFetchFailuresWithoutLosingPc();
     runsSyntheticStartupSliceToBreakpoint();
+    marksCallsAndReturnsAsLoopProofBarriers();
     executesLoadStoreWidthsAndPcPop();
     boundedRunAndDataFaultsAreStructured();
     itAlwaysInstallsConditionBeforeConditionalVfpContextTransfer();

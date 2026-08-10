@@ -154,6 +154,54 @@ void dispatchesMmioIndivisibly() {
     fil::test::check(!crossing && device.read_count == 1, "rejects cross-boundary MMIO before dispatch");
 }
 
+/** @brief Verifies compact memory results preserve values and deep-copy faults. */
+void copiesMemoryResultsSafely() {
+    fil::mem::MemoryResult<std::uint32_t> success{0x12345678U};
+    const auto copied_success = success;
+    fil::test::check(copied_success && copied_success.value() == success.value(),
+                     "copies successful memory results");
+
+    fil::mem::BusFault fault;
+    fault.reason = fil::mem::BusFaultReason::device_error;
+    fault.address = 0x40000010U;
+    fault.region = "device";
+    fault.message = "rejected";
+    fil::mem::MemoryResult<std::uint32_t> failure{fault};
+    auto copied_failure = failure;
+    copied_failure.fault().region = "copy";
+    fil::test::check(!failure && !copied_failure
+                         && failure.fault().region == "device"
+                         && copied_failure.fault().region == "copy",
+                     "deep-copies memory faults");
+
+    success = failure;
+    fil::test::check(!success
+                         && success.fault().reason
+                             == fil::mem::BusFaultReason::device_error,
+                     "copy-assigns failed memory results");
+}
+
+/** @brief Verifies the region cache rechecks mappings that share one slot. */
+void handlesRegionCacheCollisions() {
+    fil::mem::MemoryBus bus;
+    fil::test::check(bus.mapRam(0x20000000U, 16U, "low").hasValue()
+                         && bus.mapRam(0x20ff0000U, 16U, "high").hasValue(),
+                     "maps two regions in one dispatch-cache slot");
+    static_cast<void>(bus.write32(0x20000000U, 0x11223344U));
+    static_cast<void>(bus.write32(0x20ff0000U, 0xaabbccddU));
+
+    bool values_match = true;
+    for (unsigned int iteration = 0; iteration < 4U; ++iteration) {
+        const auto low = bus.read32(0x20000000U);
+        const auto high = bus.read32(0x20ff0000U);
+        values_match = values_match
+            && low && low.value() == 0x11223344U
+            && high && high.value() == 0xaabbccddU;
+    }
+    fil::test::check(values_match,
+                     "cache collisions fall back to the authoritative region map");
+}
+
 /** @brief Verifies map-time overlap, wraparound, and alias validation. */
 void validatesRegionMaps() {
     fil::mem::MemoryBus bus;
@@ -214,6 +262,17 @@ void tracksReversibleLoopMemoryEffects() {
                          && !bus.mmioUnchangedSince(mmio_checkpoint)
                          && !bus.restoreSideEffects(mmio_checkpoint),
                      "rejects rollback after an MMIO access");
+
+    const auto expired_checkpoint = bus.sideEffectCheckpoint();
+    for (std::size_t index = 0; index < 8193U; ++index) {
+        static_cast<void>(bus.write8(
+            0x2000000fU, static_cast<std::uint8_t>((index & 1U) + 1U)
+        ));
+    }
+    fil::test::check(!bus.canRestoreSideEffects(expired_checkpoint)
+                         && !bus.sideEffectsRestoredSince(expired_checkpoint)
+                         && !bus.restoreSideEffects(expired_checkpoint),
+                     "fails closed when a checkpoint exceeds the mutation journal");
 }
 
 void trapsSharedMmioBeforeDeviceSideEffects() {
@@ -330,6 +389,8 @@ void runMemoryBusTests() {
     readsAndWritesBackedMemory();
     reportsStructuredFaults();
     dispatchesMmioIndivisibly();
+    copiesMemoryResultsSafely();
+    handlesRegionCacheCollisions();
     validatesRegionMaps();
     tracksReversibleLoopMemoryEffects();
     trapsSharedMmioBeforeDeviceSideEffects();
