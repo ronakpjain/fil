@@ -1,74 +1,42 @@
 #include "fil/cli/cli.hpp"
-#include "../test_support.hpp"
 
-#include <iostream>
+#include <gtest/gtest.h>
+
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string_view>
 
-/** @brief Runs configuration unit tests defined in config_test.cpp. */
-void runConfigTests();
-/** @brief Runs integrated board execution tests. */
-void runBoardTests();
-/** @brief Runs Cortex-M system-control unit tests. */
-void runCortexMTests();
-/** @brief Runs architectural exception entry/return unit tests. */
-void runExceptionTests();
-/** @brief Runs deterministic virtual CAN bus unit tests. */
-void runCanBusTests();
-/** @brief Runs ELF unit tests defined in elf_loader_test.cpp. */
-void runElfLoaderTests();
-/** @brief Runs deterministic event-loop and trace tests. */
-void runEventLoopTests();
-/** @brief Runs FDCAN controller and message-RAM tests. */
-void runFdcanTests();
-/** @brief Runs memory bus unit tests defined in memory_bus_test.cpp. */
-void runMemoryBusTests();
-/** @brief Runs STM32G4 peripheral model tests. */
-void runPeripheralTests();
-/** @brief Runs integrated STM32G4 MMIO routing tests. */
-void runStm32G4Tests();
-/** @brief Runs the synthetic C-runtime startup integration fixture. */
-void runStartupRuntimeTests();
-/** @brief Runs the hermetic SVC/PendSV/PSP/SysTick firmware fixture. */
-void runSchedulerTickTests();
-/** @brief Runs the compiled Cortex-M4F hard-float firmware fixture. */
-void runHardFloatFirmwareTests();
-/** @brief Runs deterministic multi-board world tests. */
-void runWorldTests();
-/** @brief Runs concurrent virtual-time scheduler regression tests. */
-void runWorldTimeTests();
-
 namespace {
 
 /// @brief Verifies help output and status.
-void helpIsSuccessful() {
+TEST(SmokeTest, HelpIsSuccessful) {
     std::ostringstream out;
     std::ostringstream err;
     const std::string_view args[] = {"--help"};
 
     const auto result = fil::cli::run(args, out, err);
 
-    fil::test::check(result == fil::cli::ExitCode::success, "--help returns success");
-    fil::test::check(out.str().find("Usage:") != std::string::npos, "--help prints usage");
-    fil::test::check(err.str().empty(), "--help does not print an error");
+    EXPECT_TRUE(result == fil::cli::ExitCode::success) << "--help returns success";
+    EXPECT_TRUE(out.str().find("Usage:") != std::string::npos) << "--help prints usage";
+    EXPECT_TRUE(err.str().empty()) << "--help does not print an error";
 }
 
 /// @brief Verifies unknown commands produce a usage error.
-void unknownCommandIsAUsageError() {
+TEST(SmokeTest, UnknownCommandIsAUsageError) {
     std::ostringstream out;
     std::ostringstream err;
     const std::string_view args[] = {"not-a-command"};
 
     const auto result = fil::cli::run(args, out, err);
 
-    fil::test::check(result == fil::cli::ExitCode::usage_error, "unknown command returns usage error");
-    fil::test::check(out.str().empty(), "unknown command does not print normal output");
-    fil::test::check(err.str().find("unknown command") != std::string::npos, "unknown command prints a diagnostic");
+    EXPECT_TRUE(result == fil::cli::ExitCode::usage_error) << "unknown command returns usage error";
+    EXPECT_TRUE(out.str().empty()) << "unknown command does not print normal output";
+    EXPECT_TRUE(err.str().find("unknown command") != std::string::npos)
+        << "unknown command prints a diagnostic";
 }
 
-void disassemblesSyntheticWindow() {
+TEST(SmokeTest, DisassemblesSyntheticWindow) {
     const std::string path = (
         std::filesystem::path(FIL_SOURCE_DIR) / "tests/fixtures/elf/startup_runtime.elf"
     ).string();
@@ -78,15 +46,15 @@ void disassemblesSyntheticWindow() {
     std::ostringstream out;
     std::ostringstream err;
     const auto result = fil::cli::run(args, out, err);
-    fil::test::check(result == fil::cli::ExitCode::success,
-                     "disasm-window decodes a synthetic firmware range");
-    fil::test::check(out.str().find("0x08000008: 480c") != std::string::npos
-                         && out.str().find("ldr") != std::string::npos,
-                     "disasm-window prints addresses, raw encodings, and semantic names");
-    fil::test::check(err.str().empty(), "successful disasm-window has no error output");
+    EXPECT_TRUE(result == fil::cli::ExitCode::success)
+        << "disasm-window decodes a synthetic firmware range";
+    EXPECT_TRUE(out.str().find("0x08000008: 480c") != std::string::npos &&
+                out.str().find("ldr") != std::string::npos)
+        << "disasm-window prints addresses, raw encodings, and semantic names";
+    EXPECT_TRUE(err.str().empty()) << "successful disasm-window has no error output";
 }
 
-void requiresExplicitBreakpointAcceptance() {
+TEST(SmokeTest, RequiresExplicitBreakpointAcceptance) {
     const std::filesystem::path config_path =
         std::filesystem::temp_directory_path() / "fil-cli-breakpoint-test.json";
     const std::filesystem::path mcu =
@@ -109,12 +77,11 @@ void requiresExplicitBreakpointAcceptance() {
     };
     std::ostringstream default_out;
     std::ostringstream default_err;
-    fil::test::check(
-        fil::cli::run(default_args, default_out, default_err) == fil::cli::ExitCode::runtime_error,
-        "run rejects an unrequested firmware BKPT"
-    );
-    fil::test::check(default_err.str().find("breakpoint") != std::string::npos,
-                     "unrequested BKPT produces an explicit diagnostic");
+    EXPECT_TRUE(
+        fil::cli::run(default_args, default_out, default_err) == fil::cli::ExitCode::runtime_error)
+        << "run rejects an unrequested firmware BKPT";
+    EXPECT_TRUE(default_err.str().find("breakpoint") != std::string::npos)
+        << "unrequested BKPT produces an explicit diagnostic";
 
     const std::string_view allowed_args[]{
         "run", config_text, "--duration-ms", "0", "--max-instructions", "20",
@@ -122,46 +89,12 @@ void requiresExplicitBreakpointAcceptance() {
     };
     std::ostringstream allowed_out;
     std::ostringstream allowed_err;
-    fil::test::check(
-        fil::cli::run(allowed_args, allowed_out, allowed_err) == fil::cli::ExitCode::success,
-        "--allow-breakpoint explicitly accepts a firmware BKPT"
-    );
-    fil::test::check(allowed_err.str().empty(),
-                     "an explicitly accepted BKPT has no error diagnostic");
+    EXPECT_TRUE(
+        fil::cli::run(allowed_args, allowed_out, allowed_err) == fil::cli::ExitCode::success)
+        << "--allow-breakpoint explicitly accepts a firmware BKPT";
+    EXPECT_TRUE(allowed_err.str().empty()) << "an explicitly accepted BKPT has no error diagnostic";
     std::error_code remove_error;
     std::filesystem::remove(config_path, remove_error);
 }
 
 } // namespace
-
-/// @brief Runs the dependency-free unit-test executable.
-int main() {
-    helpIsSuccessful();
-    unknownCommandIsAUsageError();
-    disassemblesSyntheticWindow();
-    requiresExplicitBreakpointAcceptance();
-    runConfigTests();
-    runBoardTests();
-    runCortexMTests();
-    runExceptionTests();
-    runCanBusTests();
-    runElfLoaderTests();
-    runEventLoopTests();
-    runFdcanTests();
-    runMemoryBusTests();
-    runPeripheralTests();
-    runStm32G4Tests();
-    runStartupRuntimeTests();
-    runSchedulerTickTests();
-    runHardFloatFirmwareTests();
-    runWorldTests();
-    runWorldTimeTests();
-
-    if (fil::test::failures != 0) {
-        std::cerr << fil::test::failures << " test(s) failed\n";
-        return 1;
-    }
-
-    std::cout << "all tests passed\n";
-    return 0;
-}

@@ -1,5 +1,6 @@
 #include "fil/sim/board.hpp"
-#include "../test_support.hpp"
+
+#include <gtest/gtest.h>
 
 #include <array>
 #include <cstdint>
@@ -30,7 +31,7 @@ std::optional<std::uint32_t> readHardFloatWord(
     return value.value();
 }
 
-void executesCompiledHardFloatFirmware() {
+TEST(HardFloatFirmwareTest, ExecutesCompiledHardFloatFirmware) {
     fil::config::BoardConfig config;
     config.name = "hard-float-firmware";
     config.mcu_path = std::filesystem::path(FIL_SOURCE_DIR)
@@ -40,20 +41,19 @@ void executesCompiledHardFloatFirmware() {
     config.vector_base = 0x08000000U;
 
     auto loaded = fil::sim::Board::load(config, true);
-    fil::test::check(loaded.hasValue(), "loads compiled Cortex-M4F hard-float fixture");
+    EXPECT_TRUE(loaded.hasValue()) << "loads compiled Cortex-M4F hard-float fixture";
     if (!loaded) return;
     auto& board = *loaded.value();
 
     const auto& image = board.image();
     const auto& attributes = image.armAttributes();
-    fil::test::check(image.hardFloatAbi(), "fixture ELF declares the hard-float ABI");
-    fil::test::check(attributes.fp_arch == 6U,
-                     "fixture declares the VFPv4-D16 architecture");
-    fil::test::check(attributes.hard_fp_use == 1U && attributes.vfp_args == 1U,
-                     "fixture declares scalar HardFP use and VFP argument passing");
+    EXPECT_TRUE(image.hardFloatAbi()) << "fixture ELF declares the hard-float ABI";
+    EXPECT_TRUE(attributes.fp_arch == 6U) << "fixture declares the VFPv4-D16 architecture";
+    EXPECT_TRUE(attributes.hard_fp_use == 1U && attributes.vfp_args == 1U)
+        << "fixture declares scalar HardFP use and VFP argument passing";
 
     const auto results = hardFloatSymbol(image, "hard_float_results");
-    fil::test::check(results.has_value(), "hard-float fixture exposes its result array");
+    EXPECT_TRUE(results.has_value()) << "hard-float fixture exposes its result array";
     if (!results) return;
 
     fil::sim::BoardRunOptions options;
@@ -62,10 +62,10 @@ void executesCompiledHardFloatFirmware() {
     options.detect_spin = false;
     const auto result = board.run(options);
 
-    fil::test::check(result.reason != fil::sim::BoardStopReason::unimplemented_instruction,
-                     "compiled hard-float firmware uses no unsupported instruction");
-    fil::test::check(result.reason == fil::sim::BoardStopReason::breakpoint,
-                     "compiled hard-float firmware completes and stops at BKPT");
+    EXPECT_TRUE(result.reason != fil::sim::BoardStopReason::unimplemented_instruction)
+        << "compiled hard-float firmware uses no unsupported instruction";
+    EXPECT_TRUE(result.reason == fil::sim::BoardStopReason::breakpoint)
+        << "compiled hard-float firmware completes and stops at BKPT";
 
     const std::array<std::uint32_t, 4> expected_float_bits{
         0x41700000U, // (1.5 + 2.25) * 4.0 = 15.0
@@ -77,19 +77,15 @@ void executesCompiledHardFloatFirmware() {
         const auto value = board.memory().read32(
             *results + static_cast<std::uint32_t>(index * sizeof(std::uint32_t))
         );
-        fil::test::check(value && value.value() == expected_float_bits[index],
-                         "compiled scalar VFP result has exact binary32 bits");
+        EXPECT_TRUE(value && value.value() == expected_float_bits[index])
+            << "compiled scalar VFP result has exact binary32 bits";
     }
-    fil::test::check(readHardFloatWord(board, "hard_signed_result") == 0xfffffff4U,
-                     "float-to-signed conversion truncates -12.75 to -12");
-    fil::test::check(readHardFloatWord(board, "hard_unsigned_result") == 255U,
-                     "float-to-unsigned conversion truncates 255.75 to 255");
-    fil::test::check(readHardFloatWord(board, "hard_float_complete") == 0xf00dcafeU,
-                     "hard-float main reaches its completion sentinel");
+    EXPECT_TRUE(readHardFloatWord(board, "hard_signed_result") == 0xfffffff4U)
+        << "float-to-signed conversion truncates -12.75 to -12";
+    EXPECT_TRUE(readHardFloatWord(board, "hard_unsigned_result") == 255U)
+        << "float-to-unsigned conversion truncates 255.75 to 255";
+    EXPECT_TRUE(readHardFloatWord(board, "hard_float_complete") == 0xf00dcafeU)
+        << "hard-float main reaches its completion sentinel";
 }
 
 } // namespace
-
-void runHardFloatFirmwareTests() {
-    executesCompiledHardFloatFirmware();
-}

@@ -14,7 +14,7 @@ support boundary.
 ## Build and test
 
 Requirements: CMake 3.20+, a C++20 compiler, and a CMake-supported build tool such
-as Ninja.
+as Ninja. Test builds also require an installed GoogleTest CMake package.
 
 ```bash
 cmake -S . -B build -G Ninja -DFIL_BUILD_TESTS=ON

@@ -1,7 +1,8 @@
 # Testing
 
 The required suite is hermetic: it uses committed synthetic Cortex-M4F fixtures and
-does not require the external PER repository or an ARM toolchain.
+does not require the external PER repository or an ARM toolchain. It uses the
+installed GoogleTest CMake package; CTest discovers each test case independently.
 
 ## Required suite
 
@@ -56,11 +57,9 @@ LLVM_PROFILE_FILE='/tmp/fil-%p.profraw' \
 llvm-profdata merge -sparse /tmp/fil-*.profraw -o /tmp/fil.profdata
 llvm-cov report \
   ./build-coverage/tests/fil_tests \
-  ./build-coverage/tests/fil_cpu_tests \
-  ./build-coverage/tests/fil_can_end_to_end_tests \
   ./build-coverage/fil \
   -instr-profile=/tmp/fil.profdata \
-  -ignore-filename-regex='(/tests/|/usr/)'
+  -ignore-filename-regex='(/tests/|/usr/|/Library/|/opt/homebrew/)'
 ```
 
 On macOS, prefix the LLVM tools with `xcrun`. Coverage percentages are diagnostic,
