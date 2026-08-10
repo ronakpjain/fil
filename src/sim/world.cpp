@@ -278,6 +278,9 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
         std::uint64_t same_time_dispatches{0};
     };
     std::vector<SchedulerState> states(boards_.size());
+    std::vector<Board*> lane_boards;
+    lane_boards.reserve(boards_.size());
+    for (const auto& entry : boards_) lane_boards.push_back(entry->board.get());
     std::vector<std::uint64_t> planned_iterations(boards_.size(), 0U);
     std::vector<Board::ConcurrentStepResult> burst_steps(boards_.size());
     std::unique_ptr<LaneWorkerPool> worker_pool;
@@ -459,8 +462,11 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
             }
 
             std::optional<Board::ProvenLoop> observed_loop;
-            if (board.cpu().state().r[15]
-                <= completed.cpu_result.instruction_address) {
+            // Keep this cheap gate at the hot call site. observeLoopBoundary()
+            // repeats it as a defensive check for less frequent callers.
+            if (!completed.cpu_result.suppress_loop_observation
+                && board.cpu().state().r[15]
+                    <= completed.cpu_result.instruction_address) {
                 observed_loop = board.observeLoopBoundary(
                     completed.cpu_result,
                     board_output.result.instructions,
@@ -548,20 +554,19 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
             ++output.lockstep_bursts;
             for (; completed_rounds < 64U; ++completed_rounds) {
                 const SimTimeNs round_start = event_loop_.now();
-                const SimTimeNs elapsed = boards_.front()->board->nextInstructionElapsedNs();
+                const SimTimeNs elapsed = lane_boards.front()->nextInstructionElapsedNs();
                 if (elapsed == 0U
                     || (deadline != 0U && elapsed > deadline - round_start)) break;
                 bool same_elapsed = true;
                 for (std::size_t index = 1; index < boards_.size(); ++index) {
                     same_elapsed = same_elapsed
-                        && boards_[index]->board->nextInstructionElapsedNs() == elapsed;
+                        && lane_boards[index]->nextInstructionElapsedNs() == elapsed;
                 }
                 if (!same_elapsed) break;
 
                 for (std::size_t index = 0; index < boards_.size(); ++index) {
                     auto owner_scope = event_loop_.useOwner(static_cast<EventOwner>(index));
-                    burst_steps[index] =
-                        boards_[index]->board->beginConcurrentStep(false);
+                    burst_steps[index] = lane_boards[index]->beginConcurrentStep(false);
                     ++output.dispatches;
                     ++output.exact_dispatches;
                 }
@@ -584,7 +589,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
 
                 bool leave_burst = events.events_executed != 0U;
                 for (std::size_t index = 0; index < boards_.size(); ++index) {
-                    Board& board = *boards_[index]->board;
+                    Board& board = *lane_boards[index];
                     WorldBoardRunResult& board_output = output.boards[index];
                     const cpu::FastStepResult& step = burst_steps[index].cpu_result;
                     if (step.reason != cpu::StopReason::step_complete) [[unlikely]] {
@@ -644,7 +649,9 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                     }
 
                     std::optional<Board::ProvenLoop> observed;
-                    if (board.cpu().state().r[15] <= step.instruction_address) {
+                    // Avoid entering the proof machinery for ordinary forward flow.
+                    if (!step.suppress_loop_observation
+                        && board.cpu().state().r[15] <= step.instruction_address) {
                         observed = board.observeLoopBoundary(
                             step, board_output.result.instructions,
                             board_output.result.cycles
@@ -785,14 +792,14 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
             // monopolize a timestamp. The user quantum caps each same-time burst;
             // ordinary positive-duration instructions naturally yield every step.
             std::fill(planned_iterations.begin(), planned_iterations.end(), 0U);
-            bool safe_loop_mode = options.enable_loop_batching
+            bool can_batch_all_lanes = options.enable_loop_batching
                 && !options.trace_instructions && !options.detect_spin;
-            bool saw_runnable = false;
-            std::optional<SimTimeNs> safe_horizon;
-            if (deadline != 0U) safe_horizon = deadline;
+            bool has_runnable_lane = false;
+            std::optional<SimTimeNs> batch_horizon;
+            if (deadline != 0U) batch_horizon = deadline;
             if (const auto event_time = event_loop_.nextScheduledTime()) {
-                if (!safe_horizon || *event_time < *safe_horizon) {
-                    safe_horizon = *event_time;
+                if (!batch_horizon || *event_time < *batch_horizon) {
+                    batch_horizon = *event_time;
                 }
             }
 
@@ -800,38 +807,39 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
             // serviceable interrupt or shared event, the lane cannot affect a
             // different board. Lanes need not land on the same loop boundary;
             // they only need to stay behind the earliest observable frontier.
-            for (std::size_t index = 0; index < boards_.size() && safe_loop_mode; ++index) {
+            for (std::size_t index = 0;
+                 index < boards_.size() && can_batch_all_lanes;
+                 ++index) {
                 SchedulerState& state = states[index];
                 if (!state.runnable) continue;
-                saw_runnable = true;
+                has_runnable_lane = true;
                 Board& board = *boards_[index]->board;
                 if (!state.inside_proven_loop || !state.proven_loop
                     || !board.loopHasNoMmioSince(*state.proven_loop)) {
-                    safe_loop_mode = false;
+                    can_batch_all_lanes = false;
                     break;
                 }
 
                 const SimTimeNs lane_boundary = state.in_flight
                     ? state.ready_time_ns : now;
                 if (const auto observable = board.nextObservableTime(lane_boundary)) {
-                    if (!safe_horizon || *observable < *safe_horizon) {
-                        safe_horizon = *observable;
+                    if (!batch_horizon || *observable < *batch_horizon) {
+                        batch_horizon = *observable;
                     }
                 }
             }
-            safe_loop_mode = safe_loop_mode && saw_runnable
-                && (!safe_horizon || *safe_horizon > now);
+            can_batch_all_lanes = can_batch_all_lanes && has_runnable_lane
+                && (!batch_horizon || *batch_horizon > now);
 
-            if (safe_loop_mode) {
+            if (can_batch_all_lanes) {
                 for (std::size_t index = 0; index < boards_.size(); ++index) {
                     SchedulerState& state = states[index];
                     if (!state.runnable || state.in_flight || !state.proven_loop) continue;
                     Board& board = *boards_[index]->board;
-                    if (!board.loopProofStillValid(*state.proven_loop)) continue;
                     const std::uint64_t remaining = options.max_instructions_per_board
                         - output.boards[index].result.instructions;
                     planned_iterations[index] = board.maximumLoopIterations(
-                        *state.proven_loop, remaining, safe_horizon
+                        *state.proven_loop, remaining, batch_horizon
                     );
                 }
             }

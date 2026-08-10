@@ -252,6 +252,7 @@ std::optional<Board::ProvenLoop> Board::observeLoopBoundary(
 ) {
     const std::uint32_t boundary_pc = cpu_->state().r[15];
     if (step.reason != cpu::StopReason::step_complete
+        || step.suppress_loop_observation
         || boundary_pc > step.instruction_address) {
         return std::nullopt;
     }
@@ -267,8 +268,8 @@ std::optional<Board::ProvenLoop> Board::observeLoopBoundary(
     if (observation.valid
         && observation.generation == loop_observation_generation_
         && observation.boundary_pc == boundary_pc
-        && memory_.sideEffectsRestoredSince(observation.side_effect_checkpoint)
         && sameCpuState(observation.state, cpu_->state())
+        && memory_.sideEffectsRestoredSince(observation.side_effect_checkpoint)
         && logical_instructions > observation.instructions
         && logical_cycles > observation.cycles) {
         ProvenLoop loop{
@@ -719,7 +720,10 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
             );
             break;
         }
-        if (!options.enable_loop_batching || options.trace_instructions) continue;
+        if (!options.enable_loop_batching || options.trace_instructions
+            || options.detect_spin) {
+            continue;
+        }
 
         std::optional<SimTimeNs> horizon;
         if (deadline != 0U) horizon = deadline;

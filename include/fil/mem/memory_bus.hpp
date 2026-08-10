@@ -78,13 +78,13 @@ private:
     std::unique_ptr<BusFault> fault_;
 };
 
-/** @brief Interface implemented by target peripheral register blocks. */
 /** @brief Visibility of an MMIO access to independently executing board lanes. */
 enum class MmioDomain {
     board_local,
     shared,
 };
 
+/** @brief Interface implemented by target peripheral register blocks. */
 class MmioDevice {
 public:
     /** @brief Allows polymorphic destruction through the interface. */

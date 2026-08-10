@@ -133,6 +133,7 @@ struct FastStepResult {
     std::uint8_t instruction_size{0};
     std::uint8_t instructions{0};
     std::uint8_t cycles{0};
+    bool suppress_loop_observation{false};
 };
 
 /** @brief Minimal deterministic Cortex-M4 Thumb interpreter. */
@@ -176,7 +177,7 @@ private:
         std::uint8_t size{0};
     };
 
-    static constexpr std::size_t instruction_cache_entries = 8192U;
+    static constexpr std::size_t instruction_cache_entries = 16384U;
 
     [[nodiscard]] StopReason execute(
         const DecodedInstruction& instruction,
