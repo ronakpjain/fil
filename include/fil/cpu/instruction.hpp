@@ -8,6 +8,21 @@
 
 namespace fil::cpu {
 
+/** @brief Tests whether a value is an ARMv7-M EXC_RETURN token. */
+[[nodiscard]] constexpr bool isExceptionReturn(const std::uint32_t value) noexcept {
+    switch (value) {
+    case 0xfffffff1U:
+    case 0xfffffff9U:
+    case 0xfffffffdU:
+    case 0xffffffe1U:
+    case 0xffffffe9U:
+    case 0xffffffedU:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /** @brief ARM condition-code encodings. */
 enum class Condition : std::uint8_t {
     eq = 0x0,

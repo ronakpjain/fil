@@ -1,8 +1,6 @@
 #include "fil/cortexm/system_control.hpp"
 
-#include <algorithm>
 #include <bit>
-#include <limits>
 #include <string>
 
 namespace fil::cortexm {
@@ -10,11 +8,6 @@ namespace {
 
 constexpr std::uint32_t system_base = 0xe0000000U;
 constexpr std::uint32_t cpuid_value = 0x410fc241U;
-
-std::uint32_t widthMask(const mem::AccessSize size) {
-    const std::uint32_t bits = mem::byteCount(size) * 8U;
-    return bits == 32U ? std::numeric_limits<std::uint32_t>::max() : (std::uint32_t{1} << bits) - 1U;
-}
 
 } // namespace
 
@@ -382,7 +375,8 @@ mem::MemoryResult<std::uint64_t> SystemControl::read(
     }
     const std::uint32_t lane = offset & 3U;
     const std::uint32_t value = readWord(offset & ~3U);
-    return static_cast<std::uint64_t>((value >> (lane * 8U)) & widthMask(size));
+    return (value >> (lane * 8U))
+        & static_cast<std::uint32_t>(mem::accessWidthMask(size));
 }
 
 mem::MemoryResult<std::uint64_t> SystemControl::write(
@@ -396,7 +390,8 @@ mem::MemoryResult<std::uint64_t> SystemControl::write(
         return accessFault(offset, size, context, "unsupported or cross-register system-control write");
     }
     const std::uint32_t shift = (offset & 3U) * 8U;
-    const std::uint32_t mask = widthMask(size) << shift;
+    const std::uint32_t mask =
+        static_cast<std::uint32_t>(mem::accessWidthMask(size)) << shift;
     writeWord(offset & ~3U, static_cast<std::uint32_t>(value) << shift, mask);
     return std::uint64_t{0};
 }

@@ -1,5 +1,7 @@
 #include "fil/config/config.hpp"
 
+#include "fil/common/format.hpp"
+
 #include <charconv>
 #include <cctype>
 #include <fstream>
@@ -737,19 +739,6 @@ Result<std::vector<SpiConfig>> parseSpi(
             config.device = std::move(parsed).value();
         }
         result.push_back(std::move(config));
-    }
-    return result;
-}
-
-/// @brief Formats a 32-bit config value as fixed-width hexadecimal.
-std::string hex32(const std::uint32_t value) {
-    constexpr char digits[] = "0123456789abcdef";
-    std::string result(10, '0');
-    result[0] = '0';
-    result[1] = 'x';
-    for (std::size_t index = 0; index < 8; ++index) {
-        const unsigned int shift = static_cast<unsigned int>((7U - index) * 4U);
-        result[index + 2] = digits[(value >> shift) & 0xfU];
     }
     return result;
 }

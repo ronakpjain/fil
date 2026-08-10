@@ -1,14 +1,12 @@
 #include "fil/mem/mmio_router.hpp"
 
+#include "fil/common/numeric.hpp"
+
 #include <algorithm>
 #include <utility>
 
 namespace fil::mem {
 namespace {
-
-bool validRange(const std::uint32_t base, const std::uint32_t size, const std::uint32_t limit) {
-    return size != 0 && base <= limit && size <= limit - base;
-}
 
 Error routeError(std::string message) {
     return Error{ErrorCategory::invalid_argument, std::move(message), std::nullopt};
@@ -34,7 +32,7 @@ Result<void> MmioRouter::map(
     MmioDevice& device,
     std::string name
 ) {
-    if (!validRange(offset, size, window_size_)) {
+    if (size == 0U || !rangeFits(offset, size, window_size_)) {
         return routeError("MMIO route '" + name + "' has an empty or out-of-window range");
     }
     const std::uint64_t end = static_cast<std::uint64_t>(offset) + size;
@@ -71,7 +69,7 @@ MmioDomain MmioRouter::domain(
     const std::uint32_t offset, const AccessSize size
 ) const noexcept {
     const std::uint32_t width = byteCount(size);
-    if (!validRange(offset, width, window_size_)) return MmioDomain::board_local;
+    if (!rangeFits(offset, width, window_size_)) return MmioDomain::board_local;
     const Route* const route = find(offset, width);
     if (route == nullptr) return MmioDomain::board_local;
     return route->device->domain(offset - route->offset, size);
@@ -112,7 +110,7 @@ MemoryResult<std::uint64_t> MmioRouter::read(
     const AccessContext& context
 ) {
     const std::uint32_t width = byteCount(size);
-    if (!validRange(offset, width, window_size_)) {
+    if (!rangeFits(offset, width, window_size_)) {
         return fault(offset, size, context, "MMIO read is outside the router window");
     }
     if (const Route* route = find(offset, width)) {
@@ -136,7 +134,7 @@ MemoryResult<std::uint64_t> MmioRouter::write(
     const AccessContext& context
 ) {
     const std::uint32_t width = byteCount(size);
-    if (!validRange(offset, width, window_size_)) {
+    if (!rangeFits(offset, width, window_size_)) {
         return fault(offset, size, context, "MMIO write is outside the router window");
     }
     if (const Route* route = find(offset, width)) {

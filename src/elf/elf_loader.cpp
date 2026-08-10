@@ -1,8 +1,10 @@
 #include "fil/elf/elf_loader.hpp"
 
+#include "fil/common/format.hpp"
+#include "fil/common/numeric.hpp"
+
 #include <algorithm>
 #include <fstream>
-#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <string_view>
@@ -21,11 +23,6 @@ constexpr std::uint8_t symbol_type_function = 2;
 /// @brief Creates a source-associated ELF parse error.
 Error elfError(const std::filesystem::path& path, std::string message) {
     return Error{ErrorCategory::parse, std::move(message), SourceContext{path, 0, 0}};
-}
-
-/// @brief Checks a host-size range without overflow.
-bool rangeFits(const std::size_t offset, const std::size_t size, const std::size_t total) {
-    return offset <= total && size <= total - offset;
 }
 
 /// @brief Checks a target address range without 32-bit wraparound.
@@ -477,25 +474,14 @@ Result<void> validateFileBackedOverlap(
             if (file[candidate_offset] != file[other_offset]) {
                 return elfError(
                     path,
-                    "PT_LOAD file ranges overlap with different bytes at load address 0x"
-                        + [&address] {
-                            std::ostringstream output;
-                            output << std::hex << address;
-                            return output.str();
-                        }()
-                        + " (new segment and segment " + std::to_string(index) + ")"
+                    "PT_LOAD file ranges overlap with different bytes at load address "
+                        + hexValue(address) + " (new segment and segment "
+                        + std::to_string(index) + ")"
                 );
             }
         }
     }
     return {};
-}
-
-/// @brief Formats a target value as fixed-width hexadecimal.
-std::string hex(const std::uint32_t value) {
-    std::ostringstream output;
-    output << "0x" << std::hex << std::setfill('0') << std::setw(8) << value;
-    return output.str();
 }
 
 /// @brief Formats ELF segment permission flags as RWX text.
@@ -716,21 +702,21 @@ std::string inspect(const ElfImage& image, const std::filesystem::path& path) {
            << "class: ELF32\n"
            << "endian: little\n"
            << "machine: ARM\n"
-           << "entry: " << hex(image.entryPoint()) << '\n'
+           << "entry: " << hex32(image.entryPoint()) << '\n'
            << "abi: EABI" << ((image.flags() >> 24U) & 0xffU)
            << (image.hardFloatAbi() ? " hard-float" : " soft-float-or-unspecified") << '\n'
            << "load segments:\n";
     for (const ElfLoadSegment& segment : image.segments()) {
-        output << "  vaddr=" << hex(segment.virtual_address)
-               << " paddr=" << hex(segment.physical_address)
+        output << "  vaddr=" << hex32(segment.virtual_address)
+               << " paddr=" << hex32(segment.physical_address)
                << " mem=" << segment.memory_size
                << " file=" << segment.file_size
-               << " offset=" << hex(segment.file_offset)
+               << " offset=" << hex32(segment.file_offset)
                << " " << permissions(segment) << '\n';
     }
-    output << "vector table: " << hex(image.vectorBase()) << '\n'
-           << "initial MSP: " << hex(image.initialMsp()) << '\n'
-           << "reset handler: " << hex(image.resetHandler()) << '\n'
+    output << "vector table: " << hex32(image.vectorBase()) << '\n'
+           << "initial MSP: " << hex32(image.initialMsp()) << '\n'
+           << "reset handler: " << hex32(image.resetHandler()) << '\n'
            << "symbols: " << image.symbols().size() << '\n';
 
     const ArmAttributes& attributes = image.armAttributes();

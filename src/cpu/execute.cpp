@@ -41,20 +41,6 @@ void setNzcv(CpuState& state, const AddResult& result) noexcept {
         || kind == InstrKind::strd;
 }
 
-[[nodiscard]] bool isExceptionReturn(const std::uint32_t value) noexcept {
-    switch (value) {
-    case 0xfffffff1U:
-    case 0xfffffff9U:
-    case 0xfffffffdU:
-    case 0xffffffe1U:
-    case 0xffffffe9U:
-    case 0xffffffedU:
-        return true;
-    default:
-        return false;
-    }
-}
-
 [[nodiscard]] std::uint32_t branchTarget(
     const CpuState& state,
     const std::int32_t offset

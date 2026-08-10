@@ -34,14 +34,6 @@ BusFault makeFault(
     return BusFault{reason, address, size, context, std::move(region), std::move(message)};
 }
 
-/** @brief Returns a width mask without shifting by 64 bits. */
-std::uint64_t widthMask(const AccessSize size) {
-    if (size == AccessSize::doubleword) {
-        return std::numeric_limits<std::uint64_t>::max();
-    }
-    return (std::uint64_t{1} << (byteCount(size) * 8U)) - 1U;
-}
-
 } // namespace
 
 struct MemoryBus::Region {
@@ -304,7 +296,7 @@ MemoryResult<std::uint64_t> MemoryBus::read(
             result.fault().region = region->info.name;
         }
         if (result) {
-            result.value() &= widthMask(size);
+            result.value() &= accessWidthMask(size);
         }
         return result;
     }
@@ -372,7 +364,9 @@ MemoryResult<std::uint64_t> MemoryBus::write(
         }
         ++side_effect_generation_;
         ++mmio_generation_;
-        auto result = region->device->write(offset, size, value & widthMask(size), context);
+        auto result = region->device->write(
+            offset, size, value & accessWidthMask(size), context
+        );
         if (!result && result.fault().region.empty()) {
             result.fault().region = region->info.name;
         }

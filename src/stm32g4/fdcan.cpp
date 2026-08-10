@@ -1,8 +1,9 @@
 #include "fil/stm32g4/fdcan.hpp"
 
+#include "fil/common/numeric.hpp"
+
 #include <algorithm>
 #include <array>
-#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -57,18 +58,6 @@ constexpr std::array<std::uint32_t, 7> interrupt_groups{
     0x030000U, // error logging and passive state
     0xfc0000U, // warning, bus-off, watchdog, protocol/access errors
 };
-
-bool validAccessSize(const mem::AccessSize size) noexcept {
-    const std::uint32_t width = mem::byteCount(size);
-    return width == 1U || width == 2U || width == 4U || width == 8U;
-}
-
-std::uint64_t widthMask(const mem::AccessSize size) noexcept {
-    if (size == mem::AccessSize::doubleword) {
-        return std::numeric_limits<std::uint64_t>::max();
-    }
-    return (std::uint64_t{1} << (mem::byteCount(size) * 8U)) - 1U;
-}
 
 unsigned int checkedControllerIndex(const unsigned int instance_number) {
     if (instance_number == 0U || instance_number > FdcanMessageRam::controllerCount) {
@@ -136,7 +125,7 @@ mem::MemoryResult<std::uint64_t> FdcanMessageRam::read(const std::uint32_t offse
                                                        const mem::AccessSize size,
                                                        const mem::AccessContext& context) {
     const std::uint32_t width = mem::byteCount(size);
-    if (!validAccessSize(size) || offset > sizeBytes || width > sizeBytes - offset) {
+    if (!mem::validAccessSize(size) || !rangeFits(offset, width, sizeBytes)) {
         return fault(offset, size, context, "FDCAN message RAM read is outside the shared RAM");
     }
 
@@ -144,7 +133,7 @@ mem::MemoryResult<std::uint64_t> FdcanMessageRam::read(const std::uint32_t offse
     for (std::uint32_t index = 0; index < width; ++index) {
         value |= static_cast<std::uint64_t>(bytes_[offset + index]) << (index * 8U);
     }
-    return value & widthMask(size);
+    return value & mem::accessWidthMask(size);
 }
 
 mem::MemoryResult<std::uint64_t> FdcanMessageRam::write(const std::uint32_t offset,
@@ -152,7 +141,7 @@ mem::MemoryResult<std::uint64_t> FdcanMessageRam::write(const std::uint32_t offs
                                                         const std::uint64_t value,
                                                         const mem::AccessContext& context) {
     const std::uint32_t width = mem::byteCount(size);
-    if (!validAccessSize(size) || offset > sizeBytes || width > sizeBytes - offset) {
+    if (!mem::validAccessSize(size) || !rangeFits(offset, width, sizeBytes)) {
         return fault(offset, size, context, "FDCAN message RAM write is outside the shared RAM");
     }
 

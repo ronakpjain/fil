@@ -5,6 +5,7 @@
  */
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
 
@@ -62,6 +63,30 @@ struct BusFault {
  */
 [[nodiscard]] constexpr std::uint32_t byteCount(const AccessSize size) noexcept {
     return static_cast<std::uint32_t>(size);
+}
+
+/** @brief Tests whether a value names a supported indivisible access width. */
+[[nodiscard]] constexpr bool validAccessSize(const AccessSize size) noexcept {
+    switch (size) {
+    case AccessSize::byte:
+    case AccessSize::halfword:
+    case AccessSize::word:
+    case AccessSize::doubleword:
+        return true;
+    }
+    return false;
+}
+
+/** @brief Returns a low-bit mask for an access width. */
+[[nodiscard]] constexpr std::uint64_t accessWidthMask(
+    const AccessSize size
+) noexcept {
+    if (size == AccessSize::doubleword) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return validAccessSize(size)
+        ? (std::uint64_t{1} << (byteCount(size) * 8U)) - 1U
+        : 0U;
 }
 
 /**

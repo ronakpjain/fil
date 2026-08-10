@@ -125,8 +125,7 @@ Result<bool> ExceptionController::enterPending(cpu::CpuState& state) {
 }
 
 bool ExceptionController::isExceptionReturn(const std::uint32_t value) noexcept {
-    return value == 0xfffffff1U || value == 0xfffffff9U || value == 0xfffffffdU
-        || value == 0xffffffe1U || value == 0xffffffe9U || value == 0xffffffedU;
+    return cpu::isExceptionReturn(value);
 }
 
 Result<void> ExceptionController::exceptionReturn(

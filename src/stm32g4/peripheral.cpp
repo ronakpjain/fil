@@ -1,32 +1,15 @@
 #include "fil/stm32g4/peripheral.hpp"
 
+#include "fil/common/format.hpp"
+#include "fil/common/numeric.hpp"
+
 #include <array>
-#include <iomanip>
 #include <limits>
-#include <sstream>
 #include <stdexcept>
 #include <utility>
 
 namespace fil::stm32g4 {
 namespace {
-
-bool validAccessSize(const mem::AccessSize size) noexcept {
-    const std::uint32_t width = mem::byteCount(size);
-    return width == 1U || width == 2U || width == 4U || width == 8U;
-}
-
-std::uint64_t widthMask(const mem::AccessSize size) noexcept {
-    if (size == mem::AccessSize::doubleword) {
-        return std::numeric_limits<std::uint64_t>::max();
-    }
-    return (std::uint64_t{1} << (mem::byteCount(size) * 8U)) - 1U;
-}
-
-std::string hexadecimal(const std::uint64_t value) {
-    std::ostringstream output;
-    output << "0x" << std::hex << value;
-    return output.str();
-}
 
 std::string qualifiedTraceSource(
     const std::string_view prefix,
@@ -88,7 +71,7 @@ mem::MemoryResult<std::uint64_t> RegisterPeripheral::read(
     const mem::AccessContext& context
 ) {
     const std::uint32_t width = mem::byteCount(size);
-    if (!validAccessSize(size) || offset > block_size_ || width > block_size_ - offset) {
+    if (!mem::validAccessSize(size) || !rangeFits(offset, width, block_size_)) {
         return accessFault(offset, size, context, "peripheral register read is outside the register block");
     }
 
@@ -113,7 +96,7 @@ mem::MemoryResult<std::uint64_t> RegisterPeripheral::read(
         const std::uint64_t byte = (cached_values[cache_index] >> shift) & 0xffU;
         value |= byte << (byte_index * 8U);
     }
-    return value & widthMask(size);
+    return value & mem::accessWidthMask(size);
 }
 
 mem::MemoryResult<std::uint64_t> RegisterPeripheral::write(
@@ -123,7 +106,7 @@ mem::MemoryResult<std::uint64_t> RegisterPeripheral::write(
     const mem::AccessContext& context
 ) {
     const std::uint32_t width = mem::byteCount(size);
-    if (!validAccessSize(size) || offset > block_size_ || width > block_size_ - offset) {
+    if (!mem::validAccessSize(size) || !rangeFits(offset, width, block_size_)) {
         return accessFault(offset, size, context, "peripheral register write is outside the register block");
     }
 
@@ -282,10 +265,10 @@ void UnknownMmioDevice::traceAccess(const PeripheralAccess& access) {
         trace_source_,
         access.write ? "unknown_mmio_write" : "unknown_mmio_read",
         {
-            {"offset", hexadecimal(access.offset)},
+            {"offset", hexValue(access.offset)},
             {"size", std::to_string(mem::byteCount(access.size))},
-            {"value", hexadecimal(access.value)},
-            {"pc", hexadecimal(access.pc)},
+            {"value", hexValue(access.value)},
+            {"pc", hexValue(access.pc)},
         }
     ));
 }
@@ -295,7 +278,7 @@ mem::MemoryResult<std::uint64_t> UnknownMmioDevice::read(
     const mem::AccessSize size,
     const mem::AccessContext& context
 ) {
-    if (!validAccessSize(size)) {
+    if (!mem::validAccessSize(size)) {
         return fault(offset, size, context, "unknown MMIO read has an invalid width");
     }
     const std::uint32_t width = mem::byteCount(size);
@@ -326,7 +309,7 @@ mem::MemoryResult<std::uint64_t> UnknownMmioDevice::write(
     const std::uint64_t value,
     const mem::AccessContext& context
 ) {
-    if (!validAccessSize(size)) {
+    if (!mem::validAccessSize(size)) {
         return fault(offset, size, context, "unknown MMIO write has an invalid width");
     }
     const std::uint32_t width = mem::byteCount(size);
@@ -334,7 +317,10 @@ mem::MemoryResult<std::uint64_t> UnknownMmioDevice::write(
         return fault(offset, size, context, "unknown MMIO write wraps the address space");
     }
 
-    const PeripheralAccess access{currentTime(), true, offset, size, value & widthMask(size), context.pc};
+    const PeripheralAccess access{
+        currentTime(), true, offset, size,
+        value & mem::accessWidthMask(size), context.pc,
+    };
     accesses_.push_back(access);
     traceAccess(access);
     if (strict_) {
