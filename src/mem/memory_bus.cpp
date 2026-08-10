@@ -287,9 +287,17 @@ MemoryResult<std::uint64_t> MemoryBus::read(
         return read(translated, size, context, alias_depth + 1U);
     }
     if (region->info.kind == RegionKind::mmio) {
+        const std::uint32_t offset = address - region->info.base;
+        if (trap_all_mmio_ || (trap_shared_mmio_
+            && region->device->domain(offset, size) == MmioDomain::shared)) {
+            return makeFault(
+                BusFaultReason::synchronization_required, address, size, context,
+                region->info.name, "MMIO access requires coordinator synchronization"
+            );
+        }
         ++side_effect_generation_;
         ++mmio_generation_;
-        auto result = region->device->read(address - region->info.base, size, context);
+        auto result = region->device->read(offset, size, context);
         if (!result && result.fault().region.empty()) {
             result.fault().region = region->info.name;
         }
@@ -349,9 +357,17 @@ MemoryResult<std::uint64_t> MemoryBus::write(
         return write(translated, size, value, context, alias_depth + 1U);
     }
     if (region->info.kind == RegionKind::mmio) {
+        const std::uint32_t offset = address - region->info.base;
+        if (trap_all_mmio_ || (trap_shared_mmio_
+            && region->device->domain(offset, size) == MmioDomain::shared)) {
+            return makeFault(
+                BusFaultReason::synchronization_required, address, size, context,
+                region->info.name, "MMIO access requires coordinator synchronization"
+            );
+        }
         ++side_effect_generation_;
         ++mmio_generation_;
-        auto result = region->device->write(address - region->info.base, size, value & widthMask(size), context);
+        auto result = region->device->write(offset, size, value & widthMask(size), context);
         if (!result && result.fault().region.empty()) {
             result.fault().region = region->info.name;
         }
@@ -486,6 +502,40 @@ bool MemoryBus::sideEffectsRestoredSince(const SideEffectCheckpoint checkpoint) 
         const std::size_t offset = current.address - region->info.base;
         if (region->bytes[offset] != current.old_value) return false;
     }
+    return true;
+}
+
+bool MemoryBus::canRestoreSideEffects(
+    const SideEffectCheckpoint checkpoint
+) const noexcept {
+    return checkpoint.mmio_generation == mmio_generation_
+        && checkpoint.mutation_sequence <= mutation_sequence_
+        && mutation_sequence_ - checkpoint.mutation_sequence
+            <= mutation_journal_capacity;
+}
+
+bool MemoryBus::restoreSideEffects(const SideEffectCheckpoint checkpoint) {
+    if (!canRestoreSideEffects(checkpoint)) return false;
+
+    bool executable_changed = false;
+    for (std::uint64_t sequence = mutation_sequence_;
+         sequence > checkpoint.mutation_sequence; --sequence) {
+        BackedMutation& mutation =
+            mutation_journal_[(sequence - 1U) % mutation_journal_capacity];
+        if (mutation.sequence != sequence) return false;
+        Region* const region = find(mutation.address);
+        if (region == nullptr || region->info.kind == RegionKind::mmio
+            || region->info.kind == RegionKind::alias) {
+            return false;
+        }
+        const std::size_t offset = mutation.address - region->info.base;
+        region->bytes[offset] = mutation.old_value;
+        executable_changed = executable_changed || region->info.executable;
+        mutation = {};
+    }
+    mutation_sequence_ = checkpoint.mutation_sequence;
+    ++side_effect_generation_;
+    if (executable_changed) ++execution_generation_;
     return true;
 }
 

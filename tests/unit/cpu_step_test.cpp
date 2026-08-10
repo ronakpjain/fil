@@ -14,6 +14,26 @@ namespace {
 constexpr std::uint32_t flash_base = 0x08000000U;
 constexpr std::uint32_t ram_base = 0x20000000U;
 
+class SharedMmio final : public fil::mem::MmioDevice {
+public:
+    fil::mem::MemoryResult<std::uint64_t> read(
+        std::uint32_t, fil::mem::AccessSize, const fil::mem::AccessContext&
+    ) override { return std::uint64_t{0}; }
+    fil::mem::MemoryResult<std::uint64_t> write(
+        std::uint32_t, fil::mem::AccessSize, std::uint64_t,
+        const fil::mem::AccessContext&
+    ) override {
+        ++writes;
+        return std::uint64_t{0};
+    }
+    std::string_view name() const noexcept override { return "shared-mmio"; }
+    fil::mem::MmioDomain domain(
+        std::uint32_t, fil::mem::AccessSize
+    ) const noexcept override { return fil::mem::MmioDomain::shared; }
+
+    unsigned int writes{0};
+};
+
 [[nodiscard]] std::vector<std::uint8_t> halfwords(
     const std::initializer_list<std::uint16_t> words
 ) {
@@ -124,6 +144,31 @@ void invalidatesDecodedInstructionsAfterExecutableWrites() {
         cpu.step().reason == fil::cpu::StopReason::step_complete && cpu.state().r[0] == 2U,
         "executable write invalidates decoded instruction cache"
     );
+}
+
+void yieldsAndRestartsBeforeSharedMmio() {
+    auto bus = basicBus();
+    SharedMmio device;
+    fil::test::check(bus.mapMmio(0x40000000U, 0x100U, device, "shared").hasValue()
+                         && bus.loadBytes(flash_base, halfwords({0x6008U})).hasValue(),
+                     "maps shared MMIO store fixture");
+    fil::cpu::CortexM4 cpu(bus);
+    prepare(cpu);
+    cpu.state().r[0] = 0x12345678U;
+    cpu.state().r[1] = 0x40000000U;
+
+    bus.setSharedMmioTrapping(true);
+    const auto trapped = cpu.stepFast();
+    fil::test::check(trapped.reason == fil::cpu::StopReason::synchronization_required
+                         && trapped.instructions == 0U && trapped.cycles == 0U
+                         && cpu.state().r[15] == flash_base && device.writes == 0U,
+                     "CPU restores its pre-instruction state at shared MMIO");
+
+    bus.setSharedMmioTrapping(false);
+    const auto committed = cpu.stepFast();
+    fil::test::check(committed.reason == fil::cpu::StopReason::step_complete
+                         && cpu.state().r[15] == flash_base + 2U && device.writes == 1U,
+                     "coordinator can restart and commit the trapped instruction once");
 }
 
 void reportsDecoderAndFetchFailuresWithoutLosingPc() {
@@ -563,6 +608,7 @@ void runCpuStepTests() {
     runsFromMaterializedElfResetVector();
     fetchesSixteenAndThirtyTwoBitInstructions();
     invalidatesDecodedInstructionsAfterExecutableWrites();
+    yieldsAndRestartsBeforeSharedMmio();
     reportsDecoderAndFetchFailuresWithoutLosingPc();
     runsSyntheticStartupSliceToBreakpoint();
     executesLoadStoreWidthsAndPcPop();

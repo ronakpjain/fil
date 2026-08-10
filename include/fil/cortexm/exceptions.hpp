@@ -7,6 +7,7 @@
 #include "fil/common/result.hpp"
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace fil::cpu {
@@ -39,6 +40,11 @@ public:
 
     /** @brief Gets nested active exceptions from oldest to newest. */
     [[nodiscard]] const std::vector<std::uint16_t>& activeStack() const noexcept { return active_stack_; }
+
+    /** @brief Restores the active stack from a transactional board checkpoint. */
+    void restoreActiveStack(std::vector<std::uint16_t> stack) {
+        active_stack_ = std::move(stack);
+    }
 
 private:
     [[nodiscard]] Result<void> validateStackRange(std::uint32_t address, std::uint32_t size) const;

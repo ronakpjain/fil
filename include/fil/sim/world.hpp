@@ -40,6 +40,7 @@ struct WorldRunOptions {
     bool detect_spin{false}; ///< Stop a lane on a repeatedly proven exact-state loop.
     std::uint64_t spin_threshold{1'000'000}; ///< Logical loop instructions required before stopping.
     bool enable_loop_batching{true}; ///< Fast-forward jointly proven side-effect-free loops.
+    bool enable_transactional_slices{false}; ///< Execute experimental reversible lane epochs.
     bool stop_on_board_failure{true}; ///< Stop immediately instead of finishing other boards.
 };
 
@@ -63,6 +64,9 @@ struct WorldRunResult {
     std::uint64_t loop_batches{0}; ///< Proven-loop batches applied without interpretation.
     std::uint64_t batched_instructions{0}; ///< Logical instructions represented by loop batches.
     std::uint64_t event_callbacks{0}; ///< Shared event callbacks executed during the run.
+    std::uint64_t transactional_attempts{0}; ///< Reversible multi-lane epochs attempted.
+    std::uint64_t transactional_commits{0}; ///< MMIO-free epochs committed without rollback.
+    std::uint64_t transactional_instructions{0}; ///< Instructions committed by lane epochs.
     std::vector<WorldBoardRunResult> boards; ///< Outcomes in network configuration order.
     std::string message;
 

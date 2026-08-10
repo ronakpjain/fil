@@ -192,7 +192,8 @@ StopReason CortexM4::execute(
     const auto failBus = [&](const mem::BusFault& fault, const std::string_view message) {
         diagnostic.bus_fault = fault;
         diagnostic.message = message;
-        return StopReason::bus_fault;
+        return fault.reason == mem::BusFaultReason::synchronization_required
+            ? StopReason::synchronization_required : StopReason::bus_fault;
     };
     const auto writeAluResult = [&](const std::uint8_t rd, const std::uint32_t value) {
         if (rd == 15U) {

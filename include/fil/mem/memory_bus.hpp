@@ -87,6 +87,12 @@ private:
 };
 
 /** @brief Interface implemented by target peripheral register blocks. */
+/** @brief Visibility of an MMIO access to independently executing board lanes. */
+enum class MmioDomain {
+    board_local,
+    shared,
+};
+
 class MmioDevice {
 public:
     /** @brief Allows polymorphic destruction through the interface. */
@@ -122,6 +128,15 @@ public:
 
     /** @brief Gets the device's diagnostic name. @return Static or device-owned name. */
     [[nodiscard]] virtual std::string_view name() const noexcept = 0;
+
+    /** @brief Classifies an access for conservative multi-board synchronization. */
+    [[nodiscard]] virtual MmioDomain domain(
+        std::uint32_t offset, AccessSize size
+    ) const noexcept {
+        static_cast<void>(offset);
+        static_cast<void>(size);
+        return MmioDomain::board_local;
+    }
 };
 
 /**
@@ -218,6 +233,23 @@ public:
     /** @brief Gets mapped ranges sorted by base address. */
     [[nodiscard]] std::vector<MemoryRegionInfo> regions() const;
 
+    /** @brief Makes shared MMIO return a side-effect-free worker synchronization fault. */
+    void setSharedMmioTrapping(bool enabled) noexcept { trap_shared_mmio_ = enabled; }
+
+    /** @brief Whether shared MMIO accesses currently stop before device dispatch. */
+    [[nodiscard]] bool sharedMmioTrapping() const noexcept { return trap_shared_mmio_; }
+
+    /** @brief Makes every MMIO access yield, for fully reversible worker windows. */
+    void setAllMmioTrapping(bool enabled) noexcept { trap_all_mmio_ = enabled; }
+
+    /** @brief Whether every MMIO access currently yields before dispatch. */
+    [[nodiscard]] bool allMmioTrapping() const noexcept { return trap_all_mmio_; }
+
+    /** @brief Whether any MMIO trap mode requires restartable CPU execution. */
+    [[nodiscard]] bool mmioTrapping() const noexcept {
+        return trap_shared_mmio_ || trap_all_mmio_;
+    }
+
     /**
      * @brief Gets the generation of executable backing storage.
      *
@@ -245,6 +277,12 @@ public:
 
     /** @brief True when no MMIO occurred and all changed backed bytes were restored. */
     [[nodiscard]] bool sideEffectsRestoredSince(SideEffectCheckpoint checkpoint) const;
+
+    /** @brief Whether backed-memory state can be transactionally restored. */
+    [[nodiscard]] bool canRestoreSideEffects(SideEffectCheckpoint checkpoint) const noexcept;
+
+    /** @brief Reverses backed-memory writes when no MMIO occurred since a checkpoint. */
+    [[nodiscard]] bool restoreSideEffects(SideEffectCheckpoint checkpoint);
 
     /** @brief True when no MMIO read or write occurred since the checkpoint. */
     [[nodiscard]] bool mmioUnchangedSince(SideEffectCheckpoint checkpoint) const noexcept {
@@ -281,6 +319,8 @@ private:
     std::uint64_t mutation_sequence_{0};
     static constexpr std::size_t mutation_journal_capacity = 8192U;
     std::array<BackedMutation, mutation_journal_capacity> mutation_journal_{};
+    bool trap_shared_mmio_{false};
+    bool trap_all_mmio_{false};
 };
 
 } // namespace fil::mem

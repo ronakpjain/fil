@@ -97,6 +97,7 @@ enum class StopReason : std::uint8_t {
     breakpoint,
     halted,
     bus_fault,
+    synchronization_required,
     undefined_instruction,
     invalid_state,
 };

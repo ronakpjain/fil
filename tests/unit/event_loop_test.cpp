@@ -1,11 +1,15 @@
 #include "fil/sim/event_loop.hpp"
 #include "fil/sim/trace.hpp"
+#include "fil/sim/worker_pool.hpp"
 #include "../test_support.hpp"
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -27,6 +31,114 @@ void ordersEventsDeterministically() {
 
     const auto second = loop.advanceBy(10);
     fil::test::check(second.events_executed == 1 && order.back() == 3, "event loop advances relative time");
+}
+
+void tracksLocalAndSharedEventOwnership() {
+    fil::sim::EventLoop loop;
+    std::vector<fil::sim::EventOwner> observed;
+    {
+        auto owner = loop.useOwner(3U);
+        static_cast<void>(loop.scheduleAt(5U, [&]() {
+            observed.push_back(loop.activeOwner());
+            static_cast<void>(loop.scheduleAfter(0U, [&]() {
+                observed.push_back(loop.activeOwner());
+            }));
+        }));
+    }
+    fil::test::check(loop.activeOwner() == fil::sim::shared_event_owner,
+                     "event owner scope restores the shared domain");
+    static_cast<void>(loop.scheduleAt(5U, [&]() {
+        observed.push_back(loop.activeOwner());
+    }));
+    fil::test::check(loop.nextScheduledTime(3U) == 5U
+                         && loop.nextScheduledTime(fil::sim::shared_event_owner) == 5U
+                         && !loop.nextScheduledTime(4U),
+                     "owner queues expose independent event horizons");
+
+    const auto result = loop.runDueEvents(5U);
+    fil::test::check(result.events_executed == 3U
+                         && result.local_owner_mask == (std::uint64_t{1U} << 3U)
+                         && result.shared_event_executed,
+                     "event runs report local and shared ownership");
+    fil::test::check(observed == std::vector<fil::sim::EventOwner>{
+                         3U, fil::sim::shared_event_owner, 3U,
+                     },
+                     "nested events inherit their callback owner deterministically");
+}
+
+void advancesOneOwnerIndependently() {
+    fil::sim::EventLoop rewindable;
+    const auto checkpoint = rewindable.ownerCheckpoint(4U);
+    static_cast<void>(rewindable.runOwnedEvents(4U, 10U));
+    fil::test::check(rewindable.restoreOwnerCheckpoint(checkpoint)
+                         && rewindable.now(4U) == 0U,
+                     "untouched owner queues permit transactional clock rewind");
+
+    fil::sim::EventLoop loop;
+    std::vector<unsigned int> calls;
+    {
+        auto owner = loop.useOwner(1U);
+        static_cast<void>(loop.scheduleAt(7U, [&]() { calls.push_back(1U); }));
+    }
+    {
+        auto owner = loop.useOwner(2U);
+        static_cast<void>(loop.scheduleAt(7U, [&]() { calls.push_back(2U); }));
+    }
+    static_cast<void>(loop.scheduleAt(7U, [&]() { calls.push_back(3U); }));
+
+    const auto event_checkpoint = loop.ownerCheckpoint(1U);
+    const auto local = loop.runOwnedEvents(1U, 7U);
+    fil::test::check(local.events_executed == 1U && calls == std::vector<unsigned int>{1U},
+                     "owner-local execution drains only the selected lane");
+    fil::test::check(loop.now() == 0U && loop.now(1U) == 7U && loop.pending() == 2U,
+                     "owner-local execution leaves the shared clock and other lanes untouched");
+    fil::test::check(!loop.restoreOwnerCheckpoint(event_checkpoint),
+                     "executed owner callbacks reject unsafe clock-only rollback");
+
+    const auto remaining = loop.runDueEvents(7U);
+    fil::test::check(remaining.events_executed == 2U
+                         && calls == std::vector<unsigned int>{1U, 2U, 3U}
+                         && loop.pending() == 0U,
+                     "global execution skips an owner event already committed locally");
+}
+
+void reusesPersistentLaneWorkers() {
+    fil::sim::LaneWorkerPool workers(4U);
+    std::array<std::atomic<unsigned int>, 4> calls{};
+    const auto task = [&](const std::size_t lane) {
+        calls[lane].fetch_add(1U, std::memory_order_relaxed);
+    };
+    workers.run(task);
+    workers.run(task);
+    bool exact = workers.size() == 4U;
+    for (const auto& count : calls) {
+        exact = exact && count.load(std::memory_order_relaxed) == 2U;
+    }
+    fil::test::check(exact, "persistent worker pool executes every lane once per epoch");
+}
+
+void supportsConcurrentOwnerLanes() {
+    fil::sim::EventLoop loop;
+    loop.setConcurrentAccess(true);
+    std::atomic<unsigned int> calls{0U};
+    const auto worker = [&](const fil::sim::EventOwner owner) {
+        auto scope = loop.useOwner(owner);
+        for (unsigned int index = 0U; index < 100U; ++index) {
+            static_cast<void>(loop.scheduleAt(0U, [&]() {
+                calls.fetch_add(1U, std::memory_order_relaxed);
+            }));
+        }
+        const auto result = loop.runOwnedEvents(owner, 0U);
+        fil::test::check(result.events_executed == 100U,
+                         "worker drains its concurrently scheduled owner queue");
+    };
+    std::thread first(worker, 1U);
+    std::thread second(worker, 2U);
+    first.join();
+    second.join();
+    fil::test::check(calls.load(std::memory_order_relaxed) == 200U
+                         && loop.pending() == 0U && loop.now() == 0U,
+                     "concurrent owner lanes preserve exactly-once callback execution");
 }
 
 void cancelsAndRejectsInvalidTime() {
@@ -109,6 +221,10 @@ void disablesTraceCollectionWithoutDisturbingSequence() {
 /** @brief Runs deterministic event-loop and trace unit tests. */
 void runEventLoopTests() {
     ordersEventsDeterministically();
+    tracksLocalAndSharedEventOwnership();
+    advancesOneOwnerIndependently();
+    reusesPersistentLaneWorkers();
+    supportsConcurrentOwnerLanes();
     cancelsAndRejectsInvalidTime();
     detectsZeroDelayLivelock();
     serializesStableTraceRecords();

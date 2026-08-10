@@ -1,7 +1,6 @@
 #include "fil/mem/mmio_router.hpp"
 
 #include <algorithm>
-#include <limits>
 #include <utility>
 
 namespace fil::mem {
@@ -66,6 +65,16 @@ const MmioRouter::Route* MmioRouter::find(
         }
     }
     return nullptr;
+}
+
+MmioDomain MmioRouter::domain(
+    const std::uint32_t offset, const AccessSize size
+) const noexcept {
+    const std::uint32_t width = byteCount(size);
+    if (!validRange(offset, width, window_size_)) return MmioDomain::board_local;
+    const Route* const route = find(offset, width);
+    if (route == nullptr) return MmioDomain::board_local;
+    return route->device->domain(offset - route->offset, size);
 }
 
 UnknownMmioAccess& MmioRouter::record(const std::uint32_t absolute_address) {

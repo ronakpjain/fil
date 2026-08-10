@@ -41,6 +41,7 @@ enum class BoardStopReason : std::uint8_t {
     unimplemented_instruction,
     architectural_fault,
     reset_requested,
+    synchronization_required,
     host_error,
 };
 
@@ -71,6 +72,9 @@ struct BoardRunResult {
 /** @brief Loaded and wired firmware board instance. */
 class Board {
 public:
+    struct TransactionCheckpoint;
+    using TransactionCheckpointPtr = std::shared_ptr<const TransactionCheckpoint>;
+
     /** @brief Loads config references, ELF, MCU map, CPU, and peripherals. */
     [[nodiscard]] static Result<std::unique_ptr<Board>> load(
         const config::BoardConfig& config,
@@ -88,6 +92,21 @@ public:
 
     /** @brief Runs until a configured boundary or architectural failure. */
     [[nodiscard]] BoardRunResult run(const BoardRunOptions& options);
+
+    /** @brief Runs one lane using only owner-local events until shared synchronization. */
+    [[nodiscard]] BoardRunResult runWorkerSlice(
+        EventOwner owner,
+        std::uint64_t instruction_budget,
+        SimTimeNs deadline_ns,
+        bool enable_loop_batching = true,
+        bool trap_all_mmio = false
+    );
+
+    /** @brief Captures reversible CPU, RAM, system, scheduler, and lane-clock state. */
+    [[nodiscard]] TransactionCheckpointPtr captureTransaction(EventOwner owner) const;
+
+    /** @brief Restores a checkpoint when no MMIO or owner event escaped the slice. */
+    [[nodiscard]] bool restoreTransaction(const TransactionCheckpointPtr& checkpoint);
 
     [[nodiscard]] cpu::CortexM4& cpu() noexcept { return *cpu_; }
     [[nodiscard]] const cpu::CortexM4& cpu() const noexcept { return *cpu_; }

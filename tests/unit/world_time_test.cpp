@@ -387,6 +387,50 @@ void acceleratedPhaseMismatchedLoopsMatchExactExecution() {
     );
 }
 
+void transactionalSlicesMatchExactIdleExecution() {
+    TempWorldTimeConfigs files;
+    const auto alpha = files.writeBoard("txn-alpha.json", "txn-alpha");
+    const auto beta = files.writeBoard("txn-beta.json", "txn-beta");
+    const auto config = files.network({alpha, beta});
+    auto exact = fil::sim::World::load(config);
+    auto transactional = fil::sim::World::load(config);
+    if (!exact || !transactional) {
+        fil::test::check(false, "loads worlds for transactional equivalence");
+        return;
+    }
+    exact.value()->setDiagnosticsEnabled(false);
+    transactional.value()->setDiagnosticsEnabled(false);
+    fil::test::check(installIdleLoop(*exact.value(), "txn-alpha", 0U)
+                         && installIdleLoop(*exact.value(), "txn-beta", 0U)
+                         && installIdleLoop(*transactional.value(), "txn-alpha", 0U)
+                         && installIdleLoop(*transactional.value(), "txn-beta", 0U),
+                     "installs MMIO-free transactional loop fixtures");
+
+    auto exact_options = runOptions(100'000U);
+    exact_options.max_instructions_per_board = 10'000U;
+    exact_options.enable_loop_batching = false;
+    exact_options.enable_transactional_slices = false;
+    auto transactional_options = exact_options;
+    transactional_options.enable_transactional_slices = true;
+    const auto exact_result = exact.value()->run(exact_options);
+    const auto transactional_result = transactional.value()->run(transactional_options);
+    fil::test::check(exact_result && transactional_result
+                         && transactional_result.value().transactional_commits > 0U,
+                     "transactional scheduler commits MMIO-free lane epochs");
+    if (!exact_result || !transactional_result) return;
+    fil::test::check(exact_result.value().end_time_ns
+                             == transactional_result.value().end_time_ns
+                         && exact_result.value().instructions
+                             == transactional_result.value().instructions
+                         && exact_result.value().cycles
+                             == transactional_result.value().cycles
+                         && sameLoopState(exact.value()->board("txn-alpha")->cpu().state(),
+                                          transactional.value()->board("txn-alpha")->cpu().state())
+                         && sameLoopState(exact.value()->board("txn-beta")->cpu().state(),
+                                          transactional.value()->board("txn-beta")->cpu().state()),
+                     "transactional slices preserve virtual time counters and CPU state");
+}
+
 void acceleratedLoopsPreserveSysTickAndExceptionEntry() {
     TempWorldTimeConfigs files;
     const auto alpha = files.writeBoard("tick-alpha.json", "tick-alpha");
@@ -450,5 +494,6 @@ void runWorldTimeTests() {
     concurrentScheduleIsByteDeterministic();
     sharedEventsKeepTheirExactDeadlines();
     acceleratedPhaseMismatchedLoopsMatchExactExecution();
+    transactionalSlicesMatchExactIdleExecution();
     acceleratedLoopsPreserveSysTickAndExceptionEntry();
 }

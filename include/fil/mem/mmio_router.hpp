@@ -75,6 +75,10 @@ public:
 
     [[nodiscard]] std::string_view name() const noexcept override { return name_; }
 
+    [[nodiscard]] MmioDomain domain(
+        std::uint32_t offset, AccessSize size
+    ) const noexcept override;
+
 private:
     struct Route {
         std::uint32_t offset{0};

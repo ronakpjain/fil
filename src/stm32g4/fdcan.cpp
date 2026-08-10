@@ -440,7 +440,13 @@ bool FdcanPeripheral::transmitBuffer(const unsigned int buffer_index) {
         return false;
     }
     if (bus_ != nullptr) {
-        auto sent = bus_->send(bus_node_id_, frame, currentTime());
+        Result<void> sent;
+        if (sim::EventLoop* const loop = eventLoop()) {
+            auto shared_scope = loop->useOwner(sim::shared_event_owner);
+            sent = bus_->send(bus_node_id_, frame, currentTime());
+        } else {
+            sent = bus_->send(bus_node_id_, frame, currentTime());
+        }
         if (!sent) {
             setInterruptFlags(interrupt_protocol_arbitration_error);
             return false;

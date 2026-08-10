@@ -36,6 +36,7 @@ enum class BusFaultReason {
     execute_protected, ///< Region does not permit instruction fetches.
     alias_cycle,      ///< Alias translation exceeded the recursion limit.
     device_error,     ///< An MMIO device rejected the operation.
+    synchronization_required, ///< Worker reached cross-board MMIO before commit.
 };
 
 /** @brief Metadata attached to every target memory access. */
