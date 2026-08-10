@@ -110,7 +110,10 @@ public:
 
     [[nodiscard]] cpu::CortexM4& cpu() noexcept { return *cpu_; }
     [[nodiscard]] const cpu::CortexM4& cpu() const noexcept { return *cpu_; }
+    /** @brief Gets mutable target memory for controlled inspection or injection. */
     [[nodiscard]] mem::MemoryBus& memory() noexcept { return memory_; }
+    /** @brief Gets read access to the target memory map. */
+    [[nodiscard]] const mem::MemoryBus& memory() const noexcept { return memory_; }
     [[nodiscard]] const elf::ElfImage& image() const noexcept { return image_; }
     [[nodiscard]] EventLoop& eventLoop() noexcept { return *event_loop_; }
     [[nodiscard]] TraceRecorder& trace() noexcept { return *trace_; }

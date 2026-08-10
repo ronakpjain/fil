@@ -66,6 +66,13 @@ On macOS, prefix the LLVM tools with `xcrun`. Coverage percentages are diagnosti
 not a release gate; prioritize deterministic behavior and boundary cases over tests
 that only execute lines.
 
+## Physical hardware comparison
+
+The hermetic suite exercises the ST-Link orchestration through a fake OpenOCD
+process. A real STM32G47x/G48x comparison is always manual because it resets and
+controls the attached target and can optionally rewrite flash. See
+[Hardware comparison](hardware_comparison.md) for the probe fixture and command.
+
 ## External PER acceptance
 
 External firmware checks are opt-in. Point CMake at the directory containing the

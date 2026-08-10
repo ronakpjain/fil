@@ -91,12 +91,27 @@ Validate and normalize configuration:
 Configuration rejects duplicate and unknown keys. Referenced paths resolve relative
 to the file that contains them. See [Configuration](docs/configuration.md).
 
+## Compare with STM32G4 hardware
+
+With OpenOCD and an ST-Link attached, compare deterministic register and RAM state:
+
+```bash
+./build/fil compare-stlink \
+  tests/fixtures/config/hardware_compare_board.json \
+  --flash --memory 0x20000000:16
+```
+
+Flashing is opt-in; every comparison resets and controls the target. See
+[Hardware comparison](docs/hardware_comparison.md) for safety, stop boundaries,
+JSON artifacts, and comparison scope.
+
 ## Documentation
 
 - [Architecture](docs/architecture.md)
 - [Configuration](docs/configuration.md)
 - [ELF loading](docs/elf_loading.md)
 - [Memory system](docs/memory_system.md)
+- [Hardware comparison](docs/hardware_comparison.md)
 - [JSONL trace contract](docs/tracing.md)
 - [Performance](docs/performance.md)
 - [Testing](docs/testing.md)

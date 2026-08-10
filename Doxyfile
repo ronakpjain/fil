@@ -15,6 +15,7 @@ INPUT                  = README.md \
                          docs/configuration.md \
                          docs/elf_loading.md \
                          docs/memory_system.md \
+                         docs/hardware_comparison.md \
                          docs/thumb_instruction_coverage.md \
                          docs/stm32g4_peripheral_coverage.md \
                          docs/testing.md \

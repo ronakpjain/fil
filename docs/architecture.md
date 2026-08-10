@@ -141,5 +141,7 @@ register corners are simplified. Simulated time is suitable for deterministic
 regression tests, not hardware performance prediction.
 
 Required tests use synthetic firmware and direct fixtures. External PER firmware is
-an acceptance input, never a source of application-specific behavior. See
+an acceptance input, never a source of application-specific behavior. The optional
+[hardware comparison](hardware_comparison.md) validates deterministic architectural
+state through OpenOCD without treating physical timing as an emulator contract. See
 [Testing](testing.md) for the validation matrix.

@@ -5,10 +5,13 @@
 #include "fil/devices/can_bus.hpp"
 #include "fil/cpu/decoder.hpp"
 #include "fil/elf/elf_loader.hpp"
+#include "fil/hardware/comparison.hpp"
 #include "fil/sim/board.hpp"
 #include "fil/sim/world.hpp"
 #include "fil/stm32g4/stm32g4.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -437,6 +440,246 @@ ExitCode runBoardCommand(
     return ExitCode::success;
 }
 
+ExitCode compareStlinkCommand(
+    const std::span<const std::string_view> args,
+    std::ostream& out,
+    std::ostream& err
+) {
+    if (args.size() < 2U) {
+        err << "fil: compare-stlink requires a board config path\n";
+        return ExitCode::usage_error;
+    }
+
+    std::optional<std::uint64_t> max_instructions;
+    std::optional<std::uint32_t> stop_address;
+    std::optional<std::string> stop_symbol;
+    std::optional<std::string> serial;
+    std::optional<std::filesystem::path> artifacts;
+    std::filesystem::path openocd{"openocd"};
+    std::chrono::milliseconds timeout{10'000};
+    std::vector<hardware::MemoryRange> memory_ranges;
+    std::vector<std::string> explicit_registers;
+    std::vector<std::string> ignored_registers;
+    bool strict_mmio = false;
+    bool flash = false;
+
+    for (std::size_t index = 2U; index < args.size(); ++index) {
+        const std::string_view option = args[index];
+        const auto valueAfter = [&]() -> std::optional<std::string_view> {
+            if (index + 1U >= args.size()) return std::nullopt;
+            return args[++index];
+        };
+        if (option == "--flash") {
+            flash = true;
+        } else if (option == "--strict-mmio") {
+            strict_mmio = true;
+        } else if (option == "--lenient-mmio") {
+            strict_mmio = false;
+        } else if (option == "--max-instructions" || option == "--stop-address"
+                   || option == "--timeout-ms") {
+            const auto value = valueAfter();
+            if (!value) {
+                err << "fil: " << option << " requires a value\n";
+                return ExitCode::usage_error;
+            }
+            const auto parsed = config::parseUnsigned(*value);
+            if (!parsed) {
+                err << "fil: invalid value for " << option << ": "
+                    << parsed.error().message << '\n';
+                return ExitCode::usage_error;
+            }
+            if (option == "--max-instructions") {
+                max_instructions = parsed.value();
+            } else if (option == "--stop-address") {
+                if (parsed.value() > std::numeric_limits<std::uint32_t>::max()) {
+                    err << "fil: --stop-address exceeds 32-bit target address space\n";
+                    return ExitCode::usage_error;
+                }
+                stop_address = static_cast<std::uint32_t>(parsed.value());
+                if ((*stop_address & 1U) != 0U) {
+                    err << "fil: --stop-address must be halfword aligned\n";
+                    return ExitCode::usage_error;
+                }
+            } else {
+                if (parsed.value() == 0U
+                    || parsed.value() > static_cast<std::uint64_t>(
+                        std::numeric_limits<std::chrono::milliseconds::rep>::max()
+                    )) {
+                    err << "fil: --timeout-ms is outside the supported range\n";
+                    return ExitCode::usage_error;
+                }
+                timeout = std::chrono::milliseconds(
+                    static_cast<std::chrono::milliseconds::rep>(parsed.value())
+                );
+            }
+        } else if (option == "--memory") {
+            const auto value = valueAfter();
+            if (!value) {
+                err << "fil: --memory requires ADDRESS:LENGTH\n";
+                return ExitCode::usage_error;
+            }
+            auto parsed = hardware::parseMemoryRange(*value);
+            if (!parsed) {
+                err << "fil: invalid --memory value: " << parsed.error().message << '\n';
+                return ExitCode::usage_error;
+            }
+            memory_ranges.push_back(parsed.value());
+        } else if (option == "--stop-at-symbol" || option == "--serial"
+                   || option == "--openocd" || option == "--artifacts"
+                   || option == "--register" || option == "--ignore-register") {
+            const auto value = valueAfter();
+            if (!value) {
+                err << "fil: " << option << " requires a value\n";
+                return ExitCode::usage_error;
+            }
+            if (option == "--stop-at-symbol") stop_symbol = std::string(*value);
+            else if (option == "--serial") serial = std::string(*value);
+            else if (option == "--openocd") openocd = std::filesystem::path(*value);
+            else if (option == "--artifacts") artifacts = std::filesystem::path(*value);
+            else if (option == "--register") explicit_registers.emplace_back(*value);
+            else ignored_registers.emplace_back(*value);
+        } else {
+            err << "fil: unknown compare-stlink option: " << option << '\n';
+            return ExitCode::usage_error;
+        }
+    }
+    if (stop_address && stop_symbol) {
+        err << "fil: --stop-address and --stop-at-symbol are mutually exclusive\n";
+        return ExitCode::usage_error;
+    }
+
+    auto board_config = config::loadBoardConfig(args[1]);
+    if (!board_config) {
+        err << "fil: " << formatError(board_config.error()) << '\n';
+        return ExitCode::config_error;
+    }
+    auto board = sim::Board::load(board_config.value(), strict_mmio);
+    if (!board) {
+        err << "fil: " << formatError(board.error()) << '\n';
+        return board.error().category == ErrorCategory::config
+            ? ExitCode::config_error : ExitCode::runtime_error;
+    }
+
+    if (stop_symbol) {
+        const auto match = std::find_if(
+            board.value()->image().symbols().begin(), board.value()->image().symbols().end(),
+            [&](const elf::ElfSymbol& symbol) { return symbol.name == *stop_symbol; }
+        );
+        if (match == board.value()->image().symbols().end()) {
+            err << "fil: symbol not found: " << *stop_symbol << '\n';
+            return ExitCode::usage_error;
+        }
+        stop_address = match->address & ~1U;
+    }
+
+    std::vector<std::string> selected_registers;
+    if (explicit_registers.empty()) {
+        for (const std::string_view name : hardware::comparableRegisterNames()) {
+            selected_registers.emplace_back(name);
+        }
+    } else {
+        selected_registers = explicit_registers;
+    }
+    const auto knownRegister = [](const std::string_view name) {
+        const auto names = hardware::comparableRegisterNames();
+        return std::find(names.begin(), names.end(), name) != names.end();
+    };
+    for (const std::string& name : selected_registers) {
+        if (!knownRegister(name)) {
+            err << "fil: unknown comparison register: " << name << '\n';
+            return ExitCode::usage_error;
+        }
+    }
+    for (const std::string& name : ignored_registers) {
+        if (!knownRegister(name)) {
+            err << "fil: unknown ignored register: " << name << '\n';
+            return ExitCode::usage_error;
+        }
+        std::erase(selected_registers, name);
+    }
+    std::vector<std::string> unique_registers;
+    unique_registers.reserve(selected_registers.size());
+    for (const std::string& name : selected_registers) {
+        if (std::find(unique_registers.begin(), unique_registers.end(), name)
+            == unique_registers.end()) {
+            unique_registers.push_back(name);
+        }
+    }
+    selected_registers = std::move(unique_registers);
+
+    sim::BoardRunOptions run_options;
+    run_options.max_instructions = max_instructions.value_or(
+        board_config.value().run.max_instructions
+    );
+    run_options.duration_ns = 0U;
+    run_options.stop_address = stop_address;
+    run_options.detect_spin = false;
+    run_options.enable_loop_batching = false;
+    const sim::BoardRunResult run_result = board.value()->run(run_options);
+    const sim::BoardStopReason expected_stop = stop_address
+        ? sim::BoardStopReason::target_reached : sim::BoardStopReason::breakpoint;
+    if (run_result.reason != expected_stop) {
+        err << "fil: emulator stopped with " << sim::boardStopReasonName(run_result.reason)
+            << " before the comparison boundary\n";
+        return ExitCode::runtime_error;
+    }
+    auto emulator = hardware::captureEmulator(*board.value(), run_result, memory_ranges);
+    if (!emulator) {
+        err << "fil: " << formatError(emulator.error()) << '\n';
+        return ExitCode::runtime_error;
+    }
+
+    hardware::StlinkCaptureOptions capture_options;
+    capture_options.openocd = openocd;
+    capture_options.serial = serial;
+    capture_options.stop_address = stop_address;
+    capture_options.timeout = timeout;
+    capture_options.flash = flash;
+    auto target = hardware::captureStlink(
+        board_config.value().elf_path, memory_ranges, capture_options
+    );
+    if (!target) {
+        err << "fil: " << formatError(target.error()) << '\n';
+        return ExitCode::runtime_error;
+    }
+
+    const hardware::Comparison comparison = hardware::compare(
+        emulator.value(), target.value(), selected_registers
+    );
+    hardware::writeJson(comparison, out);
+
+    if (artifacts) {
+        std::error_code directory_error;
+        std::filesystem::create_directories(*artifacts, directory_error);
+        if (directory_error) {
+            err << "fil: unable to create artifact directory: "
+                << directory_error.message() << '\n';
+            return ExitCode::runtime_error;
+        }
+        const auto writeArtifact = [&](
+            const std::string_view name,
+            const auto& value
+        ) -> bool {
+            std::ofstream file(*artifacts / std::string(name), std::ios::binary | std::ios::trunc);
+            if (!file) return false;
+            hardware::writeJson(value, file);
+            return static_cast<bool>(file);
+        };
+        if (!writeArtifact("emulator.json", emulator.value())
+            || !writeArtifact("hardware.json", target.value())
+            || !writeArtifact("comparison.json", comparison)) {
+            err << "fil: unable to write comparison artifacts\n";
+            return ExitCode::runtime_error;
+        }
+    }
+
+    if (!comparison.matches()) {
+        err << "fil: hardware state differs from emulator state\n";
+        return ExitCode::runtime_error;
+    }
+    return ExitCode::success;
+}
+
 ExitCode runNetworkCommand(
     const std::span<const std::string_view> args,
     std::ostream& out,
@@ -638,11 +881,16 @@ void printHelp(std::ostream& out) {
         << "  inspect-elf <firmware.elf>     Inspect an ELF32 ARM firmware image\n"
         << "  disasm-window <firmware.elf>   Decode a bounded Thumb instruction window\n"
         << "  run <board.json> [options]     Execute one firmware board deterministically\n"
-        << "  run-network <network.json>     Execute a deterministic multi-board CAN network\n\n"
+        << "  run-network <network.json>     Execute a deterministic multi-board CAN network\n"
+        << "  compare-stlink <board.json>    Compare emulator state with STM32G4 hardware\n\n"
         << "Run options:\n"
         << "  --duration-ms N --max-instructions N --trace FILE --trace-instr\n"
         << "  --strict-mmio --stop-address ADDR --stop-at-symbol NAME --allow-breakpoint\n"
         << "  --detect-spin --no-loop-batching\n\n"
+        << "ST-Link comparison options:\n"
+        << "  --flash --memory ADDR:LENGTH --register NAME --ignore-register NAME\n"
+        << "  --stop-address ADDR --stop-at-symbol NAME --max-instructions N\n"
+        << "  --serial ID --openocd PATH --timeout-ms N --artifacts DIRECTORY\n\n"
         << "Network options:\n"
         << "  --duration-ms N --max-instructions N --quantum N --trace FILE\n"
         << "  --strict-mmio --trace-instr --detect-spin --no-loop-batching --allow-breakpoint\n"
@@ -720,6 +968,10 @@ ExitCode run(
 
     if (args.front() == "run-network") {
         return runNetworkCommand(args, out, err);
+    }
+
+    if (args.front() == "compare-stlink") {
+        return compareStlinkCommand(args, out, err);
     }
 
     err << "fil: unknown command or option: " << args.front() << '\n'

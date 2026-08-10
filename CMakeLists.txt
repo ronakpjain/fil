@@ -105,6 +105,7 @@ add_library(fil_core STATIC
     src/cortexm/system_control.cpp
     src/devices/can_bus.cpp
     src/elf/elf_loader.cpp
+    src/hardware/comparison.cpp
     src/mem/address.cpp
     src/mem/mcu_map.cpp
     src/mem/memory_bus.cpp
