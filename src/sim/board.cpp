@@ -1,16 +1,14 @@
 #include "fil/sim/board.hpp"
 
+#include "fil/common/format.hpp"
+#include "fil/common/numeric.hpp"
 #include "fil/cortexm/exceptions.hpp"
 #include "fil/cortexm/system_control.hpp"
 #include "fil/mem/mcu_map.hpp"
 #include "fil/stm32g4/stm32g4.hpp"
 
 #include <algorithm>
-#include <iomanip>
-#include <cstdio>
-#include <cstring>
 #include <limits>
-#include <sstream>
 #include <utility>
 
 namespace fil::sim {
@@ -18,33 +16,8 @@ namespace {
 
 constexpr std::uint64_t nanoseconds_per_second = 1'000'000'000ULL;
 
-std::string hex32(const std::uint32_t value) {
-    std::ostringstream output;
-    output << "0x" << std::hex << std::setfill('0') << std::setw(8) << value;
-    return output.str();
-}
-
 Error runtimeError(std::string message) {
     return Error{ErrorCategory::runtime, std::move(message), std::nullopt};
-}
-
-SimTimeNs deadlineAfter(const SimTimeNs start, const SimTimeNs duration) noexcept {
-    return duration > std::numeric_limits<SimTimeNs>::max() - start
-        ? std::numeric_limits<SimTimeNs>::max() : start + duration;
-}
-
-bool sameCpuState(const cpu::CpuState& left, const cpu::CpuState& right) noexcept {
-    if (left.r != right.r || left.xpsr != right.xpsr || left.msp != right.msp
-        || left.psp != right.psp || left.primask != right.primask
-        || left.basepri != right.basepri || left.faultmask != right.faultmask
-        || left.control != right.control || left.thumb != right.thumb
-        || left.halted != right.halted || left.pending_exception != right.pending_exception
-        || left.pending_exc_return != right.pending_exc_return || left.fpscr != right.fpscr
-        || left.it_state != right.it_state
-        || left.instruction_address != right.instruction_address) {
-        return false;
-    }
-    return std::memcmp(left.s.data(), right.s.data(), sizeof(left.s)) == 0;
 }
 
 } // namespace
@@ -268,7 +241,7 @@ std::optional<Board::ProvenLoop> Board::observeLoopBoundary(
     if (observation.valid
         && observation.generation == loop_observation_generation_
         && observation.boundary_pc == boundary_pc
-        && sameCpuState(observation.state, cpu_->state())
+        && cpu::bitwiseEqual(observation.state, cpu_->state())
         && memory_.sideEffectsRestoredSince(observation.side_effect_checkpoint)
         && logical_instructions > observation.instructions
         && logical_cycles > observation.cycles) {
@@ -309,7 +282,7 @@ bool Board::loopProofStillValid(const ProvenLoop& loop) const noexcept {
         && observation.generation == loop_observation_generation_
         && observation.revision == loop.observation_revision
         && observation.boundary_pc == loop.boundary_pc
-        && sameCpuState(cpu_->state(), observation.state)
+        && cpu::bitwiseEqual(cpu_->state(), observation.state)
         && (loop.read_footprint_complete
             ? memory_.sideEffectsCompatibleSince(
                 loop.side_effect_checkpoint, loop.read_footprint
@@ -437,6 +410,15 @@ void Board::refreshLoopObservation(
     observation.cycles = logical_cycles;
 }
 
+BoardRunResult Board::cpuFailure(const cpu::FastStepResult& result) const {
+    cpu::RunResult detailed;
+    detailed.reason = result.reason;
+    detailed.instructions = result.instructions;
+    detailed.cycles = result.cycles;
+    detailed.diagnostic = cpu_->lastDiagnostic();
+    return cpuFailure(detailed);
+}
+
 BoardRunResult Board::cpuFailure(const cpu::RunResult& result) const {
     BoardRunResult board;
     board.cycles = result.cycles;
@@ -527,9 +509,7 @@ BoardRunResult Board::runWorkerSlice(
         }
         restore_trapping();
         aggregate.time_ns = trap_all_mmio ? local_now : event_loop_->now(owner);
-        aggregate.diagnostic.next_pc = cpu_->state().r[15];
-        aggregate.diagnostic.registers = cpu_->state().r;
-        aggregate.diagnostic.xpsr = cpu_->state().xpsr;
+        cpu_->captureDiagnostic(aggregate.diagnostic);
         return aggregate;
     };
 
@@ -576,7 +556,7 @@ BoardRunResult Board::runWorkerSlice(
         aggregate.instructions += result.instructions;
         aggregate.cycles += result.cycles;
         const SimTimeNs elapsed = accountCycles(result.cycles);
-        const SimTimeNs completion = deadlineAfter(
+        const SimTimeNs completion = saturatingAdd(
             trap_all_mmio ? local_now : event_loop_->now(owner), elapsed
         );
         if (trap_all_mmio) local_now = completion;
@@ -589,12 +569,7 @@ BoardRunResult Board::runWorkerSlice(
             }
         }
         if (result.reason != cpu::StopReason::step_complete) {
-            cpu::RunResult detailed;
-            detailed.reason = result.reason;
-            detailed.instructions = result.instructions;
-            detailed.cycles = result.cycles;
-            detailed.diagnostic = cpu_->lastDiagnostic();
-            BoardRunResult stopped = cpuFailure(detailed);
+            BoardRunResult stopped = cpuFailure(result);
             stopped.instructions = aggregate.instructions;
             stopped.cycles = aggregate.cycles;
             restore_trapping();
@@ -621,7 +596,7 @@ BoardRunResult Board::runWorkerSlice(
         const LoopSkip skip = applyLoopIterations(*loop, iterations);
         aggregate.instructions += skip.instructions;
         aggregate.cycles += skip.cycles;
-        const SimTimeNs skipped_completion = deadlineAfter(
+        const SimTimeNs skipped_completion = saturatingAdd(
             trap_all_mmio ? local_now : event_loop_->now(owner), skip.elapsed_ns
         );
         if (trap_all_mmio) local_now = skipped_completion;
@@ -652,7 +627,7 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
     std::optional<std::uint32_t> proven_spin_pc;
     std::uint64_t proven_spin_instructions = 0U;
     const SimTimeNs deadline = options.duration_ns == 0U
-        ? 0U : deadlineAfter(event_loop_->now(), options.duration_ns);
+        ? 0U : saturatingAdd(event_loop_->now(), options.duration_ns);
 
     while (aggregate.instructions < options.max_instructions) {
         const std::uint32_t pc = cpu_->state().r[15];
@@ -680,12 +655,7 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
         }
         static_cast<void>(advanceTime(result.cycles));
         if (result.reason != cpu::StopReason::step_complete) {
-            cpu::RunResult detailed;
-            detailed.reason = result.reason;
-            detailed.instructions = result.instructions;
-            detailed.cycles = result.cycles;
-            detailed.diagnostic = cpu_->lastDiagnostic();
-            BoardRunResult failure = cpuFailure(detailed);
+            BoardRunResult failure = cpuFailure(result);
             failure.instructions = aggregate.instructions;
             failure.cycles = aggregate.cycles;
             return failure;
@@ -749,9 +719,7 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
     }
 
     aggregate.time_ns = event_loop_->now();
-    aggregate.diagnostic.next_pc = cpu_->state().r[15];
-    aggregate.diagnostic.registers = cpu_->state().r;
-    aggregate.diagnostic.xpsr = cpu_->state().xpsr;
+    cpu_->captureDiagnostic(aggregate.diagnostic);
     if (aggregate.instructions == options.max_instructions && aggregate.message.empty()) {
         aggregate.reason = BoardStopReason::instruction_budget;
         aggregate.message = "instruction budget exhausted";

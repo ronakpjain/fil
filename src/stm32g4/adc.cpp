@@ -35,13 +35,12 @@ AdcPeripheral::AdcPeripheral(
     std::string name,
     sim::EventLoop* const event_loop,
     sim::TraceRecorder* const trace
-) : RegisterPeripheral(std::move(name), 0x50, event_loop, trace) {
+) : RegisterPeripheral(std::move(name), 0x50, event_loop, trace),
+    conversion_event_(event_loop) {
     reset();
 }
 
-AdcPeripheral::~AdcPeripheral() {
-    cancelConversion();
-}
+AdcPeripheral::~AdcPeripheral() = default;
 
 mem::MemoryResult<std::uint64_t> AdcPeripheral::read(
     const std::uint32_t offset,
@@ -286,7 +285,7 @@ void AdcPeripheral::materializeConversion(
 }
 
 void AdcPeripheral::synchronizeLazyConversions() {
-    if (conversion_event_ != 0U || !next_conversion_ns_) return;
+    if (conversion_event_.pending() || !next_conversion_ns_) return;
     const sim::SimTimeNs now = currentTime();
     if (now < *next_conversion_ns_) return;
 
@@ -307,13 +306,10 @@ void AdcPeripheral::synchronizeLazyConversions() {
 void AdcPeripheral::refreshConversionScheduling() {
     if (!next_conversion_ns_) return;
     if (lazyConversionEligible()) {
-        if (conversion_event_ != 0U && eventLoop() != nullptr) {
-            static_cast<void>(eventLoop()->cancel(conversion_event_));
-            conversion_event_ = 0;
-        }
+        conversion_event_.cancel();
         return;
     }
-    if (conversion_event_ == 0U) scheduleConversionEvent();
+    if (!conversion_event_.pending()) scheduleConversionEvent();
 }
 
 void AdcPeripheral::armNextConversion(const sim::SimTimeNs completion_time) {
@@ -323,18 +319,14 @@ void AdcPeripheral::armNextConversion(const sim::SimTimeNs completion_time) {
 
 void AdcPeripheral::scheduleConversionEvent() {
     if (eventLoop() == nullptr || !next_conversion_ns_) return;
-    conversion_event_ = eventLoop()->scheduleAt(*next_conversion_ns_, [this]() {
-        conversion_event_ = 0;
+    static_cast<void>(conversion_event_.scheduleAt(*next_conversion_ns_, [this]() {
         next_conversion_ns_.reset();
         completeConversion();
-    });
+    }));
 }
 
 void AdcPeripheral::cancelConversion() noexcept {
-    if (conversion_event_ != 0 && eventLoop() != nullptr) {
-        static_cast<void>(eventLoop()->cancel(conversion_event_));
-    }
-    conversion_event_ = 0;
+    conversion_event_.cancel();
     next_conversion_ns_.reset();
 }
 

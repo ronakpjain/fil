@@ -143,4 +143,34 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+/**
+ * @brief Owns one replaceable event scheduled on a longer-lived EventLoop.
+ *
+ * Scheduling replaces the previous callback, and destruction cancels any event
+ * still pending. The event loop must outlive the handle.
+ */
+class ScheduledEvent {
+public:
+    explicit ScheduledEvent(EventLoop* loop = nullptr) noexcept : loop_(loop) {}
+    ~ScheduledEvent();
+
+    ScheduledEvent(const ScheduledEvent&) = delete;
+    ScheduledEvent& operator=(const ScheduledEvent&) = delete;
+    ScheduledEvent(ScheduledEvent&&) = delete;
+    ScheduledEvent& operator=(ScheduledEvent&&) = delete;
+
+    [[nodiscard]] EventId scheduleAfter(SimTimeNs delta, EventCallback callback);
+    [[nodiscard]] EventId scheduleAt(SimTimeNs at, EventCallback callback);
+    void cancel() noexcept;
+
+    [[nodiscard]] bool pending() const noexcept { return id_ != 0U; }
+    [[nodiscard]] EventId id() const noexcept { return id_; }
+
+private:
+    [[nodiscard]] EventCallback retireBefore(EventCallback callback);
+
+    EventLoop* loop_{nullptr};
+    EventId id_{0};
+};
+
 } // namespace fil::sim

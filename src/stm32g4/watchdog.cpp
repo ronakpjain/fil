@@ -22,15 +22,14 @@ IwdgPeripheral::IwdgPeripheral(
     sim::EventLoop* const event_loop,
     sim::TraceRecorder* const trace
 ) : RegisterPeripheral("IWDG", 0x14, event_loop, trace),
-    reset_enabled_(reset_enabled) {
+    reset_enabled_(reset_enabled),
+    timeout_event_(event_loop) {
     setResetValue(0x08, 0x0fffU);
     setResetValue(0x10, 0x0fffU);
     reset();
 }
 
-IwdgPeripheral::~IwdgPeripheral() {
-    cancelTimeout();
-}
+IwdgPeripheral::~IwdgPeripheral() = default;
 
 void IwdgPeripheral::setResetCallback(ResetCallback callback) {
     reset_callback_ = std::move(callback);
@@ -104,20 +103,16 @@ void IwdgPeripheral::reload() {
     const sim::SimTimeNs duration = boundedDuration(
         static_cast<long double>(ticks) * static_cast<long double>(prescaler) * 1000000000.0L / 32000.0L
     );
-    timeout_event_ = eventLoop()->scheduleAfter(duration, [this]() {
-        timeout_event_ = 0;
+    static_cast<void>(timeout_event_.scheduleAfter(duration, [this]() {
         traceEvent("watchdog_timeout");
         if (reset_enabled_ && reset_callback_) {
             reset_callback_();
         }
-    });
+    }));
 }
 
 void IwdgPeripheral::cancelTimeout() noexcept {
-    if (timeout_event_ != 0 && eventLoop() != nullptr) {
-        static_cast<void>(eventLoop()->cancel(timeout_event_));
-    }
-    timeout_event_ = 0;
+    timeout_event_.cancel();
 }
 
 WwdgPeripheral::WwdgPeripheral(
@@ -127,15 +122,14 @@ WwdgPeripheral::WwdgPeripheral(
     sim::TraceRecorder* const trace
 ) : RegisterPeripheral("WWDG", 0x0c, event_loop, trace),
     reset_enabled_(reset_enabled),
-    peripheral_clock_hz_(peripheral_clock_hz == 0 ? 1U : peripheral_clock_hz) {
+    peripheral_clock_hz_(peripheral_clock_hz == 0 ? 1U : peripheral_clock_hz),
+    timeout_event_(event_loop) {
     setResetValue(0x00, 0x7fU);
     setResetValue(0x04, 0x7fU);
     reset();
 }
 
-WwdgPeripheral::~WwdgPeripheral() {
-    cancelTimeout();
-}
+WwdgPeripheral::~WwdgPeripheral() = default;
 
 void WwdgPeripheral::setResetCallback(ResetCallback callback) {
     reset_callback_ = std::move(callback);
@@ -186,20 +180,16 @@ void WwdgPeripheral::reload() {
         static_cast<long double>(steps) * 4096.0L * static_cast<long double>(prescaler)
         * 1000000000.0L / static_cast<long double>(peripheral_clock_hz_)
     );
-    timeout_event_ = eventLoop()->scheduleAfter(duration, [this]() {
-        timeout_event_ = 0;
+    static_cast<void>(timeout_event_.scheduleAfter(duration, [this]() {
         traceEvent("watchdog_timeout");
         if (reset_enabled_ && reset_callback_) {
             reset_callback_();
         }
-    });
+    }));
 }
 
 void WwdgPeripheral::cancelTimeout() noexcept {
-    if (timeout_event_ != 0 && eventLoop() != nullptr) {
-        static_cast<void>(eventLoop()->cancel(timeout_event_));
-    }
-    timeout_event_ = 0;
+    timeout_event_.cancel();
 }
 
 } // namespace fil::stm32g4

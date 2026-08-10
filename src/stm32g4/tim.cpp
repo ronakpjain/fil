@@ -59,14 +59,13 @@ TimerPeripheral::TimerPeripheral(
     sim::EventLoop* const event_loop,
     sim::TraceRecorder* const trace
 ) : RegisterPeripheral(std::move(name), 0x50, event_loop, trace),
-    input_clock_hz_(input_clock_hz == 0 ? 1U : input_clock_hz) {
+    input_clock_hz_(input_clock_hz == 0 ? 1U : input_clock_hz),
+    update_event_(event_loop) {
     setResetValue(arr, 0xffffU);
     reset();
 }
 
-TimerPeripheral::~TimerPeripheral() {
-    cancelUpdate();
-}
+TimerPeripheral::~TimerPeripheral() = default;
 
 void TimerPeripheral::setInputClockHz(const std::uint64_t frequency_hz) {
     if (frequency_hz == 0) {
@@ -160,17 +159,13 @@ void TimerPeripheral::scheduleUpdate() {
     const std::uint64_t remaining = period - std::min(current, period - 1U);
     const std::uint64_t prescaler = static_cast<std::uint64_t>(registerValue(psc)) + 1U;
     const sim::SimTimeNs delay = durationForTicks(remaining, input_clock_hz_, prescaler);
-    update_event_ = eventLoop()->scheduleAfter(delay, [this]() {
-        update_event_ = 0;
+    static_cast<void>(update_event_.scheduleAfter(delay, [this]() {
         fireUpdate(false);
-    });
+    }));
 }
 
 void TimerPeripheral::cancelUpdate() noexcept {
-    if (update_event_ != 0 && eventLoop() != nullptr) {
-        static_cast<void>(eventLoop()->cancel(update_event_));
-    }
-    update_event_ = 0;
+    update_event_.cancel();
 }
 
 void TimerPeripheral::fireUpdate(const bool forced) {

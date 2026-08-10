@@ -26,14 +26,13 @@ UsartPeripheral::UsartPeripheral(
     std::string name,
     sim::EventLoop* const event_loop,
     sim::TraceRecorder* const trace
-) : RegisterPeripheral(std::move(name), 0x30, event_loop, trace) {
+) : RegisterPeripheral(std::move(name), 0x30, event_loop, trace),
+    idle_event_(event_loop) {
     setResetValue(isr, tc_flag | txe_flag | txfe_flag);
     reset();
 }
 
-UsartPeripheral::~UsartPeripheral() {
-    cancelIdle();
-}
+UsartPeripheral::~UsartPeripheral() = default;
 
 void UsartPeripheral::injectRx(const std::span<const std::uint8_t> bytes) {
     for (const std::uint8_t byte : bytes) {
@@ -178,19 +177,15 @@ void UsartPeripheral::scheduleIdle() {
     if (eventLoop() == nullptr || rx_queue_.empty()) {
         return;
     }
-    idle_event_ = eventLoop()->scheduleAfter(idle_gap_ns_, [this]() {
-        idle_event_ = 0;
+    static_cast<void>(idle_event_.scheduleAfter(idle_gap_ns_, [this]() {
         setRegister(isr, registerValue(isr) | idle_flag);
         traceEvent("uart_idle");
         signalInterruptIfEnabled();
-    });
+    }));
 }
 
 void UsartPeripheral::cancelIdle() noexcept {
-    if (idle_event_ != 0 && eventLoop() != nullptr) {
-        static_cast<void>(eventLoop()->cancel(idle_event_));
-    }
-    idle_event_ = 0;
+    idle_event_.cancel();
 }
 
 } // namespace fil::stm32g4

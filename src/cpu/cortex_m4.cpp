@@ -5,6 +5,7 @@
 #include "fil/mem/memory_bus.hpp"
 
 #include <cassert>
+#include <cstring>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -129,6 +130,21 @@ void CpuState::advanceIt() noexcept {
     setItState(advanceItState(it_state));
 }
 
+bool bitwiseEqual(const CpuState& left, const CpuState& right) noexcept {
+    if (left.r != right.r || left.xpsr != right.xpsr || left.msp != right.msp
+        || left.psp != right.psp || left.primask != right.primask
+        || left.basepri != right.basepri || left.faultmask != right.faultmask
+        || left.control != right.control || left.thumb != right.thumb
+        || left.halted != right.halted
+        || left.pending_exception != right.pending_exception
+        || left.pending_exc_return != right.pending_exc_return
+        || left.fpscr != right.fpscr || left.it_state != right.it_state
+        || left.instruction_address != right.instruction_address) {
+        return false;
+    }
+    return std::memcmp(left.s.data(), right.s.data(), sizeof(left.s)) == 0;
+}
+
 bool RunResult::succeeded() const noexcept {
     return reason != StopReason::bus_fault
         && reason != StopReason::undefined_instruction
@@ -148,6 +164,10 @@ void CortexM4::capture(DiagnosticSnapshot& diagnostic) const {
     diagnostic.registers = state_.r;
     diagnostic.registers[13] = state_.activeSp();
     diagnostic.xpsr = state_.xpsr;
+}
+
+void CortexM4::captureDiagnostic(DiagnosticSnapshot& diagnostic) const {
+    capture(diagnostic);
 }
 
 FastStepResult CortexM4::stepFast() {

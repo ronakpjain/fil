@@ -90,6 +90,12 @@ struct CpuState {
     void advanceIt() noexcept;
 };
 
+/** @brief Compares complete CPU state by stored representation, including FP bits. */
+[[nodiscard]] bool bitwiseEqual(
+    const CpuState& left,
+    const CpuState& right
+) noexcept;
+
 /** @brief Stable reason a one-step or bounded execution request stopped. */
 enum class StopReason : std::uint8_t {
     step_complete,
@@ -164,6 +170,9 @@ public:
     [[nodiscard]] const DiagnosticSnapshot& lastDiagnostic() const noexcept {
         return last_diagnostic_;
     }
+
+    /** @brief Copies current architectural state into a diagnostic snapshot. */
+    void captureDiagnostic(DiagnosticSnapshot& diagnostic) const;
 
     /** @brief Executes until budget exhaustion, breakpoint, halt, or a fault. */
     [[nodiscard]] RunResult run(std::uint64_t instruction_budget);

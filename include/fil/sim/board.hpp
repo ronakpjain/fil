@@ -199,6 +199,7 @@ private:
     );
     void invalidateLoopObservations() noexcept;
     [[nodiscard]] BoardRunResult cpuFailure(const cpu::RunResult& result) const;
+    [[nodiscard]] BoardRunResult cpuFailure(const cpu::FastStepResult& result) const;
     [[nodiscard]] SimTimeNs elapsedForCycles(std::uint64_t cycles) const noexcept;
 
     config::BoardConfig config_;

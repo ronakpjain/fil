@@ -355,7 +355,7 @@ private:
     RxProvider rx_provider_;
     InterruptCallback interrupt_callback_;
     sim::SimTimeNs idle_gap_ns_{1000000};
-    sim::EventId idle_event_{0};
+    sim::ScheduledEvent idle_event_;
 };
 
 /** @brief STM32G4 timer update event record. */
@@ -408,7 +408,7 @@ private:
     std::uint64_t input_clock_hz_{16000000};
     sim::SimTimeNs counter_epoch_ns_{0};
     std::uint32_t counter_epoch_value_{0};
-    sim::EventId update_event_{0};
+    sim::ScheduledEvent update_event_;
     InterruptCallback interrupt_callback_;
     UpdateCallback update_callback_;
     std::vector<TimerUpdate> updates_;
@@ -496,7 +496,7 @@ private:
     std::uint64_t input_clock_hz_{16'000'000U};
     sim::SimTimeNs conversion_delay_override_ns_{0};
     unsigned int sequence_rank_{0};
-    sim::EventId conversion_event_{0};
+    sim::ScheduledEvent conversion_event_;
     std::optional<sim::SimTimeNs> next_conversion_ns_;
     bool sample_history_enabled_{true};
     std::vector<AdcSample> samples_;
@@ -691,7 +691,7 @@ private:
     bool reset_enabled_{false};
     bool running_{false};
     bool registers_unlocked_{false};
-    sim::EventId timeout_event_{0};
+    sim::ScheduledEvent timeout_event_;
     ResetCallback reset_callback_;
 };
 
@@ -727,7 +727,7 @@ private:
 
     bool reset_enabled_{false};
     std::uint64_t peripheral_clock_hz_{16000000};
-    sim::EventId timeout_event_{0};
+    sim::ScheduledEvent timeout_event_;
     ResetCallback reset_callback_;
 };
 

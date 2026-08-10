@@ -361,4 +361,44 @@ std::size_t EventLoop::maximumSameTimeEvents() const noexcept {
     return impl_->maximum_same_time_events;
 }
 
+ScheduledEvent::~ScheduledEvent() {
+    cancel();
+}
+
+EventCallback ScheduledEvent::retireBefore(EventCallback callback) {
+    return [this, callback = std::move(callback)]() mutable {
+        id_ = 0U;
+        callback();
+    };
+}
+
+EventId ScheduledEvent::scheduleAfter(
+    const SimTimeNs delta,
+    EventCallback callback
+) {
+    if (!callback) throw std::invalid_argument("scheduled event callback is empty");
+    cancel();
+    if (loop_ == nullptr) return 0U;
+    id_ = loop_->scheduleAfter(delta, retireBefore(std::move(callback)));
+    return id_;
+}
+
+EventId ScheduledEvent::scheduleAt(
+    const SimTimeNs at,
+    EventCallback callback
+) {
+    if (!callback) throw std::invalid_argument("scheduled event callback is empty");
+    cancel();
+    if (loop_ == nullptr) return 0U;
+    id_ = loop_->scheduleAt(at, retireBefore(std::move(callback)));
+    return id_;
+}
+
+void ScheduledEvent::cancel() noexcept {
+    if (id_ != 0U && loop_ != nullptr) {
+        static_cast<void>(loop_->cancel(id_));
+    }
+    id_ = 0U;
+}
+
 } // namespace fil::sim

@@ -1,5 +1,6 @@
 #include "fil/sim/world.hpp"
 
+#include "fil/common/numeric.hpp"
 #include "fil/devices/can_bus.hpp"
 #include "fil/stm32g4/fdcan.hpp"
 #include "fil/stm32g4/stm32g4.hpp"
@@ -33,20 +34,11 @@ struct ConcurrentEventGuard {
     }
 };
 
-std::uint64_t saturatingAdd(const std::uint64_t left, const std::uint64_t right) noexcept {
-    if (right > std::numeric_limits<std::uint64_t>::max() - left) {
-        return std::numeric_limits<std::uint64_t>::max();
-    }
-    return left + right;
-}
-
 void initializeSnapshot(WorldBoardRunResult& output, const Board& board, const SimTimeNs now) {
     output.name = board.config().name;
     output.result.reason = BoardStopReason::instruction_budget;
     output.result.time_ns = now;
-    output.result.diagnostic.next_pc = board.cpu().state().r[15];
-    output.result.diagnostic.registers = board.cpu().state().r;
-    output.result.diagnostic.xpsr = board.cpu().state().xpsr;
+    board.cpu().captureDiagnostic(output.result.diagnostic);
 }
 
 void stopBoard(
@@ -59,9 +51,7 @@ void stopBoard(
     output.result.reason = reason;
     output.result.time_ns = now;
     output.result.message = std::move(message);
-    output.result.diagnostic.next_pc = board.cpu().state().r[15];
-    output.result.diagnostic.registers = board.cpu().state().r;
-    output.result.diagnostic.xpsr = board.cpu().state().xpsr;
+    board.cpu().captureDiagnostic(output.result.diagnostic);
     output.terminal = true;
 }
 
@@ -348,9 +338,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                 state.loop_skip_in_flight = false;
                 state.in_flight = false;
                 board_output.result.time_ns = now;
-                board_output.result.diagnostic.next_pc = board.cpu().state().r[15];
-                board_output.result.diagnostic.registers = board.cpu().state().r;
-                board_output.result.diagnostic.xpsr = board.cpu().state().xpsr;
+                board.cpu().captureDiagnostic(board_output.result.diagnostic);
                 if (state.inside_proven_loop && state.proven_loop) {
                     board.refreshLoopObservation(
                         *state.proven_loop,
@@ -400,12 +388,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
             state.in_flight = false;
 
             if (completed.cpu_result.reason != cpu::StopReason::step_complete) [[unlikely]] {
-                cpu::RunResult detailed;
-                detailed.reason = completed.cpu_result.reason;
-                detailed.instructions = completed.cpu_result.instructions;
-                detailed.cycles = completed.cpu_result.cycles;
-                detailed.diagnostic = board.cpu().lastDiagnostic();
-                BoardRunResult slice = board.cpuFailure(detailed);
+                BoardRunResult slice = board.cpuFailure(completed.cpu_result);
                 slice.time_ns = now;
                 accumulate(board_output, slice, output);
                 state.runnable = false;
@@ -593,12 +576,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                     WorldBoardRunResult& board_output = output.boards[index];
                     const cpu::FastStepResult& step = burst_steps[index].cpu_result;
                     if (step.reason != cpu::StopReason::step_complete) [[unlikely]] {
-                        cpu::RunResult detailed;
-                        detailed.reason = step.reason;
-                        detailed.instructions = step.instructions;
-                        detailed.cycles = step.cycles;
-                        detailed.diagnostic = board.cpu().lastDiagnostic();
-                        BoardRunResult slice = board.cpuFailure(detailed);
+                        BoardRunResult slice = board.cpuFailure(step);
                         slice.time_ns = completion;
                         accumulate(board_output, slice, output);
                         states[index].runnable = false;
