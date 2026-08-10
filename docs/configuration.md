@@ -113,11 +113,6 @@ At least one board is required. Only `type: "can"` is supported, bitrate must be
 
 The repository provides `configs/networks/per_vehicle.json` and board files for `g4_testing`, `dashboard`, `main_module`, `torque_vector`, `a_box`, `front_driveline`, and `rear_driveline`. Their ELF paths target a sibling PER checkout and must exist to run them.
 
-With the currently configured external builds, all seven board files complete a
-10 ms smoke run with zero top-level unknown MMIO addresses, and the six-board
-`per_vehicle` world completes its compatibility run. These results apply to those
-specific ELF builds; the coverage documents remain the support boundary.
-
 ## Inspection and execution
 
 Validate and print a normalized summary without starting emulation:

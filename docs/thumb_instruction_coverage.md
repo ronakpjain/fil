@@ -50,50 +50,15 @@ The core implements architectural PC reads, Thumb-target validation, APSR N/Z/C/
 
 At board level, SVC enters exception 11, pending SysTick/PendSV/NVIC exceptions vector through VTOR, and `BX`, `POP`, or `LDM` with a recognized EXC_RETURN restores a frame. Basic integer frames and extended frames containing S0-S15 plus FPSCR are unit covered. FreeRTOS-style manual S16-S31 transfers are covered separately by VSTM/VLDM.
 
-The one-second real-firmware acceptance command is:
+The optional PER audit runs `tools/audit_per_instructions.py` over all configured
+external ELFs. It uses `arm-none-eabi-objdump -d` as the code/data boundary and
+checks that `fil disasm-window` agrees on instruction address, raw halfwords, width,
+and supported status. The JSON report records per-ELF counts, input hashes, and tool
+versions; it does not treat instructions absent from those binaries as covered.
 
-```bash
-./build/fil run configs/boards/g4_testing.json \
-  --duration-ms 1000 \
-  --max-instructions 50000000
-```
-
-With the configured external ELF it reaches FreeRTOS scheduling and continues to the
-time boundary after 16,000,000 instructions with no undefined instruction and zero
-top-level unknown MMIO addresses.
-
-The opt-in `fil.per.audit_instructions` CTest runs
-`tools/audit_per_instructions.py` over all seven configured PER ELFs. The tool uses
-`arm-none-eabi-objdump -d` as its code/data boundary authority, groups contiguous
-instructions, and checks that `fil disasm-window` agrees on address, raw halfwords,
-instruction width, and supported status. With the current artifacts it audits
-55,068 objdump-recognized instructions with zero unsupported results and zero
-address/width mismatches. It writes the observed per-ELF counts to
-`per-instruction-audit.json` in the CMake build directory rather than embedding
-artifact-dependent counts in the test. The report also records the fil and objdump
-versions plus each ELF's SHA-256 digest so results can be tied to exact inputs.
-
-Run the same audit outside CTest with:
-
-```bash
-python3 tools/audit_per_instructions.py \
-  --fil ./build/fil \
-  --objdump arm-none-eabi-objdump \
-  --report /tmp/per-instruction-audit.json \
-  /absolute/path/to/PER/Projects/firmware/output/g4_testing/g4_testing.elf \
-  /absolute/path/to/PER/Projects/firmware/output/dashboard/dashboard.elf \
-  /absolute/path/to/PER/Projects/firmware/output/main_module/main_module.elf \
-  /absolute/path/to/PER/Projects/firmware/output/torque_vector/torque_vector.elf \
-  /absolute/path/to/PER/Projects/firmware/output/a_box/a_box.elf \
-  /absolute/path/to/PER/Projects/firmware/output/front_driveline/front_driveline.elf \
-  /absolute/path/to/PER/Projects/firmware/output/rear_driveline/rear_driveline.elf
-```
-
-The automated audit deliberately does not compare operand fields or normalize
-objdump mnemonic aliases and condition suffixes. A separate targeted audit checked
-mnemonic kinds and operand fields for 2,268 ADDW/scalar-VFP instances. Both scans
-cover instructions present in those particular binaries; neither implies support
-for encodings absent from them or replaces execution tests.
+The audit intentionally avoids mnemonic-alias and operand normalization, so it
+complements rather than replaces execution tests. See [Testing](testing.md) for the
+CTest setup and standalone validation workflow.
 
 ## Intentional simplifications
 

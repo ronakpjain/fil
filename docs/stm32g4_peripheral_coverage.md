@@ -64,18 +64,16 @@ on the shared event loop and may be repeated. A missing `@TIME_MS` means time ze
 
 The configured bitrate is informational. The bus does not model arbitration priority, simultaneous transmit, serialization delay, physical errors, termination, or load.
 
-## Acceptance and interpreting unknown MMIO
+## Interpreting unknown MMIO
 
-All seven configured external board ELFs currently complete a 10 ms smoke run with
-zero top-level unknown MMIO addresses, and the configured six-board CAN network run
-also succeeds. The real `g4_testing` acceptance reaches FreeRTOS scheduling, executes
-16,000,000 instructions over one simulated second, and reports
-`unknown_mmio_addresses: 0`.
+The `unknown_mmio_addresses` counter records only addresses that miss every
+top-level routed block. It does not count generic storage inside a modeled block or
+accesses absorbed by the ADC-common, SYSCFG, and EXTI sparse stubs. The tables above,
+not a zero unknown-address count, define peripheral fidelity. Strict MMIO remains
+useful for finding entirely unrouted ranges.
 
-That counter records only addresses which miss every top-level routed block. It does
-not count accesses to generic storage inside a modeled block, nor accesses absorbed
-by the ADC-common, SYSCFG, or EXTI sparse stubs. Use the tables above—not the zero
-count—as the fidelity statement. Strict MMIO remains useful for discovering entirely
-unrouted address ranges.
-
-Representative tests are in `tests/unit/peripheral_test.cpp`, `tests/unit/fdcan_test.cpp`, `tests/unit/stm32g4_test.cpp`, `tests/unit/cortexm_test.cpp`, `tests/unit/exceptions_test.cpp`, `tests/unit/can_bus_test.cpp`, and `tests/unit/world_test.cpp`.
+Representative tests are in `tests/unit/peripheral_test.cpp`,
+`tests/unit/fdcan_test.cpp`, `tests/unit/stm32g4_test.cpp`,
+`tests/unit/cortexm_test.cpp`, `tests/unit/exceptions_test.cpp`,
+`tests/unit/can_bus_test.cpp`, and `tests/unit/world_test.cpp`. External firmware
+validation is described in [Testing](testing.md).

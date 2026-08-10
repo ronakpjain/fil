@@ -1,12 +1,15 @@
 # Architecture
 
-`fil` separates generic ARM execution from STM32G4 devices and board-specific inputs. Firmware behavior is derived from the ELF, target configuration, architectural state, and modeled register accesses; the emulator does not dispatch on application symbols or source names.
+`fil` separates generic ARM execution from STM32G4 devices and board-specific
+inputs. Behavior comes from ELF contents, configuration, architectural state, and
+modeled register accesses. The emulator does not dispatch on application symbols,
+task names, or source paths.
 
-## Execution path
+## Components
 
 ```text
 CLI
- |-- strict JSON config ---- MCU / board / network values
+ |-- strict JSON config ---- MCU, board, and network values
  |-- ELF32 ARM loader ------ segments, vectors, symbols, ABI attributes
  |
  +-- Board
@@ -16,83 +19,127 @@ CLI
      |-- ExceptionController -- stacking, vectoring, EXC_RETURN
      |-- Stm32G4 ----------- routed register-level peripherals
      |-- EventLoop --------- deterministic simulated-time callbacks
-     +-- TraceRecorder ----- stable ordered JSONL records
+     +-- TraceRecorder ----- ordered JSONL records
 
 World
  |-- shared EventLoop and TraceRecorder
- |-- fixed-order Board dispatch
+ |-- fixed-order Board scheduling
  +-- named VirtualCanBus instances connecting FDCAN nodes
 ```
 
-The CLI is a thin adapter around library APIs. Lower layers return typed results and structured bus faults; they do not print output or choose process exit codes.
+The CLI adapts command-line input to library APIs. Lower layers return typed results
+and structured faults; they do not print output or choose process exit codes.
 
 ## Loading and memory
 
-The ELF loader accepts ELF32 little-endian ARM executable images and keeps load addresses separate from runtime virtual addresses. Board startup validates a 128-byte-aligned vector base, an aligned initial MSP inside writable memory, a Thumb reset vector, and an executable reset target.
+The ELF loader accepts ELF32 little-endian ARM executables and keeps physical load
+addresses separate from runtime virtual addresses. Startup validates a 128-byte
+aligned vector base, an aligned initial MSP in writable memory, a Thumb reset vector,
+and an executable reset target.
 
-The STM32G474 map currently contains:
+The STM32G474 map contains:
 
-- executable flash at the configured flash address and a boot alias at `0x00000000`;
+- configured flash and a boot alias at `0x00000000`;
 - SRAM and CCM SRAM from the MCU config;
-- a read-only system-memory window at `0x1fff0000`;
-- the STM32 peripheral aperture at `0x40000000..0x5fffffff`;
+- read-only system memory at `0x1fff0000`;
+- the STM32 peripheral aperture at `0x40000000..0x5fffffff`; and
 - the Cortex-M system window at `0xe0000000..0xe00fffff`.
 
-The memory bus enforces mapped permissions and records access type and originating PC in faults. The peripheral aperture is subdivided by an MMIO router. Lenient mode returns zero for addresses outside routed blocks and aggregates those addresses; `--strict-mmio` turns the same accesses into faults.
+`MemoryBus` enforces range and permission checks and includes access type and PC in
+faults. MMIO accesses retain their original width and are routed once. Lenient mode
+returns zero and aggregates addresses outside known peripheral blocks;
+`--strict-mmio` turns those accesses into faults.
+
+See [ELF loading](elf_loading.md) and [Memory system](memory_system.md).
 
 ## CPU and exceptions
 
-`CortexM4` owns integer registers, xPSR and IT state, MSP/PSP and mask registers, and 32 single-precision register slots with D0-D15 memory-transfer aliases. Each step fetches one 16- or 32-bit Thumb instruction, decodes it through non-overlapping mask/value tables, executes it, and returns a stable diagnostic snapshot.
+`CortexM4` owns integer registers, xPSR/IT state, MSP/PSP, mask registers, and 32
+single-precision FP slots. Each step fetches one 16- or 32-bit Thumb instruction,
+decodes it through non-overlapping mask/value tables, executes it, and returns a
+stable result.
 
-The board loop consumes synchronous SVC and EXC_RETURN markers from the CPU, then checks pending SysTick, PendSV, and enabled NVIC interrupts. `ExceptionController` stacks and restores basic or extended floating-point frames, selects MSP or PSP, vectors through VTOR, and supports nested active exceptions. Unsupported instruction encodings and invalid architectural state stop with diagnostics rather than silently continuing.
+At each instruction boundary, `Board` consumes SVC and EXC_RETURN markers and then
+checks SysTick, PendSV, and enabled NVIC interrupts. `ExceptionController` stacks or
+restores basic and extended FP frames, selects MSP or PSP, vectors through VTOR, and
+tracks nested exceptions. Unsupported encodings and invalid state stop with
+structured diagnostics.
 
-The exact implemented instruction subset is documented in [Thumb instruction coverage](thumb_instruction_coverage.md).
+See [Thumb instruction coverage](thumb_instruction_coverage.md).
 
 ## Peripherals and external devices
 
-`Stm32G4` owns stable register-device instances and routes their real STM32G474 base addresses. Modeled side effects cover startup clocks and flash state, GPIO, basic serial data paths, timers, ADC, DMA, watchdog timers, and three FDCAN controllers with shared message RAM. Device callbacks pend NVIC exceptions through `SystemControl`.
+`Stm32G4` owns stable register-device instances at STM32G474 addresses. The model
+covers startup clocks and flash state, GPIO, serial data paths, timers, ADC, DMA,
+watchdogs, and three FDCAN controllers with message RAM. Peripheral callbacks pend
+interrupts through `SystemControl`.
 
-Board configuration supplies deterministic external inputs such as GPIO levels,
-scripted USART RX, binary USART TX logs, ADC constants or simulated-time sine waves,
-and SPI zero/echo devices. ADC conversion completion is an event-loop callback, and
-the input provider is sampled at that deterministic completion timestamp.
-`VirtualCanBus` validates classic CAN and CAN-FD frames and broadcasts synchronously
-in attachment order. CLI CAN injections use the same shared event loop. The detailed
-semantic and simplification boundary is in [STM32G4 peripheral coverage](stm32g4_peripheral_coverage.md).
+Board configuration supplies deterministic GPIO levels, USART input/output, ADC
+sources, and SPI devices. ADC inputs are sampled at simulated conversion-completion
+time. `VirtualCanBus` validates classic CAN and CAN-FD frames and delivers them in
+attachment order. CLI CAN injection uses the same event loop.
 
-## Time, scheduling, and traces
+See [STM32G4 peripheral coverage](stm32g4_peripheral_coverage.md) for modeled
+semantics and intentional gaps.
 
-The interpreter currently charges one target cycle per executed instruction. A board converts cycles to nanoseconds using the RCC system-clock estimate, advances SysTick/DWT, then runs due events. Events with the same timestamp execute in insertion order and have a bounded same-time callback count. The decoded-instruction, address-region, sparse-NVIC, and allocation-free stepping optimizations are described in [Performance](performance.md).
+## Time and deterministic scheduling
 
-`World` loads boards in network-config order and gives each board an independent virtual CPU timeline. Boards ready at the same timestamp start in configuration order; the shared event loop then advances to the earliest instruction-completion or external-event frontier. The instruction quantum is a same-time fairness cap, not serialized simulated time. All boards share one event loop and one trace recorder, so board dispatch, CAN delivery, and equal-time events remain reproducible without host threads or wall-clock time.
+Each instruction currently costs one target cycle. A board converts cycles to
+nanoseconds from the RCC clock estimate, advances SysTick/DWT, and runs due events.
+Same-time callbacks execute in insertion order and have a bounded callback count.
 
-Every scheduled callback carries an inherited event owner: one board lane or the shared domain. Peripheral callbacks created while a board executes remain local through nested scheduling, while FDCAN delivery and externally injected work are explicitly shared. Event execution reports the affected owner mask, allowing local callbacks to invalidate only their lane's lookahead proof. A global timestamp/sequence heap preserves deterministic dispatch, while per-owner queues expose board-local and shared horizons without scanning unrelated callbacks. Global and owner queues reference the same live event, so a worker can commit one lane's callbacks exactly once while the global queue later skips those retired entries. Each owner also has a monotonic local clock; ordinary single-threaded execution advances all clocks together, while worker execution can advance one owner independently. MMIO devices classify accesses as board-local or shared through nested routers. In worker mode, shared accesses return a side-effect-free synchronization boundary before device dispatch; the CPU restores its pre-instruction state so the coordinator can restart that instruction exactly once in deterministic board order. FDCAN control blocks are shared, while message RAM and ordinary MCU peripherals remain board-local. `Board::runWorkerSlice()` advances one owner clock, services only that owner's callbacks, settles interrupts at every instruction boundary, and retains exact-state loop batching up to its local event or coordinator deadline. It returns before shared MMIO without charging an instruction or cycle, and transactional windows may conservatively trap all MMIO. A board transaction captures CPU and system-control state, active exception nesting, reversible RAM position, loop observations, fractional clock state, and an owner event-generation checkpoint. Restore walks RAM mutations backward and rewinds the owner clock only when no MMIO or callback escaped the window. Event ownership is thread-local, and the event loop can enable recursive locking before workers start; normal single-threaded runs leave locking disabled, while concurrent owner tests verify exact callback retirement and isolated scheduling contexts. Persistent lane workers can run these reversible slices concurrently. The coordinator commits an epoch only when every board reaches the same MMIO-free instruction budget before the next event; otherwise it restores every checkpoint and returns to exact frontier scheduling with a failure backoff. Tracing and instruction tracing disable transactional epochs because speculative records cannot be retracted. The path is currently opt-in with `--transactional-slices` while workload-specific commit rates are tuned. This provenance, queue ownership, restartable access boundary, reversible transaction, and independently testable lane runner form the synchronization contract for worker threads without changing timestamp or insertion-order semantics.
+`World` gives every board an independent virtual CPU timeline. Boards ready at the
+same timestamp start in configuration order, and the event loop advances to the
+earliest instruction completion or callback. The instruction quantum limits
+same-time fairness; it does not serialize board time. All boards share one trace
+recorder and event loop, so dispatch, CAN delivery, and equal-time events are
+reproducible without wall-clock input.
 
-Peripheral trace sources are qualified as `board.device` (for example,
-`dashboard.FDCAN1`) so identical MCU instances remain unambiguous in a shared
-world trace. Virtual CAN fabric records use `bus/node` sources. CAN records expose
-the encoded data-length code as `dlc` and the decoded payload byte count as
-`length`.
+### Event ownership and worker slices
 
-When an exact architectural state repeats through a side-effect-free idle loop, the
-runner may batch identical iterations up to the next observable time, event,
-interrupt, or budget boundary. Instruction tracing and explicit spin diagnosis
-disable batching. This is a firmware-agnostic throughput optimization; it does not
-recognize application symbols or task names. See [Performance](performance.md) for
-the proof conditions, opt-outs, and benchmark method.
+Every callback belongs to one board lane or to the shared domain. Ownership is
+inherited by nested scheduling. Per-owner queues and clocks provide local horizons
+without changing the global timestamp/sequence order.
 
-Trace records have a simulated timestamp and monotonic insertion sequence. Instruction tracing is optional because it is much larger than device and lifecycle tracing.
+This ownership supports conservative independent execution:
 
-## Intentional fidelity boundary
+- board-local callbacks invalidate only their lane's lookahead;
+- shared callbacks invalidate every lane;
+- shared MMIO yields before device dispatch so the coordinator can restart the
+  instruction once in deterministic order;
+- `Board::runWorkerSlice()` services only one owner's callbacks and stops at shared
+  synchronization; and
+- a transaction captures CPU, system, RAM journal, event-clock, fractional-time,
+  and loop-proof state for rollback.
 
-The emulator is instruction-level, not pipeline- or bus-cycle-accurate. Peripheral clocks, electrical behavior, analog settling, CAN arbitration timing, debug transport, and many register corner cases are simplified. One instruction per cycle also means simulated time is suitable for deterministic regression tests, not performance prediction.
+Persistent lane workers may run reversible slices concurrently. An epoch commits
+only when every board reaches the same MMIO-free boundary before the next event;
+otherwise all checkpoints are restored and exact frontier scheduling resumes.
+Tracing disables transactional epochs because speculative trace records cannot be
+retracted. The path remains opt-in through `--transactional-slices`.
 
-Required tests use synthetic firmware and direct unit fixtures. External PER firmware is an acceptance input, not a source of special cases: no application function name, task name, CAN identifier, or source path is recognized by the emulator.
+### Loop batching
 
-The hermetic `startup_runtime.elf` integration fixture verifies flash-to-SRAM `.data`
-copying, `.bss` zeroing, entry to `main`, and a deterministic `BKPT` stop. Separately,
-the current external-firmware checks statically scan all seven configured ELFs, run
-each board for 10 ms with zero top-level unknown MMIO addresses, run the configured
-six-board CAN world, and run `g4_testing` into FreeRTOS scheduling through one
-simulated second. These checks establish compatibility with those builds, not full
-ARM or STM32 conformance.
+When a side-effect-free polling loop returns to the exact same architectural and
+memory state, the scheduler may account for repeated iterations up to the next
+event, interrupt, deadline, budget, or scheduling frontier. Instruction tracing and
+spin diagnosis disable batching. The proof and benchmark controls are documented in
+[Performance](performance.md).
+
+## Traces
+
+Every trace record has a simulated timestamp and monotonic insertion sequence.
+Peripheral sources use `board.device`; virtual CAN sources use `bus/node`.
+Instruction tracing is optional because it is much larger than lifecycle and device
+tracing. See the [JSONL trace contract](tracing.md).
+
+## Fidelity boundary
+
+The emulator is instruction-level, not pipeline- or bus-cycle-accurate. Peripheral
+clocks, analog/electrical behavior, CAN arbitration timing, debug transport, and many
+register corners are simplified. Simulated time is suitable for deterministic
+regression tests, not hardware performance prediction.
+
+Required tests use synthetic firmware and direct fixtures. External PER firmware is
+an acceptance input, never a source of application-specific behavior. See
+[Testing](testing.md) for the validation matrix.
