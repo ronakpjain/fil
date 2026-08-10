@@ -458,10 +458,15 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                 state.inside_proven_loop = false;
             }
 
-            const auto observed_loop = board.observeLoopBoundary(
+            std::optional<Board::ProvenLoop> observed_loop;
+            if (board.cpu().state().r[15]
+                <= completed.cpu_result.instruction_address) {
+                observed_loop = board.observeLoopBoundary(
                     completed.cpu_result,
                     board_output.result.instructions,
-                    board_output.result.cycles);
+                    board_output.result.cycles
+                );
+            }
             if (observed_loop) {
                 const auto& loop = *observed_loop;
                 if (state.proven_loop
@@ -638,10 +643,13 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                         leave_burst = true;
                     }
 
-                    const auto observed = board.observeLoopBoundary(
-                        step, board_output.result.instructions,
-                        board_output.result.cycles
-                    );
+                    std::optional<Board::ProvenLoop> observed;
+                    if (board.cpu().state().r[15] <= step.instruction_address) {
+                        observed = board.observeLoopBoundary(
+                            step, board_output.result.instructions,
+                            board_output.result.cycles
+                        );
+                    }
                     if (observed && options.enable_loop_batching) {
                         const bool newly_proven = !states[index].inside_proven_loop
                             || !states[index].proven_loop;

@@ -375,31 +375,24 @@ std::uint64_t Board::maximumLoopIterations(
         const SimTimeNs available_ns = *horizon_ns - now;
         const std::uint64_t frequency = peripherals_->rcc().systemClockHz();
         if (frequency == 0U) return 0U;
-        const auto elapsedFor = [&](const std::uint64_t count) -> SimTimeNs {
-            if (count > std::numeric_limits<std::uint64_t>::max()
-                    / loop.cycles_per_iteration) {
-                return std::numeric_limits<SimTimeNs>::max();
-            }
-            const std::uint64_t cycles = count * loop.cycles_per_iteration;
-            if (cycles > (std::numeric_limits<std::uint64_t>::max() - time_fraction_)
-                    / nanoseconds_per_second) {
-                return std::numeric_limits<SimTimeNs>::max();
-            }
-            return (cycles * nanoseconds_per_second + time_fraction_) / frequency;
-        };
-        if (elapsedFor(iterations) >= available_ns) {
-            // Include at most the first loop iteration whose rounded completion
-            // reaches the observable frontier. At clocks above 1 GHz, several
-            // iterations can otherwise share one integer nanosecond and run
-            // before an event that exact stepping would dispatch after the first.
-            std::uint64_t low = 1U;
-            std::uint64_t high = iterations;
-            while (low < high) {
-                const std::uint64_t middle = low + (high - low) / 2U;
-                if (elapsedFor(middle) >= available_ns) high = middle;
-                else low = middle + 1U;
-            }
-            iterations = elapsedFor(low) == available_ns ? low : low - 1U;
+
+        // floor((cycles * 1e9 + fraction) / frequency) <= available
+        // exactly when the numerator is below (available + 1) * frequency.
+        // Solve that inequality directly instead of binary-searching iteration
+        // counts. If the right side cannot fit in uint64_t, the earlier
+        // accountable-cycle bound is already stricter than this horizon.
+        if (available_ns != std::numeric_limits<SimTimeNs>::max()
+            && available_ns + 1U
+                <= std::numeric_limits<std::uint64_t>::max() / frequency) {
+            const std::uint64_t exclusive_numerator =
+                (available_ns + 1U) * frequency;
+            if (exclusive_numerator <= time_fraction_) return 0U;
+            const std::uint64_t maximum_cycles =
+                (exclusive_numerator - 1U - time_fraction_)
+                / nanoseconds_per_second;
+            iterations = std::min(
+                iterations, maximum_cycles / loop.cycles_per_iteration
+            );
         }
     }
     return iterations;
@@ -407,23 +400,13 @@ std::uint64_t Board::maximumLoopIterations(
 
 Board::LoopSkip Board::applyLoopIterations(
     const ProvenLoop& loop,
-    const std::uint64_t iterations
+    const std::uint64_t validated_iterations
 ) {
-    if (iterations == 0U || !loopProofStillValid(loop)) return {};
-    LoopSkip skip = describeLoopIterations(loop, iterations);
-    skip.elapsed_ns = accountCycles(skip.cycles);
-    return skip;
-}
-
-Board::LoopSkip Board::describeLoopIterations(
-    const ProvenLoop& loop,
-    const std::uint64_t iterations
-) const {
-    if (iterations == 0U || !loopProofStillValid(loop)) return {};
+    if (validated_iterations == 0U) return {};
     LoopSkip skip;
-    skip.instructions = iterations * loop.instructions_per_iteration;
-    skip.cycles = iterations * loop.cycles_per_iteration;
-    skip.elapsed_ns = elapsedForCycles(skip.cycles);
+    skip.instructions = validated_iterations * loop.instructions_per_iteration;
+    skip.cycles = validated_iterations * loop.cycles_per_iteration;
+    skip.elapsed_ns = accountCycles(skip.cycles);
     return skip;
 }
 
