@@ -192,6 +192,22 @@ void tracksReversibleLoopMemoryEffects() {
                          && bus.sideEffectsRestoredSince(rollback_checkpoint),
                      "rollback restores bytes and checkpoint sequence");
 
+    static_cast<void>(bus.read32(
+        0x20000000U, {fil::mem::AccessType::data_read, 0x08000100U}
+    ));
+    const auto footprint = bus.takeReadFootprint();
+    const auto external_checkpoint = bus.sideEffectCheckpoint();
+    static_cast<void>(bus.write8(
+        0x2000000cU, 0x33U, {fil::mem::AccessType::data_write, 0U}
+    ));
+    fil::test::check(bus.sideEffectsCompatibleSince(external_checkpoint, footprint),
+                     "ignores external writes outside a proven loop read footprint");
+    static_cast<void>(bus.write8(
+        0x20000000U, 0x44U, {fil::mem::AccessType::data_write, 0U}
+    ));
+    fil::test::check(!bus.sideEffectsCompatibleSince(external_checkpoint, footprint),
+                     "invalidates a proof when external DMA overlaps a loop read");
+
     const auto mmio_checkpoint = bus.sideEffectCheckpoint();
     static_cast<void>(bus.read32(0x40000000U));
     fil::test::check(!bus.sideEffectsRestoredSince(mmio_checkpoint)

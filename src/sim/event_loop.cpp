@@ -41,6 +41,7 @@ struct EventLoop::Impl {
     std::size_t maximum_same_time_events{100000};
     mutable std::recursive_mutex mutex;
     bool concurrent_access{false};
+    EventOwner serial_active_owner{shared_event_owner};
     Queue events;
     std::unordered_map<EventOwner, Queue> owner_events;
     std::unordered_map<EventId, EventPtr> live_events;
@@ -54,6 +55,15 @@ struct EventLoop::Impl {
         }
         std::unique_lock<std::recursive_mutex> lock;
     };
+
+    [[nodiscard]] EventOwner currentOwner() const noexcept {
+        return concurrent_access ? active_event_owner : serial_active_owner;
+    }
+
+    void setCurrentOwner(const EventOwner owner) noexcept {
+        if (concurrent_access) active_event_owner = owner;
+        else serial_active_owner = owner;
+    }
 
     [[nodiscard]] SimTimeNs timeFor(const EventOwner owner) const noexcept {
         if (owner == shared_event_owner) return shared_now;
@@ -98,15 +108,15 @@ struct EventLoop::Impl {
         ++result.events_executed;
         retire(event);
 
-        const EventOwner previous_owner = active_event_owner;
-        active_event_owner = event->owner;
+        const EventOwner previous_owner = currentOwner();
+        setCurrentOwner(event->owner);
         try {
             event->callback();
         } catch (...) {
-            active_event_owner = previous_owner;
+            setCurrentOwner(previous_owner);
             throw;
         }
-        active_event_owner = previous_owner;
+        setCurrentOwner(previous_owner);
     }
 };
 
@@ -120,16 +130,12 @@ EventLoop::EventLoop(EventLoop&&) noexcept = default;
 EventLoop& EventLoop::operator=(EventLoop&&) noexcept = default;
 
 EventLoop::OwnerScope::OwnerScope(EventLoop& loop, const EventOwner owner) noexcept
-    : loop_(&loop), previous_(active_event_owner) {
-    Impl::Lock lock(*loop.impl_);
-    active_event_owner = owner;
-    if (owner != shared_event_owner && !loop.impl_->owner_now.contains(owner)) {
-        loop.impl_->owner_now.emplace(owner, loop.impl_->shared_now);
-    }
+    : loop_(&loop), previous_(loop.impl_->currentOwner()) {
+    loop.impl_->setCurrentOwner(owner);
 }
 
 EventLoop::OwnerScope::~OwnerScope() {
-    if (loop_ != nullptr) active_event_owner = previous_;
+    if (loop_ != nullptr) loop_->impl_->setCurrentOwner(previous_);
 }
 
 EventLoop::OwnerScope::OwnerScope(OwnerScope&& other) noexcept
@@ -140,7 +146,7 @@ EventLoop::OwnerScope EventLoop::useOwner(const EventOwner owner) noexcept {
 }
 
 EventOwner EventLoop::activeOwner() const noexcept {
-    return active_event_owner;
+    return impl_->currentOwner();
 }
 
 EventId EventLoop::scheduleAfter(const SimTimeNs delta, EventCallback callback) {
@@ -162,7 +168,7 @@ EventId EventLoop::scheduleAt(const SimTimeNs at, EventCallback callback) {
     }
 
     const EventId id = impl_->next_id++;
-    const EventOwner owner = active_event_owner;
+    const EventOwner owner = impl_->currentOwner();
     auto event = std::make_shared<Impl::Event>(Impl::Event{
         at, id, impl_->next_sequence++, owner, std::move(callback), true,
     });
@@ -283,7 +289,7 @@ void EventLoop::clear() noexcept {
 
 SimTimeNs EventLoop::now() const noexcept {
     Impl::Lock lock(*impl_);
-    return impl_->timeFor(active_event_owner);
+    return impl_->timeFor(impl_->currentOwner());
 }
 
 SimTimeNs EventLoop::now(const EventOwner owner) const noexcept {

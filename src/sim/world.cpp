@@ -279,6 +279,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
     };
     std::vector<SchedulerState> states(boards_.size());
     std::vector<std::uint64_t> planned_iterations(boards_.size(), 0U);
+    std::vector<Board::ConcurrentStepResult> burst_steps(boards_.size());
     std::unique_ptr<LaneWorkerPool> worker_pool;
     ConcurrentEventGuard concurrent_guard;
     if (options.enable_transactional_slices && boards_.size() > 1U
@@ -395,28 +396,15 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
             state.step.reset();
             state.in_flight = false;
 
-            BoardRunResult slice;
-            if (completed.cpu_result.reason == cpu::StopReason::step_complete) {
-                slice.reason = BoardStopReason::instruction_budget;
-                slice.instructions = completed.cpu_result.instructions;
-                slice.cycles = completed.cpu_result.cycles;
-                slice.diagnostic.instruction_address =
-                    completed.cpu_result.instruction_address;
-                slice.diagnostic.raw = completed.cpu_result.raw;
-                slice.diagnostic.instruction_size = completed.cpu_result.instruction_size;
-                slice.time_ns = now;
-            } else {
+            if (completed.cpu_result.reason != cpu::StopReason::step_complete) {
                 cpu::RunResult detailed;
                 detailed.reason = completed.cpu_result.reason;
                 detailed.instructions = completed.cpu_result.instructions;
                 detailed.cycles = completed.cpu_result.cycles;
                 detailed.diagnostic = board.cpu().lastDiagnostic();
-                slice = board.cpuFailure(detailed);
+                BoardRunResult slice = board.cpuFailure(detailed);
                 slice.time_ns = now;
-            }
-            accumulate(board_output, slice, output);
-
-            if (completed.cpu_result.reason != cpu::StopReason::step_complete) {
+                accumulate(board_output, slice, output);
                 state.runnable = false;
                 board_output.terminal = true;
                 state.proven_loop.reset();
@@ -427,6 +415,24 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                 }
                 continue;
             }
+
+            board_output.result.reason = BoardStopReason::instruction_budget;
+            board_output.result.instructions = saturatingAdd(
+                board_output.result.instructions, completed.cpu_result.instructions
+            );
+            board_output.result.cycles = saturatingAdd(
+                board_output.result.cycles, completed.cpu_result.cycles
+            );
+            board_output.result.time_ns = now;
+            board_output.result.diagnostic.instruction_address =
+                completed.cpu_result.instruction_address;
+            board_output.result.diagnostic.raw = completed.cpu_result.raw;
+            board_output.result.diagnostic.instruction_size =
+                completed.cpu_result.instruction_size;
+            output.instructions = saturatingAdd(
+                output.instructions, completed.cpu_result.instructions
+            );
+            output.cycles = saturatingAdd(output.cycles, completed.cpu_result.cycles);
 
             const std::uint32_t pc_before_settle = board.cpu().state().r[15];
             const std::uint16_t ipsr_before_settle = board.cpu().state().ipsr();
@@ -516,6 +522,158 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                     BoardStopReason::time_budget, "simulated-time budget exhausted", now
                 );
             }
+        }
+
+        bool burst_eligible = !options.enable_transactional_slices
+            && !options.trace_instructions && !options.detect_spin
+            && !stop_requested && !time_exhausted && !states.empty();
+        bool all_lanes_proven = !states.empty();
+        for (std::size_t index = 0; index < states.size(); ++index) {
+            burst_eligible = burst_eligible && states[index].runnable
+                && !states[index].in_flight && states[index].ready_time_ns == now
+                && output.boards[index].result.instructions + 64U
+                    <= options.max_instructions_per_board;
+            all_lanes_proven = all_lanes_proven
+                && states[index].inside_proven_loop
+                && states[index].proven_loop.has_value();
+        }
+        burst_eligible = burst_eligible && !all_lanes_proven;
+        if (burst_eligible) {
+            std::uint64_t completed_rounds = 0U;
+            ++output.lockstep_bursts;
+            for (; completed_rounds < 64U; ++completed_rounds) {
+                const SimTimeNs round_start = event_loop_.now();
+                const SimTimeNs elapsed = boards_.front()->board->nextInstructionElapsedNs();
+                if (elapsed == 0U
+                    || (deadline != 0U && elapsed > deadline - round_start)) break;
+                bool same_elapsed = true;
+                for (std::size_t index = 1; index < boards_.size(); ++index) {
+                    same_elapsed = same_elapsed
+                        && boards_[index]->board->nextInstructionElapsedNs() == elapsed;
+                }
+                if (!same_elapsed) break;
+
+                for (std::size_t index = 0; index < boards_.size(); ++index) {
+                    auto owner_scope = event_loop_.useOwner(static_cast<EventOwner>(index));
+                    burst_steps[index] =
+                        boards_[index]->board->beginConcurrentStep(false);
+                    ++output.dispatches;
+                    ++output.exact_dispatches;
+                }
+                const SimTimeNs completion = saturatingAdd(round_start, elapsed);
+                const auto events = event_loop_.runDueEvents(completion);
+                output.event_callbacks = saturatingAdd(
+                    output.event_callbacks, events.events_executed
+                );
+
+                if (events.events_executed != 0U) {
+                    for (std::size_t index = 0; index < states.size(); ++index) {
+                        const bool local_event = index < 64U
+                            && (events.local_owner_mask
+                                & (std::uint64_t{1U} << index)) != 0U;
+                        if (!events.shared_event_executed && !local_event) continue;
+                        states[index].proven_loop.reset();
+                        states[index].inside_proven_loop = false;
+                    }
+                }
+
+                bool leave_burst = events.events_executed != 0U;
+                for (std::size_t index = 0; index < boards_.size(); ++index) {
+                    Board& board = *boards_[index]->board;
+                    WorldBoardRunResult& board_output = output.boards[index];
+                    const cpu::FastStepResult& step = burst_steps[index].cpu_result;
+                    if (step.reason != cpu::StopReason::step_complete) {
+                        cpu::RunResult detailed;
+                        detailed.reason = step.reason;
+                        detailed.instructions = step.instructions;
+                        detailed.cycles = step.cycles;
+                        detailed.diagnostic = board.cpu().lastDiagnostic();
+                        BoardRunResult slice = board.cpuFailure(detailed);
+                        slice.time_ns = completion;
+                        accumulate(board_output, slice, output);
+                        states[index].runnable = false;
+                        board_output.terminal = true;
+                        if (!slice.succeeded()) {
+                            board_failed = true;
+                            stop_requested = stop_requested
+                                || options.stop_on_board_failure;
+                        }
+                        leave_burst = true;
+                        continue;
+                    }
+
+                    board_output.result.reason = BoardStopReason::instruction_budget;
+                    board_output.result.instructions = saturatingAdd(
+                        board_output.result.instructions, step.instructions
+                    );
+                    board_output.result.cycles = saturatingAdd(
+                        board_output.result.cycles, step.cycles
+                    );
+                    board_output.result.time_ns = completion;
+                    board_output.result.diagnostic.instruction_address =
+                        step.instruction_address;
+                    board_output.result.diagnostic.raw = step.raw;
+                    board_output.result.diagnostic.instruction_size = step.instruction_size;
+                    output.instructions = saturatingAdd(output.instructions, step.instructions);
+                    output.cycles = saturatingAdd(output.cycles, step.cycles);
+                    states[index].ready_time_ns = completion;
+
+                    const std::uint32_t pc_before_settle = board.cpu().state().r[15];
+                    const std::uint16_t ipsr_before_settle = board.cpu().state().ipsr();
+                    if (auto boundary = board.settleInstructionBoundary()) {
+                        states[index].runnable = false;
+                        stopBoard(
+                            board_output, board, boundary->reason,
+                            std::move(boundary->message), completion
+                        );
+                        board_failed = true;
+                        stop_requested = stop_requested || options.stop_on_board_failure;
+                        leave_burst = true;
+                        continue;
+                    }
+                    if (board.cpu().state().r[15] != pc_before_settle
+                        || board.cpu().state().ipsr() != ipsr_before_settle) {
+                        states[index].proven_loop.reset();
+                        states[index].inside_proven_loop = false;
+                        leave_burst = true;
+                    }
+
+                    const auto observed = board.observeLoopBoundary(
+                        step, board_output.result.instructions,
+                        board_output.result.cycles
+                    );
+                    if (observed && options.enable_loop_batching) {
+                        const bool newly_proven = !states[index].inside_proven_loop
+                            || !states[index].proven_loop;
+                        states[index].proven_loop = *observed;
+                        states[index].inside_proven_loop = true;
+                        leave_burst = leave_burst || newly_proven;
+                    }
+                    if (deadline != 0U && completion >= deadline) {
+                        states[index].runnable = false;
+                        stopBoard(
+                            board_output, board, BoardStopReason::time_budget,
+                            "simulated-time budget exhausted", completion
+                        );
+                        time_exhausted = true;
+                        leave_burst = true;
+                    } else if (board_output.result.instructions
+                               >= options.max_instructions_per_board) {
+                        states[index].runnable = false;
+                        stopBoard(
+                            board_output, board, BoardStopReason::instruction_budget,
+                            "instruction budget exhausted", completion
+                        );
+                        leave_burst = true;
+                    }
+                }
+                ++output.rounds;
+                if (leave_burst) {
+                    ++completed_rounds;
+                    break;
+                }
+            }
+            if (completed_rounds != 0U) continue;
         }
 
         if (transaction_backoff != 0U) --transaction_backoff;
@@ -766,6 +924,15 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                 const bool local_event = index < 64U
                     && (events.local_owner_mask & (std::uint64_t{1U} << index)) != 0U;
                 if (!events.shared_event_executed && !local_event) continue;
+                if (!events.shared_event_executed && local_event
+                    && states[index].loop_skip_in_flight
+                    && states[index].proven_loop) {
+                    // Keep the prior proof only as a revalidation template. The
+                    // completion path refreshes its observation at post-event
+                    // memory state; maximumLoopIterations still rejects the stale
+                    // checkpoint until one exact iteration proves it again.
+                    continue;
+                }
                 states[index].proven_loop.reset();
                 states[index].inside_proven_loop = false;
             }

@@ -577,7 +577,8 @@ ExitCode runNetworkCommand(
         << "transactional_attempts: " << result.value().transactional_attempts << '\n'
         << "transactional_commits: " << result.value().transactional_commits << '\n'
         << "transactional_instructions: "
-        << result.value().transactional_instructions << '\n';
+        << result.value().transactional_instructions << '\n'
+        << "lockstep_bursts: " << result.value().lockstep_bursts << '\n';
     for (const auto& board : result.value().boards) {
         out << "board " << board.name
             << ": stop=" << sim::boardStopReasonName(board.result.reason)

@@ -50,6 +50,7 @@ void SystemControl::reset(const std::uint32_t vector_base) {
     active_exception_ = 0;
     pendsv_pending_ = false;
     systick_pending_ = false;
+    external_pending_enabled_ = false;
     reset_requested_ = false;
 }
 
@@ -101,6 +102,7 @@ void SystemControl::pend(const std::uint16_t exception_number) {
     } else if (exception_number >= 16U && exception_number < 256U) {
         const std::uint16_t irq = exception_number - 16U;
         nvic_pending_[irq / 32U] |= std::uint32_t{1} << (irq % 32U);
+        refreshPendingSummary();
     }
 }
 
@@ -112,6 +114,7 @@ void SystemControl::clearPending(const std::uint16_t exception_number) {
     } else if (exception_number >= 16U && exception_number < 256U) {
         const std::uint16_t irq = exception_number - 16U;
         nvic_pending_[irq / 32U] &= ~(std::uint32_t{1} << (irq % 32U));
+        refreshPendingSummary();
     }
 }
 
@@ -130,6 +133,16 @@ void SystemControl::leave(const std::uint16_t exception_number) {
         nvic_active_[irq / 32U] &= ~(std::uint32_t{1} << (irq % 32U));
     }
     if (active_exception_ == exception_number) active_exception_ = 0;
+}
+
+void SystemControl::refreshPendingSummary() noexcept {
+    external_pending_enabled_ = false;
+    for (std::size_t index = 0; index < nvic_pending_.size(); ++index) {
+        if ((nvic_pending_[index] & nvic_enable_[index]) != 0U) {
+            external_pending_enabled_ = true;
+            return;
+        }
+    }
 }
 
 bool SystemControl::isPending(const std::uint16_t exception_number) const noexcept {
@@ -162,16 +175,7 @@ std::optional<std::uint16_t> SystemControl::nextPending(
     const std::uint32_t basepri,
     const std::uint32_t faultmask
 ) const {
-    if (!pendsv_pending_ && !systick_pending_) {
-        bool external_pending = false;
-        for (std::size_t index = 0; index < nvic_pending_.size(); ++index) {
-            if ((nvic_pending_[index] & nvic_enable_[index]) != 0U) {
-                external_pending = true;
-                break;
-            }
-        }
-        if (!external_pending) return std::nullopt;
-    }
+    if (!hasEnabledPending()) return std::nullopt;
 
     std::optional<std::uint16_t> selected;
     std::uint16_t selected_priority = 0x100U;
@@ -301,6 +305,11 @@ void SystemControl::writeWord(
     const auto merge = [=](const std::uint32_t old_value) {
         return (old_value & ~lane_mask) | (value & lane_mask);
     };
+    const bool mutates_external_pending =
+        (offset >= 0xe100U && offset < 0xe120U)
+        || (offset >= 0xe180U && offset < 0xe1a0U)
+        || (offset >= 0xe200U && offset < 0xe220U)
+        || (offset >= 0xe280U && offset < 0xe2a0U);
     if (offset == 0x1000U) dwt_ctrl_ = merge(dwt_ctrl_);
     else if (offset == 0x1004U) dwt_cyccnt_ = merge(dwt_cyccnt_);
     else if (offset == 0xe010U) {
@@ -359,6 +368,7 @@ void SystemControl::writeWord(
     else if (offset == 0xed88U) cpacr_ = merge(cpacr_);
     else if (offset == 0xedfcU) demcr_ = merge(demcr_);
     else if (offset == 0xef34U) fpccr_ = merge(fpccr_);
+    if (mutates_external_pending) refreshPendingSummary();
 }
 
 mem::MemoryResult<std::uint64_t> SystemControl::read(

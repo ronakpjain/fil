@@ -7,8 +7,8 @@
 
 #include <algorithm>
 #include <iomanip>
-#include <bit>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <sstream>
 #include <utility>
@@ -44,13 +44,7 @@ bool sameCpuState(const cpu::CpuState& left, const cpu::CpuState& right) noexcep
         || left.instruction_address != right.instruction_address) {
         return false;
     }
-    for (std::size_t index = 0; index < left.s.size(); ++index) {
-        if (std::bit_cast<std::uint32_t>(left.s[index])
-            != std::bit_cast<std::uint32_t>(right.s[index])) {
-            return false;
-        }
-    }
-    return true;
+    return std::memcmp(left.s.data(), right.s.data(), sizeof(left.s)) == 0;
 }
 
 } // namespace
@@ -64,6 +58,9 @@ struct Board::TransactionCheckpoint {
     EventLoop::OwnerCheckpoint event_checkpoint;
     std::uint64_t time_fraction{0};
     std::array<LoopObservation, 256> loop_observations{};
+    std::uint64_t loop_observation_generation{1U};
+    std::optional<std::uint32_t> read_footprint_boundary;
+    mem::MemoryBus::ReadFootprint read_footprint;
 };
 
 bool BoardRunResult::succeeded() const noexcept {
@@ -146,6 +143,9 @@ Result<void> Board::reset() {
     exceptions_ = std::make_unique<cortexm::ExceptionController>(memory_, *system_);
     time_fraction_ = 0;
     loop_observations_ = {};
+    loop_observation_generation_ = 1U;
+    read_footprint_boundary_.reset();
+    static_cast<void>(memory_.takeReadFootprint());
     return {};
 }
 
@@ -181,7 +181,21 @@ Board::ConcurrentStepResult Board::beginConcurrentStep(const bool trace_instruct
     return ConcurrentStepResult{result, accountCycles(result.cycles)};
 }
 
+bool Board::boundaryWorkPending() const noexcept {
+    return cpu_->state().pending_exc_return || cpu_->state().pending_exception
+        || system_->hasEnabledPending() || system_->resetRequested()
+        || peripherals_->resetRequested();
+}
+
 std::optional<Board::BoundaryStop> Board::settleInstructionBoundary() {
+    if (!boundaryWorkPending()) return std::nullopt;
+    return settleInstructionBoundarySlow();
+}
+
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((noinline))
+#endif
+std::optional<Board::BoundaryStop> Board::settleInstructionBoundarySlow() {
     if (cpu_->state().pending_exc_return) {
         const std::uint32_t exc_return = *cpu_->state().pending_exc_return;
         cpu_->state().pending_exc_return.reset();
@@ -193,7 +207,7 @@ std::optional<Board::BoundaryStop> Board::settleInstructionBoundary() {
             event_loop_->now(), config_.name, "exception_return",
             {{"exc_return", hex32(exc_return)}}
         );
-        loop_observations_ = {};
+        invalidateLoopObservations();
     }
 
     if (cpu_->state().pending_exception) {
@@ -207,19 +221,21 @@ std::optional<Board::BoundaryStop> Board::settleInstructionBoundary() {
             event_loop_->now(), config_.name, "exception_enter",
             {{"exception", std::to_string(exception_number)}}
         );
-        loop_observations_ = {};
+        invalidateLoopObservations();
     }
 
-    auto pending = exceptions_->enterPending(cpu_->state());
-    if (!pending) {
-        return BoundaryStop{BoardStopReason::architectural_fault, pending.error().message};
-    }
-    if (pending.value()) {
-        trace_->record(
-            event_loop_->now(), config_.name, "exception_enter",
-            {{"exception", std::to_string(cpu_->state().ipsr())}}
-        );
-        loop_observations_ = {};
+    if (system_->hasEnabledPending()) {
+        auto pending = exceptions_->enterPending(cpu_->state());
+        if (!pending) {
+            return BoundaryStop{BoardStopReason::architectural_fault, pending.error().message};
+        }
+        if (pending.value()) {
+            trace_->record(
+                event_loop_->now(), config_.name, "exception_enter",
+                {{"exception", std::to_string(cpu_->state().ipsr())}}
+            );
+            invalidateLoopObservations();
+        }
     }
     if (system_->consumeResetRequest() || peripherals_->consumeResetRequest()) {
         return BoundaryStop{
@@ -240,29 +256,41 @@ std::optional<Board::ProvenLoop> Board::observeLoopBoundary(
         return std::nullopt;
     }
 
-    LoopObservation& observation =
-        loop_observations_[(boundary_pc >> 1U) % loop_observations_.size()];
+    const std::size_t observation_index =
+        (boundary_pc >> 1U) % loop_observations_.size();
+    LoopObservation& observation = loop_observations_[observation_index];
+    const auto read_footprint = memory_.takeReadFootprint();
+    const bool read_footprint_complete = read_footprint_boundary_
+        && *read_footprint_boundary_ == boundary_pc;
+    read_footprint_boundary_ = boundary_pc;
     const auto checkpoint = memory_.sideEffectCheckpoint();
-    if (observation.valid && observation.boundary_pc == boundary_pc
+    if (observation.valid
+        && observation.generation == loop_observation_generation_
+        && observation.boundary_pc == boundary_pc
         && memory_.sideEffectsRestoredSince(observation.side_effect_checkpoint)
         && sameCpuState(observation.state, cpu_->state())
         && logical_instructions > observation.instructions
         && logical_cycles > observation.cycles) {
         ProvenLoop loop{
             boundary_pc,
-            cpu_->state(),
             logical_instructions - observation.instructions,
             logical_cycles - observation.cycles,
             checkpoint,
+            static_cast<std::uint16_t>(observation_index),
+            observation.revision,
+            read_footprint,
+            read_footprint_complete,
         };
         observation.instructions = logical_instructions;
         observation.cycles = logical_cycles;
-        observation.state = cpu_->state();
         observation.side_effect_checkpoint = checkpoint;
         return loop;
     }
 
     observation.valid = true;
+    observation.generation = loop_observation_generation_;
+    ++observation.revision;
+    if (observation.revision == 0U) observation.revision = 1U;
     observation.boundary_pc = boundary_pc;
     observation.state = cpu_->state();
     observation.side_effect_checkpoint = checkpoint;
@@ -272,10 +300,20 @@ std::optional<Board::ProvenLoop> Board::observeLoopBoundary(
 }
 
 bool Board::loopProofStillValid(const ProvenLoop& loop) const noexcept {
+    if (loop.observation_index >= loop_observations_.size()) return false;
+    const LoopObservation& observation = loop_observations_[loop.observation_index];
     return loop.instructions_per_iteration != 0U && loop.cycles_per_iteration != 0U
         && cpu_->state().r[15] == loop.boundary_pc
-        && sameCpuState(cpu_->state(), loop.boundary_state)
-        && memory_.sideEffectsRestoredSince(loop.side_effect_checkpoint);
+        && observation.valid
+        && observation.generation == loop_observation_generation_
+        && observation.revision == loop.observation_revision
+        && observation.boundary_pc == loop.boundary_pc
+        && sameCpuState(cpu_->state(), observation.state)
+        && (loop.read_footprint_complete
+            ? memory_.sideEffectsCompatibleSince(
+                loop.side_effect_checkpoint, loop.read_footprint
+            )
+            : memory_.sideEffectsRestoredSince(loop.side_effect_checkpoint));
 }
 
 bool Board::loopHasNoMmioSince(const ProvenLoop& loop) const noexcept {
@@ -389,6 +427,16 @@ Board::LoopSkip Board::describeLoopIterations(
     return skip;
 }
 
+void Board::invalidateLoopObservations() noexcept {
+    ++loop_observation_generation_;
+    read_footprint_boundary_.reset();
+    static_cast<void>(memory_.takeReadFootprint());
+    if (loop_observation_generation_ == 0U) {
+        loop_observations_ = {};
+        loop_observation_generation_ = 1U;
+    }
+}
+
 void Board::refreshLoopObservation(
     const ProvenLoop& loop,
     const std::uint64_t logical_instructions,
@@ -397,6 +445,7 @@ void Board::refreshLoopObservation(
     LoopObservation& observation =
         loop_observations_[(loop.boundary_pc >> 1U) % loop_observations_.size()];
     observation.valid = true;
+    observation.generation = loop_observation_generation_;
     observation.boundary_pc = loop.boundary_pc;
     observation.state = cpu_->state();
     observation.side_effect_checkpoint = memory_.sideEffectCheckpoint();
@@ -442,6 +491,9 @@ Board::TransactionCheckpointPtr Board::captureTransaction(
     checkpoint->event_checkpoint = event_loop_->ownerCheckpoint(owner);
     checkpoint->time_fraction = time_fraction_;
     checkpoint->loop_observations = loop_observations_;
+    checkpoint->loop_observation_generation = loop_observation_generation_;
+    checkpoint->read_footprint_boundary = read_footprint_boundary_;
+    checkpoint->read_footprint = memory_.readFootprint();
     return checkpoint;
 }
 
@@ -459,6 +511,9 @@ bool Board::restoreTransaction(const TransactionCheckpointPtr& checkpoint) {
     exceptions_->restoreActiveStack(checkpoint->active_exceptions);
     time_fraction_ = checkpoint->time_fraction;
     loop_observations_ = checkpoint->loop_observations;
+    loop_observation_generation_ = checkpoint->loop_observation_generation;
+    read_footprint_boundary_ = checkpoint->read_footprint_boundary;
+    memory_.restoreReadFootprint(checkpoint->read_footprint);
     return true;
 }
 

@@ -132,10 +132,13 @@ private:
 
     struct ProvenLoop {
         std::uint32_t boundary_pc{0};
-        cpu::CpuState boundary_state{};
         std::uint64_t instructions_per_iteration{0};
         std::uint64_t cycles_per_iteration{0};
         mem::MemoryBus::SideEffectCheckpoint side_effect_checkpoint{};
+        std::uint16_t observation_index{0};
+        std::uint64_t observation_revision{0};
+        mem::MemoryBus::ReadFootprint read_footprint{};
+        bool read_footprint_complete{false};
     };
 
     struct LoopSkip {
@@ -146,6 +149,8 @@ private:
 
     struct LoopObservation {
         bool valid{false};
+        std::uint64_t generation{0};
+        std::uint64_t revision{0};
         std::uint32_t boundary_pc{0};
         cpu::CpuState state{};
         mem::MemoryBus::SideEffectCheckpoint side_effect_checkpoint{};
@@ -166,7 +171,9 @@ private:
     /** Executes one instruction and accrues board-local cycles without moving shared time. */
     [[nodiscard]] ConcurrentStepResult beginConcurrentStep(bool trace_instructions);
     /** Applies exception/reset effects due at the just-completed instruction boundary. */
+    [[nodiscard]] bool boundaryWorkPending() const noexcept;
     [[nodiscard]] std::optional<BoundaryStop> settleInstructionBoundary();
+    [[nodiscard]] std::optional<BoundaryStop> settleInstructionBoundarySlow();
     [[nodiscard]] std::optional<ProvenLoop> observeLoopBoundary(
         const cpu::FastStepResult& step,
         std::uint64_t logical_instructions,
@@ -184,9 +191,13 @@ private:
     [[nodiscard]] bool loopProofStillValid(const ProvenLoop& loop) const noexcept;
     [[nodiscard]] bool loopHasNoMmioSince(const ProvenLoop& loop) const noexcept;
     [[nodiscard]] std::optional<SimTimeNs> nextObservableTime(SimTimeNs boundary_time) const;
+    [[nodiscard]] SimTimeNs nextInstructionElapsedNs() const noexcept {
+        return elapsedForCycles(1U);
+    }
     void refreshLoopObservation(
         const ProvenLoop& loop, std::uint64_t logical_instructions, std::uint64_t logical_cycles
     );
+    void invalidateLoopObservations() noexcept;
     [[nodiscard]] BoardRunResult cpuFailure(const cpu::RunResult& result) const;
     [[nodiscard]] SimTimeNs elapsedForCycles(std::uint64_t cycles) const noexcept;
 
@@ -204,6 +215,8 @@ private:
     std::unique_ptr<cortexm::ExceptionController> exceptions_;
     std::uint64_t time_fraction_{0};
     std::array<LoopObservation, 256> loop_observations_{};
+    std::uint64_t loop_observation_generation_{1U};
+    std::optional<std::uint32_t> read_footprint_boundary_;
 };
 
 /** @brief Stable lowercase stop-reason name for CLI/trace output. */
