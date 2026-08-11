@@ -41,6 +41,7 @@ Stm32G4::Stm32G4(
     router_(peripheral_base, 0x20000000U, "stm32g4-peripherals", true, 0),
     rcc_(hse_present, hse_hz, &event_loop, &trace),
     flash_(&event_loop, &trace),
+    crc_(&event_loop, &trace),
     pwr_(&event_loop, &trace),
     dma1_("DMA1", 8, nullptr, &event_loop, &trace),
     dma2_("DMA2", 8, nullptr, &event_loop, &trace),
@@ -107,9 +108,9 @@ Result<void> Stm32G4::mapDevices() {
         return {};
     };
 
-    for (auto entry : std::array<std::pair<std::uint32_t, RegisterPeripheral*>, 8>{
+    for (auto entry : std::array<std::pair<std::uint32_t, RegisterPeripheral*>, 9>{
         std::pair{0x40021000U, static_cast<RegisterPeripheral*>(&rcc_)},
-        {0x40022000U, &flash_}, {0x40007000U, &pwr_},
+        {0x40022000U, &flash_}, {0x40023000U, &crc_}, {0x40007000U, &pwr_},
         {0x40020000U, &dma1_}, {0x40020400U, &dma2_}, {0x40020800U, &dmamux_},
         {0x40003000U, &iwdg_}, {0x40002c00U, &wwdg_},
     }) {
@@ -330,8 +331,8 @@ void Stm32G4::setAdcDiagnosticsEnabled(const bool enabled) {
 }
 
 void Stm32G4::setTraceSourcePrefix(const std::string_view prefix) {
-    for (RegisterPeripheral* device : std::array<RegisterPeripheral*, 8>{
-             &rcc_, &flash_, &pwr_, &dma1_, &dma2_, &dmamux_, &iwdg_, &wwdg_,
+    for (RegisterPeripheral* device : std::array<RegisterPeripheral*, 9>{
+             &rcc_, &flash_, &crc_, &pwr_, &dma1_, &dma2_, &dmamux_, &iwdg_, &wwdg_,
          }) {
         device->setTraceSourcePrefix(prefix);
     }
@@ -350,6 +351,7 @@ void Stm32G4::setTraceSourcePrefix(const std::string_view prefix) {
 void Stm32G4::reset() {
     rcc_.reset();
     flash_.reset();
+    crc_.reset();
     pwr_.reset();
     dma1_.reset();
     dma2_.reset();

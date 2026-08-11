@@ -251,6 +251,48 @@ protected:
     ) override;
 };
 
+/**
+ * @brief STM32G4 CRC computation unit with CRC-32/MPEG-2 word-wise updates.
+ *
+ * Implements the default G4 configuration used by the PER bootloader: 32-bit
+ * data words processed most-significant-byte first, polynomial 0x04C11DB7,
+ * initial value 0xFFFFFFFF, and no reflection or final XOR. Writing DR feeds a
+ * word into the running CRC; reading DR returns the current result. CR RESET
+ * (bit 0) and INIT (bit 7) both reload the INIT register value.
+ */
+class CrcPeripheral final : public RegisterPeripheral {
+public:
+    explicit CrcPeripheral(sim::EventLoop* event_loop = nullptr, sim::TraceRecorder* trace = nullptr);
+
+    /** @brief Gets the current CRC calculation result. */
+    [[nodiscard]] std::uint32_t crc() const noexcept { return crc_; }
+    /** @brief Gets the configured polynomial. */
+    [[nodiscard]] std::uint32_t polynomial() const noexcept { return poly_; }
+    /** @brief Gets the configured initial value. */
+    [[nodiscard]] std::uint32_t initValue() const noexcept { return init_; }
+
+protected:
+    [[nodiscard]] std::uint32_t loadRegister(
+        std::uint32_t word_offset,
+        const mem::AccessContext& context
+    ) override;
+    void storeRegister(
+        std::uint32_t word_offset,
+        std::uint32_t previous,
+        std::uint32_t value,
+        std::uint32_t write_mask,
+        const mem::AccessContext& context
+    ) override;
+    void onReset() override;
+
+private:
+    void update(std::uint32_t data_word);
+
+    std::uint32_t crc_{0xffffffffU};
+    std::uint32_t init_{0xffffffffU};
+    std::uint32_t poly_{0x04c11db7U};
+};
+
 /** @brief One deterministic GPIO output transition. */
 struct GpioTransition {
     sim::SimTimeNs time_ns{0};

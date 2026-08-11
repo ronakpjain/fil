@@ -13,6 +13,7 @@ add_executable(fil_tests
     unit/event_loop_test.cpp
     unit/exceptions_test.cpp
     unit/fdcan_test.cpp
+    unit/crc_test.cpp
     unit/hard_float_firmware_test.cpp
     unit/hardware_comparison_test.cpp
     unit/memory_bus_test.cpp

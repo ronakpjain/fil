@@ -68,6 +68,8 @@ public:
     void reset();
 
     [[nodiscard]] RccPeripheral& rcc() noexcept { return rcc_; }
+    [[nodiscard]] FlashPeripheral& flash() noexcept { return flash_; }
+    [[nodiscard]] CrcPeripheral& crc() noexcept { return crc_; }
     [[nodiscard]] GpioPeripheral* gpio(std::string_view name) noexcept;
     [[nodiscard]] UsartPeripheral* usart(std::string_view name) noexcept;
     [[nodiscard]] AdcPeripheral* adc(std::string_view name) noexcept;
@@ -98,6 +100,7 @@ private:
 
     RccPeripheral rcc_;
     FlashPeripheral flash_;
+    CrcPeripheral crc_;
     PwrPeripheral pwr_;
     DmaPeripheral dma1_;
     DmaPeripheral dma2_;
