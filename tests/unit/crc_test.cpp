@@ -81,8 +81,8 @@ TEST(CrcPeripheralTest, MatchesCrc32Mpeg2Reference) {
     EXPECT_EQ(crc.crc(), result.value()) << "accessor exposes the current CRC";
 }
 
-/** @brief Verifies CR RESET and CR INIT reload the configured initial value. */
-TEST(CrcPeripheralTest, ResetsAndReloadsInit) {
+/** @brief Verifies CR RESET reloads the configured initial value. */
+TEST(CrcPeripheralTest, ResetsFromConfiguredInit) {
     fil::stm32g4::CrcPeripheral crc;
     auto initial = crc.read(crc_dr, fil::mem::AccessSize::word, read_context);
     EXPECT_TRUE(initial && initial.value() == 0xffffffffU)
@@ -103,11 +103,21 @@ TEST(CrcPeripheralTest, ResetsAndReloadsInit) {
     EXPECT_TRUE(crc.write(crc_init, fil::mem::AccessSize::word, 0xaaaaaaaaU, write_context)
             .hasValue())
         << "stores a new INIT register value";
+    EXPECT_TRUE(
+        crc.write(crc_dr, fil::mem::AccessSize::word, 0x12345678U, write_context).hasValue());
+    const auto before_config = crc.read(crc_dr, fil::mem::AccessSize::word, read_context);
+    ASSERT_TRUE(before_config.hasValue());
     EXPECT_TRUE(crc.write(crc_cr, fil::mem::AccessSize::word, 1U << 7U, write_context).hasValue())
-        << "sets the CR INIT bit";
+        << "sets the architectural REV_OUT bit";
+    const auto configured = crc.read(crc_dr, fil::mem::AccessSize::word, read_context);
+    ASSERT_TRUE(configured.hasValue());
+    EXPECT_EQ(configured.value(), before_config.value())
+        << "CRC configuration bits do not reload INIT";
+
+    EXPECT_TRUE(crc.write(crc_cr, fil::mem::AccessSize::word, 1U, write_context).hasValue());
     const auto reloaded = crc.read(crc_dr, fil::mem::AccessSize::word, read_context);
     EXPECT_TRUE(reloaded && reloaded.value() == 0xaaaaaaaaU)
-        << "CR INIT reloads the INIT register into DR";
+        << "CR RESET reloads the configured INIT value";
     EXPECT_EQ(crc.initValue(), 0xaaaaaaaaU) << "exposes the configured initial value";
 
     ASSERT_TRUE(crc.write(crc_pol, fil::mem::AccessSize::word, 0x1021U, write_context).hasValue());

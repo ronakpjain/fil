@@ -9,8 +9,7 @@ constexpr std::uint32_t dr = 0x00;
 constexpr std::uint32_t cr = 0x08;
 constexpr std::uint32_t init_register = 0x10;
 constexpr std::uint32_t pol_register = 0x14;
-constexpr std::uint32_t cr_reset = 1U << 0U;  ///< CR RESET bit.
-constexpr std::uint32_t cr_init = 1U << 7U;   ///< CR INIT bit.
+constexpr std::uint32_t cr_reset = 1U << 0U; ///< CR RESET bit.
 
 } // namespace
 
@@ -45,8 +44,7 @@ void CrcPeripheral::storeRegister(
     if (word_offset == dr) {
         update(value);
     } else if (word_offset == cr) {
-        // RESET and INIT both reload the INIT register into the calculator.
-        if ((value & write_mask & (cr_reset | cr_init)) != 0U) {
+        if ((value & write_mask & cr_reset) != 0U) {
             crc_ = init_;
         }
     } else if (word_offset == init_register) {

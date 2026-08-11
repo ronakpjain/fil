@@ -291,7 +291,7 @@ protected:
  * data words processed most-significant-byte first, polynomial 0x04C11DB7,
  * initial value 0xFFFFFFFF, and no reflection or final XOR. Writing DR feeds a
  * word into the running CRC; reading DR returns the current result. CR RESET
- * (bit 0) and INIT (bit 7) both reload the INIT register value.
+ * (bit 0) reloads the INIT register value.
  */
 class CrcPeripheral final : public RegisterPeripheral {
 public:
