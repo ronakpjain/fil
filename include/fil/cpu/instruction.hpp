@@ -87,6 +87,7 @@ enum class InstrKind : std::uint8_t {
     umull,
     udiv,
     clz,
+    bfc,
     ubfx,
     sxtb,
     sxth,

@@ -384,6 +384,13 @@ StopReason CortexM4::execute(
             static_cast<std::uint32_t>(std::countl_zero(state_.readRegister(instruction.rm)))
         );
         return StopReason::step_complete;
+    case InstrKind::bfc: {
+        const std::uint32_t width = instruction.imm;
+        const std::uint32_t field_mask = width == 32U
+            ? 0xffffffffU : ((std::uint32_t{1} << width) - 1U) << instruction.shift_amount;
+        state_.writeRegister(instruction.rd, state_.readRegister(instruction.rd) & ~field_mask);
+        return StopReason::step_complete;
+    }
     case InstrKind::ubfx: {
         const std::uint32_t width = instruction.imm;
         const std::uint32_t mask = width == 32U

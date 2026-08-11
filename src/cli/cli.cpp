@@ -123,6 +123,7 @@ std::string_view instructionName(const cpu::InstrKind kind) noexcept {
     case InstrKind::umull: return "umull";
     case InstrKind::udiv: return "udiv";
     case InstrKind::clz: return "clz";
+    case InstrKind::bfc: return "bfc";
     case InstrKind::ubfx: return "ubfx";
     case InstrKind::sxtb: return "sxtb";
     case InstrKind::sxth: return "sxth";

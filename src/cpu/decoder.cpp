@@ -683,6 +683,24 @@ struct ExpandedImmediate {
     return result;
 }
 
+[[nodiscard]] std::optional<DecodedInstruction> decodeBitfieldClear(
+    const std::uint16_t first,
+    const std::uint16_t second
+) {
+    const auto lsb = static_cast<std::uint8_t>(
+        ((second >> 10U) & 0x1cU) | ((second >> 6U) & 0x3U)
+    );
+    const auto width = static_cast<std::uint8_t>((second & 0x1fU) + 1U);
+    if (static_cast<unsigned int>(lsb) + width > 32U) return std::nullopt;
+    auto result = base32(first, second, InstrKind::bfc, OperandForm::immediate);
+    result.rn = static_cast<std::uint8_t>(first & 0x0fU);
+    result.rd = static_cast<std::uint8_t>((second >> 8U) & 0x0fU);
+    result.shift_amount = lsb;
+    result.imm = width;
+    if (result.rn != 15U || result.rd == 15U) return std::nullopt;
+    return result;
+}
+
 [[nodiscard]] std::optional<DecodedInstruction> decodeUbfx(
     const std::uint16_t first,
     const std::uint16_t second
@@ -1130,7 +1148,7 @@ constexpr std::array<DecodePattern16, 18> patterns16 = {{
     {0xf800U, 0xe000U, decodeUnconditionalBranch},
 }};
 
-constexpr std::array<DecodePattern32, 25> patterns32 = {{
+constexpr std::array<DecodePattern32, 26> patterns32 = {{
     {0xfbf08000U, 0xf2000000U, decodeAddSubWideImmediate},
     {0xfbf08000U, 0xf2a00000U, decodeAddSubWideImmediate},
     {0xfbf08000U, 0xf2400000U, decodeMovWide},
@@ -1151,6 +1169,7 @@ constexpr std::array<DecodePattern32, 25> patterns32 = {{
     {0xfff0f0f0U, 0xfa80f040U, decodeParallelAddSelect},
     {0xfff0f0f0U, 0xfaa0f080U, decodeParallelAddSelect},
     {0xfff0f0f0U, 0xfab0f080U, decodeClz},
+    {0xfff08020U, 0xf3600000U, decodeBitfieldClear},
     {0xfff08020U, 0xf3c00000U, decodeUbfx},
     {0xfe000000U, 0xf8000000U, decodeWideTransfer},
     {0xfe000000U, 0xe8000000U, decodeWideMultiple},
