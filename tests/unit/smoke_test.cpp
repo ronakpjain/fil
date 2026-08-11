@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <string>
 #include <string_view>
 
 namespace {
@@ -34,6 +35,17 @@ TEST(SmokeTest, UnknownCommandIsAUsageError) {
     EXPECT_TRUE(out.str().empty()) << "unknown command does not print normal output";
     EXPECT_TRUE(err.str().find("unknown command") != std::string::npos)
         << "unknown command prints a diagnostic";
+}
+
+TEST(SmokeTest, RejectsInvalidWatchRefreshInterval) {
+    const std::string_view args[]{"watch-network", "missing.json", "--refresh-ms", "0"};
+    std::ostringstream out;
+    std::ostringstream err;
+
+    const auto result = fil::cli::run(args, out, err);
+
+    EXPECT_EQ(result, fil::cli::ExitCode::usage_error);
+    EXPECT_NE(err.str().find("--refresh-ms"), std::string::npos);
 }
 
 TEST(SmokeTest, DisassemblesSyntheticWindow) {

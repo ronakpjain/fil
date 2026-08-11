@@ -12,19 +12,18 @@
 
 #include <algorithm>
 #include <chrono>
-#include <condition_variable>
-#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
-#include <mutex>
 #include <ostream>
 #include <optional>
 #include <string>
-#include <thread>
 #include <vector>
+
+#include <poll.h>
+#include <unistd.h>
 
 namespace fil::cli {
 
@@ -897,8 +896,11 @@ ExitCode watchNetworkCommand(
 
     std::uint64_t max_instructions = 50'000'000U;
     std::uint64_t quantum = 1'024U;
+    std::optional<std::uint64_t> duration_ns;
+    std::uint64_t refresh_ms = 1U;
     bool strict_mmio = false;
     bool enable_loop_batching = true;
+    bool custom_live_filters = false;
     std::vector<std::string> live_filters{"can_tx"};
 
     for (std::size_t index = 2U; index < args.size(); ++index) {
@@ -907,42 +909,51 @@ ExitCode watchNetworkCommand(
             if (index + 1U >= args.size()) return std::nullopt;
             return args[++index];
         };
-        if (option == "--max-instructions" || option == "--quantum") {
+        if (option == "--max-instructions" || option == "--quantum"
+            || option == "--duration-ms" || option == "--refresh-ms") {
             const auto value = valueAfter();
             if (!value) {
                 err << "fil: " << option << " requires a value\n";
                 return ExitCode::usage_error;
             }
-            auto parsed = config::parseUnsigned(*value);
+            const auto parsed = config::parseUnsigned(*value);
             if (!parsed) {
                 err << "fil: invalid value for " << option << ": "
                     << parsed.error().message << '\n';
                 return ExitCode::usage_error;
             }
             if (option == "--max-instructions") max_instructions = parsed.value();
-            else quantum = parsed.value();
+            else if (option == "--quantum") quantum = parsed.value();
+            else if (option == "--duration-ms") {
+                if (parsed.value() > std::numeric_limits<std::uint64_t>::max() / 1'000'000ULL) {
+                    err << "fil: duration overflows nanoseconds\n";
+                    return ExitCode::usage_error;
+                }
+                duration_ns = parsed.value() * 1'000'000ULL;
+            } else {
+                if (parsed.value() == 0U
+                    || parsed.value() > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+                    err << "fil: --refresh-ms must be between 1 and "
+                        << std::numeric_limits<int>::max() << '\n';
+                    return ExitCode::usage_error;
+                }
+                refresh_ms = parsed.value();
+            }
         } else if (option == "--live-filter") {
             const auto value = valueAfter();
             if (!value || value->empty()) {
                 err << "fil: --live-filter requires a value\n";
                 return ExitCode::usage_error;
             }
+            if (!custom_live_filters) {
+                live_filters.clear();
+                custom_live_filters = true;
+            }
             live_filters.emplace_back(*value);
         } else if (option == "--strict-mmio") strict_mmio = true;
         else if (option == "--lenient-mmio") strict_mmio = false;
         else if (option == "--no-loop-batching") enable_loop_batching = false;
-        else if (option == "--control-stdin" || option == "--duration-ms"
-                 || option == "--refresh-ms") {
-            // The watch process advances in short slices and receives live CAN
-            // frames through stdin. These compatibility options are accepted
-            // so simple host drivers can use one stable invocation.
-            if (option == "--duration-ms" || option == "--refresh-ms") {
-                if (!valueAfter()) {
-                    err << "fil: " << option << " requires a value\n";
-                    return ExitCode::usage_error;
-                }
-            }
-        } else {
+        else if (option != "--control-stdin") {
             err << "fil: unknown watch-network option: " << option << '\n';
             return ExitCode::usage_error;
         }
@@ -968,68 +979,16 @@ ExitCode watchNetworkCommand(
     });
     out << "watching network " << network_config.value().name << '\n' << std::flush;
 
-    struct StdinState {
-        std::mutex mutex;
-        std::condition_variable condition;
-        std::deque<std::string> lines;
-        bool eof{false};
-    };
-    StdinState stdin_state;
-    std::thread reader([&stdin_state]() {
-        std::string line;
-        while (std::getline(std::cin, line)) {
-            {
-                std::lock_guard lock(stdin_state.mutex);
-                stdin_state.lines.push_back(std::move(line));
-            }
-            stdin_state.condition.notify_one();
-        }
-        {
-            std::lock_guard lock(stdin_state.mutex);
-            stdin_state.eof = true;
-        }
-        stdin_state.condition.notify_one();
-    });
-
-    bool bootstrapped = false;
-    for (;;) {
-        std::optional<std::string> line;
-        {
-            std::lock_guard lock(stdin_state.mutex);
-            if (!stdin_state.lines.empty()) {
-                line = std::move(stdin_state.lines.front());
-                stdin_state.lines.pop_front();
-            } else if (stdin_state.eof && bootstrapped) {
-                break;
-            }
-        }
-
-        if (line) {
-            if (*line == "quit" || *line == "exit") {
-                // EOF is still required before returning so the reader thread
-                // can be joined without leaving a detached stdin reader.
-                err << "fil: close stdin to stop watch-network\n";
-                continue;
-            }
-            auto injection = parseCanInjection(*line);
-            if (!injection) {
-                err << "fil: ignored stdin CAN command: "
-                    << injection.error().message << '\n';
-            } else {
-                devices::VirtualCanBus* bus = world.value()->canBus(injection.value().bus);
-                if (bus == nullptr) {
-                    err << "fil: ignored stdin CAN command for undeclared bus: "
-                        << injection.value().bus << '\n';
-                } else {
-                    static_cast<void>(bus->inject(
-                        injection.value().frame, world.value()->eventLoop().now()
-                    ));
-                }
-            }
-        }
+    const sim::SimTimeNs started_at = world.value()->eventLoop().now();
+    const std::uint64_t slice_ns = refresh_ms * 1'000'000ULL;
+    bool stdin_eof = false;
+    bool stop_requested = false;
+    while (!stop_requested) {
+        const sim::SimTimeNs elapsed = world.value()->eventLoop().now() - started_at;
+        if (duration_ns && elapsed >= *duration_ns) break;
 
         sim::WorldRunOptions options;
-        options.duration_ns = 1'000'000U;
+        options.duration_ns = duration_ns ? std::min(slice_ns, *duration_ns - elapsed) : slice_ns;
         options.max_instructions_per_board = max_instructions;
         options.instruction_quantum = quantum;
         options.enable_loop_batching = enable_loop_batching;
@@ -1038,17 +997,49 @@ ExitCode watchNetworkCommand(
             if (!result) err << "fil: " << formatError(result.error()) << '\n';
             else err << "fil: watch stopped with "
                      << sim::worldStopReasonName(result.value().reason) << '\n';
-            break;
+            return ExitCode::runtime_error;
         }
-        bootstrapped = true;
 
-        std::unique_lock lock(stdin_state.mutex);
-        if (stdin_state.lines.empty() && !stdin_state.eof) {
-            stdin_state.condition.wait_for(lock, std::chrono::milliseconds(1));
+        if (stdin_eof) continue;
+        pollfd input{STDIN_FILENO, POLLIN, 0};
+        const bool buffered = std::cin.rdbuf()->in_avail() > 0;
+        const int ready = buffered ? 1 : ::poll(&input, 1, static_cast<int>(refresh_ms));
+        if (ready < 0) {
+            err << "fil: failed to poll stdin\n";
+            return ExitCode::runtime_error;
         }
+        if (ready == 0) continue;
+        if (!buffered && (input.revents & (POLLERR | POLLNVAL)) != 0) {
+            err << "fil: failed to poll stdin\n";
+            return ExitCode::runtime_error;
+        }
+
+        std::string line;
+        if (!std::getline(std::cin, line)) {
+            stdin_eof = true;
+            if (!duration_ns) break;
+            continue;
+        }
+        if (line == "quit" || line == "exit") {
+            stop_requested = true;
+            continue;
+        }
+
+        auto injection = parseCanInjection(line);
+        if (!injection) {
+            err << "fil: ignored stdin CAN command: " << injection.error().message << '\n';
+            continue;
+        }
+        devices::VirtualCanBus* bus = world.value()->canBus(injection.value().bus);
+        if (bus == nullptr) {
+            err << "fil: ignored stdin CAN command for undeclared bus: "
+                << injection.value().bus << '\n';
+            continue;
+        }
+        static_cast<void>(
+            bus->inject(injection.value().frame, world.value()->eventLoop().now())
+        );
     }
-
-    if (reader.joinable()) reader.join();
     return ExitCode::success;
 }
 
@@ -1079,10 +1070,11 @@ void printHelp(std::ostream& out) {
         << "  --duration-ms N --max-instructions N --quantum N --trace FILE\n"
         << "  --strict-mmio --trace-instr --detect-spin --no-loop-batching --allow-breakpoint\n"
         << "  --transactional-slices (experimental parallel lane epochs)\n"
-        << "  --inject-can BUS[@TIME_MS]:ID:HEXDATA\n"
-        << "  --control-stdin (watch-network compatibility flag)\n"
-        << "\nWatch-network stdin format:\n"
-        << "  BUS:ID:HEXDATA (for example vehicle:0x180:0104000000)\n";
+        << "  --inject-can BUS[@TIME_MS]:ID:HEXDATA\n\n"
+        << "Watch-network options:\n"
+        << "  --duration-ms N --refresh-ms N --max-instructions N --quantum N\n"
+        << "  --live-filter TYPE --strict-mmio --no-loop-batching --control-stdin\n"
+        << "  stdin: BUS:ID:HEXDATA, quit, or exit\n";
 }
 
 ExitCode run(

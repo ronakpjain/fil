@@ -8,6 +8,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <sstream>
 #include <string>
@@ -190,6 +191,42 @@ TEST(WorldTest, EnforcesBudgetsAndValidatesTopology) {
     auto invalid_network = files.network({missing});
     EXPECT_TRUE(!fil::sim::World::load(invalid_network))
         << "rejects an attachment to an undeclared bus";
+}
+
+TEST(WorldTest, ExecutesWatchNetworkForConfiguredDuration) {
+    TempWorldConfigs files;
+    const auto network_path = files.writeNetwork({files.writeBoard("watch.json", "watch")});
+    const std::string path = network_path.string();
+    const std::string_view args[]{
+        "watch-network", path, "--duration-ms", "0", "--refresh-ms", "2",
+        "--live-filter", "can_rx",
+    };
+    std::ostringstream out;
+    std::ostringstream err;
+
+    const auto result = fil::cli::run(args, out, err);
+
+    EXPECT_EQ(result, fil::cli::ExitCode::success);
+    EXPECT_NE(out.str().find("watching network fixture-network"), std::string::npos);
+    EXPECT_TRUE(err.str().empty());
+}
+
+TEST(WorldTest, StopsWatchNetworkFromStdin) {
+    TempWorldConfigs files;
+    const auto network_path = files.writeNetwork({files.writeBoard("watch-quit.json", "watch")});
+    const std::string path = network_path.string();
+    const std::string_view args[]{"watch-network", path, "--refresh-ms", "1"};
+    std::istringstream input{"quit\n"};
+    std::ostringstream out;
+    std::ostringstream err;
+
+    std::streambuf* const original_input = std::cin.rdbuf(input.rdbuf());
+    const auto result = fil::cli::run(args, out, err);
+    std::cin.rdbuf(original_input);
+    std::cin.clear();
+
+    EXPECT_EQ(result, fil::cli::ExitCode::success);
+    EXPECT_TRUE(err.str().empty());
 }
 
 TEST(WorldTest, ExecutesRunNetworkCli) {
