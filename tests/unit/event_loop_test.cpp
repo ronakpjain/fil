@@ -263,6 +263,22 @@ TEST(EventLoopTest, SerializesStableTraceRecords) {
         << "trace encodes every CAN-FD payload byte";
 }
 
+TEST(EventLoopTest, NotifiesTraceObserverAfterAppendingRecord) {
+    fil::sim::TraceRecorder trace;
+    const fil::sim::TraceRecord* observed = nullptr;
+    trace.setObserver([&observed](const fil::sim::TraceRecord& record) { observed = &record; });
+
+    static_cast<void>(trace.record(4, "board", "can_tx"));
+    ASSERT_NE(observed, nullptr);
+    EXPECT_EQ(observed, &trace.records().back());
+    EXPECT_EQ(observed->time_ns, 4U);
+
+    trace.setEnabled(false);
+    observed = nullptr;
+    static_cast<void>(trace.record(5, "board", "hidden"));
+    EXPECT_EQ(observed, nullptr);
+}
+
 TEST(EventLoopTest, DisablesTraceCollectionWithoutDisturbingSequence) {
     fil::sim::TraceRecorder trace;
     EXPECT_TRUE(trace.enabled()) << "trace collection defaults to enabled";

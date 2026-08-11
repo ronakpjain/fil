@@ -7,10 +7,10 @@
 #include "fil/sim/event_loop.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <iosfwd>
 #include <span>
 #include <string>
-#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -41,11 +41,16 @@ struct CanTraceFrame {
 /** @brief Collects trace records in insertion order and serializes stable JSONL. */
 class TraceRecorder {
 public:
+    using Observer = std::function<void(const TraceRecord&)>;
+
     /** @brief Enables or disables future record collection without clearing existing records. */
     void setEnabled(bool enabled) noexcept { enabled_ = enabled; }
 
     /** @brief Reports whether future trace records are currently observable. */
     [[nodiscard]] bool enabled() const noexcept { return enabled_; }
+
+    /** @brief Observes newly appended records without changing stored trace output. */
+    void setObserver(Observer observer) { observer_ = std::move(observer); }
 
     /**
      * @brief Appends one trace record and returns its assigned sequence.
@@ -88,6 +93,7 @@ private:
     bool enabled_{true};
     std::uint64_t next_sequence_{0};
     std::vector<TraceRecord> records_;
+    Observer observer_;
 };
 
 } // namespace fil::sim

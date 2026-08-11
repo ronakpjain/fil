@@ -12,13 +12,18 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <limits>
+#include <mutex>
 #include <ostream>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fil::cli {
@@ -94,6 +99,16 @@ Result<PendingCanInjection> parseCanInjection(const std::string_view text) {
     injection.frame.dlc = *dlc;
     injection.frame.fd = byte_count > 8U;
     return injection;
+}
+
+void printLiveTraceRecord(std::ostream& out, const sim::TraceRecord& record) {
+    out << '[' << std::fixed << std::setprecision(3)
+        << static_cast<double>(record.time_ns) / 1'000'000.0
+        << " ms] " << record.source << ' ' << record.type;
+    for (const auto& [key, value] : record.fields) {
+        out << ' ' << key << '=' << value;
+    }
+    out << '\n' << std::flush;
 }
 
 std::string_view instructionName(const cpu::InstrKind kind) noexcept {
@@ -870,6 +885,173 @@ ExitCode runNetworkCommand(
     return ExitCode::success;
 }
 
+ExitCode watchNetworkCommand(
+    const std::span<const std::string_view> args,
+    std::ostream& out,
+    std::ostream& err
+) {
+    if (args.size() < 2U) {
+        err << "fil: watch-network requires a network config path\n";
+        return ExitCode::usage_error;
+    }
+
+    std::uint64_t max_instructions = 50'000'000U;
+    std::uint64_t quantum = 1'024U;
+    bool strict_mmio = false;
+    bool enable_loop_batching = true;
+    std::vector<std::string> live_filters{"can_tx"};
+
+    for (std::size_t index = 2U; index < args.size(); ++index) {
+        const std::string_view option = args[index];
+        const auto valueAfter = [&]() -> std::optional<std::string_view> {
+            if (index + 1U >= args.size()) return std::nullopt;
+            return args[++index];
+        };
+        if (option == "--max-instructions" || option == "--quantum") {
+            const auto value = valueAfter();
+            if (!value) {
+                err << "fil: " << option << " requires a value\n";
+                return ExitCode::usage_error;
+            }
+            auto parsed = config::parseUnsigned(*value);
+            if (!parsed) {
+                err << "fil: invalid value for " << option << ": "
+                    << parsed.error().message << '\n';
+                return ExitCode::usage_error;
+            }
+            if (option == "--max-instructions") max_instructions = parsed.value();
+            else quantum = parsed.value();
+        } else if (option == "--live-filter") {
+            const auto value = valueAfter();
+            if (!value || value->empty()) {
+                err << "fil: --live-filter requires a value\n";
+                return ExitCode::usage_error;
+            }
+            live_filters.emplace_back(*value);
+        } else if (option == "--strict-mmio") strict_mmio = true;
+        else if (option == "--lenient-mmio") strict_mmio = false;
+        else if (option == "--no-loop-batching") enable_loop_batching = false;
+        else if (option == "--control-stdin" || option == "--duration-ms"
+                 || option == "--refresh-ms") {
+            // The watch process advances in short slices and receives live CAN
+            // frames through stdin. These compatibility options are accepted
+            // so simple host drivers can use one stable invocation.
+            if (option == "--duration-ms" || option == "--refresh-ms") {
+                if (!valueAfter()) {
+                    err << "fil: " << option << " requires a value\n";
+                    return ExitCode::usage_error;
+                }
+            }
+        } else {
+            err << "fil: unknown watch-network option: " << option << '\n';
+            return ExitCode::usage_error;
+        }
+    }
+
+    auto network_config = config::loadNetworkConfig(args[1]);
+    if (!network_config) {
+        err << "fil: " << formatError(network_config.error()) << '\n';
+        return ExitCode::config_error;
+    }
+    auto world = sim::World::load(network_config.value(), strict_mmio);
+    if (!world) {
+        err << "fil: " << formatError(world.error()) << '\n';
+        return world.error().category == ErrorCategory::config
+            ? ExitCode::config_error : ExitCode::runtime_error;
+    }
+
+    world.value()->setDiagnosticsEnabled(true);
+    world.value()->trace().setObserver([&out, &live_filters](const sim::TraceRecord& record) {
+        if (std::find(live_filters.begin(), live_filters.end(), record.type) != live_filters.end()) {
+            printLiveTraceRecord(out, record);
+        }
+    });
+    out << "watching network " << network_config.value().name << '\n' << std::flush;
+
+    struct StdinState {
+        std::mutex mutex;
+        std::condition_variable condition;
+        std::deque<std::string> lines;
+        bool eof{false};
+    };
+    StdinState stdin_state;
+    std::thread reader([&stdin_state]() {
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            {
+                std::lock_guard lock(stdin_state.mutex);
+                stdin_state.lines.push_back(std::move(line));
+            }
+            stdin_state.condition.notify_one();
+        }
+        {
+            std::lock_guard lock(stdin_state.mutex);
+            stdin_state.eof = true;
+        }
+        stdin_state.condition.notify_one();
+    });
+
+    bool bootstrapped = false;
+    for (;;) {
+        std::optional<std::string> line;
+        {
+            std::lock_guard lock(stdin_state.mutex);
+            if (!stdin_state.lines.empty()) {
+                line = std::move(stdin_state.lines.front());
+                stdin_state.lines.pop_front();
+            } else if (stdin_state.eof && bootstrapped) {
+                break;
+            }
+        }
+
+        if (line) {
+            if (*line == "quit" || *line == "exit") {
+                // EOF is still required before returning so the reader thread
+                // can be joined without leaving a detached stdin reader.
+                err << "fil: close stdin to stop watch-network\n";
+                continue;
+            }
+            auto injection = parseCanInjection(*line);
+            if (!injection) {
+                err << "fil: ignored stdin CAN command: "
+                    << injection.error().message << '\n';
+            } else {
+                devices::VirtualCanBus* bus = world.value()->canBus(injection.value().bus);
+                if (bus == nullptr) {
+                    err << "fil: ignored stdin CAN command for undeclared bus: "
+                        << injection.value().bus << '\n';
+                } else {
+                    static_cast<void>(bus->inject(
+                        injection.value().frame, world.value()->eventLoop().now()
+                    ));
+                }
+            }
+        }
+
+        sim::WorldRunOptions options;
+        options.duration_ns = 1'000'000U;
+        options.max_instructions_per_board = max_instructions;
+        options.instruction_quantum = quantum;
+        options.enable_loop_batching = enable_loop_batching;
+        auto result = world.value()->run(options);
+        if (!result || !result.value().succeeded()) {
+            if (!result) err << "fil: " << formatError(result.error()) << '\n';
+            else err << "fil: watch stopped with "
+                     << sim::worldStopReasonName(result.value().reason) << '\n';
+            break;
+        }
+        bootstrapped = true;
+
+        std::unique_lock lock(stdin_state.mutex);
+        if (stdin_state.lines.empty() && !stdin_state.eof) {
+            stdin_state.condition.wait_for(lock, std::chrono::milliseconds(1));
+        }
+    }
+
+    if (reader.joinable()) reader.join();
+    return ExitCode::success;
+}
+
 } // namespace
 
 void printHelp(std::ostream& out) {
@@ -883,6 +1065,7 @@ void printHelp(std::ostream& out) {
         << "  disasm-window <firmware.elf>   Decode a bounded Thumb instruction window\n"
         << "  run <board.json> [options]     Execute one firmware board deterministically\n"
         << "  run-network <network.json>     Execute a deterministic multi-board CAN network\n"
+        << "  watch-network <network.json>   Run a CAN network with stdin/stdout control\n"
         << "  compare-stlink <board.json>    Compare emulator state with STM32G4 hardware\n\n"
         << "Run options:\n"
         << "  --duration-ms N --max-instructions N --trace FILE --trace-instr\n"
@@ -896,7 +1079,10 @@ void printHelp(std::ostream& out) {
         << "  --duration-ms N --max-instructions N --quantum N --trace FILE\n"
         << "  --strict-mmio --trace-instr --detect-spin --no-loop-batching --allow-breakpoint\n"
         << "  --transactional-slices (experimental parallel lane epochs)\n"
-        << "  --inject-can BUS[@TIME_MS]:ID:HEXDATA\n";
+        << "  --inject-can BUS[@TIME_MS]:ID:HEXDATA\n"
+        << "  --control-stdin (watch-network compatibility flag)\n"
+        << "\nWatch-network stdin format:\n"
+        << "  BUS:ID:HEXDATA (for example vehicle:0x180:0104000000)\n";
 }
 
 ExitCode run(
@@ -969,6 +1155,10 @@ ExitCode run(
 
     if (args.front() == "run-network") {
         return runNetworkCommand(args, out, err);
+    }
+
+    if (args.front() == "watch-network") {
+        return watchNetworkCommand(args, out, err);
     }
 
     if (args.front() == "compare-stlink") {
