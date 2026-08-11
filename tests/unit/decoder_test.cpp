@@ -122,8 +122,12 @@ TEST(DecoderTest, DecodesRealG4AndFreeRtosEncodings) {
     EXPECT_TRUE(mla && mla->kind == fil::cpu::InstrKind::mla) << "decodes real MLA encoding";
 
     const auto clz = fil::cpu::decode32(0xfab2U, 0xf282U);
+    const auto bfc = fil::cpu::decode32(0xf36fU, 0x200fU);
     const auto ubfx = fil::cpu::decode32(0xf3c3U, 0x1303U);
     EXPECT_TRUE(clz && clz->kind == fil::cpu::InstrKind::clz) << "decodes real CLZ encoding";
+    EXPECT_TRUE(bfc && bfc->kind == fil::cpu::InstrKind::bfc && bfc->shift_amount == 8U &&
+                bfc->imm == 8U)
+        << "decodes BFC msb as an inclusive bit position";
     EXPECT_TRUE(ubfx && ubfx->kind == fil::cpu::InstrKind::ubfx && ubfx->shift_amount == 4U &&
                 ubfx->imm == 4U)
         << "decodes real UBFX bit range";

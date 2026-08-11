@@ -690,8 +690,9 @@ struct ExpandedImmediate {
     const auto lsb = static_cast<std::uint8_t>(
         ((second >> 10U) & 0x1cU) | ((second >> 6U) & 0x3U)
     );
-    const auto width = static_cast<std::uint8_t>((second & 0x1fU) + 1U);
-    if (static_cast<unsigned int>(lsb) + width > 32U) return std::nullopt;
+    const auto msb = static_cast<std::uint8_t>(second & 0x1fU);
+    if (msb < lsb) return std::nullopt;
+    const auto width = static_cast<std::uint8_t>(msb - lsb + 1U);
     auto result = base32(first, second, InstrKind::bfc, OperandForm::immediate);
     result.rn = static_cast<std::uint8_t>(first & 0x0fU);
     result.rd = static_cast<std::uint8_t>((second >> 8U) & 0x0fU);

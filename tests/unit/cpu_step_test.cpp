@@ -410,6 +410,7 @@ TEST(CpuStepTest, ExecutesRealWideAluMultiplyAndBitfieldEncodings) {
         0xfb06U, 0x5212U, // mls r2, r6, r2, r5
         0xfb02U, 0xf303U, // mul.w r3, r2, r3
         0xfab2U, 0xf282U, // clz r2, r2
+        0xf36fU, 0x230fU, // bfc r3, #8, #8
         0xf3c3U, 0x1303U, // ubfx r3, r3, #4, #4
         0xfb01U, 0x3002U, // mla r0, r1, r2, r3
         0xfba1U, 0x1303U, // umull r1, r3, r1, r3
@@ -459,6 +460,10 @@ TEST(CpuStepTest, ExecutesRealWideAluMultiplyAndBitfieldEncodings) {
     cpu.state().r[2] = 0x1000U;
     EXPECT_TRUE(cpu.step().reason == fil::cpu::StopReason::step_complete) << "executes CLZ";
     EXPECT_TRUE(cpu.state().r[2] == 19U) << "CLZ counts all leading zeroes";
+
+    cpu.state().r[3] = 0x1234abcdU;
+    EXPECT_TRUE(cpu.step().reason == fil::cpu::StopReason::step_complete) << "executes BFC";
+    EXPECT_TRUE(cpu.state().r[3] == 0x123400cdU) << "BFC clears only the requested bit range";
 
     cpu.state().r[3] = 0x0ab0U;
     EXPECT_TRUE(cpu.step().reason == fil::cpu::StopReason::step_complete) << "executes UBFX";
