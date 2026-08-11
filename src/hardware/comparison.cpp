@@ -124,7 +124,8 @@ bool rangeIsInspectable(
             }
         );
         if (match == regions.end() || !match->readable
-            || (match->kind != mem::RegionKind::ram && match->kind != mem::RegionKind::rom)) {
+            || (match->kind != mem::RegionKind::ram && match->kind != mem::RegionKind::rom
+                && match->kind != mem::RegionKind::flash)) {
             return false;
         }
         cursor = std::min(

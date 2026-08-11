@@ -218,7 +218,34 @@ private:
 /** @brief STM32G4 FLASH control-register model with key-based lock state. */
 class FlashPeripheral final : public RegisterPeripheral {
 public:
+    /**
+     * @brief Erases one flash page through the installed memory backing.
+     *
+     * The callback receives the absolute page base address and its size in
+     * bytes. Returning an error leaves the flash status without EOP set.
+     */
+    using PageEraseCallback = std::function<Result<void>(std::uint32_t page_base, std::uint32_t page_size)>;
+
     explicit FlashPeripheral(sim::EventLoop* event_loop = nullptr, sim::TraceRecorder* trace = nullptr);
+
+    /** @brief Installs the backing callback that physically erases pages. */
+    void setPageEraseCallback(PageEraseCallback callback);
+
+    /**
+     * @brief Configures how CR page numbers map to absolute flash addresses.
+     * @param flash_base First address of flash bank 0.
+     * @param page_size Size in bytes of one flash page.
+     * @param bank_size Size in bytes of one flash bank.
+     */
+    void setEraseGeometry(
+        std::uint32_t flash_base,
+        std::uint32_t page_size,
+        std::uint32_t bank_size
+    ) noexcept {
+        flash_base_ = flash_base;
+        page_size_ = page_size;
+        bank_size_ = bank_size;
+    }
 
 protected:
     [[nodiscard]] std::uint32_t loadRegister(
@@ -235,8 +262,14 @@ protected:
     void onReset() override;
 
 private:
+    void performPageErase(std::uint32_t control);
+
     unsigned int key_step_{0};
     unsigned int option_key_step_{0};
+    PageEraseCallback page_erase_callback_;
+    std::uint32_t flash_base_{0x08000000U};
+    std::uint32_t page_size_{4096U};
+    std::uint32_t bank_size_{512U * 1024U};
 };
 
 /** @brief Permissive power-control register model. */

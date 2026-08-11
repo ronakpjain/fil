@@ -6,6 +6,9 @@ PwrPeripheral::PwrPeripheral(
     sim::EventLoop* const event_loop,
     sim::TraceRecorder* const trace
 ) : RegisterPeripheral("PWR", 0x40, event_loop, trace) {
+    // STM32G4 resets in voltage-scaling range 1, which is required for flash
+    // programming at the firmware's configured clock rate.
+    setResetValue(0x00U, 1U << 9U);
     reset();
 }
 

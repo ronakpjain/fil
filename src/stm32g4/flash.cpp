@@ -1,5 +1,8 @@
 #include "fil/stm32g4/peripheral.hpp"
 
+#include <cstdint>
+#include <utility>
+
 namespace fil::stm32g4 {
 namespace {
 
@@ -11,6 +14,19 @@ constexpr std::uint32_t busy = 1U << 16U;
 constexpr std::uint32_t lock = 1U << 31U;
 constexpr std::uint32_t option_lock = 1U << 30U;
 
+// FLASH_CR operation bits (STM32G4 RM0440).
+constexpr std::uint32_t per = 1U << 1U;    ///< Page erase enable.
+constexpr std::uint32_t bker = 1U << 11U;  ///< Bank select for page erase.
+constexpr std::uint32_t strt = 1U << 16U; ///< Start erase or programming.
+
+// FLASH_SR status bits.
+constexpr std::uint32_t eop = 1U << 0U; ///< End of operation.
+
+/** @brief Reconstructs the flat page number from the contiguous CR PNB field. */
+std::uint32_t pageNumberFromControl(const std::uint32_t control) {
+    return (control >> 3U) & 0x7fU;
+}
+
 } // namespace
 
 FlashPeripheral::FlashPeripheral(
@@ -19,6 +35,10 @@ FlashPeripheral::FlashPeripheral(
 ) : RegisterPeripheral("FLASH", 0x40, event_loop, trace) {
     setResetValue(cr, lock | option_lock);
     reset();
+}
+
+void FlashPeripheral::setPageEraseCallback(PageEraseCallback callback) {
+    page_erase_callback_ = std::move(callback);
 }
 
 std::uint32_t FlashPeripheral::loadRegister(
@@ -67,6 +87,34 @@ void FlashPeripheral::storeRegister(
         setRegister(sr, (previous & ~(value & write_mask)) & ~busy);
     } else if (word_offset == cr && (previous & lock) != 0U) {
         setRegister(cr, previous);
+    } else if (word_offset == cr) {
+        setRegister(cr, value);
+        if ((value & per) != 0U && (value & strt) != 0U) {
+            performPageErase(value);
+        }
+    }
+}
+
+void FlashPeripheral::performPageErase(const std::uint32_t control) {
+    // Model the operation synchronously: raise BSY, erase the page through the
+    // installed backing, then clear BSY and report EOP on success. Reading SR
+    // already masks BSY away, so firmware polling sees a completed erase.
+    setRegister(sr, registerValue(sr) | busy);
+
+    const std::uint32_t bank = (control & bker) != 0U ? 1U : 0U;
+    const std::uint32_t page = pageNumberFromControl(control);
+    const std::uint32_t page_base =
+        flash_base_ + bank * bank_size_ + page * page_size_;
+
+    bool succeeded = true;
+    if (page_erase_callback_) {
+        auto result = page_erase_callback_(page_base, page_size_);
+        succeeded = static_cast<bool>(result);
+    }
+    if (succeeded) {
+        setRegister(sr, (registerValue(sr) & ~busy) | eop);
+    } else {
+        setRegister(sr, registerValue(sr) & ~busy);
     }
 }
 

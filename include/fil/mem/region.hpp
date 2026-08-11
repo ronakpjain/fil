@@ -13,6 +13,7 @@ namespace fil::mem {
 enum class RegionKind {
     ram,   ///< Mutable zero-initialized byte storage.
     rom,   ///< Read-only storage initialized to erased bytes.
+    flash, ///< Mutable storage initialized to erased bytes, writable by flash programming.
     alias, ///< Address translation into another mapped region.
     mmio,  ///< Indivisible dispatch to a peripheral device.
 };

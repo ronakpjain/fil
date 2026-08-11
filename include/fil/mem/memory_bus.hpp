@@ -169,6 +169,17 @@ public:
         std::uint32_t base, std::uint32_t size, std::string name, bool executable = true
     );
 
+    /**
+     * @brief Maps writable erased (`0xff`) flash storage.
+     *
+     * Unlike ROM, the backing accepts CPU writes so firmware flash programming
+     * can store code and data directly. It still initializes to erased bytes
+     * and remains executable, matching STM32G4 flash region semantics.
+     */
+    [[nodiscard]] Result<void> mapFlash(
+        std::uint32_t base, std::uint32_t size, std::string name, bool executable = true
+    );
+
     /** @brief Maps an address range that translates to a target range. */
     [[nodiscard]] Result<void> mapAlias(
         std::uint32_t alias_base,

@@ -248,6 +248,26 @@ void Stm32G4::serviceDmaRequest(const std::uint8_t request) {
 void Stm32G4::attachMemory(mem::MemoryBus& memory) noexcept {
     dma1_.setMemory(&memory);
     dma2_.setMemory(&memory);
+
+    std::uint32_t flash_base = 0x08000000U;
+    std::uint32_t flash_size = 0U;
+    for (const auto& region : memory.regions()) {
+        if (region.name == "flash") {
+            flash_base = region.base;
+            flash_size = region.size;
+        }
+    }
+    if (flash_size == 0U) {
+        flash_size = 512U * 1024U;
+    }
+    // STM32G4 default OPTR.DBANK=0: one 512 KiB bank of 4 KiB pages.
+    flash_.setEraseGeometry(flash_base, 4096U, flash_size);
+    flash_.setPageEraseCallback(
+        [&memory](const std::uint32_t page_base, const std::uint32_t page_size) {
+            const std::vector<std::uint8_t> erased(page_size, 0xffU);
+            return memory.loadBytes(page_base, erased);
+        }
+    );
 }
 
 GpioPeripheral* Stm32G4::gpio(const std::string_view name) noexcept { return named(gpio_, name); }

@@ -23,7 +23,8 @@ TEST(PeripheralTest, StoresRegistersAndUnknownMmio) {
         << "register storage merges little-endian byte writes";
     pwr.reset();
     const auto reset = pwr.read(0, fil::mem::AccessSize::word, read_context);
-    EXPECT_TRUE(reset && reset.value() == 0) << "register reset restores deterministic values";
+    EXPECT_TRUE(reset && reset.value() == (1U << 9U))
+        << "register reset restores STM32G4 voltage-scaling range 1";
 
     fil::stm32g4::UnknownMmioDevice unknown("fallback", 0x40000000U);
     EXPECT_TRUE(unknown.write(3, fil::mem::AccessSize::halfword, 0xabcdU, write_context).hasValue())

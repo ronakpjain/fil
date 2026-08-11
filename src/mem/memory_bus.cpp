@@ -117,6 +117,20 @@ Result<void> MemoryBus::mapRom(
     return addRegion(std::move(region));
 }
 
+Result<void> MemoryBus::mapFlash(
+    const std::uint32_t base,
+    const std::uint32_t size,
+    std::string name,
+    const bool executable
+) {
+    auto region = std::make_unique<Region>();
+    region->info = MemoryRegionInfo{base, size, RegionKind::flash, std::move(name), true, true, executable};
+    if (validRange(base, size)) {
+        region->bytes.assign(size, 0xffU);
+    }
+    return addRegion(std::move(region));
+}
+
 Result<void> MemoryBus::mapAlias(
     const std::uint32_t alias_base,
     const std::uint32_t target_base,
@@ -190,8 +204,9 @@ Result<void> MemoryBus::loadBytes(
     if (region == nullptr || !region->containsRange(address, static_cast<std::uint32_t>(bytes.size()))) {
         return mapError("load byte range is not contained in one mapped region");
     }
-    if (region->info.kind != RegionKind::ram && region->info.kind != RegionKind::rom) {
-        return mapError("load bytes require directly backed RAM or ROM, not region '" + region->info.name + "'");
+    if (region->info.kind != RegionKind::ram && region->info.kind != RegionKind::rom
+        && region->info.kind != RegionKind::flash) {
+        return mapError("load bytes require directly backed RAM, ROM, or flash, not region '" + region->info.name + "'");
     }
     const std::size_t offset = address - region->info.base;
     for (std::size_t index = 0; index < bytes.size(); ++index) {
@@ -417,7 +432,8 @@ MemoryResult<std::uint32_t> MemoryBus::read32(
     const Region* region = find(address);
     if (region != nullptr
         && (region->info.kind == RegionKind::ram
-            || region->info.kind == RegionKind::rom)
+            || region->info.kind == RegionKind::rom
+            || region->info.kind == RegionKind::flash)
         && region->info.readable
         && region->containsRange(address, sizeof(std::uint32_t))
         && (context.type != AccessType::instruction_fetch
@@ -473,7 +489,8 @@ MemoryResult<std::uint64_t> MemoryBus::write32(
     Region* region = find(address);
     if (region != nullptr
         && (region->info.kind == RegionKind::ram
-            || region->info.kind == RegionKind::rom)
+            || region->info.kind == RegionKind::rom
+            || region->info.kind == RegionKind::flash)
         && region->info.writable
         && region->containsRange(address, sizeof(value))) {
         const std::size_t offset = address - region->info.base;

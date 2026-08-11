@@ -64,7 +64,7 @@ Result<MemoryBus> buildMcuMemoryMap(
     const bool executable_sram
 ) {
     MemoryBus memory;
-    auto flash = memory.mapRom(mcu.flash_base, mcu.flash_size, "flash", true);
+    auto flash = memory.mapFlash(mcu.flash_base, mcu.flash_size, "flash", true);
     if (!flash) return flash.error();
     auto ccm = memory.mapRam(
         mcu.ccm_sram_base, mcu.ccm_sram_size, "ccm-sram", executable_sram
