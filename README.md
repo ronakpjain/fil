@@ -57,6 +57,22 @@ Run the configured six-board vehicle network:
 `--inject-can BUS[@TIME_MS]:ID:HEXDATA` may be repeated. Omitting `@TIME_MS`
 schedules at time zero; identifiers above `0x7ff` are treated as extended.
 
+Monitor a running network and inject CAN frames interactively:
+
+```bash
+./build/fil watch-network configs/networks/per_vehicle.json \
+  --refresh-ms 10 \
+  --live-filter can_tx \
+  --live-filter can_rx \
+  --control-stdin
+```
+
+Enter `BUS:ID:HEXDATA` lines on standard input, or enter `quit` or `exit` to stop.
+The monitor prints selected events with simulated timestamps; `can_tx` is shown by
+default, and repeatable `--live-filter TYPE` options replace that default. See
+[Live network monitoring](docs/watch_network.md) for input syntax, output format,
+options, and stopping behavior.
+
 The checked-in board configs reference ELF files in a sibling `PER` checkout. Those
 files are optional acceptance inputs and are not embedded into emulator behavior.
 
@@ -113,6 +129,7 @@ JSON artifacts, and comparison scope.
 - [Memory system](docs/memory_system.md)
 - [Hardware comparison](docs/hardware_comparison.md)
 - [JSONL trace contract](docs/tracing.md)
+- [Live network monitoring](docs/watch_network.md)
 - [Performance](docs/performance.md)
 - [Testing](docs/testing.md)
 - [Thumb instruction coverage](docs/thumb_instruction_coverage.md)

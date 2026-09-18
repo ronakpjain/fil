@@ -5,6 +5,11 @@
 Without `--trace`, the CLI disables trace collection to avoid retaining diagnostic
 history. Add `--trace-instr` when instruction records are also required.
 
+`fil watch-network` instead prints selected events as human-readable lines while a
+network runs and accepts CAN frames on standard input. Its live output is not JSONL;
+see [Live network monitoring](watch_network.md) for its filters, format, and control
+syntax.
+
 ## Common fields and ordering
 
 Every record begins with these fields in this serialized order:
