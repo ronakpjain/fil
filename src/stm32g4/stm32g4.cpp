@@ -78,7 +78,9 @@ Stm32G4::Stm32G4(
     stubs_.push_back(std::make_unique<UnknownMmioDevice>("ADC345_COMMON", 0x50000700U, false, 0, &event_loop, &trace));
 }
 
-Stm32G4::~Stm32G4() = default;
+Stm32G4::~Stm32G4() {
+    clearInterruptLines();
+}
 
 Result<std::unique_ptr<Stm32G4>> Stm32G4::create(
     sim::EventLoop& event_loop,
@@ -175,21 +177,35 @@ Result<void> Stm32G4::mapDevices() {
 }
 
 void Stm32G4::wireInterrupts() {
+    unsigned int source = 0U;
+    const auto connect = [this, &source](RegisterPeripheral& peripheral, const auto irqs) {
+        const std::uint32_t source_bit = std::uint32_t{1} << source++;
+        peripheral.setInterruptLevelCallback(
+            [this, irqs, source_bit](const unsigned int line, const bool asserted) {
+                if (line >= irqs.size()) return;
+                const std::uint16_t irq = irqs[line];
+                auto& sources = irq_sources_[irq];
+                if (asserted) sources |= source_bit;
+                else sources &= ~source_bit;
+                system_.setInterruptLine(irq, sources != 0U);
+            }
+        );
+    };
     constexpr std::array<std::uint16_t, 3> usart_irqs{37, 38, 39};
     for (std::size_t index = 0; index < usart_.size(); ++index) {
-        usart_[index]->setInterruptCallback([this, irq = usart_irqs[index]] { system_.pend(irq + 16U); });
+        connect(*usart_[index], std::array{usart_irqs[index]});
     }
     constexpr std::array<std::uint16_t, 3> spi_irqs{35, 36, 51};
     for (std::size_t index = 0; index < spi_.size(); ++index) {
-        spi_[index]->setInterruptCallback([this, irq = spi_irqs[index]] { system_.pend(irq + 16U); });
+        connect(*spi_[index], std::array{spi_irqs[index]});
     }
     constexpr std::array<std::uint16_t, 12> timer_irqs{28, 29, 30, 54, 55, 25, 44, 24, 25, 26, 78, 50};
     for (std::size_t index = 0; index < timers_.size(); ++index) {
-        timers_[index]->setInterruptCallback([this, irq = timer_irqs[index]] { system_.pend(irq + 16U); });
+        connect(*timers_[index], std::array{timer_irqs[index]});
     }
     constexpr std::array<std::uint8_t, 4> adc_dma_requests{5U, 36U, 37U, 38U};
     for (std::size_t index = 0; index < adc_.size(); ++index) {
-        adc_[index]->setInterruptCallback([this] { system_.pend(18U + 16U); });
+        connect(*adc_[index], std::array<std::uint16_t, 1>{18U});
         adc_[index]->setSampleCallback(
             [this, request = adc_dma_requests[index]](const AdcSample&) {
                 serviceDmaRequest(request);
@@ -200,20 +216,10 @@ void Stm32G4::wireInterrupts() {
         {{21U, 22U}}, {{86U, 87U}}, {{88U, 89U}},
     }};
     for (std::size_t index = 0; index < fdcan_.size(); ++index) {
-        fdcan_[index]->setInterruptCallback([this, irqs = fdcan_irqs[index]](const unsigned int line) {
-            if (line < irqs.size()) system_.pend(static_cast<std::uint16_t>(irqs[line] + 16U));
-        });
+        connect(*fdcan_[index], fdcan_irqs[index]);
     }
-    dma1_.setInterruptCallback([this](const unsigned int channel) {
-        const std::uint16_t irq = channel == 8U ? 96U : static_cast<std::uint16_t>(10U + channel);
-        system_.pend(irq + 16U);
-    });
-    dma2_.setInterruptCallback([this](const unsigned int channel) {
-        const std::uint16_t irq = channel <= 5U
-            ? static_cast<std::uint16_t>(55U + channel)
-            : static_cast<std::uint16_t>(91U + channel);
-        system_.pend(irq + 16U);
-    });
+    connect(dma1_, std::array<std::uint16_t, 8>{11U, 12U, 13U, 14U, 15U, 16U, 17U, 96U});
+    connect(dma2_, std::array<std::uint16_t, 8>{56U, 57U, 58U, 59U, 60U, 97U, 98U, 99U});
     rcc_.setClockChangedCallback([this](const std::uint64_t frequency) {
         for (auto& timer : timers_) timer->setInputClockHz(frequency);
         for (auto& adc : adc_) adc->setInputClockHz(frequency);
@@ -368,7 +374,17 @@ void Stm32G4::setTraceSourcePrefix(const std::string_view prefix) {
     qualify(stubs_);
 }
 
+void Stm32G4::clearInterruptLines() {
+    for (std::uint16_t irq = 0U; irq < irq_sources_.size(); ++irq) {
+        if (irq_sources_[irq] != 0U) system_.setInterruptLine(irq, false);
+    }
+    irq_sources_.fill(0U);
+}
+
 void Stm32G4::reset() {
+    // Drop shared-source state together, before individual devices reset. This
+    // avoids reasserting stale sources when SystemControl has already reset.
+    clearInterruptLines();
     rcc_.reset();
     flash_.reset();
     crc_.reset();

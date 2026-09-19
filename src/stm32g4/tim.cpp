@@ -117,11 +117,16 @@ void TimerPeripheral::storeRegister(
         scheduleUpdate();
     } else if (word_offset == sr) {
         setRegister(sr, previous & (value | ~write_mask));
+        setInterruptLevel(0, (registerValue(dier) & 1U) != 0U && (registerValue(sr) & 1U) != 0U);
+    } else if (word_offset == dier) {
+        setInterruptLevel(0, (value & 1U) != 0U && (registerValue(sr) & 1U) != 0U);
     } else if (word_offset == egr) {
         const bool generate_update = (value & write_mask & 1U) != 0U;
         setRegister(egr, 0);
         if (generate_update) {
             fireUpdate(true);
+        } else {
+            setInterruptLevel(0, (registerValue(dier) & 1U) != 0U && (registerValue(sr) & 1U) != 0U);
         }
     }
 }
@@ -174,6 +179,7 @@ void TimerPeripheral::fireUpdate(const bool forced) {
     counter_epoch_value_ = 0;
     setRegister(cnt, 0);
     setRegister(sr, registerValue(sr) | 1U);
+    setInterruptLevel(0, (registerValue(dier) & 1U) != 0U);
     updates_.push_back(TimerUpdate{currentTime(), before});
     traceEvent("timer_update", {{"forced", forced ? "true" : "false"}});
     if ((registerValue(dier) & 1U) != 0U && interrupt_callback_) {

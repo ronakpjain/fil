@@ -532,6 +532,7 @@ bool FdcanPeripheral::interruptLinePending(const unsigned int line) const noexce
 void FdcanPeripheral::updateInterruptLines() {
     for (unsigned int line = 0; line < interrupt_line_asserted_.size(); ++line) {
         const bool pending = interruptLinePending(line);
+        setInterruptLevel(line, pending);
         if (!pending) {
             interrupt_line_asserted_[line] = false;
             continue;

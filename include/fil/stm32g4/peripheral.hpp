@@ -30,6 +30,8 @@ namespace fil::stm32g4 {
  */
 class RegisterPeripheral : public mem::MmioDevice {
 public:
+    using InterruptLevelCallback = std::function<void(unsigned int line, bool asserted)>;
+
     RegisterPeripheral(
         std::string name,
         std::uint32_t register_block_size,
@@ -68,6 +70,9 @@ public:
     /** @brief Replaces the recorder used by future side-effect traces. */
     void setTraceRecorder(sim::TraceRecorder* trace) noexcept { trace_ = trace; }
 
+    /** @brief Observes level-sensitive interrupt requests, one callback per changed line. */
+    void setInterruptLevelCallback(InterruptLevelCallback callback);
+
     /** @brief Qualifies future trace sources as `prefix.device`; empty restores the device name. */
     void setTraceSourcePrefix(std::string_view prefix);
 
@@ -100,6 +105,7 @@ protected:
     }
 
     void traceEvent(std::string type, std::vector<sim::TraceField> fields = {});
+    void setInterruptLevel(unsigned int line, bool asserted);
 
 private:
     [[nodiscard]] mem::BusFault accessFault(
@@ -116,6 +122,8 @@ private:
     std::vector<std::uint32_t> reset_values_;
     sim::EventLoop* event_loop_{nullptr};
     sim::TraceRecorder* trace_{nullptr};
+    std::array<bool, 8> interrupt_levels_{};
+    InterruptLevelCallback interrupt_level_callback_;
 };
 
 /** @brief One observed access handled by a lenient unknown MMIO device. */
@@ -693,6 +701,7 @@ private:
         std::uint64_t value
     );
     void setChannelFlag(unsigned int channel, unsigned int flag_bit);
+    void updateInterruptLevels();
 
     unsigned int channel_count_{7};
     mem::MemoryBus* memory_{nullptr};

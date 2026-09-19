@@ -71,8 +71,10 @@ See [Thumb instruction coverage](thumb_instruction_coverage.md).
 
 `Stm32G4` owns stable register-device instances at STM32G474 addresses. The model
 covers startup clocks and flash state, GPIO, serial data paths, timers, ADC, DMA,
-watchdogs, and three FDCAN controllers with message RAM. Peripheral callbacks pend
-interrupts through `SystemControl`.
+watchdogs, and three FDCAN controllers with message RAM. Peripheral callbacks drive
+level-sensitive NVIC inputs through `SystemControl`; shared IRQ sources are ORed.
+Exception return re-pends a still-asserted source, while resuming a preempted handler
+preserves any separately latched pending interrupt.
 
 Board configuration supplies deterministic GPIO levels, USART input/output, ADC
 sources, and SPI devices. ADC inputs are sampled at simulated conversion-completion

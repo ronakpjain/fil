@@ -104,18 +104,21 @@ void UsartPeripheral::storeRegister(
         if (tx_callback_) {
             tx_callback_(byte, output.time_ns);
         }
+        setRegister(isr, registerValue(isr) | tc_flag); // Instantaneous TX completion.
         updateStatus();
         signalInterruptIfEnabled();
     } else if (word_offset == icr) {
         setRegister(isr, registerValue(isr) & ~value);
         setRegister(icr, 0);
         updateStatus();
+        signalInterruptIfEnabled();
     } else if (word_offset == rqr) {
         if ((value & (1U << 3U)) != 0U) {
             rx_queue_.clear();
         }
         setRegister(rqr, 0);
         updateStatus();
+        signalInterruptIfEnabled();
     } else if (word_offset == cr1) {
         updateStatus();
         scheduleIdle();
@@ -144,7 +147,7 @@ void UsartPeripheral::refillRx() {
 }
 
 void UsartPeripheral::updateStatus() {
-    std::uint32_t status = registerValue(isr) | tc_flag | txe_flag | txfe_flag;
+    std::uint32_t status = registerValue(isr) | txe_flag | txfe_flag;
     if (rx_queue_.empty()) {
         status &= ~rxne_flag;
     } else {
@@ -158,16 +161,14 @@ void UsartPeripheral::updateStatus() {
 }
 
 void UsartPeripheral::signalInterruptIfEnabled() {
-    if (!interrupt_callback_) {
-        return;
-    }
     const std::uint32_t control = registerValue(cr1);
     const std::uint32_t status = registerValue(isr);
     const bool pending = (((control & (1U << 4U)) != 0U) && ((status & idle_flag) != 0U))
         || (((control & (1U << 5U)) != 0U) && ((status & rxne_flag) != 0U))
         || (((control & (1U << 6U)) != 0U) && ((status & tc_flag) != 0U))
         || (((control & (1U << 7U)) != 0U) && ((status & txe_flag) != 0U));
-    if (pending) {
+    setInterruptLevel(0, pending);
+    if (pending && interrupt_callback_) {
         interrupt_callback_();
     }
 }

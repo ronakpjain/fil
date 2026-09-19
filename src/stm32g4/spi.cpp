@@ -138,9 +138,10 @@ void SpiPeripheral::signalRequests() {
     updateStatus();
     const std::uint32_t control = registerValue(cr2);
     const std::uint32_t status = registerValue(sr);
-    if (interrupt_callback_
-        && ((((control & (1U << 6U)) != 0U) && ((status & rxne) != 0U))
-            || (((control & (1U << 7U)) != 0U) && ((status & txe) != 0U)))) {
+    const bool pending = (((control & (1U << 6U)) != 0U) && ((status & rxne) != 0U))
+        || (((control & (1U << 7U)) != 0U) && ((status & txe) != 0U));
+    setInterruptLevel(0, pending);
+    if (interrupt_callback_ && pending) {
         interrupt_callback_();
     }
     if (dma_request_callback_) {

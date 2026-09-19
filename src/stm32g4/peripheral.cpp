@@ -49,6 +49,15 @@ void RegisterPeripheral::setTraceSourcePrefix(const std::string_view prefix) {
     trace_source_ = qualifiedTraceSource(prefix, name_);
 }
 
+void RegisterPeripheral::setInterruptLevelCallback(InterruptLevelCallback callback) {
+    interrupt_level_callback_ = std::move(callback);
+    if (interrupt_level_callback_) {
+        for (unsigned int line = 0; line < interrupt_levels_.size(); ++line) {
+            interrupt_level_callback_(line, interrupt_levels_[line]);
+        }
+    }
+}
+
 mem::BusFault RegisterPeripheral::accessFault(
     const std::uint32_t offset,
     const mem::AccessSize size,
@@ -146,6 +155,9 @@ mem::MemoryResult<std::uint64_t> RegisterPeripheral::write(
 
 void RegisterPeripheral::reset() {
     registers_ = reset_values_;
+    for (unsigned int line = 0; line < interrupt_levels_.size(); ++line) {
+        setInterruptLevel(line, false);
+    }
     onReset();
 }
 
@@ -204,6 +216,12 @@ std::uint32_t RegisterPeripheral::registerValue(const std::uint32_t word_offset)
 
 sim::SimTimeNs RegisterPeripheral::currentTime() const noexcept {
     return event_loop_ == nullptr ? 0 : event_loop_->now();
+}
+
+void RegisterPeripheral::setInterruptLevel(const unsigned int line, const bool asserted) {
+    if (line >= interrupt_levels_.size() || interrupt_levels_[line] == asserted) return;
+    interrupt_levels_[line] = asserted;
+    if (interrupt_level_callback_) interrupt_level_callback_(line, asserted);
 }
 
 void RegisterPeripheral::traceEvent(

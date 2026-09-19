@@ -53,7 +53,14 @@ The separate `0xe0000000..0xe00fffff` system device implements:
 - CPACR FPU-enable visibility, DEMCR, FPCCR, DWT CTRL, and gated DWT CYCCNT;
 - priority selection under PRIMASK, BASEPRI, FAULTMASK, and current active exception.
 
-Unit tests cover SysTick wrap, COUNTFLAG, NVIC enable/masking/priority, PendSV, CPACR, AIRCR, and basic/extended exception entry and return. MPU, ITM/SWO, breakpoint/watchpoint comparators, debug transport, lazy FP stacking, and automatic fault escalation are not modeled.
+BASEPRI reads, writes, and arbitration use the same four implemented priority bits
+as NVIC/SHPR. Peripheral IRQ inputs are level-sensitive: an uncleared enabled source
+re-pends on exception return, and shared sources remain asserted until all are
+acknowledged or disabled. Software-pended interrupts remain independently latched.
+
+Unit tests cover SysTick wrap, COUNTFLAG, NVIC enable/masking/priority, BASEPRI_MAX,
+PendSV, CPACR, AIRCR, basic/extended exception entry and return, preservation of
+re-pended nested interrupts, peripheral IRQ acknowledgment, shared IRQs, and reset/teardown. MPU, ITM/SWO, breakpoint/watchpoint comparators, debug transport, lazy FP stacking, and automatic fault escalation are not modeled.
 
 ## Virtual CAN and multi-board world
 

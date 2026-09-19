@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -272,6 +273,137 @@ TEST(PeripheralTest, PreservesObservableAndSingleShotAdcEvents) {
     const auto single_data = single_adc.read(0x40, fil::mem::AccessSize::word, read_context);
     EXPECT_TRUE(single_data && single_data.value() == 1234U)
         << "unobserved single-shot ADC still materializes DR";
+}
+
+TEST(PeripheralTest, ReportsPeripheralInterruptLevelsAndRependsOnEnable) {
+    std::vector<std::pair<unsigned int, bool>> levels;
+
+    fil::stm32g4::TimerPeripheral timer("TIM1");
+    timer.setInterruptLevelCallback([&](const unsigned int line, const bool asserted) {
+        levels.emplace_back(line, asserted);
+    });
+    levels.clear();
+    EXPECT_TRUE(timer.write(0x14, fil::mem::AccessSize::word, 1U, write_context).hasValue());
+    EXPECT_TRUE(timer.write(0x0c, fil::mem::AccessSize::word, 1U, write_context).hasValue());
+    ASSERT_EQ(levels.size(), 1U);
+    EXPECT_TRUE(levels.back() == std::make_pair(0U, true));
+    EXPECT_TRUE(timer.write(0x10, fil::mem::AccessSize::word, 0U, write_context).hasValue());
+    ASSERT_EQ(levels.size(), 2U);
+    EXPECT_TRUE(levels.back() == std::make_pair(0U, false));
+
+    fil::stm32g4::SpiPeripheral spi;
+    levels.clear();
+    spi.setInterruptLevelCallback([&](const unsigned int line, const bool asserted) {
+        levels.emplace_back(line, asserted);
+    });
+    levels.clear();
+    EXPECT_TRUE(spi.write(0x04, fil::mem::AccessSize::word, 1U << 7U, write_context).hasValue());
+    ASSERT_EQ(levels.size(), 1U);
+    EXPECT_TRUE(levels.back() == std::make_pair(0U, true));
+    EXPECT_TRUE(spi.write(0x04, fil::mem::AccessSize::word, 0U, write_context).hasValue());
+    ASSERT_EQ(levels.size(), 2U);
+    EXPECT_TRUE(levels.back() == std::make_pair(0U, false));
+
+    fil::stm32g4::AdcPeripheral adc;
+    levels.clear();
+    adc.setInterruptLevelCallback([&](const unsigned int line, const bool asserted) {
+        levels.emplace_back(line, asserted);
+    });
+    levels.clear();
+    EXPECT_TRUE(adc.write(0x08, fil::mem::AccessSize::word, 1U | (1U << 2U), write_context).hasValue());
+    EXPECT_TRUE(adc.write(0x04, fil::mem::AccessSize::word, 1U << 2U, write_context).hasValue());
+    ASSERT_EQ(levels.size(), 1U);
+    EXPECT_TRUE(levels.back() == std::make_pair(0U, true));
+    EXPECT_TRUE(adc.write(0x04, fil::mem::AccessSize::word, 0U, write_context).hasValue());
+    ASSERT_EQ(levels.size(), 2U);
+    EXPECT_TRUE(levels.back() == std::make_pair(0U, false));
+
+    fil::stm32g4::DmaPeripheral dma("DMA1", 1);
+    levels.clear();
+    dma.setInterruptLevelCallback([&](const unsigned int line, const bool asserted) {
+        levels.emplace_back(line, asserted);
+    });
+    levels.clear();
+    EXPECT_TRUE(dma.write(0x0c, fil::mem::AccessSize::word, 1U, write_context).hasValue());
+    EXPECT_TRUE(dma.write(0x08, fil::mem::AccessSize::word, 1U | (1U << 3U), write_context).hasValue());
+    EXPECT_TRUE(dma.request(1U));
+    ASSERT_EQ(levels.size(), 1U);
+    EXPECT_TRUE(levels.back() == std::make_pair(0U, true));
+    EXPECT_TRUE(dma.write(0x04, fil::mem::AccessSize::word, 1U << 3U, write_context).hasValue());
+    ASSERT_EQ(levels.size(), 2U);
+    EXPECT_TRUE(levels.back() == std::make_pair(0U, false));
+}
+
+TEST(PeripheralTest, AdcInterruptLevelMatchesEnabledStatusBits) {
+    fil::sim::EventLoop events;
+    fil::stm32g4::AdcPeripheral adc("ADC1", &events);
+    adc.setConversionDelay(100U);
+    std::vector<bool> levels;
+    adc.setInterruptLevelCallback([&](const unsigned int line, const bool asserted) {
+        if (line == 0U) levels.push_back(asserted);
+    });
+    EXPECT_EQ(levels, std::vector<bool>{false});
+    constexpr auto word = fil::mem::AccessSize::word;
+    ASSERT_TRUE(adc.write(0x30U, word, 1U, {})); // Two ranks.
+    ASSERT_TRUE(adc.write(0x04U, word, 1U << 3U, {})); // Only EOSIE, not EOCIE.
+    ASSERT_TRUE(adc.write(0x08U, word, 1U | (1U << 2U), {}));
+    EXPECT_EQ(events.runDueEvents(100U).events_executed, 1U);
+    EXPECT_EQ(levels, std::vector<bool>{false}); // First rank: EOC, but no EOS.
+    ASSERT_TRUE(adc.write(0x04U, word, 1U << 3U, {}));
+    EXPECT_EQ(levels, std::vector<bool>{false}); // IER write must not confuse EOC/EOS.
+    EXPECT_EQ(events.runDueEvents(200U).events_executed, 1U);
+    EXPECT_EQ(levels, (std::vector<bool>{false, true}));
+    ASSERT_TRUE(adc.write(0U, word, 1U << 3U, {})); // W1C EOS leaves EOC set.
+    EXPECT_EQ(levels, (std::vector<bool>{false, true, false}));
+    ASSERT_TRUE(adc.write(0x04U, word, 1U << 2U, {})); // Enable already-set EOC.
+    EXPECT_EQ(levels, (std::vector<bool>{false, true, false, true}));
+    ASSERT_TRUE(adc.read(0x40U, word, {})); // DR read acknowledges conversion.
+    EXPECT_EQ(levels, (std::vector<bool>{false, true, false, true, false}));
+}
+
+TEST(PeripheralTest, DmaGlobalFlagClearDeassertsOnlySelectedChannel) {
+    fil::stm32g4::DmaPeripheral dma("DMA1", 8U);
+    std::uint32_t levels = 0U;
+    dma.setInterruptLevelCallback([&](const unsigned int line, const bool asserted) {
+        if (asserted) levels |= 1U << line;
+        else levels &= ~(1U << line);
+    });
+    constexpr auto word = fil::mem::AccessSize::word;
+    for (const unsigned int channel : {1U, 8U}) {
+        const std::uint32_t base = 0x08U + (channel - 1U) * 0x14U;
+        ASSERT_TRUE(dma.write(base + 4U, word, 1U, {}));
+        ASSERT_TRUE(dma.write(base, word, 1U, {}));
+        ASSERT_TRUE(dma.request(channel)); // No memory attached: TEIF, interrupt disabled.
+        EXPECT_EQ(levels & (1U << (channel - 1U)), 0U);
+        ASSERT_TRUE(dma.write(base, word, 1U << 3U, {})); // Enable TEIE after flag set.
+        EXPECT_NE(levels & (1U << (channel - 1U)), 0U);
+    }
+    EXPECT_EQ(levels, 0x81U);
+    ASSERT_TRUE(dma.write(0x04U, word, 1U, {})); // CGIF1 clears TEIF1 as well.
+    EXPECT_EQ(levels, 0x80U);
+    EXPECT_EQ(dma.peekRegister(0U), 0x90000000U);
+    ASSERT_TRUE(dma.write(0x07U, fil::mem::AccessSize::byte, 0x10U, {})); // CGIF8.
+    EXPECT_EQ(levels, 0U);
+    EXPECT_EQ(dma.peekRegister(0U), 0U);
+}
+
+TEST(PeripheralTest, UsartTransmissionCompleteCanBeAcknowledged) {
+    fil::stm32g4::UsartPeripheral usart;
+    std::vector<bool> levels;
+    usart.setInterruptLevelCallback([&](const unsigned int line, const bool asserted) {
+        if (line == 0U) levels.push_back(asserted);
+    });
+    constexpr auto word = fil::mem::AccessSize::word;
+    ASSERT_TRUE(usart.write(0U, word, 1U | (1U << 6U), {})); // TCIE and UE.
+    EXPECT_EQ(levels, (std::vector<bool>{false, true}));
+    ASSERT_TRUE(usart.write(0x20U, word, 1U << 6U, {})); // TCCF.
+    EXPECT_EQ(levels, (std::vector<bool>{false, true, false}));
+    ASSERT_TRUE(usart.read(0x1cU, word, {})); // Status read must not reassert TC.
+    EXPECT_EQ(levels, (std::vector<bool>{false, true, false}));
+    ASSERT_TRUE(usart.write(0x28U, word, 0x42U, {}));
+    EXPECT_EQ(levels, (std::vector<bool>{false, true, false, true}));
+    usart.reset();
+    EXPECT_EQ(levels, (std::vector<bool>{false, true, false, true, false}));
 }
 
 TEST(PeripheralTest, CompletesDmaAndWatchdogSideEffects) {

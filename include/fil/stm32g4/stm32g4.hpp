@@ -30,8 +30,8 @@ namespace fil::stm32g4 {
  * @brief Owns and routes the peripheral models for one STM32G474 instance.
  *
  * Device lifetimes are stable after construction, allowing MmioRouter to hold
- * non-owning pointers. All interrupt callbacks pend the corresponding NVIC
- * exception through the caller-owned Cortex-M system model.
+ * non-owning pointers. Peripheral interrupt levels are ORed for shared IRQs
+ * and drive the caller-owned Cortex-M NVIC model.
  */
 class Stm32G4 {
 public:
@@ -89,6 +89,7 @@ private:
 
     [[nodiscard]] Result<void> mapDevices();
     void wireInterrupts();
+    void clearInterruptLines();
     void serviceDmaRequest(std::uint8_t request);
     [[nodiscard]] Result<void> map(
         std::uint32_t absolute_address,
@@ -97,6 +98,7 @@ private:
 
     cortexm::SystemControl& system_;
     mem::MmioRouter router_;
+    std::array<std::uint32_t, 240> irq_sources_{};
 
     RccPeripheral rcc_;
     FlashPeripheral flash_;

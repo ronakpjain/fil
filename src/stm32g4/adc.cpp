@@ -84,6 +84,7 @@ void AdcPeripheral::setSampleCallback(SampleCallback callback) {
 void AdcPeripheral::setInterruptCallback(InterruptCallback callback) {
     synchronizeLazyConversions();
     interrupt_callback_ = std::move(callback);
+    setInterruptLevel(0, (registerValue(ier) & registerValue(isr) & (eoc | eos)) != 0U);
     refreshConversionScheduling();
 }
 
@@ -108,6 +109,7 @@ std::uint32_t AdcPeripheral::loadRegister(
     const std::uint32_t value = registerValue(word_offset);
     if (word_offset == dr) {
         setRegister(isr, registerValue(isr) & ~(eoc | eos));
+        setInterruptLevel(0, (registerValue(ier) & registerValue(isr) & (eoc | eos)) != 0U);
     }
     return value;
 }
@@ -122,6 +124,11 @@ void AdcPeripheral::storeRegister(
     static_cast<void>(context);
     if (word_offset == isr) {
         setRegister(isr, previous & ~(value & write_mask));
+        setInterruptLevel(0, (registerValue(ier) & registerValue(isr) & (eoc | eos)) != 0U);
+        return;
+    }
+    if (word_offset == ier) {
+        setInterruptLevel(0, (value & registerValue(isr) & (eoc | eos)) != 0U);
         return;
     }
     if (word_offset == dr) {
@@ -267,6 +274,7 @@ void AdcPeripheral::materializeConversion(
     setRegister(dr, value);
     const bool sequence_complete = sequence_rank_ + 1U >= sequenceLength();
     setRegister(isr, registerValue(isr) | eoc | (sequence_complete ? eos : 0U));
+    setInterruptLevel(0, (registerValue(ier) & registerValue(isr) & (eoc | eos)) != 0U);
     if (observable && sample_history_enabled_) samples_.push_back(sample);
     if (observable && traceEnabled()) {
         traceEvent("adc_sample", {

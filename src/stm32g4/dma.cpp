@@ -66,15 +66,26 @@ void DmaPeripheral::storeRegister(
     const std::uint32_t write_mask,
     const mem::AccessContext& context
 ) {
-    static_cast<void>(write_mask);
     static_cast<void>(context);
     if (word_offset == dma_isr) {
         setRegister(dma_isr, previous);
+        updateInterruptLevels();
         return;
     }
     if (word_offset == dma_ifcr) {
-        setRegister(dma_isr, registerValue(dma_isr) & ~value);
+        std::uint32_t status = registerValue(dma_isr);
+        const std::uint32_t clear = value & write_mask;
+        for (unsigned int channel = 0U; channel < channel_count_; ++channel) {
+            const unsigned int shift = channel * 4U;
+            // CGIF clears every flag in the channel, not just the summary bit.
+            const std::uint32_t flags = ((clear >> shift) & 1U) != 0U
+                ? 0xfU : ((clear >> shift) & 0xeU);
+            status &= ~(flags << shift);
+            if ((status & (0xeU << shift)) == 0U) status &= ~(1U << shift);
+        }
+        setRegister(dma_isr, status);
         setRegister(dma_ifcr, 0);
+        updateInterruptLevels();
         return;
     }
 
@@ -90,6 +101,7 @@ void DmaPeripheral::storeRegister(
             }
         }
     }
+    if (channelForOffset(word_offset, channel)) updateInterruptLevels();
 }
 
 bool DmaPeripheral::channelForOffset(
@@ -231,6 +243,22 @@ void DmaPeripheral::setChannelFlag(
 ) {
     const unsigned int shift = (channel - 1U) * 4U;
     setRegister(dma_isr, registerValue(dma_isr) | (1U << shift) | (1U << (shift + flag_bit)));
+    updateInterruptLevels();
+}
+
+void DmaPeripheral::updateInterruptLevels() {
+    const std::uint32_t status = registerValue(dma_isr);
+    for (unsigned int channel = 1U; channel <= channel_count_; ++channel) {
+        const unsigned int shift = (channel - 1U) * 4U;
+        const std::uint32_t control = registerValue(first_channel + (channel - 1U) * channel_stride);
+        const bool asserted = ((status & (1U << (shift + 1U))) != 0U
+                && (control & (1U << 1U)) != 0U)
+            || ((status & (1U << (shift + 2U))) != 0U
+                && (control & (1U << 2U)) != 0U)
+            || ((status & (1U << (shift + 3U))) != 0U
+                && (control & (1U << 3U)) != 0U);
+        setInterruptLevel(channel - 1U, asserted);
+    }
 }
 
 DmamuxPeripheral::DmamuxPeripheral(
