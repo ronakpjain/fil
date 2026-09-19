@@ -570,7 +570,7 @@ TEST(CpuStepTest, ExecutesSystemInstructionsAndRaisesConsumableMarkers) {
     EXPECT_TRUE(cpu.step().reason == fil::cpu::StopReason::step_complete) << "executes MRS IPSR";
     EXPECT_TRUE(cpu.state().r[3] == 11U) << "MRS reads IPSR exception number";
     EXPECT_TRUE(cpu.step().reason == fil::cpu::StopReason::step_complete) << "executes MSR BASEPRI";
-    EXPECT_TRUE(cpu.state().basepri == 11U) << "MSR writes BASEPRI low byte";
+    EXPECT_TRUE(cpu.state().basepri == 0U) << "MSR BASEPRI ignores unimplemented low bits";
 
     cpu.state().xpsr &= ~fil::cpu::xpsr_ipsr_mask;
     cpu.state().r[0] = ram_base + 0x80U;
@@ -613,6 +613,50 @@ TEST(CpuStepTest, ExecutesSystemInstructionsAndRaisesConsumableMarkers) {
         << "executes POP EXC_RETURN";
     EXPECT_TRUE(cpu.state().pending_exc_return && *cpu.state().pending_exc_return == 0xfffffff9U)
         << "POP exposes consumable EXC_RETURN marker";
+}
+
+TEST(CpuStepTest, MasksBasepriToImplementedPriorityBits) {
+    for (const std::uint32_t value : {0U, 0x0fU, 0x10U, 0x1fU, 0xffU, 0x100U}) {
+        SCOPED_TRACE(value);
+        auto bus = basicBus();
+        ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({
+            0xf383U, 0x8811U, // MSR BASEPRI, r3
+            0xf3efU, 0x8111U, // MRS r1, BASEPRI
+        })));
+        fil::cpu::CortexM4 cpu(bus);
+        prepare(cpu);
+        cpu.state().basepri = 0x20U;
+        cpu.state().r[3] = value;
+        ASSERT_EQ(cpu.step().reason, fil::cpu::StopReason::step_complete);
+        ASSERT_EQ(cpu.step().reason, fil::cpu::StopReason::step_complete);
+        EXPECT_EQ(cpu.state().basepri, value & 0xf0U);
+        EXPECT_EQ(cpu.state().r[1], value & 0xf0U);
+    }
+}
+
+TEST(CpuStepTest, BasepriMaxOnlyRaisesImplementedExecutionPriority) {
+    struct Case { std::uint32_t initial, requested, expected; };
+    const Case cases[]{
+        {0U, 0U, 0U}, {0U, 0x0fU, 0U}, {0U, 0x2fU, 0x20U},
+        {0x20U, 0x3fU, 0x20U}, {0x20U, 0x2fU, 0x20U},
+        {0x20U, 0x1fU, 0x10U}, {0x20U, 0U, 0x20U}, {0x20U, 0x0fU, 0x20U},
+    };
+    for (const auto& test : cases) {
+        SCOPED_TRACE(::testing::Message() << test.initial << " -> " << test.requested);
+        auto bus = basicBus();
+        ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({
+            0xf383U, 0x8812U, // MSR BASEPRI_MAX, r3
+            0xf3efU, 0x8111U, // MRS r1, BASEPRI
+        })));
+        fil::cpu::CortexM4 cpu(bus);
+        prepare(cpu);
+        cpu.state().basepri = test.initial;
+        cpu.state().r[3] = test.requested;
+        ASSERT_EQ(cpu.step().reason, fil::cpu::StopReason::step_complete);
+        ASSERT_EQ(cpu.step().reason, fil::cpu::StopReason::step_complete);
+        EXPECT_EQ(cpu.state().basepri, test.expected);
+        EXPECT_EQ(cpu.state().r[1], test.expected);
+    }
 }
 
 TEST(CpuStepTest, ExecutesRealScalarVfpPipeline) {

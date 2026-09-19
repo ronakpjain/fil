@@ -837,7 +837,7 @@ StopReason CortexM4::execute(
         case 9U: value = state_.psp; break;
         case 16U: value = state_.primask & 1U; break;
         case 17U:
-        case 18U: value = state_.basepri & 0xffU; break;
+        case 18U: value = state_.basepri & 0xf0U; break;
         case 19U: value = state_.faultmask & 1U; break;
         case 20U: value = state_.control & 0x7U; break;
         default:
@@ -860,9 +860,9 @@ StopReason CortexM4::execute(
             if (&state_.activeSp() == &state_.psp) state_.r[13] = state_.psp;
             break;
         case 16U: state_.primask = value & 1U; break;
-        case 17U: state_.basepri = value & 0xffU; break;
+        case 17U: state_.basepri = value & 0xf0U; break;
         case 18U: {
-            const std::uint32_t requested = value & 0xffU;
+            const std::uint32_t requested = value & 0xf0U;
             if (requested != 0U && (state_.basepri == 0U || requested < state_.basepri)) {
                 state_.basepri = requested;
             }
