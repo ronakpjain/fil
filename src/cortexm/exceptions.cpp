@@ -200,7 +200,7 @@ Result<void> ExceptionController::exceptionReturn(
     state.r[13] = state.inHandlerMode() ? state.msp : (((state.control & 2U) != 0) ? state.psp : state.msp);
     state.instruction_address = state.r[15];
     state.setItState(0);
-    if (!active_stack_.empty()) system_.enter(active_stack_.back());
+    if (!active_stack_.empty()) system_.resume(active_stack_.back());
     return {};
 }
 

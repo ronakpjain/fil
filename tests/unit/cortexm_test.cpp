@@ -26,6 +26,63 @@ TEST(CortexMTest, ModelsSysTick) {
         << "clears COUNTFLAG on read";
 }
 
+TEST(CortexMTest, SamplesInterruptLevelsWithoutInventingPendingEdges) {
+    fil::cortexm::SystemControl system;
+    constexpr auto word = fil::mem::AccessSize::word;
+    system.setInterruptLine(5U, true);
+    EXPECT_FALSE(system.hasEnabledPending()); // Latched even while disabled.
+    ASSERT_TRUE(system.write(0xe100U, word, 1U << 5U, {}));
+    EXPECT_EQ(system.nextPending(0U, 0U, 0U), 21U);
+    system.clearPending(21U);
+    EXPECT_EQ(system.nextPending(0U, 0U, 0U), 21U);
+    ASSERT_TRUE(system.write(0xe280U, word, 1U << 5U, {}));
+    EXPECT_EQ(system.nextPending(0U, 0U, 0U), 21U);
+
+    system.enter(21U);
+    system.setInterruptLine(5U, true); // Same level, not a new edge.
+    const auto pending = system.read(0xe200U, word, {});
+    ASSERT_TRUE(pending);
+    EXPECT_EQ(pending.value() & (1U << 5U), 0U);
+    system.setInterruptLine(5U, false); // Handler acknowledges source.
+    system.leave(21U);
+    EXPECT_FALSE(system.hasEnabledPending());
+
+    system.setInterruptLine(5U, true);
+    system.setInterruptLine(5U, false); // A pulse still latches pending.
+    EXPECT_EQ(system.nextPending(0U, 0U, 0U), 21U);
+    system.enter(21U);
+    system.setInterruptLine(5U, true); // New edge during active handler.
+    system.setInterruptLine(5U, false);
+    system.leave(21U);
+    EXPECT_EQ(system.nextPending(0U, 0U, 0U), 21U);
+    system.enter(21U);
+    system.leave(21U);
+    EXPECT_FALSE(system.hasEnabledPending());
+}
+
+TEST(CortexMTest, ResetClearsInterruptLevelsAndPendingSummary) {
+    fil::cortexm::SystemControl system;
+    ASSERT_TRUE(system.write(0xe100U, fil::mem::AccessSize::word, 1U, {}));
+    system.setInterruptLine(0U, true);
+    system.reset(0x08000000U);
+    ASSERT_TRUE(system.write(0xe100U, fil::mem::AccessSize::word, 1U, {}));
+    EXPECT_FALSE(system.hasEnabledPending());
+    EXPECT_FALSE(system.nextPending(0U, 0U, 0U));
+    system.setInterruptLine(240U, true); // Outside implemented IRQ range.
+    EXPECT_FALSE(system.hasEnabledPending());
+}
+
+TEST(CortexMTest, BasepriArbitrationUsesOnlyImplementedPriorityBits) {
+    fil::cortexm::SystemControl system;
+    ASSERT_TRUE(system.write(0xe100U, fil::mem::AccessSize::word, 1U, {}));
+    ASSERT_TRUE(system.write(0xe400U, fil::mem::AccessSize::byte, 0x10U, {}));
+    system.pend(16U);
+    EXPECT_EQ(system.nextPending(0U, 0x0fU, 0U), 16U);
+    EXPECT_EQ(system.nextPending(0U, 0x20U, 0U), 16U);
+    EXPECT_FALSE(system.nextPending(0U, 0x10U, 0U));
+    EXPECT_FALSE(system.nextPending(0U, 0x1fU, 0U));
+}
+
 TEST(CortexMTest, ModelsNvicAndScb) {
     fil::cortexm::SystemControl system(0x08000000U);
     EXPECT_TRUE(system.write(0xe100U, fil::mem::AccessSize::word, 1U << 5U, {}).hasValue())

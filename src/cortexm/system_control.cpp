@@ -19,6 +19,7 @@ void SystemControl::reset(const std::uint32_t vector_base) {
     nvic_enable_.fill(0);
     nvic_pending_.fill(0);
     nvic_active_.fill(0);
+    nvic_lines_.fill(0);
     nvic_priority_.fill(0);
     system_priority_.fill(0);
     systick_ctrl_ = 0;
@@ -99,6 +100,19 @@ void SystemControl::pend(const std::uint16_t exception_number) {
     }
 }
 
+void SystemControl::setInterruptLine(const std::uint16_t irq, const bool asserted) {
+    if (irq >= 240U) return;
+    const std::uint32_t mask = std::uint32_t{1} << (irq % 32U);
+    auto& lines = nvic_lines_[irq / 32U];
+    const bool was_asserted = (lines & mask) != 0U;
+    if (asserted) lines |= mask;
+    else lines &= ~mask;
+    // A new edge also pends an active IRQ. A continuously asserted level is
+    // sampled again on deactivation, not latched anew on exception entry.
+    if (asserted && !was_asserted) nvic_pending_[irq / 32U] |= mask;
+    refreshPendingSummary();
+}
+
 void SystemControl::clearPending(const std::uint16_t exception_number) {
     if (exception_number == static_cast<std::uint16_t>(ExceptionNumber::pend_sv)) {
         pendsv_pending_ = false;
@@ -112,12 +126,16 @@ void SystemControl::clearPending(const std::uint16_t exception_number) {
 }
 
 void SystemControl::enter(const std::uint16_t exception_number) {
-    clearPending(exception_number);
     active_exception_ = exception_number;
     if (exception_number >= 16U && exception_number < 256U) {
         const std::uint16_t irq = exception_number - 16U;
         nvic_active_[irq / 32U] |= std::uint32_t{1} << (irq % 32U);
     }
+    clearPending(exception_number);
+}
+
+void SystemControl::resume(const std::uint16_t exception_number) noexcept {
+    active_exception_ = exception_number;
 }
 
 void SystemControl::leave(const std::uint16_t exception_number) {
@@ -126,14 +144,16 @@ void SystemControl::leave(const std::uint16_t exception_number) {
         nvic_active_[irq / 32U] &= ~(std::uint32_t{1} << (irq % 32U));
     }
     if (active_exception_ == exception_number) active_exception_ = 0;
+    refreshPendingSummary();
 }
 
 void SystemControl::refreshPendingSummary() noexcept {
     external_pending_enabled_ = false;
     for (std::size_t index = 0; index < nvic_pending_.size(); ++index) {
+        // Inactive level-sensitive sources reassert pending even after ICPR.
+        nvic_pending_[index] |= nvic_lines_[index] & ~nvic_active_[index];
         if ((nvic_pending_[index] & nvic_enable_[index]) != 0U) {
             external_pending_enabled_ = true;
-            return;
         }
     }
 }
@@ -170,6 +190,7 @@ std::optional<std::uint16_t> SystemControl::nextPending(
 ) const {
     if (!hasEnabledPending()) return std::nullopt;
 
+    const std::uint32_t effective_basepri = basepri & 0xf0U;
     std::optional<std::uint16_t> selected;
     std::uint16_t selected_priority = 0x100U;
     const auto architectural_priority = [this](const std::uint16_t exception_number) -> int {
@@ -186,8 +207,8 @@ std::optional<std::uint16_t> SystemControl::nextPending(
             && architectural_priority(exception_number) >= architectural_priority(active_exception_)) {
             return;
         }
-        if (basepri != 0 && exception_number > static_cast<std::uint16_t>(ExceptionNumber::hard_fault)
-            && candidate_priority >= (basepri & 0xffU)) return;
+        if (effective_basepri != 0U && exception_number > static_cast<std::uint16_t>(ExceptionNumber::hard_fault)
+            && candidate_priority >= effective_basepri) return;
         if (!selected || candidate_priority < selected_priority
             || (candidate_priority == selected_priority && exception_number < *selected)) {
             selected = exception_number;

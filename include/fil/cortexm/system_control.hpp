@@ -52,13 +52,19 @@ public:
     /** @brief Pends any architectural or external exception number. */
     void pend(std::uint16_t exception_number);
 
-    /** @brief Clears a pending exception. */
+    /** @brief Drives an external NVIC IRQ input (0-239); deassertion preserves latched pending state. */
+    void setInterruptLine(std::uint16_t irq, bool asserted);
+
+    /** @brief Clears a pending exception, unless an inactive external IRQ remains asserted. */
     void clearPending(std::uint16_t exception_number);
 
     /** @brief Marks an exception active after CPU exception entry. */
     void enter(std::uint16_t exception_number);
 
-    /** @brief Clears active state after CPU exception return. */
+    /** @brief Resumes an already-active preempted exception without accepting its pending state. */
+    void resume(std::uint16_t exception_number) noexcept;
+
+    /** @brief Clears active state after CPU exception return and re-pends asserted external IRQs. */
     void leave(std::uint16_t exception_number);
 
     /**
@@ -131,6 +137,7 @@ private:
     std::array<std::uint32_t, 8> nvic_enable_{};
     std::array<std::uint32_t, 8> nvic_pending_{};
     std::array<std::uint32_t, 8> nvic_active_{};
+    std::array<std::uint32_t, 8> nvic_lines_{};
     std::array<std::uint8_t, 240> nvic_priority_{};
     std::array<std::uint8_t, 12> system_priority_{};
 

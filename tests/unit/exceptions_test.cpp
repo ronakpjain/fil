@@ -44,6 +44,53 @@ TEST(ExceptionTest, StacksAndReturnsBasicFrame) {
         << "restores stack pointer and registers";
 }
 
+TEST(ExceptionTest, NestedReturnPreservesRependedOuterInterrupt) {
+    fil::mem::MemoryBus memory;
+    ASSERT_TRUE(memory.mapRom(0x08000000U, 0x200U, "flash"));
+    ASSERT_TRUE(memory.mapRam(0x20000000U, 0x1000U, "ram"));
+    const std::array<std::uint8_t, 8> handlers{
+        0x01U, 0x01U, 0x00U, 0x08U, 0x21U, 0x01U, 0x00U, 0x08U,
+    };
+    ASSERT_TRUE(memory.loadBytes(0x08000040U, handlers));
+    fil::cortexm::SystemControl system;
+    fil::cortexm::ExceptionController exceptions(memory, system);
+    fil::cpu::CpuState state;
+    state.msp = state.r[13] = 0x20001000U;
+    state.r[15] = 0x08000080U;
+    state.xpsr = fil::cpu::xpsr_t;
+    ASSERT_TRUE(system.write(0xe100U, fil::mem::AccessSize::word, 3U, {}));
+    ASSERT_TRUE(system.write(0xe400U, fil::mem::AccessSize::word, 0x4080U, {}));
+
+    system.pend(16U);
+    auto entered = exceptions.enterPending(state);
+    ASSERT_TRUE(entered && entered.value());
+    EXPECT_EQ(state.ipsr(), 16U);
+    system.pend(17U);
+    entered = exceptions.enterPending(state);
+    ASSERT_TRUE(entered && entered.value());
+    EXPECT_EQ(state.ipsr(), 17U);
+    system.pend(16U); // A second occurrence while the outer handler is preempted.
+
+    ASSERT_TRUE(exceptions.exceptionReturn(state, 0xfffffff1U));
+    EXPECT_EQ(state.ipsr(), 16U);
+    EXPECT_EQ(system.activeException(), 16U);
+    const auto pending = system.read(0xe200U, fil::mem::AccessSize::word, {});
+    ASSERT_TRUE(pending);
+    EXPECT_EQ(pending.value() & 1U, 1U);
+    const auto active = system.read(0xe300U, fil::mem::AccessSize::word, {});
+    ASSERT_TRUE(active);
+    EXPECT_EQ(active.value() & 3U, 1U);
+    EXPECT_FALSE(system.nextPending(0U, 0U, 0U)); // Cannot preempt itself.
+
+    ASSERT_TRUE(exceptions.exceptionReturn(state, 0xfffffff9U));
+    EXPECT_EQ(system.nextPending(0U, 0U, 0U), 16U);
+    entered = exceptions.enterPending(state);
+    ASSERT_TRUE(entered && entered.value());
+    EXPECT_EQ(state.ipsr(), 16U);
+    ASSERT_TRUE(exceptions.exceptionReturn(state, 0xfffffff9U));
+    EXPECT_FALSE(system.nextPending(0U, 0U, 0U));
+}
+
 TEST(ExceptionTest, StacksAndReturnsExtendedFloatingPointFrame) {
     fil::mem::MemoryBus memory;
     EXPECT_TRUE(memory.mapRom(0x08000000U, 0x200U, "fp-flash").hasValue())
