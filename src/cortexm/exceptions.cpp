@@ -199,7 +199,9 @@ Result<void> ExceptionController::exceptionReturn(
     }
     state.r[13] = state.inHandlerMode() ? state.msp : (((state.control & 2U) != 0) ? state.psp : state.msp);
     state.instruction_address = state.r[15];
-    state.setItState(0);
+    state.setItState(static_cast<std::uint8_t>(
+        ((state.xpsr >> 8U) & 0xfcU) | ((state.xpsr >> 25U) & 0x03U)
+    ));
     if (!active_stack_.empty()) system_.resume(active_stack_.back());
     return {};
 }
