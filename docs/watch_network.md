@@ -47,6 +47,23 @@ identifiers above `0x7ff` are treated as extended. Payloads must contain an even
 number of hexadecimal digits and use a valid classic CAN or CAN-FD length. Frames
 are injected at the network's current simulated time.
 
+## Inject ADC and GPIO values
+
+ADC and GPIO commands take effect immediately at the current simulated time:
+
+```text
+adc dashboard ADC1 5 2048
+gpio dashboard GPIOA 5 1
+gpio dashboard GPIOA 5 release
+```
+
+The `adc` command sets the constant input value for one ADC channel; the board
+and instance must name a configured board and its ADC peripheral, the channel
+must be 0..19, and the value must be 0..4095. The `gpio` command drives one
+externally controlled input pin; the port must name a GPIO peripheral such as
+`GPIOA`, the pin must be 0..15, and the value is `0`, `1`, or `release` to stop
+driving the pin and let firmware outputs own it.
+
 Enter `quit` or `exit` to stop cleanly. Invalid commands are reported to standard
 error and ignored without stopping the simulation.
 

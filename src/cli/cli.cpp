@@ -17,8 +17,9 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
-#include <ostream>
 #include <optional>
+#include <ostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -97,6 +98,80 @@ Result<PendingCanInjection> parseCanInjection(const std::string_view text) {
     }
     injection.frame.dlc = *dlc;
     injection.frame.fd = byte_count > 8U;
+    return injection;
+}
+
+struct PendingAdcInjection {
+    std::string board;
+    std::string instance;
+    std::uint8_t channel{0};
+    std::uint16_t value{0};
+};
+
+struct PendingGpioInjection {
+    std::string board;
+    std::string port;
+    std::uint8_t pin{0};
+    std::optional<bool> level; ///< nullopt releases the externally driven pin.
+};
+
+std::vector<std::string> splitTokens(const std::string_view text) {
+    std::istringstream stream{std::string(text)};
+    std::vector<std::string> tokens;
+    std::string token;
+    while (stream >> token) tokens.push_back(token);
+    return tokens;
+}
+
+Result<PendingAdcInjection> parseAdcInjection(const std::string_view text) {
+    const auto tokens = splitTokens(text);
+    if (tokens.size() != 5U) {
+        return Error{ErrorCategory::invalid_argument,
+                     "ADC injection must be adc BOARD INSTANCE CHANNEL VALUE", std::nullopt};
+    }
+    PendingAdcInjection injection;
+    injection.board = tokens[1];
+    injection.instance = tokens[2];
+    const auto channel = config::parseUnsigned(tokens[3]);
+    if (!channel || channel.value() > 19U) {
+        return Error{ErrorCategory::invalid_argument,
+                     "ADC injection channel must be an integer from 0 through 19", std::nullopt};
+    }
+    const auto value = config::parseUnsigned(tokens[4]);
+    if (!value || value.value() > 0x0fffU) {
+        return Error{ErrorCategory::invalid_argument,
+                     "ADC injection value must be an integer from 0 through 4095", std::nullopt};
+    }
+    injection.channel = static_cast<std::uint8_t>(channel.value());
+    injection.value = static_cast<std::uint16_t>(value.value());
+    return injection;
+}
+
+Result<PendingGpioInjection> parseGpioInjection(const std::string_view text) {
+    const auto tokens = splitTokens(text);
+    if (tokens.size() != 5U) {
+        return Error{ErrorCategory::invalid_argument,
+                     "GPIO injection must be gpio BOARD PORT PIN VALUE", std::nullopt};
+    }
+    PendingGpioInjection injection;
+    injection.board = tokens[1];
+    injection.port = tokens[2];
+    const auto pin = config::parseUnsigned(tokens[3]);
+    if (!pin || pin.value() > 15U) {
+        return Error{ErrorCategory::invalid_argument,
+                     "GPIO injection pin must be an integer from 0 through 15", std::nullopt};
+    }
+    if (tokens[4] == "release") {
+        injection.level = std::nullopt;
+    } else if (tokens[4] == "0") {
+        injection.level = false;
+    } else if (tokens[4] == "1") {
+        injection.level = true;
+    } else {
+        return Error{ErrorCategory::invalid_argument,
+                     "GPIO injection value must be 0, 1, or release", std::nullopt};
+    }
+    injection.pin = static_cast<std::uint8_t>(pin.value());
     return injection;
 }
 
@@ -1030,20 +1105,66 @@ ExitCode watchNetworkCommand(
             continue;
         }
 
-        auto injection = parseCanInjection(line);
-        if (!injection) {
-            err << "fil: ignored stdin CAN command: " << injection.error().message << '\n';
-            continue;
+        const std::size_t command_end = line.find_first_of(" \t");
+        const std::string_view command = std::string_view{line}.substr(0U, command_end);
+        if (command == "adc") {
+            auto injection = parseAdcInjection(line);
+            if (!injection) {
+                err << "fil: ignored stdin ADC command: " << injection.error().message << '\n';
+                continue;
+            }
+            sim::Board* board = world.value()->board(injection.value().board);
+            if (board == nullptr) {
+                err << "fil: ignored stdin ADC command for unknown board: "
+                    << injection.value().board << '\n';
+                continue;
+            }
+            stm32g4::AdcPeripheral* adc = board->peripherals().adc(injection.value().instance);
+            if (adc == nullptr) {
+                err << "fil: ignored stdin ADC command for unknown ADC instance: "
+                    << injection.value().instance << '\n';
+                continue;
+            }
+            adc->setChannelValue(injection.value().channel, injection.value().value);
+        } else if (command == "gpio") {
+            auto injection = parseGpioInjection(line);
+            if (!injection) {
+                err << "fil: ignored stdin GPIO command: " << injection.error().message << '\n';
+                continue;
+            }
+            sim::Board* board = world.value()->board(injection.value().board);
+            if (board == nullptr) {
+                err << "fil: ignored stdin GPIO command for unknown board: "
+                    << injection.value().board << '\n';
+                continue;
+            }
+            stm32g4::GpioPeripheral* port = board->peripherals().gpio(injection.value().port);
+            if (port == nullptr) {
+                err << "fil: ignored stdin GPIO command for unknown port: "
+                    << injection.value().port << '\n';
+                continue;
+            }
+            if (injection.value().level.has_value()) {
+                port->setInput(injection.value().pin, injection.value().level.value());
+            } else {
+                port->releaseInput(injection.value().pin);
+            }
+        } else {
+            auto injection = parseCanInjection(line);
+            if (!injection) {
+                err << "fil: ignored stdin CAN command: " << injection.error().message << '\n';
+                continue;
+            }
+            devices::VirtualCanBus* bus = world.value()->canBus(injection.value().bus);
+            if (bus == nullptr) {
+                err << "fil: ignored stdin CAN command for undeclared bus: "
+                    << injection.value().bus << '\n';
+                continue;
+            }
+            static_cast<void>(
+                bus->inject(injection.value().frame, world.value()->eventLoop().now())
+            );
         }
-        devices::VirtualCanBus* bus = world.value()->canBus(injection.value().bus);
-        if (bus == nullptr) {
-            err << "fil: ignored stdin CAN command for undeclared bus: "
-                << injection.value().bus << '\n';
-            continue;
-        }
-        static_cast<void>(
-            bus->inject(injection.value().frame, world.value()->eventLoop().now())
-        );
     }
     return ExitCode::success;
 }
@@ -1079,7 +1200,8 @@ void printHelp(std::ostream& out) {
         << "Watch-network options:\n"
         << "  --duration-ms N --refresh-ms N --max-instructions N --quantum N\n"
         << "  --live-filter TYPE --strict-mmio --no-loop-batching --control-stdin\n"
-        << "  stdin: BUS:ID:HEXDATA, quit, or exit\n";
+        << "  stdin: BUS:ID:HEXDATA, adc BOARD INSTANCE CHANNEL VALUE,\n"
+        << "  gpio BOARD PORT PIN 0|1|release, quit, or exit\n";
 }
 
 ExitCode run(
