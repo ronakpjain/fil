@@ -929,7 +929,10 @@ ExitCode watchNetworkCommand(
                     err << "fil: duration overflows nanoseconds\n";
                     return ExitCode::usage_error;
                 }
-                duration_ns = parsed.value() * 1'000'000ULL;
+                // Zero selects an unlimited simulated-time run.
+                duration_ns = parsed.value() == 0U
+                    ? std::nullopt
+                    : std::optional<std::uint64_t>{parsed.value() * 1'000'000ULL};
             } else {
                 if (parsed.value() == 0U
                     || parsed.value() > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
@@ -1010,8 +1013,10 @@ ExitCode watchNetworkCommand(
         }
         if (ready == 0) continue;
         if (!buffered && (input.revents & (POLLERR | POLLNVAL)) != 0) {
-            err << "fil: failed to poll stdin\n";
-            return ExitCode::runtime_error;
+            // An unusable control channel behaves like end-of-input.
+            stdin_eof = true;
+            if (!duration_ns) break;
+            continue;
         }
 
         std::string line;

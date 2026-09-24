@@ -54,7 +54,7 @@ error and ignored without stopping the simulation.
 
 | Option | Meaning |
 |---|---|
-| `--duration-ms N` | Stop after `N` milliseconds of simulated time. Without it, the monitor runs until `quit`, `exit`, or standard-input EOF. |
+| `--duration-ms N` | Stop after `N` milliseconds of simulated time; `0` runs without a simulated-time limit. Without it, the monitor runs until `quit`, `exit`, or standard-input EOF. |
 | `--refresh-ms N` | Run and poll input in slices of `N` simulated milliseconds; defaults to `1` and must be nonzero. |
 | `--live-filter TYPE` | Print one exact trace event type. Repeat to select more than one type. |
 | `--max-instructions N` | Set the per-board instruction budget used for each run slice. |
