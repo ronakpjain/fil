@@ -2,7 +2,7 @@
   "schema_version": 1,
   "name": "g4_testing",
   "mcu": "../mcus/stm32g474retx.json",
-  "elf": "../../../../PER/Projects/firmware/output/g4_testing/g4_testing.elf",
+  "elf": "../../../../PER/Projects/monorepo/firmware/output/g4_testing/g4_testing.elf",
   "vector_base": "0x08000000",
   "run": {
     "default_duration_ms": 1000,
