@@ -86,7 +86,7 @@ The current semantic event set is:
 | `exception_return` | hexadecimal `exc_return` |
 | `spin_detected` | `pc`, `period_instructions`, `period_cycles` |
 | `event_livelock` | none |
-| `gpio_input`, `gpio_output` | `pin`, `value` |
+| `gpio_input`, `gpio_output` | `pin`, `value`; `gpio_input` values are `0`, `1`, or `release` |
 | `uart_tx`, `uart_rx` | `byte` |
 | `uart_idle` | none |
 | `clock_change` | `frequency_hz` |
