@@ -193,12 +193,12 @@ TEST(WorldTest, EnforcesBudgetsAndValidatesTopology) {
         << "rejects an attachment to an undeclared bus";
 }
 
-TEST(WorldTest, ExecutesWatchNetworkForConfiguredDuration) {
+TEST(WorldTest, StopsWatchNetworkWhenAllBoardsReachTerminalBoundaries) {
     TempWorldConfigs files;
     const auto network_path = files.writeNetwork({files.writeBoard("watch.json", "watch")});
     const std::string path = network_path.string();
     const std::string_view args[]{
-        "watch-network", path, "--duration-ms", "0", "--refresh-ms", "2",
+        "watch-network", path, "--duration-ms", "5", "--refresh-ms", "2",
         "--live-filter", "can_rx",
     };
     std::ostringstream out;

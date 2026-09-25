@@ -71,7 +71,7 @@ error and ignored without stopping the simulation.
 
 | Option | Meaning |
 |---|---|
-| `--duration-ms N` | Stop after `N` milliseconds of simulated time; `0` runs without a simulated-time limit. Without it, the monitor runs until `quit`, `exit`, or standard-input EOF. |
+| `--duration-ms N` | Stop after at most `N` milliseconds of simulated time; `0` runs without a simulated-time limit. The monitor also stops if all boards reach terminal CPU boundaries. Without a duration, it runs until `quit`, `exit`, standard-input EOF, or all boards stop. |
 | `--refresh-ms N` | Run and poll input in slices of `N` simulated milliseconds; defaults to `1` and must be nonzero. |
 | `--live-filter TYPE` | Print one exact trace event type. Repeat to select more than one type. |
 | `--max-instructions N` | Set the per-board instruction budget used for each run slice. |
@@ -82,5 +82,5 @@ error and ignored without stopping the simulation.
 | `--control-stdin` | Explicitly marks standard input as the control channel; standard input is monitored by default. |
 
 When `--duration-ms` is present, standard-input EOF does not end the run; the
-network continues to the requested simulated-time limit. Without a duration, EOF
-stops the monitor.
+network continues toward the requested simulated-time limit unless all boards
+reach terminal CPU boundaries first. Without a duration, EOF stops the monitor.

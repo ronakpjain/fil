@@ -1075,6 +1075,7 @@ ExitCode watchNetworkCommand(
                      << sim::worldStopReasonName(result.value().reason) << '\n';
             return ExitCode::runtime_error;
         }
+        if (result.value().reason == sim::WorldStopReason::all_boards_stopped) break;
 
         if (stdin_eof) continue;
         pollfd input{STDIN_FILENO, POLLIN, 0};
@@ -1198,6 +1199,7 @@ void printHelp(std::ostream& out) {
         << "Watch-network options:\n"
         << "  --duration-ms N --refresh-ms N --max-instructions N --quantum N\n"
         << "  --live-filter TYPE --strict-mmio --no-loop-batching --control-stdin\n"
+        << "  watch also stops early when all boards reach terminal CPU boundaries\n"
         << "  stdin: BUS:ID:HEXDATA, adc BOARD INSTANCE CHANNEL VALUE,\n"
         << "  gpio BOARD PORT PIN 0|1|release, quit, or exit\n";
 }
