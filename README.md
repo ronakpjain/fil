@@ -78,12 +78,20 @@ files are optional acceptance inputs and are not embedded into emulator behavior
 
 ## Performance
 
-On the development host, the corrected one-second six-board workload has measured
-medians of 0.87 s with portable Release+IPO and 0.73 s with workload-trained Clang
-PGO. Both produce the same 96,000,000 logical instruction/cycle total and exact
-per-board results. Host, compiler, power mode, and firmware affect these numbers.
-See [Performance](docs/performance.md) for the benchmark method, controls, results,
-and correctness boundaries of each optimization.
+Pacing follows the documented real-timing model: Cortex-M4 per-class pipeline
+cycles plus STM32G4 flash wait states (`cycles >= instructions`, CPI reported).
+On Apple M3 / Release+IPO, the runnable reference
+(`python3 tools/bench_real_timing.py ./build-release/fil`) reaches 5.53x
+single-board and 0.67x six-board interpreter throughput at 16 MHz and 16M/96M
+cycles per simulated second, with loop batching 250x or faster on
+loop-dominated firmware; a firmware-driven 170 MHz pll170 case (CPI 2.40)
+reaches 0.88x unbatched. The retired 1-CPI six-board figures (0.87 s Release,
+0.73 s PGO for a 96M/96M total) are preserved as stale baselines in
+docs/performance.md and are not comparable to real-timing runs. Host, compiler,
+power mode, and firmware affect these numbers. See [Performance](docs/performance.md)
+for the benchmark method, controls, results, and correctness boundaries of
+each optimization, and [Real timing audit](docs/real_timing_audit.md) for the
+silicon model.
 
 ## Inspect inputs
 

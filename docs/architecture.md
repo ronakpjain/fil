@@ -86,9 +86,16 @@ semantics and intentional gaps.
 
 ## Time and deterministic scheduling
 
-Each instruction currently costs one target cycle. A board converts cycles to
-nanoseconds from the RCC clock estimate, advances SysTick/DWT, and runs due events.
-Same-time callbacks execute in insertion order and have a bounded callback count.
+Each instruction costs its documented Cortex-M4 pipeline cycles plus any
+STM32G4 flash fetch stall (see [Real timing audit](real_timing_audit.md)):
+loads cost 2, calls/taken branches pay a refill, divides and single-precision
+divide/sqrt cost up to 14, multi-register transfers scale with the register
+list, and non-sequential flash fetches pay the programmed FLASH_ACR LATENCY
+unless the ART prefetch/cache hits. A board converts total cycles to
+nanoseconds from the RCC clock, advances SysTick/DWT, and runs due events.
+Loop-batch proofs additionally pin the clock and flash generation, so a clock
+or LATENCY change fails a stale batch closed. Same-time callbacks execute in
+insertion order and have a bounded callback count.
 
 `World` gives every board an independent virtual CPU timeline. Boards ready at the
 same timestamp start in configuration order, and the event loop advances to the
@@ -137,8 +144,10 @@ tracing. See the [JSONL trace contract](tracing.md).
 
 ## Fidelity boundary
 
-The emulator is instruction-level, not pipeline- or bus-cycle-accurate. Peripheral
-clocks, analog/electrical behavior, CAN arbitration timing, debug transport, and many
+The emulator is instruction-level with documented pipeline-per-class and
+flash wait-state timing, not bus-cycle-accurate. AHB/APB prescalers, I-cache
+line hits (the ART model is prefetch-only and conservative on branch misses),
+CAN arbitration timing, analog/electrical behavior, debug transport, and many
 register corners are simplified. Simulated time is suitable for deterministic
 regression tests, not hardware performance prediction.
 

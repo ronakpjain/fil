@@ -2,15 +2,57 @@
 
 `fil` aims to run representative firmware at or above real time without changing
 observable target behavior. Host timings are measured with `/usr/bin/time`; simulated
-time comes from emulator output. The one-cycle-per-instruction model is deterministic,
-but it is not an estimate of STM32 pipeline timing.
+time comes from emulator output. Pacing follows the documented real-timing
+model (Cortex-M4 per-class pipeline cycles plus STM32G4 flash wait states),
+not one cycle per instruction; see [Real timing audit](real_timing_audit.md).
+Under this model `cycles >= instructions` and CPI is reported alongside
+throughput (`simulated seconds / wall seconds`).
 
 ## Reference results
 
-The reference workload is a one-second run of the six-board
-`configs/networks/per_vehicle.json` network. All modes stop at exactly
-1,000,000,000 ns with 96,000,000 logical instructions and cycles (16,000,000 per
-board).
+### Real-timing model (current)
+
+The runnable reference is `tools/bench_real_timing.py`, which needs no PER
+checkout: it generates hand-assembled Thumb fixtures (an idle `4x NOP + B`
+flash loop at reset 16 MHz, and a variant that programs `FLASH_ACR=0x304`
+then a 170 MHz HSE-PLL before spinning the same loop) and runs 1 s
+single-board and synthetic six-board workloads, batching on and off.
+All runs stop at 1,000,000,000 ns (pll170 overshoots by 1 ns of atomic batch
+completion); `cycles >= instructions` holds everywhere.
+
+Measured 2026-09-25 on Apple M3 / 8 cores / 8 GB / macOS 27.0, Homebrew Clang
+23.1.1, Release + IPO, AC power, median of 3 (`python3
+tools/bench_real_timing.py ./build-release/fil --reps 3`):
+
+| Case | Instructions | Cycles | CPI | Median wall time | Throughput |
+|---|---|---:|---:|---:|---:|
+| idle16 x1, batching | 10,000,000 | 16,000,000 | 1.60 | 0.003 s | ~343x |
+| idle16 x1, no-batch | 10,000,000 | 16,000,000 | 1.60 | 0.181 s | 5.53x |
+| idle16 x6, batching | 60,000,000 | 96,000,000 | 1.60 | 0.004 s | ~266x |
+| idle16 x6, no-batch | 60,000,000 | 96,000,000 | 1.60 | 1.493 s | 0.67x |
+| pll170 x1, batching | 70,833,277 | 169,999,856 | 2.40 | 0.002 s | ~440x |
+| pll170 x1, no-batch | 70,833,277 | 169,999,856 | 2.40 | 1.135 s | 0.88x |
+
+The idle loop costs 5 instructions / 8 cycles per iteration (taken `B` pays
+the +2 pipeline refill); the pll170 loop costs 5 / 12 (plus 4 ART-miss
+cycles on the taken branch at LATENCY=4). Against the pre-model baseline
+measured on the same host and binary configuration (1.00 CPI: x6 no-batch
+1.697 s / 0.59x, pll170 no-batch 2.858 s / 0.35x), realistic pacing executes
+fewer instructions per simulated second, so fixed-simulation-time throughput
+improved even though per-instruction host cost rose (memoized cycle LUT and
+cached clock/ACR keep the added timing work to a few loads and compares).
+The six-board no-batch interpreter path (0.67x) remains below real time and
+is the standing optimization target; batching covers it by 250x or more on
+loop-dominated firmware.
+
+### Pre-model baseline (one cycle per instruction, stale)
+
+The historical reference workload is a one-second run of the six-board
+`configs/networks/per_vehicle.json` network. Under the retired 1-CPI model
+all modes stopped at exactly 1,000,000,000 ns with 96,000,000 logical
+instructions and cycles (16,000,000 per board). Do not compare these figures
+with real-timing-model runs: equal instruction counts now advance more
+simulated time.
 
 | Host mode | Build | Loop batching | Median wall time | Throughput |
 |---|---|---:|---:|---:|
@@ -19,6 +61,8 @@ board).
 | AC power | Release + IPO | off | 3.33 s | 0.30x real time |
 | Battery, macOS Low Power Mode | Release + IPO | on | 1.57 s | 0.64x real time |
 | Battery, macOS Low Power Mode | Clang PGO | on | 1.33 s | 0.75x real time |
+
+(1-CPI model; see above.)
 
 The AC figures are medians of three consecutive runs; the battery figures are
 medians from alternating five-run A/B tests. Power mode, compiler, firmware, and
@@ -37,6 +81,19 @@ from incorrect clock/CAN topology or unobservable ADC-to-DMA work are not
 comparable.
 
 ## Reproduce the benchmark
+
+Without the PER firmware checkout, run the runnable reference (needs only the
+just-built binary):
+
+```bash
+python3 tools/bench_real_timing.py ./build-release/fil --reps 3
+```
+
+It generates its own fixtures, asserts `cycles >= instructions` and the 1 s
+deadline window on every case, and prints instructions / cycles / CPI /
+wall time / throughput. With the PER checkout, use the six-board network below
+and expect `cycles >= instructions` with per-board instruction counts that
+vary with firmware CPI instead of the fixed stale 16M/board.
 
 Use a fresh optimized build and the same firmware, compiler, power mode, and command
 line for every comparison:
@@ -59,20 +116,11 @@ for run in 1 2 3; do
 done
 ```
 
-Record wall time and verify the exact emulator result:
-
-```text
-stop: time-budget
-instructions: 96000000
-cycles: 96000000
-time_ns: 1000000000
-board dashboard:       instructions=16000000
-board main_module:     instructions=16000000
-board torque_vector:   instructions=16000000
-board a_box:           instructions=16000000
-board front_driveline: instructions=16000000
-board rear_driveline:  instructions=16000000
-```
+Record wall time and verify the emulator result. Under the retired 1-CPI
+model this was exactly `instructions: 96000000 / cycles: 96000000 /
+time_ns: 1000000000` at 16M/board; under the real-timing model expect
+`time_ns: 1000000000` with `cycles >= instructions` and per-board counts set
+by firmware CPI (loads 2, calls/branches 3-4, flash stalls at high clocks).
 
 Throughput is `simulated seconds / wall seconds`. Keep tracing off: instruction
 tracing writes one record per instruction and intentionally disables batching.
@@ -101,7 +149,22 @@ without dispatching each one.
   raw encoding, width, and decoded instruction. Hits execute the cached object
   directly; IT-state adjustment makes a copy only when needed. Entries are tagged
   with the executable-memory generation, so loading or modifying executable bytes
-  invalidates stale code.
+  invalidates stale code. Each entry memoizes its static pipeline cost at decode
+  time, so stepping and burst prediction pay one load instead of a ~90-case
+  switch (divides resolve data-dependently via a flag).
+- **Real-timing pacing.** The stepper charges per-class pipeline cycles plus a
+  taken-branch refill on discontinuous PCs, and the board wrapper adds the
+  simplified-ART flash stall from cached FLASH_ACR LATENCY/prefetch state.
+  Clock and ACR values are cached with generation checks, and loop proofs pin
+  both, so timing work is a few loads and compares per instruction.
+- **Exact lockstep bursts.** Equal-cost boards step up to 64 rounds per gate;
+  prediction covers direct branches exactly (targets evaluate from pre-state,
+  fault paths refuse), and the gate compares clock/numerator pairs with one
+  ns division per round. Proof work is skipped when neither batching nor spin
+  detection can consume it, which also keeps no-batch bursts firing.
+- **Outlined cold paths.** The ~90 KiB loop-observation reset and the 250-byte
+  MMIO-restart snapshot are noinline/heap-boxed so the hot frames carry no
+  stack probes.
 - **Compact stepping.** `stepFast()` returns counters, instruction metadata, and a
   stop reason instead of copying the full register file and constructing diagnostic
   text after every successful instruction. Fault and stop paths still materialize
