@@ -8,9 +8,10 @@ This roadmap lists deliberate gaps; it is not a release schedule.
 
 1. **Broaden instruction tests.** Add execution cases for implemented VFP, DSP, and
    addressing forms that currently have decode-only or acceptance-only evidence.
-2. **Deepen peripheral behavior.** Prioritize register semantics exercised by real
-   firmware, especially EXTI/SYSCFG routing, USART/SPI DMA requests, and watchdog
-   reset integration.
+2. **Deepen peripheral behavior.** EXTI/SYSCFG routing and USART/SPI DMA requests
+   are now modelled (see peripheral coverage); prioritize remaining register
+   semantics exercised by real firmware, especially watchdog reset integration
+   and timer PWM/capture-compare behavior.
 3. **Improve fault fidelity.** Convert more decode and memory failures into modeled
    UsageFault, BusFault, and HardFault escalation while retaining clear diagnostics.
 4. **Measure scheduler changes.** Keep transactional worker epochs opt-in until they
@@ -25,9 +26,10 @@ This roadmap lists deliberate gaps; it is not a release schedule.
 - Cortex-M event-latch behavior for `WFI`, `WFE`, and `SEV`;
 - exclusive accesses and additional ARMv7E-M DSP/SIMD instructions;
 - FPSCR modes, exception status, and more complete floating-point edge behavior;
-- functional EXTI edge routing and GPIO alternate functions;
-- richer timer capture/compare and PWM behavior;
-- USART/SPI transfer timing and peripheral DMA handshakes;
+- GPIO alternate functions and pull-resistor electrical behavior;
+- richer timer capture/compare and PWM behavior (CCMR/CCER/CCR/BDTR time-based
+  compare scheduling beyond EGR software triggers);
+- USART/SPI transfer timing (baud-derived delays) beyond functional DMA handshakes;
 - CAN arbitration, serialization delay, error state, and additional M_CAN queues;
 - optional automatic MCU reset/restart after watchdog or AIRCR reset requests.
 

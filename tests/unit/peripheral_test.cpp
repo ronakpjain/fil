@@ -124,6 +124,44 @@ TEST(PeripheralTest, ModelsUsartAndSpiDataPaths) {
     EXPECT_TRUE(trace.records().size() >= 3) << "USART and SPI emit device-facing trace records";
 }
 
+TEST(PeripheralTest, SignalsUsartDmaRequestsForTxAndRx) {
+    fil::sim::EventLoop loop;
+    fil::sim::TraceRecorder trace;
+    fil::stm32g4::UsartPeripheral usart("USART1", &loop, &trace);
+    int tx_requests = 0;
+    int rx_requests = 0;
+    usart.setDmaRequestCallback([&](const bool transmit) {
+        if (transmit) ++tx_requests;
+        else ++rx_requests;
+    });
+    // No DMA enabled: RX data must not request DMA.
+    usart.injectRx(0x42);
+    EXPECT_EQ(tx_requests, 0);
+    EXPECT_EQ(rx_requests, 0);
+    // Enable DMAR (CR3.6): existing RXNE should request once, and RDR pop
+    // with remaining data should request again.
+    EXPECT_TRUE(usart.write(0x08, fil::mem::AccessSize::word, 1U << 6U, write_context).hasValue())
+        << "enables USART RX DMA";
+    EXPECT_EQ(rx_requests, 1) << "RX DMA requested for queued input";
+    EXPECT_EQ(tx_requests, 0);
+    usart.injectRx(0x43);
+    EXPECT_EQ(rx_requests, 2) << "RX DMA requested for newly injected byte";
+    const auto first = usart.read(0x24, fil::mem::AccessSize::byte, read_context);
+    EXPECT_TRUE(first && first.value() == 0x42U);
+    EXPECT_EQ(rx_requests, 3) << "RX DMA requested after RDR pop with data remaining";
+    // Enable DMAT (CR3.7): TXE ready should request TX DMA once. RX also
+    // re-requests once because one byte (0x43) still remains queued.
+    EXPECT_TRUE(usart.write(0x08, fil::mem::AccessSize::word, (1U << 6U) | (1U << 7U), write_context).hasValue())
+        << "enables USART TX DMA";
+    EXPECT_EQ(tx_requests, 1) << "TX DMA requested when DMAT enabled with TXE ready";
+    EXPECT_EQ(rx_requests, 4) << "RX DMA re-requested for remaining queued byte on CR3 update";
+    // Suppress during burst: no callbacks while suppressed.
+    usart.setDmaSuppress(true);
+    usart.injectRx(0x44);
+    EXPECT_EQ(rx_requests, 4) << "DMA suppressed during burst";
+    usart.setDmaSuppress(false);
+}
+
 TEST(PeripheralTest, DrivesTimerAndAdcFromSimulatedTime) {
     fil::sim::EventLoop loop;
     fil::stm32g4::TimerPeripheral timer("TIM1", 1000000, &loop);

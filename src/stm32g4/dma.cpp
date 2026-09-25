@@ -100,6 +100,9 @@ void DmaPeripheral::storeRegister(
                 if (!request(channel)) break;
             }
         }
+        if (enable_callback_) {
+            enable_callback_(channel);
+        }
     }
     if (channelForOffset(word_offset, channel)) updateInterruptLevels();
 }

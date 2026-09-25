@@ -227,6 +227,30 @@ void Stm32G4::wireInterrupts() {
             exti_.notifyGpioEdge(static_cast<unsigned int>(port), pin, high);
         });
     }
+    // RM0440 Table 91 DMAMUX requests: USART1-3 RX 24/26/28 TX 25/27/29,
+    // SPI1-3 RX 10/12/14 TX 11/13/15. Bursts drain the channel synchronously
+    // with suppression so TDR/DR writes do not recurse.
+    constexpr std::array<std::uint8_t, 3> usart_tx_requests{25U, 27U, 29U};
+    constexpr std::array<std::uint8_t, 3> usart_rx_requests{24U, 26U, 28U};
+    for (std::size_t i = 0; i < usart_.size() && i < 3U; ++i) {
+        usart_[i]->setDmaRequestCallback(
+            [this, usart = usart_[i].get(), tx = usart_tx_requests[i], rx = usart_rx_requests[i]](const bool transmit) {
+                serviceUsartDma(usart, tx, rx, transmit);
+            }
+        );
+    }
+    constexpr std::array<std::uint8_t, 3> spi_tx_requests{11U, 13U, 15U};
+    constexpr std::array<std::uint8_t, 3> spi_rx_requests{10U, 12U, 14U};
+    for (std::size_t i = 0; i < spi_.size() && i < 3U; ++i) {
+        spi_[i]->setDmaRequestCallback(
+            [this, spi = spi_[i].get(), tx = spi_tx_requests[i], rx = spi_rx_requests[i]](const bool transmit) {
+                serviceSpiDma(spi, tx, rx, transmit);
+            }
+        );
+    }
+    const auto dma_enable_trigger = [this](const unsigned int) { serviceAllSerialDma(); };
+    dma1_.setEnableCallback(dma_enable_trigger);
+    dma2_.setEnableCallback(dma_enable_trigger);
     rcc_.setClockChangedCallback([this](const std::uint64_t frequency) {
         for (auto& timer : timers_) timer->setInputClockHz(frequency);
         for (auto& adc : adc_) adc->setInputClockHz(frequency);
@@ -236,6 +260,10 @@ void Stm32G4::wireInterrupts() {
 }
 
 void Stm32G4::serviceDmaRequest(const std::uint8_t request) {
+    static_cast<void>(serviceDmaRequestOnce(request));
+}
+
+bool Stm32G4::serviceDmaRequestOnce(const std::uint8_t request) {
     const std::uint64_t generation = dmamux_.routingGeneration();
     if (dma_route_generation_ != generation) {
         dma_request_routes_.fill(0U);
@@ -246,15 +274,95 @@ void Stm32G4::serviceDmaRequest(const std::uint8_t request) {
         dma_route_generation_ = generation;
     }
 
+    bool progressed = false;
     std::uint16_t routes = dma_request_routes_[request];
     while (routes != 0U) {
         const auto mux_channel = static_cast<unsigned int>(std::countr_zero(routes));
         routes &= static_cast<std::uint16_t>(routes - 1U);
+        bool ok = false;
         if (mux_channel < 8U) {
-            static_cast<void>(dma1_.request(mux_channel + 1U));
+            ok = dma1_.request(mux_channel + 1U);
         } else {
-            static_cast<void>(dma2_.request(mux_channel - 7U));
+            ok = dma2_.request(mux_channel - 7U);
         }
+        progressed = progressed || ok;
+    }
+    return progressed;
+}
+
+void Stm32G4::serviceUsartDma(
+    UsartPeripheral* const usart,
+    const std::uint8_t tx_request,
+    const std::uint8_t rx_request,
+    const bool transmit
+) {
+    if (usart == nullptr) return;
+    if (transmit) {
+        // TX (memory->periph to TDR): TXE is always ready in this instantaneous
+        // model, so drain the DMA channel synchronously. Suppress re-triggering
+        // during the burst; TDR writes do not re-trigger TX DMA by design.
+        usart->setDmaSuppress(true);
+        for (unsigned int i = 0; i < 65536U; ++i) {
+            if (!serviceDmaRequestOnce(tx_request)) break;
+        }
+        usart->setDmaSuppress(false);
+    } else {
+        // RX (periph->memory from RDR): only transfer while data is available,
+        // otherwise DMA would consume zeros. Each RDR pop may reveal more data.
+        usart->setDmaSuppress(true);
+        for (unsigned int i = 0; i < 65536U; ++i) {
+            if (!usart->hasRxData()) break;
+            if (!serviceDmaRequestOnce(rx_request)) break;
+        }
+        usart->setDmaSuppress(false);
+    }
+}
+
+void Stm32G4::serviceSpiDma(
+    SpiPeripheral* const spi,
+    const std::uint8_t tx_request,
+    const std::uint8_t rx_request,
+    const bool transmit
+) {
+    if (spi == nullptr) return;
+    spi->setDmaSuppress(true);
+    if (transmit) {
+        for (unsigned int i = 0; i < 65536U; ++i) {
+            if (!serviceDmaRequestOnce(tx_request)) break;
+        }
+        // Full-duplex: each TX byte generated an RX byte; drain RX now that
+        // TX burst is complete and suppression will be lifted for the RX loop
+        // below (still suppressed here, so use direct Once with hasRxData).
+        for (unsigned int i = 0; i < 65536U; ++i) {
+            if (!spi->hasRxData()) break;
+            if (!serviceDmaRequestOnce(rx_request)) break;
+        }
+    } else {
+        for (unsigned int i = 0; i < 65536U; ++i) {
+            if (!spi->hasRxData()) break;
+            if (!serviceDmaRequestOnce(rx_request)) break;
+        }
+    }
+    spi->setDmaSuppress(false);
+}
+
+void Stm32G4::serviceAllSerialDma() {
+    // Called on DMA channel enable: a peripheral already ready (TXE/RXNE with
+    // DMAT/DMAR) should start even though its enable edge already passed.
+    // Bursts are safe no-ops when the peripheral or DMA channel is not ready.
+    constexpr std::array<std::uint8_t, 3> usart_tx{25U, 27U, 29U};
+    constexpr std::array<std::uint8_t, 3> usart_rx{24U, 26U, 28U};
+    for (std::size_t i = 0; i < usart_.size() && i < 3U; ++i) {
+        if (usart_[i]->dmaTxEnabled()) serviceUsartDma(usart_[i].get(), usart_tx[i], usart_rx[i], true);
+        if (usart_[i]->dmaRxEnabled() && usart_[i]->hasRxData())
+            serviceUsartDma(usart_[i].get(), usart_tx[i], usart_rx[i], false);
+    }
+    constexpr std::array<std::uint8_t, 3> spi_tx{11U, 13U, 15U};
+    constexpr std::array<std::uint8_t, 3> spi_rx{10U, 12U, 14U};
+    for (std::size_t i = 0; i < spi_.size() && i < 3U; ++i) {
+        // TXE is always ready; RX only when data available.
+        serviceSpiDma(spi_[i].get(), spi_tx[i], spi_rx[i], true);
+        if (spi_[i]->hasRxData()) serviceSpiDma(spi_[i].get(), spi_tx[i], spi_rx[i], false);
     }
 }
 

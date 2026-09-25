@@ -453,6 +453,7 @@ public:
     using TxCallback = std::function<void(std::uint8_t value, sim::SimTimeNs time_ns)>;
     using RxProvider = std::function<std::optional<std::uint8_t>(sim::SimTimeNs time_ns)>;
     using InterruptCallback = std::function<void()>;
+    using DmaRequestCallback = std::function<void(bool transmit)>;
 
     explicit UsartPeripheral(
         std::string name = "USART",
@@ -466,6 +467,12 @@ public:
     void setTxCallback(TxCallback callback);
     void setRxProvider(RxProvider provider);
     void setInterruptCallback(InterruptCallback callback);
+    void setDmaRequestCallback(DmaRequestCallback callback);
+    /** @brief Suppresses DMA request callbacks during DMA burst transfers. */
+    void setDmaSuppress(bool suppress) noexcept { dma_suppress_ = suppress; }
+    [[nodiscard]] bool dmaTxEnabled() const noexcept { return (peekRegister(0x08) & (1U << 7U)) != 0U; }
+    [[nodiscard]] bool dmaRxEnabled() const noexcept { return (peekRegister(0x08) & (1U << 6U)) != 0U; }
+    [[nodiscard]] bool hasRxData() const noexcept { return !rx_queue_.empty(); }
     void setIdleGap(sim::SimTimeNs idle_gap_ns) noexcept { idle_gap_ns_ = idle_gap_ns; }
     [[nodiscard]] const std::vector<UsartTxByte>& txLog() const noexcept { return tx_log_; }
     void clearTxLog() noexcept { tx_log_.clear(); }
@@ -488,6 +495,7 @@ private:
     void refillRx();
     void updateStatus();
     void signalInterruptIfEnabled();
+    void signalDmaRequests();
     void scheduleIdle();
     void cancelIdle() noexcept;
 
@@ -496,6 +504,8 @@ private:
     TxCallback tx_callback_;
     RxProvider rx_provider_;
     InterruptCallback interrupt_callback_;
+    DmaRequestCallback dma_request_callback_;
+    bool dma_suppress_{false};
     sim::SimTimeNs idle_gap_ns_{1000000};
     sim::ScheduledEvent idle_event_;
 };
@@ -677,6 +687,9 @@ public:
     void setInterruptCallback(InterruptCallback callback);
     void setDmaRequestCallback(DmaRequestCallback callback);
     void setEcho(bool enabled) noexcept { echo_ = enabled; }
+    /** @brief Suppresses DMA request callbacks during DMA burst transfers. */
+    void setDmaSuppress(bool suppress) noexcept { dma_suppress_ = suppress; }
+    [[nodiscard]] bool hasRxData() const noexcept { return !receive_bytes_.empty(); }
     [[nodiscard]] const std::vector<SpiTransfer>& transferLog() const noexcept { return transfers_; }
     void clearTransferLog() noexcept { transfers_.clear(); }
 
@@ -704,6 +717,7 @@ private:
     InterruptCallback interrupt_callback_;
     DmaRequestCallback dma_request_callback_;
     bool echo_{false};
+    bool dma_suppress_{false};
     std::vector<SpiTransfer> transfers_;
 };
 
@@ -720,6 +734,7 @@ struct DmaTransfer {
 class DmaPeripheral final : public RegisterPeripheral {
 public:
     using InterruptCallback = std::function<void(unsigned int channel)>;
+    using EnableCallback = std::function<void(unsigned int channel)>;
 
     explicit DmaPeripheral(
         std::string name = "DMA",
@@ -731,6 +746,7 @@ public:
 
     void setMemory(mem::MemoryBus* memory) noexcept { memory_ = memory; }
     void setInterruptCallback(InterruptCallback callback);
+    void setEnableCallback(EnableCallback callback) { enable_callback_ = std::move(callback); }
     void setTransferHistoryEnabled(bool enabled) noexcept { transfer_history_enabled_ = enabled; }
     /** @brief Services one peripheral request for an already-enabled channel. */
     [[nodiscard]] bool request(unsigned int channel);
@@ -765,6 +781,7 @@ private:
     unsigned int channel_count_{7};
     mem::MemoryBus* memory_{nullptr};
     InterruptCallback interrupt_callback_;
+    EnableCallback enable_callback_;
     std::array<std::uint32_t, 8> reload_counts_{};
     bool transfer_history_enabled_{true};
     std::vector<DmaTransfer> transfers_;

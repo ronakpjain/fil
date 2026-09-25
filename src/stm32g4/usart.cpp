@@ -6,6 +6,7 @@ namespace fil::stm32g4 {
 namespace {
 
 constexpr std::uint32_t cr1 = 0x00;
+constexpr std::uint32_t cr3 = 0x08;
 constexpr std::uint32_t rqr = 0x18;
 constexpr std::uint32_t isr = 0x1c;
 constexpr std::uint32_t icr = 0x20;
@@ -42,6 +43,7 @@ void UsartPeripheral::injectRx(const std::span<const std::uint8_t> bytes) {
     updateStatus();
     scheduleIdle();
     signalInterruptIfEnabled();
+    signalDmaRequests();
 }
 
 void UsartPeripheral::injectRx(const std::uint8_t byte) {
@@ -62,6 +64,11 @@ void UsartPeripheral::setInterruptCallback(InterruptCallback callback) {
     signalInterruptIfEnabled();
 }
 
+void UsartPeripheral::setDmaRequestCallback(DmaRequestCallback callback) {
+    dma_request_callback_ = std::move(callback);
+    signalDmaRequests();
+}
+
 std::uint32_t UsartPeripheral::loadRegister(
     const std::uint32_t word_offset,
     const mem::AccessContext& context
@@ -71,6 +78,7 @@ std::uint32_t UsartPeripheral::loadRegister(
         refillRx();
         updateStatus();
         signalInterruptIfEnabled();
+        signalDmaRequests();
     } else if (word_offset == rdr) {
         refillRx();
         std::uint32_t value = 0;
@@ -81,6 +89,7 @@ std::uint32_t UsartPeripheral::loadRegister(
         setRegister(rdr, value);
         updateStatus();
         signalInterruptIfEnabled();
+        signalDmaRequests();
         return value;
     }
     return registerValue(word_offset);
@@ -123,6 +132,8 @@ void UsartPeripheral::storeRegister(
         updateStatus();
         scheduleIdle();
         signalInterruptIfEnabled();
+    } else if (word_offset == cr3) {
+        signalDmaRequests();
     } else if (word_offset == rdr || word_offset == isr) {
         setRegister(word_offset, previous);
     }
@@ -170,6 +181,23 @@ void UsartPeripheral::signalInterruptIfEnabled() {
     setInterruptLevel(0, pending);
     if (pending && interrupt_callback_) {
         interrupt_callback_();
+    }
+}
+
+void UsartPeripheral::signalDmaRequests() {
+    if (dma_suppress_ || !dma_request_callback_) return;
+    const std::uint32_t control = registerValue(cr3);
+    const std::uint32_t status = registerValue(isr);
+    // TX: DMAT (CR3.7) with TXE always ready in this instantaneous model.
+    // Triggering TX here (on CR3 enable) starts the Stm32G4 burst which drains
+    // the DMA channel without relying on TDR-write re-triggering (which would
+    // recurse, since DMA writes TDR through the same path).
+    if ((control & (1U << 7U)) != 0U) {
+        dma_request_callback_(true);
+    }
+    // RX: DMAR (CR3.6) with RXNE indicates a byte is available for DMA.
+    if ((control & (1U << 6U)) != 0U && (status & rxne_flag) != 0U) {
+        dma_request_callback_(false);
     }
 }
 

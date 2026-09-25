@@ -93,6 +93,10 @@ private:
     void wireInterrupts();
     void clearInterruptLines();
     void serviceDmaRequest(std::uint8_t request);
+    [[nodiscard]] bool serviceDmaRequestOnce(std::uint8_t request);
+    void serviceUsartDma(UsartPeripheral* usart, std::uint8_t tx_request, std::uint8_t rx_request, bool transmit);
+    void serviceSpiDma(SpiPeripheral* spi, std::uint8_t tx_request, std::uint8_t rx_request, bool transmit);
+    void serviceAllSerialDma();
     [[nodiscard]] Result<void> map(
         std::uint32_t absolute_address,
         RegisterPeripheral& device

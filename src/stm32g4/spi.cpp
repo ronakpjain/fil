@@ -144,7 +144,7 @@ void SpiPeripheral::signalRequests() {
     if (interrupt_callback_ && pending) {
         interrupt_callback_();
     }
-    if (dma_request_callback_) {
+    if (dma_request_callback_ && !dma_suppress_) {
         if ((control & 1U) != 0U && (status & rxne) != 0U) {
             dma_request_callback_(false);
         }
