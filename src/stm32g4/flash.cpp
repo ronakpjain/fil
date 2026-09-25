@@ -6,6 +6,7 @@
 namespace fil::stm32g4 {
 namespace {
 
+constexpr std::uint32_t acr = 0x00;
 constexpr std::uint32_t keyr = 0x08;
 constexpr std::uint32_t optkeyr = 0x0c;
 constexpr std::uint32_t sr = 0x10;
@@ -33,6 +34,7 @@ FlashPeripheral::FlashPeripheral(
     sim::EventLoop* const event_loop,
     sim::TraceRecorder* const trace
 ) : RegisterPeripheral("FLASH", 0x40, event_loop, trace) {
+    setResetValue(acr, 0x00000000U); // LATENCY=0, PRFTEN/ICEN/DCEN off.
     setResetValue(cr, lock | option_lock);
     reset();
 }
@@ -63,6 +65,24 @@ void FlashPeripheral::storeRegister(
     const mem::AccessContext& context
 ) {
     static_cast<void>(context);
+    if (word_offset == acr) {
+        // RM0440 FLASH_ACR: LATENCY[2:0], PRFTEN(8), ICEN(9), DCEN(10),
+        // ICRST(11), DCRST(12). Reset bits clear immediately (no cached
+        // lines are modelled); LATENCY/PRFTEN/ICEN/DCEN changes bump the
+        // generation so loop proofs fail closed across ACR rewrites.
+        constexpr std::uint32_t writable =
+            0x7U | (1U << 8U) | (1U << 9U) | (1U << 10U) | (1U << 11U) | (1U << 12U);
+        const std::uint32_t masked = value & writable & write_mask;
+        std::uint32_t next = (previous & ~(writable & write_mask))
+            | (masked & ~((1U << 11U) | (1U << 12U)));
+        setRegister(acr, next);
+        acr_ = next;
+        if (((previous ^ next) & (0x7U | (1U << 8U) | (1U << 9U) | (1U << 10U))) != 0U) {
+            ++acr_generation_;
+            if (acr_generation_ == 0U) acr_generation_ = 1U;
+        }
+        return;
+    }
     if (word_offset == keyr) {
         if (value == 0x45670123U) {
             key_step_ = 1;
@@ -121,6 +141,9 @@ void FlashPeripheral::performPageErase(const std::uint32_t control) {
 void FlashPeripheral::onReset() {
     key_step_ = 0;
     option_key_step_ = 0;
+    acr_ = registerValue(acr);
+    ++acr_generation_;
+    if (acr_generation_ == 0U) acr_generation_ = 1U;
     setRegister(sr, registerValue(sr) & ~busy);
 }
 

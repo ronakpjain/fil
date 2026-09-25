@@ -236,6 +236,59 @@ public:
 
     explicit FlashPeripheral(sim::EventLoop* event_loop = nullptr, sim::TraceRecorder* trace = nullptr);
 
+    /**
+     * @brief FLASH_ACR wait states programmed in LATENCY[2:0].
+     *
+     * This is the firmware-programmed value, not the HCLK-required value:
+     * overclocked firmware (HCLK above the LATENCY table) still pays the
+     * programmed stall, matching silicon behavior. See
+     * docs/real_timing_audit.md for the DS12288 table.
+     */
+    [[nodiscard]] std::uint32_t waitStates() const noexcept { return acr_ & 0x7U; }
+    [[nodiscard]] bool prefetchEnabled() const noexcept { return (acr_ & (1U << 8U)) != 0U; }
+    [[nodiscard]] bool instructionCacheEnabled() const noexcept {
+        return (acr_ & (1U << 9U)) != 0U;
+    }
+    [[nodiscard]] std::uint32_t flashAcr() const noexcept { return acr_; }
+    /** @brief Generation bumped on LATENCY/PRFTEN/ICEN/DCEN changes. */
+    [[nodiscard]] std::uint64_t acrGeneration() const noexcept { return acr_generation_; }
+
+    /**
+     * @brief HCLK wait-state requirement per the DS12288 Range-1 table:
+     * 0 WS to 30 MHz, 1 to 60, 2 to 90, 3 to 120, 4 to 170.
+     */
+    [[nodiscard]] static std::uint32_t requiredWaitStates(std::uint64_t hclk_hz) noexcept {
+        if (hclk_hz <= 30'000'000U) return 0U;
+        if (hclk_hz <= 60'000'000U) return 1U;
+        if (hclk_hz <= 90'000'000U) return 2U;
+        if (hclk_hz <= 120'000'000U) return 3U;
+        return 4U;
+    }
+
+    /** @brief True for flash bank bytes and the 0x00000000 boot alias. */
+    [[nodiscard]] bool isFlashAddress(std::uint32_t address) const noexcept {
+        if (address >= flash_base_ && address < flash_base_ + bank_size_) return true;
+        return address < bank_size_;
+    }
+
+    /**
+     * @brief Simplified ART fetch stall for one instruction fetch.
+     *
+     * SRAM/ROM fetches pay 0. Sequential flash fetches with prefetch or
+     * instruction cache enabled hit the ART buffer and pay 0; all other
+     * flash fetches (taken branches, prefetch/cache disabled) pay the full
+     * programmed LATENCY. Data-cache state is intentionally out of scope.
+     */
+    [[nodiscard]] std::uint32_t fetchStallCycles(
+        std::uint32_t pc, bool sequential
+    ) const noexcept {
+        if (!isFlashAddress(pc)) return 0U;
+        const std::uint32_t wait = waitStates();
+        if (wait == 0U) return 0U;
+        if (sequential && (prefetchEnabled() || instructionCacheEnabled())) return 0U;
+        return wait;
+    }
+
     /** @brief Installs the backing callback that physically erases pages. */
     void setPageEraseCallback(PageEraseCallback callback);
 
@@ -274,6 +327,8 @@ private:
 
     unsigned int key_step_{0};
     unsigned int option_key_step_{0};
+    std::uint32_t acr_{0};
+    std::uint64_t acr_generation_{1};
     PageEraseCallback page_erase_callback_;
     std::uint32_t flash_base_{0x08000000U};
     std::uint32_t page_size_{4096U};
