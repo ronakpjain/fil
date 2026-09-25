@@ -26,6 +26,7 @@ void GpioPeripheral::setInput(const unsigned int pin, const bool high) {
     if (pin >= 16U) {
         return;
     }
+    const bool old_level = (inputValue() & (1U << pin)) != 0U;
     const std::uint16_t mask = static_cast<std::uint16_t>(1U << pin);
     external_input_mask_ = static_cast<std::uint16_t>(external_input_mask_ | mask);
     if (high) {
@@ -37,10 +38,15 @@ void GpioPeripheral::setInput(const unsigned int pin, const bool high) {
         {"pin", std::to_string(pin)},
         {"value", high ? "1" : "0"},
     });
+    const bool new_level = (inputValue() & (1U << pin)) != 0U;
+    if (new_level != old_level && edge_callback_) {
+        edge_callback_(pin, new_level, currentTime());
+    }
 }
 
 void GpioPeripheral::releaseInput(const unsigned int pin) {
     if (pin < 16U) {
+        const bool old_level = (inputValue() & (1U << pin)) != 0U;
         external_input_mask_ = static_cast<std::uint16_t>(
             external_input_mask_ & static_cast<std::uint16_t>(~(1U << pin))
         );
@@ -48,6 +54,10 @@ void GpioPeripheral::releaseInput(const unsigned int pin) {
             {"pin", std::to_string(pin)},
             {"value", "release"},
         });
+        const bool new_level = (inputValue() & (1U << pin)) != 0U;
+        if (new_level != old_level && edge_callback_) {
+            edge_callback_(pin, new_level, currentTime());
+        }
     }
 }
 
@@ -57,6 +67,10 @@ bool GpioPeripheral::output(const unsigned int pin) const noexcept {
 
 void GpioPeripheral::setOutputCallback(OutputCallback callback) {
     output_callback_ = std::move(callback);
+}
+
+void GpioPeripheral::setEdgeCallback(EdgeCallback callback) {
+    edge_callback_ = std::move(callback);
 }
 
 std::uint32_t GpioPeripheral::loadRegister(
@@ -103,24 +117,32 @@ void GpioPeripheral::storeRegister(
 }
 
 void GpioPeripheral::applyOutput(const std::uint32_t new_output) {
-    const std::uint32_t previous = registerValue(odr) & 0xffffU;
-    const std::uint32_t next = new_output & 0xffffU;
-    setRegister(odr, next);
-    const std::uint32_t changed = previous ^ next;
+    const std::uint32_t previous_odr = registerValue(odr) & 0xffffU;
+    const std::uint32_t next_odr = new_output & 0xffffU;
+    // Capture IDR levels before the ODR update for edge detection. Pins with an
+    // external override keep their driven level regardless of ODR, so only
+    // undriven output/AF pins can change IDR here.
+    const std::uint32_t old_levels = inputValue();
+    setRegister(odr, next_odr);
+    const std::uint32_t new_levels = inputValue();
+    const std::uint32_t changed_odr = previous_odr ^ next_odr;
+    const std::uint32_t changed_idr = (old_levels ^ new_levels) & 0xffffU;
     for (unsigned int pin = 0; pin < 16U; ++pin) {
         const std::uint32_t mask = 1U << pin;
-        if ((changed & mask) == 0U) {
-            continue;
+        if ((changed_odr & mask) != 0U) {
+            const bool high = (next_odr & mask) != 0U;
+            const GpioTransition transition{currentTime(), pin, high};
+            transitions_.push_back(transition);
+            traceEvent("gpio_output", {
+                {"pin", std::to_string(pin)},
+                {"value", high ? "1" : "0"},
+            });
+            if (output_callback_) {
+                output_callback_(pin, high, transition.time_ns);
+            }
         }
-        const bool high = (next & mask) != 0U;
-        const GpioTransition transition{currentTime(), pin, high};
-        transitions_.push_back(transition);
-        traceEvent("gpio_output", {
-            {"pin", std::to_string(pin)},
-            {"value", high ? "1" : "0"},
-        });
-        if (output_callback_) {
-            output_callback_(pin, high, transition.time_ns);
+        if ((changed_idr & mask) != 0U && edge_callback_) {
+            edge_callback_(pin, (new_levels & mask) != 0U, currentTime());
         }
     }
 }

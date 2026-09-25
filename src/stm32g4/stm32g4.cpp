@@ -47,7 +47,9 @@ Stm32G4::Stm32G4(
     dma2_("DMA2", 8, nullptr, &event_loop, &trace),
     dmamux_("DMAMUX", 16, &event_loop, &trace),
     iwdg_(false, &event_loop, &trace),
-    wwdg_(false, 16000000U, &event_loop, &trace) {
+    wwdg_(false, 16000000U, &event_loop, &trace),
+    syscfg_("SYSCFG", &event_loop, &trace),
+    exti_("EXTI", &event_loop, &trace) {
     constexpr std::array<std::string_view, 7> gpio_names{
         "GPIOA", "GPIOB", "GPIOC", "GPIOD", "GPIOE", "GPIOF", "GPIOG",
     };
@@ -72,10 +74,9 @@ Stm32G4::Stm32G4(
         fdcan_.push_back(std::make_unique<FdcanPeripheral>(instance, fdcan_message_ram_, &event_loop, &trace));
     }
 
-    stubs_.push_back(std::make_unique<UnknownMmioDevice>("SYSCFG", 0x40010000U, false, 0, &event_loop, &trace));
-    stubs_.push_back(std::make_unique<UnknownMmioDevice>("EXTI", 0x40010400U, false, 0, &event_loop, &trace));
     stubs_.push_back(std::make_unique<UnknownMmioDevice>("ADC12_COMMON", 0x50000300U, false, 0, &event_loop, &trace));
     stubs_.push_back(std::make_unique<UnknownMmioDevice>("ADC345_COMMON", 0x50000700U, false, 0, &event_loop, &trace));
+    exti_.setSyscfg(&syscfg_);
 }
 
 Stm32G4::~Stm32G4() {
@@ -110,11 +111,12 @@ Result<void> Stm32G4::mapDevices() {
         return {};
     };
 
-    for (auto entry : std::array<std::pair<std::uint32_t, RegisterPeripheral*>, 9>{
+    for (auto entry : std::array<std::pair<std::uint32_t, RegisterPeripheral*>, 11>{
         std::pair{0x40021000U, static_cast<RegisterPeripheral*>(&rcc_)},
         {0x40022000U, &flash_}, {0x40023000U, &crc_}, {0x40007000U, &pwr_},
         {0x40020000U, &dma1_}, {0x40020400U, &dma2_}, {0x40020800U, &dmamux_},
         {0x40003000U, &iwdg_}, {0x40002c00U, &wwdg_},
+        {0x40010000U, &syscfg_}, {0x40010400U, &exti_},
     }) {
         auto result = checked(entry.first, *entry.second);
         if (!result) return result.error();
@@ -161,9 +163,8 @@ Result<void> Stm32G4::mapDevices() {
         );
         if (!result) return result.error();
     }
-    constexpr std::array<std::pair<std::uint32_t, std::uint32_t>, 4> stub_ranges{
-        std::pair{0x40010000U, 0x400U}, {0x40010400U, 0x400U},
-        {0x50000300U, 0x100U}, {0x50000700U, 0x100U},
+    constexpr std::array<std::pair<std::uint32_t, std::uint32_t>, 2> stub_ranges{
+        std::pair{0x50000300U, 0x100U}, {0x50000700U, 0x100U},
     };
     for (std::size_t index = 0; index < stubs_.size(); ++index) {
         auto result = router_.map(
@@ -220,6 +221,12 @@ void Stm32G4::wireInterrupts() {
     }
     connect(dma1_, std::array<std::uint16_t, 8>{11U, 12U, 13U, 14U, 15U, 16U, 17U, 96U});
     connect(dma2_, std::array<std::uint16_t, 8>{56U, 57U, 58U, 59U, 60U, 97U, 98U, 99U});
+    connect(exti_, std::array<std::uint16_t, 7>{6U, 7U, 8U, 9U, 10U, 23U, 40U});
+    for (std::size_t port = 0; port < gpio_.size(); ++port) {
+        gpio_[port]->setEdgeCallback([this, port](const unsigned int pin, const bool high, const sim::SimTimeNs) {
+            exti_.notifyGpioEdge(static_cast<unsigned int>(port), pin, high);
+        });
+    }
     rcc_.setClockChangedCallback([this](const std::uint64_t frequency) {
         for (auto& timer : timers_) timer->setInputClockHz(frequency);
         for (auto& adc : adc_) adc->setInputClockHz(frequency);
@@ -357,8 +364,9 @@ void Stm32G4::setAdcDiagnosticsEnabled(const bool enabled) {
 }
 
 void Stm32G4::setTraceSourcePrefix(const std::string_view prefix) {
-    for (RegisterPeripheral* device : std::array<RegisterPeripheral*, 9>{
+    for (RegisterPeripheral* device : std::array<RegisterPeripheral*, 11>{
              &rcc_, &flash_, &crc_, &pwr_, &dma1_, &dma2_, &dmamux_, &iwdg_, &wwdg_,
+             &syscfg_, &exti_,
          }) {
         device->setTraceSourcePrefix(prefix);
     }
@@ -395,6 +403,8 @@ void Stm32G4::reset() {
     dma_route_generation_ = 0U;
     iwdg_.reset();
     wwdg_.reset();
+    syscfg_.reset();
+    exti_.reset();
     for (auto& device : gpio_) device->reset();
     for (auto& device : usart_) device->reset();
     for (auto& device : timers_) device->reset();

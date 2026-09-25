@@ -75,6 +75,8 @@ public:
     [[nodiscard]] AdcPeripheral* adc(std::string_view name) noexcept;
     [[nodiscard]] SpiPeripheral* spi(std::string_view name) noexcept;
     [[nodiscard]] FdcanPeripheral* fdcan(std::string_view name) noexcept;
+    [[nodiscard]] SyscfgPeripheral& syscfg() noexcept { return syscfg_; }
+    [[nodiscard]] ExtiPeripheral& exti() noexcept { return exti_; }
     [[nodiscard]] bool resetRequested() const noexcept { return reset_requested_; }
     [[nodiscard]] bool consumeResetRequest() noexcept;
 
@@ -111,6 +113,8 @@ private:
     std::uint64_t dma_route_generation_{0U};
     IwdgPeripheral iwdg_;
     WwdgPeripheral wwdg_;
+    SyscfgPeripheral syscfg_;
+    ExtiPeripheral exti_;
     FdcanMessageRam fdcan_message_ram_;
     std::vector<std::unique_ptr<GpioPeripheral>> gpio_;
     std::vector<std::unique_ptr<UsartPeripheral>> usart_;

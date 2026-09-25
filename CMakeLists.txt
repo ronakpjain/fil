@@ -118,6 +118,7 @@ add_library(fil_core STATIC
     src/stm32g4/adc.cpp
     src/stm32g4/crc.cpp
     src/stm32g4/dma.cpp
+    src/stm32g4/exti.cpp
     src/stm32g4/flash.cpp
     src/stm32g4/fdcan.cpp
     src/stm32g4/gpio.cpp

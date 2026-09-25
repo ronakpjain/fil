@@ -400,6 +400,7 @@ struct GpioTransition {
 class GpioPeripheral final : public RegisterPeripheral {
 public:
     using OutputCallback = std::function<void(unsigned int pin, bool high, sim::SimTimeNs time_ns)>;
+    using EdgeCallback = std::function<void(unsigned int pin, bool high, sim::SimTimeNs time_ns)>;
 
     explicit GpioPeripheral(
         std::string name = "GPIO",
@@ -411,6 +412,8 @@ public:
     void releaseInput(unsigned int pin);
     [[nodiscard]] bool output(unsigned int pin) const noexcept;
     void setOutputCallback(OutputCallback callback);
+    /** @brief Observes every pin level change (external inputs and outputs) for EXTI edge detection. */
+    void setEdgeCallback(EdgeCallback callback);
     [[nodiscard]] const std::vector<GpioTransition>& transitions() const noexcept { return transitions_; }
     void clearTransitions() noexcept { transitions_.clear(); }
 
@@ -434,6 +437,7 @@ private:
     std::uint16_t external_input_mask_{0};
     std::uint16_t external_input_value_{0};
     OutputCallback output_callback_;
+    EdgeCallback edge_callback_;
     std::vector<GpioTransition> transitions_;
 };
 
@@ -868,6 +872,54 @@ private:
     std::uint64_t peripheral_clock_hz_{16000000};
     sim::ScheduledEvent timeout_event_;
     ResetCallback reset_callback_;
+};
+
+/** @brief STM32G4 SYSCFG with EXTI line port routing (EXTICR1-4). */
+class SyscfgPeripheral final : public RegisterPeripheral {
+public:
+    explicit SyscfgPeripheral(
+        std::string name = "SYSCFG",
+        sim::EventLoop* event_loop = nullptr,
+        sim::TraceRecorder* trace = nullptr
+    );
+
+    /** @brief Returns 0-6 (PA-PG) for an EXTI line, or -1 when unroutable. */
+    [[nodiscard]] int portForLine(unsigned int line) const noexcept;
+};
+
+/** @brief STM32G4 EXTI with rising/falling edge triggers and NVIC lines. */
+class ExtiPeripheral final : public RegisterPeripheral {
+public:
+    explicit ExtiPeripheral(
+        std::string name = "EXTI",
+        sim::EventLoop* event_loop = nullptr,
+        sim::TraceRecorder* trace = nullptr
+    );
+
+    /** @brief Selects the SYSCFG used to resolve EXTI line to GPIO port. */
+    void setSyscfg(const SyscfgPeripheral* syscfg) noexcept { syscfg_ = syscfg; }
+    /** @brief Notifies EXTI of a GPIO pin level (port 0-6 for A-G, pin 0-15). */
+    void notifyGpioEdge(unsigned int port, unsigned int pin, bool high);
+
+protected:
+    [[nodiscard]] std::uint32_t loadRegister(
+        std::uint32_t word_offset,
+        const mem::AccessContext& context
+    ) override;
+    void storeRegister(
+        std::uint32_t word_offset,
+        std::uint32_t previous,
+        std::uint32_t value,
+        std::uint32_t write_mask,
+        const mem::AccessContext& context
+    ) override;
+    void onReset() override;
+
+private:
+    void updateInterruptLevels();
+    [[nodiscard]] bool linePendingEnabled(unsigned int line) const noexcept;
+
+    const SyscfgPeripheral* syscfg_{nullptr};
 };
 
 /** @brief Compatibility name matching the STM32 TIM abbreviation. */

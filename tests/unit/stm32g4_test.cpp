@@ -253,4 +253,89 @@ TEST(Stm32G4Test, RoutesIntegratedPeripherals) {
         << "routes shared FDCAN message RAM";
 }
 
+TEST(Stm32G4Test, ExtiRoutesGpioEdgeToNvic) {
+    fil::sim::EventLoop events;
+    fil::sim::TraceRecorder trace;
+    fil::cortexm::SystemControl system;
+    auto mcu = fil::stm32g4::Stm32G4::create(events, trace, system);
+    ASSERT_TRUE(mcu);
+    constexpr auto word = fil::mem::AccessSize::word;
+    // Enable EXTI0 NVIC line and route EXTI0 to PB via SYSCFG EXTICR1.
+    ASSERT_TRUE(system.write(0xe100U, word, 1U << 6U, {}));
+    ASSERT_TRUE(mcu.value()->router().write(0x00010008U, word, 0x1U, {}));
+    ASSERT_TRUE(mcu.value()->router().write(0x00010400U, word, 1U << 0U, {})); // IMR1.IM0
+    ASSERT_TRUE(mcu.value()->router().write(0x00010408U, word, 1U << 0U, {})); // RTSR1.RT0
+    auto* gpiob = mcu.value()->gpio("GPIOB");
+    ASSERT_NE(gpiob, nullptr);
+    gpiob->setInput(0, false);
+    EXPECT_FALSE(system.hasEnabledPending());
+    gpiob->setInput(0, true); // Rising edge on PB0 -> EXTI0.
+    EXPECT_EQ(system.nextPending(0U, 0U, 0U), 22U); // 16+6
+    system.enter(22U);
+    // Clear PR1.PIF0 like dashboard EXTI0_IRQHandler does.
+    ASSERT_TRUE(mcu.value()->router().write(0x00010414U, word, 1U << 0U, {}));
+    system.leave(22U);
+    EXPECT_FALSE(system.hasEnabledPending());
+}
+
+TEST(Stm32G4Test, ExtiIgnoresUnroutedPortAndFallingWithoutTrigger) {
+    fil::sim::EventLoop events;
+    fil::sim::TraceRecorder trace;
+    fil::cortexm::SystemControl system;
+    auto mcu = fil::stm32g4::Stm32G4::create(events, trace, system);
+    ASSERT_TRUE(mcu);
+    constexpr auto word = fil::mem::AccessSize::word;
+    ASSERT_TRUE(system.write(0xe100U, word, 1U << 6U, {}));
+    // Default SYSCFG routes EXTI0 to PA; PB0 edge must not pend.
+    ASSERT_TRUE(mcu.value()->router().write(0x00010400U, word, 1U << 0U, {}));
+    ASSERT_TRUE(mcu.value()->router().write(0x00010408U, word, 1U << 0U, {}));
+    auto* gpiob = mcu.value()->gpio("GPIOB");
+    ASSERT_NE(gpiob, nullptr);
+    gpiob->setInput(0, false);
+    gpiob->setInput(0, true);
+    EXPECT_FALSE(system.hasEnabledPending());
+    // Route to PB but only rising armed; falling edge must not pend.
+    ASSERT_TRUE(mcu.value()->router().write(0x00010008U, word, 0x1U, {}));
+    gpiob->setInput(0, true);
+    gpiob->setInput(0, false); // Falling with only RTSR set.
+    EXPECT_FALSE(system.hasEnabledPending());
+    // Arm falling too; now falling pends.
+    ASSERT_TRUE(mcu.value()->router().write(0x0001040cU, word, 1U << 0U, {}));
+    gpiob->setInput(0, true);
+    gpiob->setInput(0, false);
+    EXPECT_TRUE(system.hasEnabledPending());
+}
+
+TEST(Stm32G4Test, ExtiSharedLinesOrIntoSingleIrq) {
+    fil::sim::EventLoop events;
+    fil::sim::TraceRecorder trace;
+    fil::cortexm::SystemControl system;
+    auto mcu = fil::stm32g4::Stm32G4::create(events, trace, system);
+    ASSERT_TRUE(mcu);
+    constexpr auto word = fil::mem::AccessSize::word;
+    ASSERT_TRUE(system.write(0xe100U, word, 1U << 23U, {})); // EXTI9_5.
+    // Route EXTI5 to PA (default), EXTI6 to PC via EXTICR2.
+    ASSERT_TRUE(mcu.value()->router().write(0x0001000cU, word, 0x2U << 8U, {}));
+    ASSERT_TRUE(mcu.value()->router().write(0x00010400U, word, (1U << 5U) | (1U << 6U), {}));
+    ASSERT_TRUE(mcu.value()->router().write(0x00010408U, word, (1U << 5U) | (1U << 6U), {}));
+    auto* gpioa = mcu.value()->gpio("GPIOA");
+    auto* gpioc = mcu.value()->gpio("GPIOC");
+    ASSERT_NE(gpioa, nullptr);
+    ASSERT_NE(gpioc, nullptr);
+    gpioa->setInput(5, false);
+    gpioc->setInput(6, false);
+    gpioa->setInput(5, true);
+    EXPECT_EQ(system.nextPending(0U, 0U, 0U), 39U); // 16+23
+    gpioc->setInput(6, true);
+    system.enter(39U);
+    ASSERT_TRUE(mcu.value()->router().write(0x00010414U, word, 1U << 5U, {}));
+    system.leave(39U);
+    // EXTI6 still pending, shared IRQ remains asserted.
+    EXPECT_EQ(system.nextPending(0U, 0U, 0U), 39U);
+    system.enter(39U);
+    ASSERT_TRUE(mcu.value()->router().write(0x00010414U, word, 1U << 6U, {}));
+    system.leave(39U);
+    EXPECT_FALSE(system.hasEnabledPending());
+}
+
 } // namespace
