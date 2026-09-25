@@ -23,6 +23,7 @@ add_executable(fil_tests
     unit/smoke_test.cpp
     unit/startup_runtime_test.cpp
     unit/stm32g4_test.cpp
+    unit/timing_test.cpp
     unit/world_test.cpp
     unit/world_time_test.cpp
 )

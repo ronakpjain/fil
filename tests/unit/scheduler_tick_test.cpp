@@ -59,7 +59,12 @@ TEST(SchedulerTickTest, StartsPspTaskAndDeliversSysTick) {
 
     EXPECT_TRUE(result.reason == fil::sim::BoardStopReason::breakpoint)
         << "PSP task resumes after SysTick and reaches its BKPT";
-    EXPECT_TRUE(result.instructions == 102U)
+    // Real-timing model (docs/real_timing_audit.md): SysTick is cycle-timed,
+    // and each instruction now costs its DDI0439C pipeline cycles, so the
+    // tick fires after fewer instructions than under the old 1-CPI model.
+    // The exception path and task state below are unchanged; only the
+    // bounded count moves 102 -> 84 (156 cycles, CPI ~1.86).
+    EXPECT_TRUE(result.instructions == 84U)
         << "scheduler fixture follows the exact bounded instruction path";
     EXPECT_TRUE(readSchedulerWord(board, "svc_count") == 1U) << "SVC handler runs exactly once";
     EXPECT_TRUE(readSchedulerWord(board, "pendsv_count") == 1U)

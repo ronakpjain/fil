@@ -157,8 +157,11 @@ TEST(WorldTimeTest, BoardCountDoesNotScaleGlobalTime) {
                 standalone_result.reason == fil::sim::BoardStopReason::breakpoint &&
                 standalone_result.time_ns == one_result.value().end_time_ns)
         << "standalone Board timing remains identical to a one-board world";
+    // Real-timing model (docs/real_timing_audit.md): the split-image fixture
+    // executes LDR, LDR, BKPT from flash at 16 MHz/0 WS, costing 2+2+1 = 5
+    // pipeline cycles for 3 instructions. The 1-CPI equality no longer holds.
     EXPECT_TRUE(one_result.value().boards[0].result.instructions == 3U &&
-                one_result.value().boards[0].result.cycles == 3U)
+                one_result.value().boards[0].result.cycles == 5U)
         << "single-board world executes the complete fixture cycle count";
     bool every_board_matches = true;
     for (const fil::sim::WorldBoardRunResult& board : three_result.value().boards) {
@@ -198,7 +201,10 @@ TEST(WorldTimeTest, TimeBudgetProgressIsIndependentOfBoardCount) {
     EXPECT_TRUE(one_result.value().end_time_ns == three_result.value().end_time_ns)
         << "atomic deadline overshoot is independent of board count";
     const auto& reference = one_result.value().boards[0].result;
-    bool equal_progress = reference.instructions == 2U && reference.cycles == 2U;
+    // Real-timing model: the first fixture LDR costs 2 cycles (125 ns at
+    // 16 MHz), so the 100 ns budget is exhausted atomically after 1
+    // instruction / 2 cycles instead of the old 2 instructions / 2 cycles.
+    bool equal_progress = reference.instructions == 1U && reference.cycles == 2U;
     for (const fil::sim::WorldBoardRunResult& board : three_result.value().boards) {
         equal_progress = equal_progress
             && board.result.reason == fil::sim::BoardStopReason::time_budget
@@ -240,14 +246,17 @@ TEST(WorldTimeTest, ConcurrentScheduleIsByteDeterministic) {
             starts.push_back(std::to_string(record.time_ns) + ":" + record.source);
         }
     }
+    // Real-timing model: each fixture LDR costs 2 cycles (125 ns at
+    // 16 MHz), so same-time frontiers land on 125 ns boundaries instead of
+    // the old 62.5 ns single-cycle grid. Order per frontier is unchanged.
     EXPECT_TRUE((starts ==
                  std::vector<std::string>{
                      "0:alpha",
                      "0:beta",
-                     "62:alpha",
-                     "62:beta",
                      "125:alpha",
                      "125:beta",
+                     "250:alpha",
+                     "250:beta",
                  }))
         << "same-time CPU starts use stable configuration order at each virtual frontier";
 }
