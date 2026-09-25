@@ -684,8 +684,6 @@ Result<std::vector<std::uint8_t>> ElfImage::readLoadImage(
 }
 
 const ElfSymbol* ElfImage::symbolAtOrBefore(const std::uint32_t address) const noexcept {
-    // Symbols are sorted during loading, so lookup stays logarithmic even for
-    // large debug builds with many local symbols.
     const auto iterator = std::upper_bound(
         symbols_.begin(), symbols_.end(), address,
         [](const std::uint32_t value, const ElfSymbol& symbol) { return value < symbol.address; }

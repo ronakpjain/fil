@@ -278,8 +278,6 @@ FastStepResult CortexM4::stepFast() {
         cache.raw = result.raw;
         cache.decoded = *newly_decoded;
         cache.size = instruction_size;
-        // Memoize the static pipeline cost once per decode; divide forms
-        // resolve data-dependently on the hot path via divide_form.
         cache.divide_form = newly_decoded->kind == InstrKind::udiv
             || newly_decoded->kind == InstrKind::sdiv;
         cache.base_cycles = cache.divide_form

@@ -4,7 +4,5 @@
   "mcu": "../mcus/stm32g474retx.json",
   "elf": "../../../../PER/Projects/monorepo/firmware/output/torque_vector/torque_vector.elf",
   "vector_base": "0x08008000",
-  "run": {"default_duration_ms": 1000, "max_instructions": 50000000},
-  "gpio": {}, "can": {"FDCAN2": {"bus": "vehicle", "loopback": false}},
-  "usart": {}, "adc": {}, "spi": {}
+  "can": {"FDCAN2": {"bus": "vehicle"}}
 }

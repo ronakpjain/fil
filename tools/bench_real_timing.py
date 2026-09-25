@@ -63,10 +63,8 @@ def build_image(code_halfwords, reset_offset=8):
     blob = struct.pack("<2I", *table)
     assert reset_offset >= len(blob)
     blob += b"\x00" * (reset_offset - len(blob))
-    code_start = len(blob)
     for h in code_halfwords:
         blob += struct.pack("<H", h)
-    # ELF header
     e_ident = b"\x7fELF" + bytes([1, 1, 1, 0]) + b"\x00" * 8
     ehdr = e_ident + struct.pack(
         "<HHIIIIIHHHHHH", 2, 40, 1, 0, 52, 0, 0, 52, 32, 1, 0, 0, 0
@@ -79,10 +77,9 @@ def build_image(code_halfwords, reset_offset=8):
 
 def idle16_code():
     loop = 0
-    code, addrs = [], []
+    code = []
     base = FLASH_BASE + 8
     for _ in range(4):
-        addrs.append(base + len(code) * 2)
         code.append(NOP)
     b_addr = base + len(code) * 2
     code.append(b_to(FLASH_BASE + 8 + loop, b_addr))
@@ -90,7 +87,6 @@ def idle16_code():
 
 
 def pll170_code():
-    # Layout: 10 setup halfwords, 5 loop halfwords, 5 literals.
     setup_count, loop_count = 10, 6
     code_base = FLASH_BASE + 8
     lit_base = code_base + (setup_count + loop_count) * 2
@@ -122,7 +118,7 @@ def pll170_code():
     return code
 
 
-def write_configs(root, idle_elf, pll_elf, mcu_src):
+def write_configs(root, idle_elf, pll_elf):
     mcu = {
         "schema_version": 1, "name": "stm32g474retx",
         "flash_base": "0x08000000", "flash_size": "512K",
@@ -195,7 +191,7 @@ def main():
             f.write(build_image(idle16_code()))
         with open(pll_elf, "wb") as f:
             f.write(build_image(pll170_code()))
-        boards, net = write_configs(root, idle_elf, pll_elf, None)
+        boards, net = write_configs(root, idle_elf, pll_elf)
 
         cases = [
             ("idle16 x1", ["run", boards["idle"], "--duration-ms", "1000",

@@ -1,5 +1,7 @@
 #include "fil/elf/elf_loader.hpp"
 
+#include "../fixture_support.hpp"
+
 #include <gtest/gtest.h>
 
 #include <cstddef>
@@ -9,6 +11,7 @@
 #include <iterator>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -24,15 +27,12 @@ std::vector<std::uint8_t> fixtureBytes() {
 
 /// @brief Writes a mutated ELF image for a negative parser test.
 std::filesystem::path writeTemporaryElf(
+    const fil::test::TemporaryDirectory& directory,
     const std::string& name,
     const std::vector<std::uint8_t>& bytes
 ) {
-    const auto directory = std::filesystem::temp_directory_path() / "fil-elf-tests";
-    std::filesystem::create_directories(directory);
-    const auto path = directory / name;
-    std::ofstream output(path, std::ios::binary);
-    output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    return path;
+    const auto* data = reinterpret_cast<const char*>(bytes.data());
+    return directory.write(name, std::string_view(data, bytes.size()));
 }
 
 /// @brief Writes a little-endian 32-bit value into fixture bytes.
@@ -91,9 +91,12 @@ TEST(ElfLoaderTest, LoadsSymbolsAndAttributes) {
 
 /// @brief Verifies malformed and ambiguous ELF images are rejected.
 TEST(ElfLoaderTest, RejectsMalformedImages) {
+    fil::test::TemporaryDirectory directory{"fil-elf-tests"};
     auto bad_magic_bytes = fixtureBytes();
     bad_magic_bytes[0] = 0;
-    const auto bad_magic = fil::elf::load(writeTemporaryElf("bad-magic.elf", bad_magic_bytes));
+    const auto bad_magic = fil::elf::load(
+        writeTemporaryElf(directory, "bad-magic.elf", bad_magic_bytes)
+    );
 
     auto bad_sizes_bytes = fixtureBytes();
     // ELF32 e_phoff is at 28; p_filesz/p_memsz are at +16/+20 in the first entry.
@@ -103,18 +106,24 @@ TEST(ElfLoaderTest, RejectsMalformedImages) {
         | (static_cast<std::uint32_t>(bad_sizes_bytes[31]) << 24U);
     writeU32(bad_sizes_bytes, program_headers + 16U, 64U);
     writeU32(bad_sizes_bytes, program_headers + 20U, 32U);
-    const auto bad_sizes = fil::elf::load(writeTemporaryElf("bad-sizes.elf", bad_sizes_bytes));
+    const auto bad_sizes = fil::elf::load(
+        writeTemporaryElf(directory, "bad-sizes.elf", bad_sizes_bytes)
+    );
 
     auto overlap_bytes = fixtureBytes();
     writeU32(overlap_bytes, program_headers + 32U + 12U, 0x08000000U);
-    const auto overlap = fil::elf::load(writeTemporaryElf("overlap.elf", overlap_bytes));
+    const auto overlap = fil::elf::load(
+        writeTemporaryElf(directory, "overlap.elf", overlap_bytes)
+    );
 
     auto wrap_bytes = fixtureBytes();
     writeU32(wrap_bytes, program_headers + 32U + 12U, 0xfffffffeU);
-    const auto wrap = fil::elf::load(writeTemporaryElf("wrap.elf", wrap_bytes));
+    const auto wrap = fil::elf::load(writeTemporaryElf(directory, "wrap.elf", wrap_bytes));
 
     std::vector<std::uint8_t> truncated(20, 0);
-    const auto short_file = fil::elf::load(writeTemporaryElf("truncated.elf", truncated));
+    const auto short_file = fil::elf::load(
+        writeTemporaryElf(directory, "truncated.elf", truncated)
+    );
     const auto bad_vector = fil::elf::load(fixture_path, 0x08010000U);
 
     EXPECT_TRUE(!bad_magic && bad_magic.error().message.find("magic") != std::string::npos)
@@ -129,9 +138,6 @@ TEST(ElfLoaderTest, RejectsMalformedImages) {
         << "rejects truncated ELF headers";
     EXPECT_TRUE(!bad_vector && bad_vector.error().message.find("vector table") != std::string::npos)
         << "rejects vector bases outside load memory";
-
-    std::error_code error;
-    std::filesystem::remove_all(std::filesystem::temp_directory_path() / "fil-elf-tests", error);
 }
 
 } // namespace

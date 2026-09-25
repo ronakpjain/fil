@@ -89,8 +89,7 @@ struct SpiConfig {
 /**
  * @brief Validated configuration for one emulated board instance.
  *
- * Paths are absolute and lexically normalized after loading. Device-specific
- * configuration will be added as peripheral models are implemented.
+ * Paths are absolute and lexically normalized after loading.
  */
 struct BoardConfig {
     std::uint32_t schema_version{current_schema_version}; ///< Input schema version.

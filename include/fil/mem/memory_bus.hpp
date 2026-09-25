@@ -197,7 +197,7 @@ public:
     );
 
     /**
-     * @brief Copies bytes into RAM or ROM without applying CPU write permissions.
+     * @brief Copies bytes into RAM, ROM, or flash without applying CPU write permissions.
      * @param address First target address.
      * @param bytes Source bytes.
      * @return Success or a map/range error.

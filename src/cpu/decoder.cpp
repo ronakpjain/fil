@@ -426,20 +426,12 @@ struct ExpandedImmediate {
     std::uint16_t second
 );
 
-[[nodiscard]] std::optional<DecodedInstruction> decodeDataProcessingImmediate(
-    const std::uint16_t first,
-    const std::uint16_t second
-) {
-    const auto opcode = static_cast<std::uint8_t>((first >> 5U) & 0x0fU);
-    const bool set_flags = (first & 0x0010U) != 0U;
-    const auto rn = static_cast<std::uint8_t>(first & 0x0fU);
-    const auto rd = static_cast<std::uint8_t>((second >> 8U) & 0x0fU);
-    const std::uint16_t imm12 = static_cast<std::uint16_t>(
-        ((first & 0x0400U) << 1U) | ((second & 0x7000U) >> 4U) | (second & 0x00ffU)
-    );
-    const auto expanded = thumbExpandImmediate(imm12);
-    if (!expanded) return std::nullopt;
-
+[[nodiscard]] std::optional<InstrKind> normalizeDataProcessingOperation(
+    const std::uint8_t opcode,
+    const bool set_flags,
+    const std::uint8_t rn,
+    const std::uint8_t rd
+) noexcept {
     InstrKind kind = InstrKind::undefined;
     switch (opcode) {
     case 0U: kind = InstrKind::and_; break;
@@ -473,8 +465,27 @@ struct ExpandedImmediate {
     if (rn == 15U && kind != InstrKind::mov && kind != InstrKind::mvn) {
         return std::nullopt;
     }
+    return kind;
+}
 
-    auto result = base32(first, second, kind, OperandForm::immediate);
+[[nodiscard]] std::optional<DecodedInstruction> decodeDataProcessingImmediate(
+    const std::uint16_t first,
+    const std::uint16_t second
+) {
+    const auto opcode = static_cast<std::uint8_t>((first >> 5U) & 0x0fU);
+    const bool set_flags = (first & 0x0010U) != 0U;
+    const auto rn = static_cast<std::uint8_t>(first & 0x0fU);
+    const auto rd = static_cast<std::uint8_t>((second >> 8U) & 0x0fU);
+    const std::uint16_t imm12 = static_cast<std::uint16_t>(
+        ((first & 0x0400U) << 1U) | ((second & 0x7000U) >> 4U) | (second & 0x00ffU)
+    );
+    const auto expanded = thumbExpandImmediate(imm12);
+    if (!expanded) return std::nullopt;
+
+    const auto kind = normalizeDataProcessingOperation(opcode, set_flags, rn, rd);
+    if (!kind) return std::nullopt;
+
+    auto result = base32(first, second, *kind, OperandForm::immediate);
     result.rd = rd;
     result.rn = rn;
     result.imm = expanded->value;
@@ -498,41 +509,10 @@ struct ExpandedImmediate {
         ((second >> 10U) & 0x1cU) | ((second >> 6U) & 0x3U)
     );
 
-    InstrKind kind = InstrKind::undefined;
-    switch (opcode) {
-    case 0U: kind = InstrKind::and_; break;
-    case 1U: kind = InstrKind::bic; break;
-    case 2U: kind = InstrKind::orr; break;
-    case 3U: kind = InstrKind::orn; break;
-    case 4U: kind = InstrKind::eor; break;
-    case 8U: kind = InstrKind::add; break;
-    case 10U: kind = InstrKind::adc; break;
-    case 11U: kind = InstrKind::sbc; break;
-    case 13U: kind = InstrKind::sub; break;
-    case 14U: kind = InstrKind::rsb; break;
-    default: return std::nullopt;
-    }
+    const auto kind = normalizeDataProcessingOperation(opcode, set_flags, rn, rd);
+    if (!kind || rm == 15U) return std::nullopt;
 
-    if (set_flags && rd == 15U) {
-        if (kind == InstrKind::and_) kind = InstrKind::tst;
-        else if (kind == InstrKind::add) kind = InstrKind::cmn;
-        else if (kind == InstrKind::sub) kind = InstrKind::cmp;
-        else return std::nullopt;
-    } else if (rn == 15U) {
-        if (kind == InstrKind::orr) kind = InstrKind::mov;
-        else if (kind == InstrKind::orn) kind = InstrKind::mvn;
-        else return std::nullopt;
-    }
-
-    if (rm == 15U || (rd == 15U && kind != InstrKind::tst && kind != InstrKind::cmp
-        && kind != InstrKind::cmn)) {
-        return std::nullopt;
-    }
-    if (rn == 15U && kind != InstrKind::mov && kind != InstrKind::mvn) {
-        return std::nullopt;
-    }
-
-    auto result = base32(first, second, kind, OperandForm::register_value);
+    auto result = base32(first, second, *kind, OperandForm::register_value);
     result.rd = rd;
     result.rn = rn;
     result.rm = rm;

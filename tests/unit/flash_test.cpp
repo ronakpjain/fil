@@ -82,7 +82,6 @@ TEST(FlashPeripheralTest, ErasesSelectedPageThroughMappedBacking) {
     fil::stm32g4::FlashPeripheral flash;
     attachEraseToMemory(flash, memory, 0x08000000U, 4096U, 16U * 1024U);
 
-    // Program page 0, 1, and 2 with distinct words.
     ASSERT_TRUE(memory.write32(0x08000000U, 0x11111111U).hasValue());
     ASSERT_TRUE(memory.write32(0x08001000U, 0x22222222U).hasValue());
     ASSERT_TRUE(memory.write32(0x08002000U, 0x33333333U).hasValue());
@@ -172,7 +171,6 @@ TEST(FlashIntegrationTest, RoutesEraseThroughStm32G4) {
         << "maps a full-size STM32G474 flash";
     mcu.value()->attachMemory(memory);
 
-    // Unlock FLASH through the routed KEYR.
     EXPECT_TRUE(
         mcu.value()->router()
             .write(0x00022008U, fil::mem::AccessSize::word, 0x45670123U, write_context)
@@ -182,7 +180,6 @@ TEST(FlashIntegrationTest, RoutesEraseThroughStm32G4) {
             .write(0x00022008U, fil::mem::AccessSize::word, 0xcdef89abU, write_context)
             .hasValue());
 
-    // Program and erase page 0 through the routed FLASH_CR.
     ASSERT_TRUE(memory.write32(0x08000000U, 0x5a5a5a5aU).hasValue());
     constexpr std::uint32_t per = 1U << 1U;
     constexpr std::uint32_t strt = 1U << 16U;

@@ -473,14 +473,12 @@ ExitCode runBoardCommand(
     options.enable_loop_batching = enable_loop_batching;
     options.stop_address = stop_address;
     if (stop_symbol) {
-        const elf::ElfSymbol* match = nullptr;
-        for (const auto& symbol : board.value()->image().symbols()) {
-            if (symbol.name == *stop_symbol) {
-                match = &symbol;
-                break;
-            }
-        }
-        if (match == nullptr) {
+        const auto& symbols = board.value()->image().symbols();
+        const auto match = std::find_if(
+            symbols.begin(), symbols.end(),
+            [&](const elf::ElfSymbol& symbol) { return symbol.name == *stop_symbol; }
+        );
+        if (match == symbols.end()) {
             err << "fil: symbol not found: " << *stop_symbol << '\n';
             return ExitCode::usage_error;
         }

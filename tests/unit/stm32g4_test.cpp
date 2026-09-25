@@ -1,6 +1,8 @@
 #include "fil/cortexm/system_control.hpp"
 #include "fil/stm32g4/stm32g4.hpp"
 
+#include "../fixture_support.hpp"
+
 #include <gtest/gtest.h>
 
 #include <filesystem>
@@ -213,7 +215,8 @@ TEST(Stm32G4Test, RoutesIntegratedPeripherals) {
 
     fil::config::BoardConfig board;
     board.gpio.push_back({"PB7", "output", false, true});
-    const auto uart_log = std::filesystem::temp_directory_path() / "fil-stm32g4-uart.bin";
+    fil::test::TemporaryDirectory directory{"fil-stm32g4-uart"};
+    const auto uart_log = directory.root() / "uart.bin";
     board.usart.push_back({"USART1", uart_log, {0x42U}});
     board.spi.push_back({"SPI1", "echo"});
     EXPECT_TRUE(mcu.value()->configure(board).hasValue()) << "applies board device configuration";
@@ -227,8 +230,6 @@ TEST(Stm32G4Test, RoutesIntegratedPeripherals) {
     std::ifstream uart_input(uart_log, std::ios::binary);
     const int logged_byte = uart_input.get();
     EXPECT_TRUE(uart_write && logged_byte == 0x5a) << "writes configured USART TX byte log";
-    std::error_code remove_error;
-    std::filesystem::remove(uart_log, remove_error);
     auto fdcan_read = mcu.value()->router().read(
         fil::stm32g4::FdcanPeripheral::baseAddresses[0] - 0x40000000U +
             fil::stm32g4::FdcanPeripheral::cccrOffset,
