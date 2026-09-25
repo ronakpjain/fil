@@ -142,6 +142,11 @@ private:
         std::uint64_t observation_revision{0};
         mem::MemoryBus::ReadFootprint read_footprint{};
         bool read_footprint_complete{false};
+        // Real-timing proof inputs: batching multiplies a measured
+        // cycles_per_iteration, so a clock or FLASH_ACR change must fail
+        // the proof closed rather than replay stale cycle counts.
+        std::uint64_t clock_hz{0};
+        std::uint64_t flash_acr_generation{0};
     };
 
     struct LoopSkip {
@@ -159,6 +164,8 @@ private:
         mem::MemoryBus::SideEffectCheckpoint side_effect_checkpoint{};
         std::uint64_t instructions{0};
         std::uint64_t cycles{0};
+        std::uint64_t clock_hz{0};
+        std::uint64_t flash_acr_generation{0};
     };
 
     Board(
@@ -171,8 +178,42 @@ private:
     [[nodiscard]] Result<void> initialize(bool strict_mmio);
     [[nodiscard]] SimTimeNs accountCycles(std::uint64_t cycles);
     [[nodiscard]] SimTimeNs advanceTime(std::uint64_t cycles);
+    /**
+     * @brief Steps once and adds the simplified-ART flash fetch stall.
+     *
+     * The CPU returns pipeline cycles (variable per DDI0439C class);
+     * this wrapper adds 0-LATENCY flash stall cycles based on whether the
+     * fetch address is sequential to the previous fetch and on the cached
+     * FLASH_ACR prefetch/cache enables. The stall is folded into
+     * `result.cycles` so instruction counters, loop batching, and the
+     * world scheduler all observe final cycle counts. Clock/ACR values are
+     * cached with generation checks to keep the per-instruction overhead
+     * to a few loads and compares.
+     */
+    [[nodiscard]] cpu::FastStepResult stepWithFetchTiming();
     /** Executes one instruction and accrues board-local cycles without moving shared time. */
     [[nodiscard]] ConcurrentStepResult beginConcurrentStep(bool trace_instructions);
+    /** @brief Exact next-instruction cost inputs for the burst gate. */
+    struct PredictedCost {
+        std::uint64_t cycles{0};    ///< Pipeline + ART flash stall cycles.
+        std::uint64_t frequency{0}; ///< Current SYSCLK Hz.
+        std::uint64_t fraction{0};  ///< Fractional-ns accumulator.
+    };
+
+    /**
+     * @brief Exact predicted next-instruction cost, if knowable.
+     *
+     * Used by the world lockstep-burst gate: unlike
+     * `nextInstructionElapsedNs()` (a 1-cycle minimum for deadline fits),
+     * this forecasts the real cost (pipeline class + exact ART flash stall
+     * from live ACR and fetch sequencing). Returns nullopt for
+     * memory-loaded targets, decode-cache misses, or fault states, in
+     * which case the burst fails closed to the exact general scheduler.
+     * Predictions are exact, so no post-step rollback is ever required.
+     * The gate compares frequencies and time numerators across lanes and
+     * performs a single ns division per burst round.
+     */
+    [[nodiscard]] std::optional<PredictedCost> peekPredictedCost() const noexcept;
     /** Applies exception/reset effects due at the just-completed instruction boundary. */
     [[nodiscard]] bool boundaryWorkPending() const noexcept;
     [[nodiscard]] std::optional<BoundaryStop> settleInstructionBoundary();
@@ -221,6 +262,14 @@ private:
     std::array<LoopObservation, 256> loop_observations_{};
     std::uint64_t loop_observation_generation_{1U};
     std::optional<std::uint32_t> read_footprint_boundary_;
+    // Cached real-timing inputs (clock + flash ACR) with fetch-sequencing
+    // for the simplified ART model. Refreshed on change, not per reset.
+    std::uint64_t cached_clock_hz_{0};
+    std::uint64_t cached_flash_acr_generation_{0};
+    std::uint32_t cached_flash_ws_{0};
+    bool cached_flash_art_hit_capable_{false};
+    std::uint32_t last_fetch_end_{0};
+    bool have_last_fetch_{false};
 };
 
 /** @brief Stable lowercase stop-reason name for CLI/trace output. */

@@ -447,7 +447,11 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
             std::optional<Board::ProvenLoop> observed_loop;
             // Keep this cheap gate at the hot call site. observeLoopBoundary()
             // repeats it as a defensive check for less frequent callers.
-            if (!completed.cpu_result.suppress_loop_observation
+            // Proof work is skipped when neither batching nor spin
+            // detection can consume it (also keeps no-batch lockstep
+            // bursts firing instead of latching lanes "proven").
+            if ((options.enable_loop_batching || options.detect_spin)
+                && !completed.cpu_result.suppress_loop_observation
                 && board.cpu().state().r[15]
                     <= completed.cpu_result.instruction_address) {
                 observed_loop = board.observeLoopBoundary(
@@ -537,15 +541,30 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
             ++output.lockstep_bursts;
             for (; completed_rounds < 64U; ++completed_rounds) {
                 const SimTimeNs round_start = event_loop_.now();
-                const SimTimeNs elapsed = lane_boards.front()->nextInstructionElapsedNs();
-                if (elapsed == 0U
-                    || (deadline != 0U && elapsed > deadline - round_start)) break;
+                // Variable-CPI prediction: every lane forecasts its exact
+                // next-instruction cost (pipeline class + ART flash stall).
+                // Any unpredictable lane or divergent cost falls back to
+                // the exact general scheduler. Lanes are compared on clock
+                // frequency and time numerators so the gate performs one ns
+                // division per round instead of one per lane; mixed-clock
+                // lanes use the general scheduler. Predictions are exact,
+                // so no post-step rollback is needed.
+                const auto first_cost = lane_boards.front()->peekPredictedCost();
+                if (!first_cost || first_cost->frequency == 0U) break;
+                const std::uint64_t numerator = first_cost->cycles
+                        * 1'000'000'000ULL + first_cost->fraction;
                 bool same_elapsed = true;
                 for (std::size_t index = 1; index < boards_.size(); ++index) {
-                    same_elapsed = same_elapsed
-                        && lane_boards[index]->nextInstructionElapsedNs() == elapsed;
+                    const auto other = lane_boards[index]->peekPredictedCost();
+                    same_elapsed = same_elapsed && other
+                        && other->frequency == first_cost->frequency
+                        && other->cycles * 1'000'000'000ULL + other->fraction
+                            == numerator;
                 }
                 if (!same_elapsed) break;
+                const SimTimeNs elapsed = numerator / first_cost->frequency;
+                if (elapsed == 0U
+                    || (deadline != 0U && elapsed > deadline - round_start)) break;
 
                 for (std::size_t index = 0; index < boards_.size(); ++index) {
                     auto owner_scope = event_loop_.useOwner(static_cast<EventOwner>(index));
@@ -628,7 +647,10 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
 
                     std::optional<Board::ProvenLoop> observed;
                     // Avoid entering the proof machinery for ordinary forward flow.
-                    if (!step.suppress_loop_observation
+                    // Skipped entirely when batching is off so no-batch bursts
+                    // keep firing instead of latching lanes "proven".
+                    if (options.enable_loop_batching
+                        && !step.suppress_loop_observation
                         && board.cpu().state().r[15] <= step.instruction_address) {
                         observed = board.observeLoopBoundary(
                             step, board_output.result.instructions,

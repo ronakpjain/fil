@@ -34,6 +34,12 @@ struct Board::TransactionCheckpoint {
     std::uint64_t loop_observation_generation{1U};
     std::optional<std::uint32_t> read_footprint_boundary;
     mem::MemoryBus::ReadFootprint read_footprint;
+    std::uint64_t cached_clock_hz{0};
+    std::uint64_t cached_flash_acr_generation{0};
+    std::uint32_t cached_flash_ws{0};
+    bool cached_flash_art_hit_capable{false};
+    std::uint32_t last_fetch_end{0};
+    bool have_last_fetch{false};
 };
 
 bool BoardRunResult::succeeded() const noexcept {
@@ -119,16 +125,76 @@ Result<void> Board::reset() {
     loop_observation_generation_ = 1U;
     read_footprint_boundary_.reset();
     static_cast<void>(memory_.takeReadFootprint());
+    cached_clock_hz_ = peripherals_->rcc().systemClockHz();
+    cached_flash_acr_generation_ = peripherals_->flash().acrGeneration();
+    cached_flash_ws_ = peripherals_->flash().waitStates();
+    cached_flash_art_hit_capable_ = peripherals_->flash().prefetchEnabled()
+        || peripherals_->flash().instructionCacheEnabled();
+    have_last_fetch_ = false;
+    last_fetch_end_ = 0U;
     return {};
 }
 
 SimTimeNs Board::accountCycles(const std::uint64_t cycles) {
     system_->advanceCycles(cycles);
+    // Cached-clock fast path: the RCC value changes only on firmware clock
+    // writes, so the common case is one inline load plus one compare.
+    // The 64-bit divide stays exact (fractional-ns remainder preserved).
     const std::uint64_t frequency = peripherals_->rcc().systemClockHz();
+    if (frequency != cached_clock_hz_) {
+        cached_clock_hz_ = frequency;
+        invalidateLoopObservations();
+    }
     const std::uint64_t numerator = cycles * nanoseconds_per_second + time_fraction_;
     const SimTimeNs elapsed = frequency == 0 ? 0 : numerator / frequency;
     time_fraction_ = frequency == 0 ? 0 : numerator % frequency;
     return elapsed;
+}
+
+cpu::FastStepResult Board::stepWithFetchTiming() {
+    auto result = cpu_->stepFast();
+    if (result.instructions == 0U || result.instruction_size == 0U) return result;
+    const auto& flash = peripherals_->flash();
+    const std::uint64_t generation = flash.acrGeneration();
+    if (generation != cached_flash_acr_generation_) {
+        cached_flash_acr_generation_ = generation;
+        cached_flash_ws_ = flash.waitStates();
+        cached_flash_art_hit_capable_ = flash.prefetchEnabled()
+            || flash.instructionCacheEnabled();
+        invalidateLoopObservations();
+    }
+    if (cached_flash_ws_ == 0U) {
+        last_fetch_end_ = result.instruction_address + result.instruction_size;
+        have_last_fetch_ = true;
+        return result;
+    }
+    const bool sequential = have_last_fetch_
+        && result.instruction_address == last_fetch_end_;
+    last_fetch_end_ = result.instruction_address + result.instruction_size;
+    have_last_fetch_ = true;
+    if (sequential && cached_flash_art_hit_capable_) return result;
+    // Range check covers flash bank + boot alias; SRAM/ROM fetches skip.
+    const std::uint32_t stall = flash.fetchStallCycles(
+        result.instruction_address, sequential
+    );
+    result.cycles = static_cast<std::uint16_t>(result.cycles + stall);
+    return result;
+}
+
+std::optional<Board::PredictedCost> Board::peekPredictedCost() const noexcept {
+    const std::uint64_t frequency = peripherals_->rcc().systemClockHz();
+    if (frequency == 0U) return std::nullopt;
+    std::uint16_t pipeline = 0U;
+    if (!cpu_->peekPredictableCycles(pipeline)) return std::nullopt;
+    const auto& flash = peripherals_->flash();
+    const std::uint32_t pc = cpu_->state().r[15];
+    const bool sequential = have_last_fetch_ && pc == last_fetch_end_;
+    PredictedCost cost;
+    cost.cycles = static_cast<std::uint64_t>(pipeline)
+        + flash.fetchStallCycles(pc, sequential);
+    cost.frequency = frequency;
+    cost.fraction = time_fraction_;
+    return cost;
 }
 
 SimTimeNs Board::advanceTime(const std::uint64_t cycles) {
@@ -141,7 +207,7 @@ SimTimeNs Board::advanceTime(const std::uint64_t cycles) {
 }
 
 Board::ConcurrentStepResult Board::beginConcurrentStep(const bool trace_instructions) {
-    auto result = cpu_->stepFast();
+    auto result = stepWithFetchTiming();
     if (trace_instructions) {
         trace_->record(
             event_loop_->now(), config_.name, "instr",
@@ -238,9 +304,13 @@ std::optional<Board::ProvenLoop> Board::observeLoopBoundary(
         && *read_footprint_boundary_ == boundary_pc;
     read_footprint_boundary_ = boundary_pc;
     const auto checkpoint = memory_.sideEffectCheckpoint();
+    const std::uint64_t clock_hz = peripherals_->rcc().systemClockHz();
+    const std::uint64_t flash_generation = peripherals_->flash().acrGeneration();
     if (observation.valid
         && observation.generation == loop_observation_generation_
         && observation.boundary_pc == boundary_pc
+        && observation.clock_hz == clock_hz
+        && observation.flash_acr_generation == flash_generation
         && cpu::bitwiseEqual(observation.state, cpu_->state())
         && memory_.sideEffectsRestoredSince(observation.side_effect_checkpoint)
         && logical_instructions > observation.instructions
@@ -254,6 +324,8 @@ std::optional<Board::ProvenLoop> Board::observeLoopBoundary(
             observation.revision,
             read_footprint,
             read_footprint_complete,
+            clock_hz,
+            flash_generation,
         };
         observation.instructions = logical_instructions;
         observation.cycles = logical_cycles;
@@ -270,6 +342,8 @@ std::optional<Board::ProvenLoop> Board::observeLoopBoundary(
     observation.side_effect_checkpoint = checkpoint;
     observation.instructions = logical_instructions;
     observation.cycles = logical_cycles;
+    observation.clock_hz = clock_hz;
+    observation.flash_acr_generation = flash_generation;
     return std::nullopt;
 }
 
@@ -282,6 +356,10 @@ bool Board::loopProofStillValid(const ProvenLoop& loop) const noexcept {
         && observation.generation == loop_observation_generation_
         && observation.revision == loop.observation_revision
         && observation.boundary_pc == loop.boundary_pc
+        && observation.clock_hz == peripherals_->rcc().systemClockHz()
+        && observation.flash_acr_generation == peripherals_->flash().acrGeneration()
+        && loop.clock_hz == peripherals_->rcc().systemClockHz()
+        && loop.flash_acr_generation == peripherals_->flash().acrGeneration()
         && cpu::bitwiseEqual(cpu_->state(), observation.state)
         && (loop.read_footprint_complete
             ? memory_.sideEffectsCompatibleSince(
@@ -384,6 +462,12 @@ Board::LoopSkip Board::applyLoopIterations(
     return skip;
 }
 
+// Outlined: the generation-wrap path value-initializes a ~90 KiB
+// observation table. Inlining it reserves that frame (and a chkstk probe)
+// in every hot caller (step/accounting); the wrap itself is near-impossible.
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((noinline))
+#endif
 void Board::invalidateLoopObservations() noexcept {
     ++loop_observation_generation_;
     read_footprint_boundary_.reset();
@@ -408,6 +492,8 @@ void Board::refreshLoopObservation(
     observation.side_effect_checkpoint = memory_.sideEffectCheckpoint();
     observation.instructions = logical_instructions;
     observation.cycles = logical_cycles;
+    observation.clock_hz = peripherals_->rcc().systemClockHz();
+    observation.flash_acr_generation = peripherals_->flash().acrGeneration();
 }
 
 BoardRunResult Board::cpuFailure(const cpu::FastStepResult& result) const {
@@ -460,6 +546,12 @@ Board::TransactionCheckpointPtr Board::captureTransaction(
     checkpoint->loop_observation_generation = loop_observation_generation_;
     checkpoint->read_footprint_boundary = read_footprint_boundary_;
     checkpoint->read_footprint = memory_.readFootprint();
+    checkpoint->cached_clock_hz = cached_clock_hz_;
+    checkpoint->cached_flash_acr_generation = cached_flash_acr_generation_;
+    checkpoint->cached_flash_ws = cached_flash_ws_;
+    checkpoint->cached_flash_art_hit_capable = cached_flash_art_hit_capable_;
+    checkpoint->last_fetch_end = last_fetch_end_;
+    checkpoint->have_last_fetch = have_last_fetch_;
     return checkpoint;
 }
 
@@ -480,6 +572,12 @@ bool Board::restoreTransaction(const TransactionCheckpointPtr& checkpoint) {
     loop_observation_generation_ = checkpoint->loop_observation_generation;
     read_footprint_boundary_ = checkpoint->read_footprint_boundary;
     memory_.restoreReadFootprint(checkpoint->read_footprint);
+    cached_clock_hz_ = checkpoint->cached_clock_hz;
+    cached_flash_acr_generation_ = checkpoint->cached_flash_acr_generation;
+    cached_flash_ws_ = checkpoint->cached_flash_ws;
+    cached_flash_art_hit_capable_ = checkpoint->cached_flash_art_hit_capable;
+    last_fetch_end_ = checkpoint->last_fetch_end;
+    have_last_fetch_ = checkpoint->have_last_fetch;
     return true;
 }
 
@@ -542,7 +640,7 @@ BoardRunResult Board::runWorkerSlice(
             break;
         }
 
-        const cpu::FastStepResult result = cpu_->stepFast();
+        const cpu::FastStepResult result = stepWithFetchTiming();
         aggregate.diagnostic.instruction_address = result.instruction_address;
         aggregate.diagnostic.raw = result.raw;
         aggregate.diagnostic.instruction_size = result.instruction_size;
@@ -581,9 +679,14 @@ BoardRunResult Board::runWorkerSlice(
             break;
         }
 
-        const auto loop = observeLoopBoundary(
-            result, aggregate.instructions, aggregate.cycles
-        );
+        // Proof work (memcmp of full CPU state, footprint, checkpoint) is
+        // skipped when loop batching is off: nothing consumes the proof.
+        std::optional<ProvenLoop> loop;
+        if (enable_loop_batching) {
+            loop = observeLoopBoundary(
+                result, aggregate.instructions, aggregate.cycles
+            );
+        }
         if (!enable_loop_batching || !loop) continue;
         std::optional<SimTimeNs> horizon = deadline_ns;
         if (const auto local_event = event_loop_->nextScheduledTime(owner);
@@ -641,7 +744,7 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
             aggregate.message = "simulated-time budget exhausted";
             break;
         }
-        auto result = cpu_->stepFast();
+        auto result = stepWithFetchTiming();
         aggregate.instructions += result.instructions;
         aggregate.cycles += result.cycles;
         aggregate.diagnostic.instruction_address = result.instruction_address;
@@ -667,7 +770,17 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
             break;
         }
 
-        const auto loop = observeLoopBoundary(result, aggregate.instructions, aggregate.cycles);
+        // Proof work is skipped unless spin detection or usable batching
+        // needs it: with tracing on, batching is disabled, and without
+        // spin detection nothing consumes the proof.
+        const bool need_proof = options.detect_spin
+            || (options.enable_loop_batching && !options.trace_instructions);
+        std::optional<ProvenLoop> loop;
+        if (need_proof) {
+            loop = observeLoopBoundary(
+                result, aggregate.instructions, aggregate.cycles
+            );
+        }
         if (!loop) continue;
         if (proven_spin_pc && *proven_spin_pc == loop->boundary_pc) {
             proven_spin_instructions += loop->instructions_per_iteration;
