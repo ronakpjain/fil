@@ -138,7 +138,9 @@ struct FastStepResult {
     std::uint32_t raw{0};
     std::uint8_t instruction_size{0};
     std::uint8_t instructions{0};
-    std::uint8_t cycles{0};
+    // Widened from 8 to 16 bits: realistic pipeline + flash-stall totals
+    // reach ~21 cycles (e.g. 16-register LDM to PC with wait states).
+    std::uint16_t cycles{0};
     bool suppress_loop_observation{false};
 };
 
@@ -174,6 +176,18 @@ public:
     /** @brief Copies current architectural state into a diagnostic snapshot. */
     void captureDiagnostic(DiagnosticSnapshot& diagnostic) const;
 
+    /**
+     * @brief Peeks the exact pipeline cycles of the current instruction.
+     *
+     * Succeeds only on a decode-cache hit for a non-control-flow form
+     * (no possible PC discontinuity): callers get the same base cost the
+     * stepper will charge, including data-dependent DIV and failed-
+     * condition short-circuiting. Control flow, cache misses, and fault
+     * paths return false so burst prediction fails closed to the exact
+     * general scheduler.
+     */
+    [[nodiscard]] bool peekPredictableCycles(std::uint16_t& cycles_out) const noexcept;
+
     /** @brief Executes until budget exhaustion, breakpoint, halt, or a fault. */
     [[nodiscard]] RunResult run(std::uint64_t instruction_budget);
 
@@ -184,6 +198,12 @@ private:
         std::uint32_t raw{0};
         DecodedInstruction decoded{};
         std::uint8_t size{0};
+        // Hot-path cycle cost, memoized at decode time so stepping and
+        // burst prediction pay one load instead of a ~90-case switch.
+        // Divide forms are data-dependent: divide_form marks entries whose
+        // cost is resolved live via divideCycles().
+        std::uint16_t base_cycles{1};
+        bool divide_form{false};
     };
 
     static constexpr std::size_t instruction_cache_entries = 16384U;

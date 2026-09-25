@@ -165,6 +165,101 @@ std::uint8_t advanceItState(const std::uint8_t it_state) noexcept {
     return static_cast<std::uint8_t>((widened & 0xe0U) | ((widened << 1U) & 0x1fU));
 }
 
+std::uint16_t divideCycles(const std::uint32_t divisor) noexcept {
+    if (divisor == 0U) return 2U;
+    const auto leading = static_cast<std::uint32_t>(std::countl_zero(divisor));
+    return static_cast<std::uint16_t>(12U - (leading * 10U) / 32U);
+}
+
+std::uint16_t takenBranchPenalty(const InstrKind kind) noexcept {
+    switch (kind) {
+    case InstrKind::cbz:
+    case InstrKind::cbnz:
+        return 1U;
+    default:
+        return 2U;
+    }
+}
+
+std::uint16_t basePipelineCycles(const DecodedInstruction& instruction) noexcept {
+    switch (instruction.kind) {
+    case InstrKind::undefined:
+    case InstrKind::bkpt:
+        return 1U;
+    case InstrKind::mul:
+        return 1U;
+    case InstrKind::mla:
+    case InstrKind::mls:
+        return 2U;
+    case InstrKind::umull:
+    case InstrKind::smull:
+        return 5U;
+    case InstrKind::udiv:
+    case InstrKind::sdiv:
+        // Data-dependent part is resolved by the stepper from the live
+        // divisor operand; the table value is only a fallback.
+        return 7U;
+    case InstrKind::ldr:
+    case InstrKind::str:
+    case InstrKind::ldrb:
+    case InstrKind::strb:
+    case InstrKind::ldrh:
+    case InstrKind::strh:
+    case InstrKind::ldrsb:
+    case InstrKind::ldrsh:
+        return 2U;
+    case InstrKind::ldrd:
+    case InstrKind::strd:
+        return 3U;
+    case InstrKind::ldm:
+    case InstrKind::stm:
+    case InstrKind::push:
+    case InstrKind::pop:
+        return static_cast<std::uint16_t>(
+            1U + static_cast<unsigned int>(std::popcount(instruction.register_list))
+        );
+    case InstrKind::b:
+    case InstrKind::bl:
+    case InstrKind::blx:
+    case InstrKind::bx:
+        // Base covers fetch/decode/link; the taken-path refill (+2) is
+        // added by the stepper when the PC proves discontinuous.
+        return 2U;
+    case InstrKind::cbz:
+    case InstrKind::cbnz:
+        return 1U;
+    case InstrKind::mrs:
+    case InstrKind::msr:
+    case InstrKind::svc:
+    case InstrKind::dmb:
+    case InstrKind::dsb:
+    case InstrKind::isb:
+        return 2U;
+    case InstrKind::vdiv:
+    case InstrKind::vsqrt:
+        return 14U;
+    case InstrKind::vfma:
+    case InstrKind::vfms:
+    case InstrKind::vfnms:
+        return 3U;
+    case InstrKind::vcvt_f32_s32:
+    case InstrKind::vcvt_f32_u32:
+    case InstrKind::vcvt_s32_f32:
+    case InstrKind::vcvt_u32_f32:
+    case InstrKind::vmrs:
+    case InstrKind::vldr:
+    case InstrKind::vstr:
+        return 2U;
+    case InstrKind::vldm:
+    case InstrKind::vstm:
+        return static_cast<std::uint16_t>(
+            1U + static_cast<unsigned int>(std::popcount(instruction.register_list))
+        );
+    default:
+        return 1U;
+    }
+}
+
 StopReason CortexM4::execute(
     const DecodedInstruction& instruction,
     DiagnosticSnapshot& diagnostic

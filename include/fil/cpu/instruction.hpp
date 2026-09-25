@@ -241,4 +241,31 @@ struct ShiftResult {
 /** @brief Advances the compact architectural IT state by one instruction. */
 [[nodiscard]] std::uint8_t advanceItState(std::uint8_t it_state) noexcept;
 
+/**
+ * @brief Base Cortex-M4 pipeline cycles for one decoded instruction.
+ *
+ * Models the ARM DDI0439C 3-stage pipeline without flash fetch stalls or
+ * taken-branch refill (added separately). Multi-register forms scale with
+ * the register-list population count; UDIV/SDIV use `divideCycles()`.
+ * Condition-failed instructions always retire for 1 cycle; the caller
+ * handles that case before consulting this table.
+ */
+[[nodiscard]] std::uint16_t basePipelineCycles(const DecodedInstruction& instruction) noexcept;
+
+/**
+ * @brief Extra pipeline-refill cycles when the program counter is
+ * discontinuous after the instruction (taken branch, call, return to PC).
+ *
+ * Uniformly +2, except CBZ/CBNZ which pay +1 on the taken path, matching
+ * the DDI0439C taken-branch refill within one cycle. Returns 0 when the
+ * instruction retired sequentially (no refill).
+ */
+[[nodiscard]] std::uint16_t takenBranchPenalty(InstrKind kind) noexcept;
+
+/**
+ * @brief Data-dependent UDIV/SDIV timing: 2 for a zero divisor, otherwise
+ * `12 - clz(divisor) * 10 / 32` (3-12 cycles), modelling early termination.
+ */
+[[nodiscard]] std::uint16_t divideCycles(std::uint32_t divisor) noexcept;
+
 } // namespace fil::cpu

@@ -8,6 +8,7 @@
 #include <cstring>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <sstream>
 
 namespace fil::cpu {
@@ -277,6 +278,12 @@ FastStepResult CortexM4::stepFast() {
         cache.raw = result.raw;
         cache.decoded = *newly_decoded;
         cache.size = instruction_size;
+        // Memoize the static pipeline cost once per decode; divide forms
+        // resolve data-dependently on the hot path via divide_form.
+        cache.divide_form = newly_decoded->kind == InstrKind::udiv
+            || newly_decoded->kind == InstrKind::sdiv;
+        cache.base_cycles = cache.divide_form
+            ? 7U : basePipelineCycles(*newly_decoded);
         decoded = &cache.decoded;
     }
     result.instruction_size = instruction_size;
@@ -290,14 +297,31 @@ FastStepResult CortexM4::stepFast() {
             && decoded->rd == 15U && decoded->rm == 14U)
         || stack_return;
 
-    std::optional<CpuState> restart_state;
-    if (memory_.mmioTrapping()) restart_state = state_;
+    // Memoized base cost (one load) sampled before execute() mutates
+    // architectural state. Only DIV reads a live operand; every other form
+    // uses the decode-time table value.
+    const bool condition_passed = conditionPasses(
+        decoded->kind == InstrKind::it
+            ? Condition::al
+            : inItBlock(state_.it_state)
+                ? currentItCondition(state_.it_state)
+                : decoded->condition,
+        state_.xpsr
+    );
+    std::uint16_t base_cycles = 1U;
+    if (condition_passed) [[likely]] {
+        base_cycles = cache.divide_form
+            ? divideCycles(state_.readRegister(decoded->rm))
+            : cache.base_cycles;
+    }
+
+    // Heap-boxed: a 250-byte optional here triggers per-instruction stack
+    // probes (chkstk) in the hot frame; the trapping path is cold/rare.
+    std::unique_ptr<CpuState> restart_state;
+    if (memory_.mmioTrapping()) restart_state = std::make_unique<CpuState>(state_);
     state_.instruction_address = pc;
     state_.r[15] = pc + instruction_size;
     const bool was_in_it = inItBlock(state_.it_state);
-    const Condition effective_condition = decoded->kind == InstrKind::it
-        ? Condition::al
-        : was_in_it ? currentItCondition(state_.it_state) : decoded->condition;
     std::optional<DecodedInstruction> it_adjusted;
     if (was_in_it && decoded->set_flags && suppressImplicitFlagsInIt(decoded->kind)) {
         it_adjusted = *decoded;
@@ -306,14 +330,23 @@ FastStepResult CortexM4::stepFast() {
     }
 
     StopReason stop = StopReason::step_complete;
-    if (conditionPasses(effective_condition, state_.xpsr)) [[likely]] {
+    if (condition_passed) [[likely]] {
         stop = execute(*decoded, last_diagnostic_);
     }
     if (decoded->kind != InstrKind::it && was_in_it) state_.advanceIt();
 
     result.reason = stop;
     result.instructions = 1;
-    result.cycles = 1;
+    // Failed conditions retire for 1 cycle with no memory/branch effect.
+    // Taken control flow adds the DDI0439C pipeline refill when the PC
+    // proves discontinuous against the sequential fallthrough.
+    result.cycles = base_cycles;
+    if (condition_passed && stop == StopReason::step_complete
+        && state_.r[15] != pc + instruction_size) {
+        result.cycles = static_cast<std::uint16_t>(
+            result.cycles + takenBranchPenalty(decoded->kind)
+        );
+    }
     if (stop != StopReason::step_complete) [[unlikely]] {
         last_diagnostic_.instruction_address = pc;
         last_diagnostic_.raw = result.raw;
@@ -326,6 +359,100 @@ FastStepResult CortexM4::stepFast() {
         capture(last_diagnostic_);
     }
     return result;
+}
+
+bool CortexM4::peekPredictableCycles(std::uint16_t& cycles_out) const noexcept {
+    if (state_.halted) return false;
+    const std::uint32_t pc = state_.r[15];
+    if (!state_.thumb || (state_.xpsr & xpsr_t) == 0U || (pc & 1U) != 0U) return false;
+    const auto& cache = instruction_cache_[(pc >> 1U) & (instruction_cache_entries - 1U)];
+    if (cache.generation != memory_.executionGeneration() || cache.pc != pc) return false;
+    const DecodedInstruction& decoded = cache.decoded;
+    const std::uint8_t size = cache.size;
+    const std::uint32_t fallthrough = pc + size;
+    // Memory-loaded targets (LDR/MOV-to-PC, LDM/POP-to-PC) need execute-
+    // time knowledge (loaded value, fault behavior), so refuse. Direct
+    // branches evaluate exactly from pre-state below, replicating stepFast's
+    // `r15 != fallthrough` refill rule including pathological coincidences.
+    switch (decoded.kind) {
+    case InstrKind::mov:
+    case InstrKind::ldr:
+    case InstrKind::ldrb:
+    case InstrKind::ldrh:
+    case InstrKind::ldrsb:
+    case InstrKind::ldrsh:
+    case InstrKind::ldrd:
+        if (decoded.rd == 15U) return false;
+        break;
+    case InstrKind::ldm:
+    case InstrKind::pop:
+        if ((decoded.register_list & (std::uint16_t{1U} << 15U)) != 0U) return false;
+        break;
+    default:
+        break;
+    }
+    const bool was_in_it = inItBlock(state_.it_state);
+    const Condition effective = decoded.kind == InstrKind::it
+        ? Condition::al
+        : was_in_it ? currentItCondition(state_.it_state) : decoded.condition;
+    const bool cond_pass = conditionPasses(effective, state_.xpsr);
+    if (!cond_pass) {
+        cycles_out = 1U;
+        return true;
+    }
+    std::uint16_t base = 0U;
+    bool branch_taken = false;
+    bool exc_return = false;
+    switch (decoded.kind) {
+    case InstrKind::b:
+    case InstrKind::bl: {
+        const auto wide = static_cast<std::int64_t>(pc) + 4 + decoded.branch_offset;
+        const std::uint32_t target = static_cast<std::uint32_t>(wide) & ~std::uint32_t{1};
+        base = cache.base_cycles;
+        branch_taken = target != fallthrough;
+        break;
+    }
+    case InstrKind::bx:
+    case InstrKind::blx: {
+        const std::uint32_t target = state_.readRegister(decoded.rm);
+        if (decoded.kind == InstrKind::bx && isExceptionReturn(target)) {
+            exc_return = true;
+            base = cache.base_cycles;
+            break;
+        }
+        if ((target & 1U) == 0U) return false; // fault path needs the stepper
+        base = cache.base_cycles;
+        branch_taken = (target & ~std::uint32_t{1}) != fallthrough;
+        break;
+    }
+    case InstrKind::cbz:
+    case InstrKind::cbnz: {
+        const bool zero = state_.readRegister(decoded.rn) == 0U;
+        const bool take = decoded.kind == InstrKind::cbz ? zero : !zero;
+        base = cache.base_cycles;
+        branch_taken = take
+            && ((state_.architecturalPcForRead() + decoded.imm) & ~std::uint32_t{1})
+                != fallthrough;
+        break;
+    }
+    case InstrKind::udiv:
+    case InstrKind::sdiv:
+        cycles_out = divideCycles(state_.readRegister(cache.decoded.rm));
+        return true;
+    default:
+        base = cache.base_cycles;
+        break;
+    }
+    if (exc_return) {
+        // EXC_RETURN pseudo-branch: the stepper leaves the PC sequential
+        // and defers to the boundary handler, which breaks any burst.
+        cycles_out = base;
+        return true;
+    }
+    cycles_out = static_cast<std::uint16_t>(
+        base + (branch_taken ? takenBranchPenalty(decoded.kind) : 0U)
+    );
+    return true;
 }
 
 RunResult CortexM4::step() {
