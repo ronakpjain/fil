@@ -1,9 +1,10 @@
 #include "fil/cli/cli.hpp"
 
+#include "../fixture_support.hpp"
+
 #include <gtest/gtest.h>
 
 #include <filesystem>
-#include <fstream>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -66,23 +67,20 @@ TEST(SmokeTest, DisassemblesSyntheticWindow) {
     EXPECT_TRUE(err.str().empty()) << "successful disasm-window has no error output";
 }
 
-TEST(SmokeTest, RequiresExplicitBreakpointAcceptance) {
-    const std::filesystem::path config_path =
-        std::filesystem::temp_directory_path() / "fil-cli-breakpoint-test.json";
-    const std::filesystem::path mcu =
-        std::filesystem::path(FIL_SOURCE_DIR) / "configs/mcus/stm32g474retx.json";
-    const std::filesystem::path elf =
-        std::filesystem::path(FIL_SOURCE_DIR) / "tests/fixtures/elf/split_image.elf";
-    {
-        std::ofstream config(config_path, std::ios::binary | std::ios::trunc);
-        config << "{\n"
-               << "  \"schema_version\": 1,\n"
-               << "  \"name\": \"cli-breakpoint\",\n"
-               << "  \"mcu\": \"" << mcu.string() << "\",\n"
-               << "  \"elf\": \"" << elf.string() << "\"\n"
-               << "}\n";
-    }
-    const std::string config_text = config_path.string();
+/// @brief Verifies breakpoint acceptance and symbol-based stopping.
+TEST(SmokeTest, HonorsRunStopControls) {
+    fil::test::TemporaryDirectory directory{"fil-cli-breakpoint-test"};
+    const auto mcu = std::filesystem::path(FIL_SOURCE_DIR)
+        / "configs/mcus/stm32g474retx.json";
+    const auto elf = std::filesystem::path(FIL_SOURCE_DIR)
+        / "tests/fixtures/elf/split_image.elf";
+    const std::string config_contents = "{\n"
+        "  \"schema_version\": 1,\n"
+        "  \"name\": \"cli-breakpoint\",\n"
+        "  \"mcu\": \"" + mcu.string() + "\",\n"
+        "  \"elf\": \"" + elf.string() + "\"\n"
+        "}\n";
+    const std::string config_text = directory.write("config.json", config_contents).string();
     const std::string_view default_args[]{
         "run", config_text, "--duration-ms", "0", "--max-instructions", "20",
         "--no-detect-spin",
@@ -105,8 +103,25 @@ TEST(SmokeTest, RequiresExplicitBreakpointAcceptance) {
         fil::cli::run(allowed_args, allowed_out, allowed_err) == fil::cli::ExitCode::success)
         << "--allow-breakpoint explicitly accepts a firmware BKPT";
     EXPECT_TRUE(allowed_err.str().empty()) << "an explicitly accepted BKPT has no error diagnostic";
-    std::error_code remove_error;
-    std::filesystem::remove(config_path, remove_error);
+
+    const std::string_view symbol_args[]{"run", config_text, "--stop-at-symbol", "Reset_Handler"};
+    std::ostringstream symbol_out;
+    std::ostringstream symbol_err;
+    EXPECT_EQ(fil::cli::run(symbol_args, symbol_out, symbol_err), fil::cli::ExitCode::success);
+    EXPECT_NE(symbol_out.str().find("stop: target-reached"), std::string::npos);
+    EXPECT_NE(symbol_out.str().find("instructions: 0"), std::string::npos);
+    EXPECT_TRUE(symbol_err.str().empty());
+
+    const std::string_view missing_symbol_args[]{
+        "run", config_text, "--stop-at-symbol", "NoSuchSymbol",
+    };
+    std::ostringstream missing_out;
+    std::ostringstream missing_err;
+    EXPECT_EQ(
+        fil::cli::run(missing_symbol_args, missing_out, missing_err),
+        fil::cli::ExitCode::usage_error
+    );
+    EXPECT_NE(missing_err.str().find("symbol not found: NoSuchSymbol"), std::string::npos);
 }
 
 } // namespace

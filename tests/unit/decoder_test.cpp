@@ -205,6 +205,33 @@ TEST(DecoderTest, DecodesRealG4AndFreeRtosEncodings) {
     EXPECT_TRUE(vmrs && vmrs->kind == fil::cpu::InstrKind::vmrs) << "decodes VMRS APSR_nzcv,FPSCR";
 }
 
+TEST(DecoderTest, NormalizesThumb2DataProcessingAliasesConsistently) {
+    const auto immediate_test = fil::cpu::decode32(0xf010U, 0x0f01U);
+    const auto register_test = fil::cpu::decode32(0xea10U, 0x0f01U);
+    EXPECT_TRUE(immediate_test && immediate_test->kind == fil::cpu::InstrKind::tst &&
+                immediate_test->set_flags)
+        << "normalizes immediate ANDS with Rd=PC to TST";
+    EXPECT_TRUE(register_test && register_test->kind == fil::cpu::InstrKind::tst &&
+                register_test->set_flags)
+        << "normalizes register ANDS with Rd=PC to TST";
+
+    const auto immediate_move = fil::cpu::decode32(0xf04fU, 0x0201U);
+    const auto register_move = fil::cpu::decode32(0xea4fU, 0x0201U);
+    EXPECT_TRUE(immediate_move && immediate_move->kind == fil::cpu::InstrKind::mov &&
+                immediate_move->rn == 15U && immediate_move->rd == 2U)
+        << "normalizes immediate ORR with Rn=PC to MOV";
+    EXPECT_TRUE(register_move && register_move->kind == fil::cpu::InstrKind::mov &&
+                register_move->rn == 15U && register_move->rd == 2U)
+        << "normalizes register ORR with Rn=PC to MOV";
+
+    EXPECT_TRUE(!fil::cpu::decode32(0xf0a0U, 0x0201U))
+        << "rejects a reserved immediate data-processing opcode";
+    EXPECT_TRUE(!fil::cpu::decode32(0xeaa0U, 0x0201U))
+        << "rejects a reserved register data-processing opcode";
+    EXPECT_TRUE(!fil::cpu::decode32(0xea4fU, 0x020fU))
+        << "rejects register data-processing Rm=PC independently of alias normalization";
+}
+
 TEST(DecoderTest, RejectsPrefixesAndReservedEncodings) {
     EXPECT_TRUE(!fil::cpu::decode16(0xf000U)) << "16-bit decoder rejects a wide prefix";
     EXPECT_TRUE(!fil::cpu::decode16(0xde00U))
