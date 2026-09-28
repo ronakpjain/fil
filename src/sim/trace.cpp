@@ -1,5 +1,6 @@
 #include "fil/sim/trace.hpp"
 
+#include <algorithm>
 #include <iomanip>
 #include <ostream>
 #include <sstream>
@@ -37,6 +38,11 @@ std::string booleanText(const bool value) {
 
 } // namespace
 
+bool TraceRecorder::passesFilter(const std::string_view type) const noexcept {
+    if (allowlist_.empty()) return true;
+    return std::find(allowlist_.begin(), allowlist_.end(), type) != allowlist_.end();
+}
+
 std::uint64_t TraceRecorder::record(
     const SimTimeNs time_ns,
     std::string source,
@@ -44,6 +50,7 @@ std::uint64_t TraceRecorder::record(
     std::vector<TraceField> fields
 ) {
     if (!enabled_) return next_sequence_;
+    if (!passesFilter(type)) return next_sequence_++;
     const std::uint64_t sequence = next_sequence_++;
     records_.push_back(TraceRecord{
         time_ns, sequence, std::move(source), std::move(type), std::move(fields),
@@ -59,6 +66,9 @@ std::uint64_t TraceRecorder::recordCanFrame(
     const CanTraceFrame& frame
 ) {
     if (!enabled_) return next_sequence_;
+    // Skip field formatting for types no consumer selected; record() would
+    // discard the formatted fields below, but only after paying for them.
+    if (!passesFilter(transmit ? "can_tx" : "can_rx")) return next_sequence_++;
     std::ostringstream id;
     id << "0x" << std::hex << frame.id;
     return record(

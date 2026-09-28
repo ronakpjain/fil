@@ -242,7 +242,7 @@ std::optional<Board::BoundaryStop> Board::settleInstructionBoundarySlow() {
         if (!returned) {
             return BoundaryStop{BoardStopReason::architectural_fault, returned.error().message};
         }
-        trace_->record(
+        if (trace_->passesFilter("exception_return")) trace_->record(
             event_loop_->now(), config_.name, "exception_return",
             {{"exc_return", hex32(exc_return)}}
         );
@@ -256,7 +256,7 @@ std::optional<Board::BoundaryStop> Board::settleInstructionBoundarySlow() {
         if (!entered) {
             return BoundaryStop{BoardStopReason::architectural_fault, entered.error().message};
         }
-        trace_->record(
+        if (trace_->passesFilter("exception_enter")) trace_->record(
             event_loop_->now(), config_.name, "exception_enter",
             {{"exception", std::to_string(exception_number)}}
         );
@@ -269,7 +269,7 @@ std::optional<Board::BoundaryStop> Board::settleInstructionBoundarySlow() {
             return BoundaryStop{BoardStopReason::architectural_fault, pending.error().message};
         }
         if (pending.value()) {
-            trace_->record(
+            if (trace_->passesFilter("exception_enter")) trace_->record(
                 event_loop_->now(), config_.name, "exception_enter",
                 {{"exception", std::to_string(cpu_->state().ipsr())}}
             );

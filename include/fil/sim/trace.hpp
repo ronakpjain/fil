@@ -11,6 +11,7 @@
 #include <iosfwd>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -53,6 +54,21 @@ public:
     void setObserver(Observer observer) { observer_ = std::move(observer); }
 
     /**
+     * @brief Restricts recorded types to an allowlist (empty allows all).
+     *
+     * Filtered-out types still consume sequence numbers but skip field
+     * formatting, storage, and observer notification. Only monitoring
+     * front ends that select a few types from a hot event stream should set
+     * this; batch trace artifacts always need the full record set.
+     */
+    void setTypeAllowlist(std::vector<std::string> allowlist) {
+        allowlist_ = std::move(allowlist);
+    }
+
+    /** @brief Reports whether a record type passes the allowlist (or none is set). */
+    [[nodiscard]] bool passesFilter(std::string_view type) const noexcept;
+
+    /**
      * @brief Appends one trace record and returns its assigned sequence.
      * @return Assigned sequence, or the unconsumed next sequence while disabled.
      */
@@ -93,6 +109,7 @@ private:
     bool enabled_{true};
     std::uint64_t next_sequence_{0};
     std::vector<TraceRecord> records_;
+    std::vector<std::string> allowlist_;
     Observer observer_;
 };
 

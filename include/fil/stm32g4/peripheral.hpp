@@ -104,6 +104,12 @@ protected:
         return trace_ != nullptr && trace_->enabled();
     }
 
+    /// Reports whether a trace type would be recorded (enabled and allowlisted).
+    /// Producers of hot event types must check this before building fields.
+    [[nodiscard]] bool tracePasses(std::string_view type) const noexcept {
+        return traceEnabled() && trace_->passesFilter(type);
+    }
+
     void traceEvent(std::string type, std::vector<sim::TraceField> fields = {});
     void setInterruptLevel(unsigned int line, bool asserted);
 

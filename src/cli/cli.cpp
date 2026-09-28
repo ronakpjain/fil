@@ -1051,6 +1051,10 @@ ExitCode watchNetworkCommand(
     }
 
     world.value()->setDiagnosticsEnabled(true);
+    // Record only what the live view selected: the hot peripheral and
+    // exception types would otherwise be formatted, stored, and discarded
+    // once per event (hundreds of thousands per simulated second).
+    world.value()->trace().setTypeAllowlist(live_filters);
     world.value()->trace().setObserver([&out, &live_filters](const sim::TraceRecord& record) {
         if (std::find(live_filters.begin(), live_filters.end(), record.type) != live_filters.end()) {
             printLiveTraceRecord(out, record);

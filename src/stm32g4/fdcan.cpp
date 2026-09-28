@@ -390,7 +390,7 @@ bool FdcanPeripheral::receiveFrame(const devices::CanFrame& frame, const std::ui
         flags |= interruptRxFifo0Lost;
     }
     setInterruptFlags(flags);
-    traceEvent("can_rx", {
+    if (tracePasses("can_rx")) traceEvent("can_rx", {
                              {"id", std::to_string(frame.id)},
                              {"dlc", std::to_string(frame.dlc)},
                              {"length", std::to_string(payload_length)},
@@ -452,7 +452,7 @@ bool FdcanPeripheral::transmitBuffer(const unsigned int buffer_index) {
     if ((registerValue(txbtie) & buffer_bit) != 0U) {
         setInterruptFlags(interruptTransmissionComplete);
     }
-    traceEvent("can_tx", {
+    if (tracePasses("can_tx")) traceEvent("can_tx", {
                              {"id", std::to_string(frame.id)},
                              {"dlc", std::to_string(frame.dlc)},
                              {"length", std::to_string(payload_length)},

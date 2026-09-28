@@ -34,7 +34,7 @@ void GpioPeripheral::setInput(const unsigned int pin, const bool high) {
     } else {
         external_input_value_ = static_cast<std::uint16_t>(external_input_value_ & ~mask);
     }
-    traceEvent("gpio_input", {
+    if (tracePasses("gpio_input")) traceEvent("gpio_input", {
         {"pin", std::to_string(pin)},
         {"value", high ? "1" : "0"},
     });
@@ -50,7 +50,7 @@ void GpioPeripheral::releaseInput(const unsigned int pin) {
         external_input_mask_ = static_cast<std::uint16_t>(
             external_input_mask_ & static_cast<std::uint16_t>(~(1U << pin))
         );
-        traceEvent("gpio_input", {
+        if (tracePasses("gpio_input")) traceEvent("gpio_input", {
             {"pin", std::to_string(pin)},
             {"value", "release"},
         });
@@ -133,7 +133,7 @@ void GpioPeripheral::applyOutput(const std::uint32_t new_output) {
             const bool high = (next_odr & mask) != 0U;
             const GpioTransition transition{currentTime(), pin, high};
             transitions_.push_back(transition);
-            traceEvent("gpio_output", {
+            if (tracePasses("gpio_output")) traceEvent("gpio_output", {
                 {"pin", std::to_string(pin)},
                 {"value", high ? "1" : "0"},
             });

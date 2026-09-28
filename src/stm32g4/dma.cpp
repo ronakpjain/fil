@@ -172,7 +172,7 @@ void DmaPeripheral::runChannelRequest(const unsigned int channel) {
             currentTime(), channel, 1U, memory_to_peripheral, success,
         });
     }
-    if (traceEnabled()) {
+    if (traceEnabled() && tracePasses("dma_transfer")) {
         traceEvent("dma_transfer", {
             {"channel", std::to_string(channel)},
             {"items", "1"},

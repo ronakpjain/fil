@@ -276,7 +276,7 @@ void AdcPeripheral::materializeConversion(
     setRegister(isr, registerValue(isr) | eoc | (sequence_complete ? eos : 0U));
     setInterruptLevel(0, (registerValue(ier) & registerValue(isr) & (eoc | eos)) != 0U);
     if (observable && sample_history_enabled_) samples_.push_back(sample);
-    if (observable && traceEnabled()) {
+    if (observable && traceEnabled() && tracePasses("adc_sample")) {
         traceEvent("adc_sample", {
             {"channel", std::to_string(channel)},
             {"value", std::to_string(value)},
