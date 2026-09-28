@@ -8,6 +8,12 @@ byte-reproducible JSONL artifact is required.
 
 ## Start a monitor
 
+`watch-network` paces simulation time to wall-clock time: after each slice it
+waits until wall time catches up before running the next one, so live
+consumers observe real message rates. When the model runs slower than real
+time there is nothing to wait for and slices run back-to-back; trace order is
+unchanged either way. Pass `--no-wall-pacing` to always run back-to-back.
+
 ```bash
 ./build/fil watch-network configs/networks/per_vehicle.json \
   --refresh-ms 10 \
@@ -73,6 +79,7 @@ error and ignored without stopping the simulation.
 |---|---|
 | `--duration-ms N` | Stop after at most `N` milliseconds of simulated time; `0` runs without a simulated-time limit. The monitor also stops if all boards reach terminal CPU boundaries. Without a duration, it runs until `quit`, `exit`, standard-input EOF, or all boards stop. |
 | `--refresh-ms N` | Run and poll input in slices of `N` simulated milliseconds; defaults to `1` and must be nonzero. |
+| `--no-wall-pacing` | Run slices back-to-back instead of pacing simulation time to wall-clock time. Pacing is on by default. |
 | `--live-filter TYPE` | Print one exact trace event type. Repeat to select more than one type. |
 | `--max-instructions N` | Set the per-board instruction budget used for each run slice. |
 | `--quantum N` | Set the deterministic network scheduling quantum; defaults to `1024`. |

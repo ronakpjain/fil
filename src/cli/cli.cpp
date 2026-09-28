@@ -24,6 +24,7 @@
 #include <vector>
 
 #include <poll.h>
+#include <thread>
 #include <unistd.h>
 
 namespace fil::cli {
@@ -973,6 +974,7 @@ ExitCode watchNetworkCommand(
     std::uint64_t refresh_ms = 1U;
     bool strict_mmio = false;
     bool enable_loop_batching = true;
+    bool wall_pacing = true;
     bool custom_live_filters = false;
     std::vector<std::string> live_filters{"can_tx"};
 
@@ -1028,6 +1030,7 @@ ExitCode watchNetworkCommand(
             live_filters.emplace_back(*value);
         } else if (option == "--strict-mmio") strict_mmio = true;
         else if (option == "--lenient-mmio") strict_mmio = false;
+        else if (option == "--no-wall-pacing") wall_pacing = false;
         else if (option == "--no-loop-batching") enable_loop_batching = false;
         else if (option != "--control-stdin") {
             err << "fil: unknown watch-network option: " << option << '\n';
@@ -1056,12 +1059,22 @@ ExitCode watchNetworkCommand(
     out << "watching network " << network_config.value().name << '\n' << std::flush;
 
     const sim::SimTimeNs started_at = world.value()->eventLoop().now();
+    const auto wall_start = std::chrono::steady_clock::now();
     const std::uint64_t slice_ns = refresh_ms * 1'000'000ULL;
     bool stdin_eof = false;
     bool stop_requested = false;
+    auto wall_elapsed_ns = [&]() -> std::uint64_t {
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wall_start
+        ).count());
+    };
+    bool duration_reached = false;
     while (!stop_requested) {
         const sim::SimTimeNs elapsed = world.value()->eventLoop().now() - started_at;
-        if (duration_ns && elapsed >= *duration_ns) break;
+        if (duration_ns && elapsed >= *duration_ns) {
+            duration_reached = true;
+            break;
+        }
 
         sim::WorldRunOptions options;
         options.duration_ns = duration_ns ? std::min(slice_ns, *duration_ns - elapsed) : slice_ns;
@@ -1077,10 +1090,29 @@ ExitCode watchNetworkCommand(
         }
         if (result.value().reason == sim::WorldStopReason::all_boards_stopped) break;
 
+        // Pace simulation time to wall-clock time so live consumers observe
+        // real rates. Each iteration re-syncs to the absolute sim-vs-wall
+        // delta, so the poll below never accumulates drift. When the model
+        // runs slower than real time there is nothing to wait for; slices
+        // run back-to-back and trace order is unchanged either way.
+        if (wall_pacing) {
+            const sim::SimTimeNs sim_elapsed = world.value()->eventLoop().now() - started_at;
+            const std::uint64_t wall_elapsed = wall_elapsed_ns();
+            if (sim_elapsed > wall_elapsed) {
+                std::this_thread::sleep_for(
+                    std::chrono::nanoseconds(sim_elapsed - wall_elapsed)
+                );
+            }
+        }
+
         if (stdin_eof) continue;
         pollfd input{STDIN_FILENO, POLLIN, 0};
         const bool buffered = std::cin.rdbuf()->in_avail() > 0;
-        const int ready = buffered ? 1 : ::poll(&input, 1, static_cast<int>(refresh_ms));
+        // Wall pacing already waited; a blocking poll here would run the
+        // simulation slower than real time by one refresh window per slice.
+        const int ready = buffered
+            ? 1
+            : ::poll(&input, 1, wall_pacing ? 0 : static_cast<int>(refresh_ms));
         if (ready < 0) {
             err << "fil: failed to poll stdin\n";
             return ExitCode::runtime_error;
@@ -1165,6 +1197,14 @@ ExitCode watchNetworkCommand(
             );
         }
     }
+    // Total-duration exactness: the per-slice sleeps keep phase within a
+    // fraction of a slice, but the last sleep's wake jitter is never
+    // corrected inside the loop. Sync once to the absolute deadline so the
+    // run's wall time equals its simulated time. Early exits (quit, halted
+    // boards, EOF without a duration) return immediately.
+    if (wall_pacing && duration_reached && !stop_requested) {
+        std::this_thread::sleep_until(wall_start + std::chrono::nanoseconds(*duration_ns));
+    }
     return ExitCode::success;
 }
 
@@ -1199,6 +1239,7 @@ void printHelp(std::ostream& out) {
         << "Watch-network options:\n"
         << "  --duration-ms N --refresh-ms N --max-instructions N --quantum N\n"
         << "  --live-filter TYPE --strict-mmio --no-loop-batching --control-stdin\n"
+        << "  --no-wall-pacing (watch runs slices back-to-back instead of real time)\n"
         << "  watch also stops early when all boards reach terminal CPU boundaries\n"
         << "  stdin: BUS:ID:HEXDATA, adc BOARD INSTANCE CHANNEL VALUE,\n"
         << "  gpio BOARD PORT PIN 0|1|release, quit, or exit\n";
