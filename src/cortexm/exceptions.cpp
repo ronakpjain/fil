@@ -60,7 +60,14 @@ Result<void> ExceptionController::enter(cpu::CpuState& state, const std::uint16_
     if (!handler) return runtimeError("unable to read exception vector: " + mem::formatBusFault(handler.fault()));
     if ((handler.value() & 1U) == 0) return runtimeError("exception handler vector does not select Thumb state");
 
-    if (extended_fp_frame) {
+    // Lazy FP stacking (LSPEN): reserve the 72-byte area but defer pushing
+    // S0-S15/FPSCR until handler code first touches the FP register file.
+    // A nested entry while one reservation is pending falls back to eager
+    // stacking for that level (memory-safe; see CpuState::fp_lazy_active).
+    const bool lazy_fp = extended_fp_frame
+        && (system_.fpccr() & SystemControl::fpccr_lspen) != 0U
+        && !state.fp_lazy_active;
+    if (extended_fp_frame && !lazy_fp) {
         for (std::size_t index = 0; index < 16U; ++index) {
             auto written = memory_.write32(
                 new_sp + static_cast<std::uint32_t>(index * 4U),
@@ -79,6 +86,16 @@ Result<void> ExceptionController::enter(cpu::CpuState& state, const std::uint16_
             {mem::AccessType::data_write, state.currentInstrAddr()}
         );
         if (!reserved_written) return runtimeError("unable to stack floating-point reserved word: " + mem::formatBusFault(reserved_written.fault()));
+    }
+    if (lazy_fp) {
+        state.fp_lazy_active = true;
+        state.fp_lazy_base = new_sp;
+    } else if (state.fp_lazy_active) {
+        // Nested eager entry inside a pending lazy reservation abandons the
+        // outer reservation: this level wrote (or will use only) its own
+        // frame, so subsequent returns unstack eagerly. Memory-safe; exact
+        // except for FP use across more than one lazy nesting level.
+        state.fp_lazy_active = false;
     }
 
     const std::uint32_t core_frame_base = new_sp + (extended_fp_frame ? fp_frame_size : 0U);
@@ -139,7 +156,10 @@ Result<void> ExceptionController::exceptionReturn(
     auto stack_valid = validateStackRange(stack_pointer, core_frame_offset + 32U);
     if (!stack_valid) return stack_valid.error();
 
-    if (extended_fp_frame) {
+    // A pending lazy reservation means this level never pushed FP state:
+    // skip the reads, deallocate the reserved area via the existing SP
+    // advance below, and clear the reservation.
+    if (extended_fp_frame && !state.fp_lazy_active) {
         for (std::size_t index = 0; index < 16U; ++index) {
             auto value = memory_.read32(
                 stack_pointer + static_cast<std::uint32_t>(index * 4U),
@@ -155,6 +175,7 @@ Result<void> ExceptionController::exceptionReturn(
         if (!fpscr) return runtimeError("unable to unstack FPSCR: " + mem::formatBusFault(fpscr.fault()));
         state.fpscr = fpscr.value();
     }
+    state.fp_lazy_active = false;
     std::array<std::uint32_t, 8> frame{};
     for (std::size_t index = 0; index < frame.size(); ++index) {
         auto value = memory_.read32(

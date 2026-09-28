@@ -38,7 +38,9 @@ void SystemControl::reset(const std::uint32_t vector_base) {
     bfar_ = 0;
     cpacr_ = 0;
     demcr_ = 0;
-    fpccr_ = 0xc0000000U;
+    // Silicon reset leaves ASPEN/LSPEN clear; firmware opts into automatic
+    // FPCA tracking and lazy FP stacking with an explicit FPCCR write.
+    fpccr_ = 0;
     dwt_ctrl_ = 0;
     dwt_cyccnt_ = 0;
     active_exception_ = 0;

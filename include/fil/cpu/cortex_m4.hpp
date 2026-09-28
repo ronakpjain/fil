@@ -20,6 +20,10 @@ namespace fil::mem {
 class MemoryBus;
 }
 
+namespace fil::cortexm {
+class SystemControl;
+}
+
 namespace fil::cpu {
 
 inline constexpr std::uint32_t xpsr_n = 1U << 31U;
@@ -54,6 +58,20 @@ struct CpuState {
     std::array<float, 32> s{};
     std::uint32_t fpscr{0};
     std::uint8_t it_state{0};
+
+    /**
+     * @brief Pending lazy FP stacking reservation (LSPEN-style).
+     *
+     * Set on exception entry when the incoming task owns FP state but the
+     * model defers pushing S0-S15/FPSCR until handler code first touches
+     * the FP register file. fp_lazy_base is the reserved area base and is
+     * valid only while fp_lazy_active. A nested entry while active falls
+     * back to eager stacking for that level (always memory-safe; exact
+     * except for FP use across more than one lazy nesting level, for which
+     * the core manual's nesting rule would require ARM ARM text to encode).
+     */
+    bool fp_lazy_active{false};
+    std::uint32_t fp_lazy_base{0};
 
     std::uint32_t instruction_address{0};
 
@@ -191,6 +209,12 @@ public:
     /** @brief Executes until budget exhaustion, breakpoint, halt, or a fault. */
     [[nodiscard]] RunResult run(std::uint64_t instruction_budget);
 
+    /**
+     * @brief Provides FPCCR (ASPEN) reads for automatic CONTROL.FPCA maintenance.
+     * May remain unset (unit tests); FP ownership tracking then assumes ASPEN.
+     */
+    void setSystemControl(const cortexm::SystemControl* system) noexcept { system_ = system; }
+
 private:
     struct InstructionCacheEntry {
         std::uint64_t generation{0};
@@ -215,6 +239,7 @@ private:
     void capture(DiagnosticSnapshot& diagnostic) const;
 
     mem::MemoryBus& memory_;
+    const cortexm::SystemControl* system_{nullptr};
     CpuState state_{};
     std::array<InstructionCacheEntry, instruction_cache_entries> instruction_cache_{};
     DiagnosticSnapshot last_diagnostic_{};

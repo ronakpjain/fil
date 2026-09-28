@@ -1,5 +1,6 @@
 #include "fil/cpu/cortex_m4.hpp"
 
+#include "fil/cortexm/system_control.hpp"
 #include "fil/mem/memory_bus.hpp"
 
 #include <array>
@@ -14,6 +15,41 @@ namespace {
 
 [[nodiscard]] bool carryFlag(const CpuState& state) noexcept {
     return (state.xpsr & xpsr_c) != 0;
+}
+
+/// Reports FP instructions that access the FP register file and therefore
+/// claim CONTROL.FPCA (and trigger pending lazy FP stacking). VMRS moves
+/// FPSCR to APSR without touching the register file, so it is excluded.
+[[nodiscard]] bool isFpRegisterAccess(const InstrKind kind) noexcept {
+    switch (kind) {
+    case InstrKind::vstm:
+    case InstrKind::vldm:
+    case InstrKind::vldr:
+    case InstrKind::vstr:
+    case InstrKind::vmov_core_to_single:
+    case InstrKind::vmov_single_to_core:
+    case InstrKind::vmov_single:
+    case InstrKind::vmov_immediate:
+    case InstrKind::vcvt_f32_s32:
+    case InstrKind::vcvt_f32_u32:
+    case InstrKind::vcvt_s32_f32:
+    case InstrKind::vcvt_u32_f32:
+    case InstrKind::vadd:
+    case InstrKind::vsub:
+    case InstrKind::vmul:
+    case InstrKind::vnmul:
+    case InstrKind::vdiv:
+    case InstrKind::vfma:
+    case InstrKind::vfms:
+    case InstrKind::vfnms:
+    case InstrKind::vcmp:
+    case InstrKind::vneg:
+    case InstrKind::vabs:
+    case InstrKind::vsqrt:
+        return true;
+    default:
+        return false;
+    }
 }
 
 void setNz(CpuState& state, const std::uint32_t value) noexcept {
@@ -299,6 +335,46 @@ StopReason CortexM4::execute(
     const auto operand2 = [&]() {
         return shiftedOperand().value;
     };
+
+    if (isFpRegisterAccess(instruction.kind)) {
+        // Hardware sets CONTROL.FPCA on any FP register-file access when
+        // ASPEN is enabled (firmware relies on this instead of MSR writes).
+        const bool aspen = system_ == nullptr
+            || (system_->fpccr() & cortexm::SystemControl::fpccr_aspen) != 0U;
+        if (aspen) state_.control |= 4U;
+        // Lazy stacking touch: a pending reservation materializes on the
+        // first handler-mode FP access (VMRS excluded by the predicate).
+        if (state_.inHandlerMode() && state_.fp_lazy_active) {
+            const mem::AccessContext context{
+                mem::AccessType::data_write, state_.currentInstrAddr()
+            };
+            for (std::uint32_t index = 0U; index < 16U; ++index) {
+                auto written = memory_.write32(
+                    state_.fp_lazy_base + index * 4U,
+                    std::bit_cast<std::uint32_t>(state_.s[index]), context
+                );
+                if (!written) {
+                    return failBus(
+                        written.fault(), "unable to stack floating-point exception frame"
+                    );
+                }
+            }
+            auto fpscr_written =
+                memory_.write32(state_.fp_lazy_base + 64U, state_.fpscr, context);
+            if (!fpscr_written) {
+                return failBus(fpscr_written.fault(), "unable to stack FPSCR");
+            }
+            auto reserved_written =
+                memory_.write32(state_.fp_lazy_base + 68U, 0U, context);
+            if (!reserved_written) {
+                return failBus(
+                    reserved_written.fault(),
+                    "unable to stack floating-point reserved word"
+                );
+            }
+            state_.fp_lazy_active = false;
+        }
+    }
 
     switch (instruction.kind) {
     case InstrKind::mov: {

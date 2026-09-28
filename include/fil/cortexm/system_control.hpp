@@ -98,6 +98,20 @@ public:
     /** @brief Gets SCB CCR for alignment/fault policy checks. */
     [[nodiscard]] std::uint32_t ccr() const noexcept { return ccr_; }
 
+    /** @brief Reads the FP context control register (ASPEN/LSPEN/LSPACT). */
+    [[nodiscard]] std::uint32_t fpccr() const noexcept { return fpccr_; }
+
+    /**
+     * @brief Directly loads FPCCR (simulation control for tests/setup).
+     * Firmware uses the MMIO write path; this bypass exists because the
+     * register block's word accessors stay private to the memory bus.
+     */
+    void setFpccr(const std::uint32_t value) noexcept { fpccr_ = value; }
+
+    /// FPCCR bit positions (automatic and lazy FP state preservation).
+    static constexpr std::uint32_t fpccr_aspen = 1U << 31U;
+    static constexpr std::uint32_t fpccr_lspen = 1U << 30U;
+
     /** @brief Gets the currently active exception number, or zero in thread mode. */
     [[nodiscard]] std::uint16_t activeException() const noexcept { return active_exception_; }
 

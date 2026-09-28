@@ -136,7 +136,9 @@ bool bitwiseEqual(const CpuState& left, const CpuState& right) noexcept {
         || left.psp != right.psp || left.primask != right.primask
         || left.basepri != right.basepri || left.faultmask != right.faultmask
         || left.control != right.control || left.thumb != right.thumb
-        || left.halted != right.halted
+        || left.halted != right.halted || left.fpscr != right.fpscr
+        || left.it_state != right.it_state || left.fp_lazy_active != right.fp_lazy_active
+        || left.fp_lazy_base != right.fp_lazy_base
         || left.pending_exception != right.pending_exception
         || left.pending_exc_return != right.pending_exc_return
         || left.fpscr != right.fpscr || left.it_state != right.it_state

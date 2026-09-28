@@ -783,4 +783,57 @@ TEST(CpuStepTest, ExecutesRemainingRealBoardIntegerEncodings) {
     EXPECT_TRUE(cpu.state().r[5] == 0xa122c3d4U) << "SEL chooses each byte from APSR.GE lane";
 }
 
+TEST(CpuStepTest, ClaimsFpOwnershipOnRegisterAccess) {
+    auto bus = basicBus();
+    // VADD.F32 (decoder-covered encoding).
+    EXPECT_TRUE(bus.loadBytes(flash_base, halfwords({0xee37U, 0x7a20U})).hasValue())
+        << "loads VADD";
+    fil::cpu::CortexM4 cpu(bus);
+    prepare(cpu);
+    EXPECT_TRUE((cpu.state().control & 4U) == 0U) << "starts without FP ownership";
+    EXPECT_TRUE(cpu.step().reason == fil::cpu::StopReason::step_complete) << "executes VADD";
+    EXPECT_TRUE((cpu.state().control & 4U) != 0U)
+        << "FP register access claims CONTROL.FPCA like ASPEN hardware";
+}
+
+TEST(CpuStepTest, VmrsDoesNotClaimFpOwnership) {
+    auto bus = basicBus();
+    // VMRS APSR_nzcv,FPSCR moves FPSCR without touching the register file.
+    EXPECT_TRUE(bus.loadBytes(flash_base, halfwords({0xeef1U, 0xfa10U})).hasValue())
+        << "loads VMRS";
+    fil::cpu::CortexM4 cpu(bus);
+    prepare(cpu);
+    EXPECT_TRUE(cpu.step().reason == fil::cpu::StopReason::step_complete) << "executes VMRS";
+    EXPECT_TRUE((cpu.state().control & 4U) == 0U)
+        << "VMRS leaves CONTROL.FPCA clear";
+}
+
+TEST(CpuStepTest, HandlerFpTouchMaterializesLazyFrame) {
+    auto bus = basicBus();
+    EXPECT_TRUE(bus.loadBytes(flash_base, halfwords({0xee37U, 0x7a20U})).hasValue())
+        << "loads VADD";
+    fil::cpu::CortexM4 cpu(bus);
+    prepare(cpu);
+    cpu.state().xpsr =
+        (cpu.state().xpsr & ~fil::cpu::xpsr_ipsr_mask) | 15U;
+    cpu.state().s[0] = 1.5F;
+    cpu.state().s[15] = -2.25F;
+    cpu.state().fpscr = 0x01000000U;
+    cpu.state().fp_lazy_active = true;
+    cpu.state().fp_lazy_base = ram_base + 0x80U;
+    EXPECT_TRUE(cpu.step().reason == fil::cpu::StopReason::step_complete)
+        << "executes VADD in a handler with a pending lazy frame";
+    const auto stacked_s0 = bus.read32(ram_base + 0x80U, {fil::mem::AccessType::data_read, 0U});
+    const auto stacked_s15 = bus.read32(ram_base + 0xbcU, {fil::mem::AccessType::data_read, 0U});
+    const auto stacked_fpscr = bus.read32(ram_base + 0xc0U, {fil::mem::AccessType::data_read, 0U});
+    EXPECT_TRUE(stacked_s0 && stacked_s0.value() == std::bit_cast<std::uint32_t>(1.5F))
+        << "first FP touch pushes S0 to the reserved area";
+    EXPECT_TRUE(stacked_s15 && stacked_s15.value() == std::bit_cast<std::uint32_t>(-2.25F))
+        << "first FP touch pushes S15 to the reserved area";
+    EXPECT_TRUE(stacked_fpscr && stacked_fpscr.value() == 0x01000000U)
+        << "first FP touch pushes FPSCR to the reserved area";
+    EXPECT_TRUE(!cpu.state().fp_lazy_active)
+        << "first FP touch clears the pending lazy reservation";
+}
+
 } // namespace

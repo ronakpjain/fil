@@ -118,6 +118,7 @@ Result<void> Board::reset() {
     auto configured = peripherals_->configure(config_);
     if (!configured) return configured.error();
     cpu_ = std::make_unique<cpu::CortexM4>(memory_);
+    cpu_->setSystemControl(system_.get());
     if (!cpu_->reset(image_)) return runtimeError("CPU rejected validated reset vectors");
     exceptions_ = std::make_unique<cortexm::ExceptionController>(memory_, *system_);
     time_fraction_ = 0;

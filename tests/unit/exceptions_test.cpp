@@ -162,4 +162,85 @@ TEST(ExceptionTest, RestoresThreadStackSelectionFromExcReturn) {
         << "EXC_RETURN bit 2 restores CONTROL.SPSEL and visible SP";
 }
 
+TEST(ExceptionTest, DefersFloatingPointStackingUntilHandlerTouch) {
+    fil::mem::MemoryBus memory;
+    EXPECT_TRUE(memory.mapRom(0x08000000U, 0x200U, "lazy-flash").hasValue())
+        << "maps lazy exception vectors";
+    EXPECT_TRUE(memory.mapRam(0x20000000U, 0x1000U, "lazy-ram").hasValue())
+        << "maps lazy exception stack";
+    const std::array<std::uint8_t, 4> handler{0x01U, 0x01U, 0x00U, 0x08U};
+    EXPECT_TRUE(memory.loadBytes(0x0800003cU, handler).hasValue()) << "loads SysTick vector";
+    fil::cortexm::SystemControl system(0x08000000U);
+    fil::cortexm::ExceptionController exceptions(memory, system);
+    fil::cpu::CpuState state;
+    state.msp = 0x20001000U;
+    state.r[13] = state.msp;
+    state.r[15] = 0x08000080U;
+    state.xpsr = fil::cpu::xpsr_t;
+    state.control = 4U;
+    state.s[0] = 1.5F;
+    state.s[15] = -2.25F;
+    state.fpscr = 0x01000000U;
+
+    EXPECT_TRUE(system.fpccr() == 0U) << "FPCCR reset leaves lazy stacking disabled";
+    system.setFpccr(0xc0000000U);
+    EXPECT_TRUE((system.fpccr() & 0x40000000U) != 0U) << "firmware-style FPCCR write enables LSPEN";
+    EXPECT_TRUE(exceptions.enter(state, 15U).hasValue())
+        << "enters an exception with active FP context";
+    EXPECT_TRUE(state.r[14] == 0xffffffe9U && state.msp == 0x20000f98U)
+        << "reserves the full extended frame including the FP area";
+    EXPECT_TRUE(state.fp_lazy_active && state.fp_lazy_base == 0x20000f98U)
+        << "records a pending lazy FP reservation at the frame base";
+    const auto reserved_s0 = memory.read32(state.msp);
+    EXPECT_TRUE(reserved_s0 && reserved_s0.value() == 0U)
+        << "leaves the reserved FP area unwritten";
+    const auto stacked_xpsr = memory.read32(state.msp + 100U);
+    EXPECT_TRUE(stacked_xpsr && (stacked_xpsr.value() & fil::cpu::xpsr_t) != 0U)
+        << "still stacks the basic frame after the reserved area";
+
+    state.s[0] = 0.0F;
+    state.s[15] = 0.0F;
+    state.fpscr = 0U;
+    EXPECT_TRUE(exceptions.exceptionReturn(state, 0xffffffe9U).hasValue())
+        << "returns from an untouched lazy frame";
+    EXPECT_TRUE(!state.fp_lazy_active)
+        << "clears the pending lazy reservation on return";
+    EXPECT_TRUE(state.msp == 0x20001000U && state.r[15] == 0x08000080U)
+        << "restores stack and PC without reading the reserved area";
+    EXPECT_TRUE(state.s[0] == 0.0F && state.s[15] == 0.0F && state.fpscr == 0U)
+        << "leaves FP state untouched when nothing was stacked";
+}
+
+TEST(ExceptionTest, NestedEntryFallsBackToEagerStacking) {
+    fil::mem::MemoryBus memory;
+    EXPECT_TRUE(memory.mapRom(0x08000000U, 0x200U, "nest-flash").hasValue())
+        << "maps nested exception vectors";
+    EXPECT_TRUE(memory.mapRam(0x20000000U, 0x1000U, "nest-ram").hasValue())
+        << "maps nested exception stack";
+    const std::array<std::uint8_t, 4> handler{0x01U, 0x01U, 0x00U, 0x08U};
+    EXPECT_TRUE(memory.loadBytes(0x0800003cU, handler).hasValue()) << "loads SysTick vector";
+    EXPECT_TRUE(memory.loadBytes(0x08000038U, handler).hasValue()) << "loads PendSV vector";
+    fil::cortexm::SystemControl system(0x08000000U);
+    system.setFpccr(0xc0000000U);
+    fil::cortexm::ExceptionController exceptions(memory, system);
+    fil::cpu::CpuState state;
+    state.msp = 0x20001000U;
+    state.r[13] = state.msp;
+    state.r[15] = 0x08000080U;
+    state.xpsr = fil::cpu::xpsr_t;
+    state.control = 4U;
+    state.s[0] = 1.5F;
+    state.fpscr = 0x01000000U;
+
+    EXPECT_TRUE(exceptions.enter(state, 15U).hasValue()) << "enters outer exception lazily";
+    EXPECT_TRUE(state.fp_lazy_active) << "outer reservation is pending";
+    const std::uint32_t outer_sp = state.msp;
+    EXPECT_TRUE(exceptions.enter(state, 14U).hasValue()) << "enters nested exception";
+    EXPECT_TRUE(!state.fp_lazy_active) << "nested entry abandons lazy mode for eager stacking";
+    const auto nested_s0 = memory.read32(state.msp);
+    EXPECT_TRUE(nested_s0 && nested_s0.value() == std::bit_cast<std::uint32_t>(1.5F))
+        << "nested level stacks FP state eagerly";
+    EXPECT_TRUE(state.msp < outer_sp) << "nested frame reserves below the outer frame";
+}
+
 } // namespace
