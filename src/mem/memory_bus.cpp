@@ -529,6 +529,19 @@ std::vector<MemoryRegionInfo> MemoryBus::regions() const {
     return result;
 }
 
+bool MemoryBus::containsWritableRange(
+    const std::uint32_t address, const std::uint64_t size
+) const noexcept {
+    const std::uint64_t end = static_cast<std::uint64_t>(address) + size;
+    for (const auto& region : regions_) {
+        const MemoryRegionInfo& info = region->info;
+        if (!info.writable || info.kind == RegionKind::mmio) continue;
+        const std::uint64_t region_end = static_cast<std::uint64_t>(info.base) + info.size;
+        if (address >= info.base && end <= region_end) return true;
+    }
+    return false;
+}
+
 void MemoryBus::addReadFootprint(
     ReadFootprint& footprint, const std::uint32_t address
 ) noexcept {

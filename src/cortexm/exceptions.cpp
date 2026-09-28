@@ -28,12 +28,7 @@ Result<void> ExceptionController::validateStackRange(
     const std::uint32_t address,
     const std::uint32_t size
 ) const {
-    const std::uint64_t end = static_cast<std::uint64_t>(address) + size;
-    for (const mem::MemoryRegionInfo& region : memory_.regions()) {
-        if (!region.writable || region.kind == mem::RegionKind::mmio) continue;
-        const std::uint64_t region_end = static_cast<std::uint64_t>(region.base) + region.size;
-        if (address >= region.base && end <= region_end) return {};
-    }
+    if (memory_.containsWritableRange(address, size)) return {};
     return runtimeError("exception stack frame is outside writable memory");
 }
 

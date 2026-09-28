@@ -240,6 +240,12 @@ public:
     /** @brief Gets mapped ranges sorted by base address. */
     [[nodiscard]] std::vector<MemoryRegionInfo> regions() const;
 
+    /**
+     * @brief Reports whether [address, address+size) fits in one writable non-MMIO range.
+     * Allocation-free equivalent of scanning regions(); for hot per-exception checks.
+     */
+    [[nodiscard]] bool containsWritableRange(std::uint32_t address, std::uint64_t size) const noexcept;
+
     /** @brief Makes shared MMIO return a side-effect-free worker synchronization fault. */
     void setSharedMmioTrapping(bool enabled) noexcept { trap_shared_mmio_ = enabled; }
 
