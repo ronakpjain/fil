@@ -54,6 +54,7 @@ struct BoardRunOptions {
     bool detect_spin{false};                     ///< Stop on a proven exact-state loop.
     std::uint64_t spin_threshold{1'000'000};     ///< Logical instructions in a repeated exact-state loop.
     bool enable_loop_batching{true};             ///< Fast-forward proven side-effect-free loops.
+    unsigned int adc_decimation{1}; ///< Keep 1 of N continuous ADC scans; higher skips side effects.
 };
 
 /** @brief Aggregate result and final CPU diagnostic for a board run. */

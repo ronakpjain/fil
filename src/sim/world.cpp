@@ -283,6 +283,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
     }
     for (std::size_t index = 0; index < boards_.size(); ++index) {
         initializeSnapshot(output.boards[index], *boards_[index]->board, output.start_time_ns);
+        boards_[index]->board->peripherals().setAdcDecimation(options.adc_decimation);
         states[index].ready_time_ns = output.start_time_ns;
         if (options.max_instructions_per_board == 0U) {
             states[index].runnable = false;

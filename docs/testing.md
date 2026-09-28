@@ -6,10 +6,19 @@ installed GoogleTest CMake package; CTest discovers each test case independently
 
 ## Required suite
 
+From the repository root, the hand-maintained Makefile delegates to CMake:
+
 ```bash
-cmake -S . -B build -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DFIL_BUILD_TESTS=ON
+make
+make test
+```
+
+The defaults build optimized Release with tests enabled in `build/`. Choose a
+specific generator or build directory with `make GENERATOR=Ninja BUILD_DIR=build-ninja`;
+`make test` always builds before running CTest. The equivalent direct CMake workflow is:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFIL_BUILD_TESTS=ON
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
@@ -22,20 +31,16 @@ hard-float startup, SysTick scheduling, and deterministic breakpoint boundaries.
 
 ## Sanitizers
 
-Request Debug explicitly for sanitizer builds:
+Use the isolated Debug ASan+UBSan build and test targets:
 
 ```bash
-cmake -S . -B build-sanitize -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DFIL_BUILD_TESTS=ON \
-  -DFIL_ENABLE_ASAN=ON \
-  -DFIL_ENABLE_UBSAN=ON
-cmake --build build-sanitize
-ctest --test-dir build-sanitize --output-on-failure
+make test-sanitize
 ```
 
-ASan and UBSan may be enabled separately when the host toolchain cannot combine
-them. IPO and PGO are disabled for sanitizer builds.
+The output is in `build-sanitize/`. To use only one sanitizer or change the
+configuration, pass `ASAN=ON UBSAN=OFF` (or the inverse) to the regular targets,
+for example `make BUILD_DIR=build-asan BUILD_TYPE=Debug IPO=OFF ASAN=ON test`.
+IPO and PGO are disabled for sanitizer builds.
 
 ## Source coverage
 
@@ -70,22 +75,24 @@ that only execute lines.
 
 The hermetic suite exercises the ST-Link orchestration through a fake OpenOCD
 process. A real STM32G47x/G48x comparison is always manual because it resets and
-controls the attached target and can optionally rewrite flash. See
+controls the attached target and can optionally rewrite flash. The explicit
+`make compare-stlink CONFIRM_STLINK=YES` target requires the confirmation variable;
+`--flash` is never passed unless explicitly included in `COMPARE_ARGS`. See
 [Hardware comparison](hardware_comparison.md) for the probe fixture and command.
 
 ## External PER acceptance
 
-External firmware checks are opt-in. Point CMake at the directory containing the
-seven board output directories:
+External firmware checks are opt-in. Point the Makefile at the directory containing
+the seven board output directories (and use a separate build directory):
 
 ```bash
-cmake -S . -B build-per -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DFIL_BUILD_TESTS=ON \
-  -DFIL_PER_FIRMWARE_DIR=/absolute/path/to/PER/Projects/firmware/output
-cmake --build build-per
-ctest --test-dir build-per -L per --output-on-failure
+make test-per BUILD_DIR=build-per \
+  PER_FIRMWARE_DIR=/absolute/path/to/PER/Projects/firmware/output
 ```
+
+This configures/builds first, then runs CTest's `per` label. CMake registers tests
+only for firmware files that exist; the full six-board network test requires all
+six non-test board images. `CTEST_ARGS='-LE long'` skips the longer integration case.
 
 CMake adds ELF inspection, strict-MMIO board smoke runs, a one-second `g4_testing`
 run, and the six-board CAN network test when the required files exist. The network
@@ -99,13 +106,14 @@ input hashes and tool versions so results remain tied to exact artifacts.
 
 ## Regenerating firmware fixtures
 
-The ARM GNU toolchain is needed only when changing fixture sources:
+The ARM GNU toolchain is needed only when changing fixture sources. The explicit
+`make firmware-tests` (alias `make fixtures`) target rewrites committed ELF files;
+review and commit those binaries only when their source changes are intentional:
 
 ```bash
-cmake --build build --target firmware_tests
-cmake --build build
-ctest --test-dir build --output-on-failure
+make firmware-tests
+make test
 ```
 
-Review binary fixture changes alongside their source and keep normal test runs
-independent of the cross-compiler.
+Normal test runs use the committed fixtures and remain independent of the
+cross-compiler.

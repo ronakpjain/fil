@@ -611,6 +611,20 @@ public:
     void setInterruptCallback(InterruptCallback callback);
     /** Overrides register-derived conversion timing, primarily for focused tests. */
     void setConversionDelay(sim::SimTimeNs delay_ns) noexcept { conversion_delay_override_ns_ = delay_ns; }
+    /**
+     * @brief Keeps one of every N continuous-mode scans, skipping the rest.
+     *
+     * The conversion schedule keeps advancing on time (no clock drift), but
+     * skipped scans do not touch DR/ISR, raise EOC/EOS, fire DMA or
+     * interrupt callbacks, or append sample history/trace records. DR holds
+     * the last kept value, so firmware observes sample data coarsened to
+     * one scan per N periods. Single-shot conversions are never skipped.
+     * Factor 1 (default) preserves current behavior exactly.
+     */
+    void setDecimation(unsigned int factor) noexcept {
+        decimation_ = factor == 0U ? 1U : factor;
+    }
+    [[nodiscard]] unsigned int decimation() const noexcept { return decimation_; }
     void setInputClockHz(std::uint64_t frequency_hz);
     /** @brief Enables timestamped sample history; disabling it permits lazy continuous conversion. */
     void setSampleHistoryEnabled(bool enabled);
@@ -640,6 +654,21 @@ private:
     [[nodiscard]] bool lazyConversionEligible() const noexcept;
     void startConversion();
     void completeConversion();
+    /** @brief Landing handler for a jumped gap of count skipped scans. */
+    void completeSkippedScans(unsigned int skipped);
+    /** @brief Arms the next scan after a boundary, jumping skipped scans. */
+    void beginNextScan();
+    /**
+     * @brief Arms one event spanning count whole skipped scans.
+     *
+     * The span repeats the live single-scan period, so ADC timing rewrites
+     * during a gap take effect at the next kept scan at the latest.
+     * Unobservable while skipped by construction (no DR/ISR/DMA/trace side
+     * effects), the internal rank granularity is invisible, making the
+     * collapse exact except for the documented decimation staleness. Falls
+     * back to per-rank arming when the span cannot be represented.
+     */
+    void armSkippedScans(unsigned int count);
     void materializeConversion(sim::SimTimeNs completion_time, bool observable);
     void synchronizeLazyConversions();
     void refreshConversionScheduling();
@@ -654,6 +683,12 @@ private:
     std::uint64_t input_clock_hz_{16'000'000U};
     sim::SimTimeNs conversion_delay_override_ns_{0};
     unsigned int sequence_rank_{0};
+    // Decimation state (see setDecimation): scan_index_ counts completed
+    // continuous scans, skip_scan_ suppresses side effects for the rest of
+    // the current scan. Both reset on start/reset; the factor persists.
+    unsigned int decimation_{1};
+    std::uint64_t scan_index_{0};
+    bool skip_scan_{false};
     sim::ScheduledEvent conversion_event_;
     std::optional<sim::SimTimeNs> next_conversion_ns_;
     bool sample_history_enabled_{true};

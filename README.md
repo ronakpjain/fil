@@ -13,19 +13,50 @@ support boundary.
 
 ## Build and test
 
-Requirements: CMake 3.20+, a C++20 compiler, and a CMake-supported build tool such
-as Ninja. Test builds also require an installed GoogleTest CMake package.
+Requirements: CMake 3.20+, a C++20 compiler, and a CMake-supported build tool.
+The default build is optimized Release in `build/`; tests require an installed
+GoogleTest CMake package.
 
 ```bash
-cmake -S . -B build -G Ninja -DFIL_BUILD_TESTS=ON
-cmake --build build
-ctest --test-dir build --output-on-failure
-./build/fil --help
+make                 # configure and build
+make test            # build, then run the hermetic CTest suite
+make app-help        # show fil commands and options
 ```
 
+Set `GENERATOR=Ninja` to choose Ninja explicitly, `BUILD_DIR=build-release` to use
+another out-of-tree build, or `JOBS=8` to set build parallelism. `make debug`,
+`make test-sanitize`, `make benchmark`, and `make clean` cover common workflows.
+`make clean` removes only a root-level `build`/`build-*` directory whose CMake cache
+belongs to this repo; it refuses source trees, symlinks, and other paths. `make clean-all`
+removes the Makefile's designated out-of-tree build directories.
+See `make help` for the full target list and [Testing](docs/testing.md) for
+sanitizer, coverage, firmware-fixture, and external-firmware checks.
+
 The required suite uses committed synthetic Cortex-M4F ELF fixtures. An ARM GNU
-toolchain is needed only to regenerate those fixtures. See [Testing](docs/testing.md)
-for sanitizer, coverage, and external-firmware checks.
+toolchain is needed only to regenerate those fixtures.
+
+## Make shortcuts for fil
+
+The Makefile exposes every CLI subcommand. For example:
+
+```bash
+make run RUN_CONFIG=configs/boards/g4_testing.json \
+  RUN_ARGS='--duration-ms 10 --strict-mmio'
+make run-network NETWORK_CONFIG=configs/networks/per_vehicle.json \
+  NETWORK_ARGS='--duration-ms 1000 --quantum 1024'
+make watch-network NETWORK_CONFIG=configs/networks/per_vehicle.json
+make inspect-config CONFIG=configs/mcus/stm32g474retx.json
+make inspect-elf ELF=tests/fixtures/elf/split_image.elf
+make disasm-window ELF=tests/fixtures/elf/split_image.elf DISASM_ADDR=0x08000000
+```
+
+`make run` defaults to the committed synthetic hardware-comparison fixture; board
+and network configs under `configs/` generally reference firmware in a sibling
+PER checkout. The watch target is interactive and accepts control lines on stdin.
+`make compare-stlink CONFIRM_STLINK=YES` explicitly opts into controlling/resetting
+physical hardware; flashing remains opt-in via `COMPARE_ARGS=--flash`.
+Use `make cli CLI_ARGS='--version'` for any other `fil` invocation. See
+[Testing](docs/testing.md) for the external PER test setup.
 
 ## Run firmware
 
@@ -80,12 +111,11 @@ files are optional acceptance inputs and are not embedded into emulator behavior
 
 Pacing follows the documented real-timing model: Cortex-M4 per-class pipeline
 cycles plus STM32G4 flash wait states (`cycles >= instructions`, CPI reported).
-On Apple M3 / Release+IPO, the runnable reference
-(`python3 tools/bench_real_timing.py ./build-release/fil`) reaches 5.53x
-single-board and 0.67x six-board interpreter throughput at 16 MHz and 16M/96M
-cycles per simulated second, with loop batching 250x or faster on
-loop-dominated firmware; a firmware-driven 170 MHz pll170 case (CPI 2.40)
-reaches 0.88x unbatched. The retired 1-CPI six-board figures (0.87 s Release,
+On Apple M3 / Release+IPO, the six-board PER vehicle network (real firmware,
+continuous ADC+DMA on every board) runs 1 s of simulated time in 2.57 s by
+default, 1.24 s with `--adc-decimation 8`, and 0.93 s with `--adc-decimation
+32` (1.08x realtime); single boards run well above realtime (dashboard: 19x
+default, 48x decimated). The retired 1-CPI six-board figures (0.87 s Release,
 0.73 s PGO for a 96M/96M total) are preserved as stale baselines in
 docs/performance.md and are not comparable to real-timing runs. Host, compiler,
 power mode, and firmware affect these numbers. See [Performance](docs/performance.md)
@@ -147,6 +177,8 @@ JSON artifacts, and comparison scope.
 Generate the Doxygen site when Doxygen is installed:
 
 ```bash
-cmake -S . -B build -G Ninja -DFIL_BUILD_DOCS=ON
-cmake --build build --target docs
+make docs
 ```
+
+The equivalent direct CMake commands are `cmake -S . -B build -DFIL_BUILD_DOCS=ON`
+then `cmake --build build --target docs`.

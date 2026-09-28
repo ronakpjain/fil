@@ -10,40 +10,65 @@ throughput (`simulated seconds / wall seconds`).
 
 ## Reference results
 
-### Real-timing model (current)
+### Real firmware (PER vehicle network, current)
 
-The runnable reference is `tools/bench_real_timing.py`, which needs no PER
-checkout: it generates hand-assembled Thumb fixtures (an idle `4x NOP + B`
-flash loop at reset 16 MHz, and a variant that programs `FLASH_ACR=0x304`
-then a 170 MHz HSE-PLL before spinning the same loop) and runs 1 s
-single-board and synthetic six-board workloads, batching on and off.
-All runs stop at 1,000,000,000 ns (pll170 overshoots by 1 ns of atomic batch
-completion); `cycles >= instructions` holds everywhere.
+The reference workload is 1 simulated second of the six-board
+`configs/networks/per_vehicle.json` network running real PER firmware
+(dashboard, main module, torque vector, a_box, front and rear driveline on
+a shared 500 kbit/s CAN bus). It needs the sibling PER checkout referenced
+by `configs/boards/*.json`; without it, use the synthetic smoke benchmark
+below. Every board runs continuous ADC+DMA motor-control firmware. At
+default settings no batchable idle loop exists (`loop_batches: 0`), so the
+default row measures the interpreter, scheduler, and event paths, not loop
+acceleration. Decimation has a second-order effect beyond removing ADC
+work: with fewer interrupts, firmware idles long enough for exact-state
+loop proofs to engage (N=8: 87,984 batches covering 16.7M instructions;
+N=32: 37,332 batches covering 21.7M) — same proofs, same guarantees, more
+idle to cover.
 
-Measured 2026-09-25 on Apple M3 / 8 cores / 8 GB / macOS 27.0, Homebrew Clang
-23.1.1, Release + IPO, AC power, median of 3 (`python3
-tools/bench_real_timing.py ./build-release/fil --reps 3`):
+Measured 2026-09-28 on Apple M3 / 8 cores / 8 GB / macOS 27.2, Apple Clang
+21.0.0, Release + IPO, AC power, median of 3:
 
-| Case | Instructions | Cycles | CPI | Median wall time | Throughput |
-|---|---|---:|---:|---:|---:|
-| idle16 x1, batching | 10,000,000 | 16,000,000 | 1.60 | 0.003 s | ~343x |
-| idle16 x1, no-batch | 10,000,000 | 16,000,000 | 1.60 | 0.181 s | 5.53x |
-| idle16 x6, batching | 60,000,000 | 96,000,000 | 1.60 | 0.004 s | ~266x |
-| idle16 x6, no-batch | 60,000,000 | 96,000,000 | 1.60 | 1.493 s | 0.67x |
-| pll170 x1, batching | 70,833,277 | 169,999,856 | 2.40 | 0.002 s | ~440x |
-| pll170 x1, no-batch | 70,833,277 | 169,999,856 | 2.40 | 1.135 s | 0.88x |
+| Case | Instructions | Cycles | CPI | Event callbacks | Median wall time | Throughput | Speedup vs default |
+|---|---|---:|---:|---:|---:|---:|---:|
+| network x6, default | 39,844,635 | 96,000,012 | 2.41 | 244,239 | 2.565 s | 0.39x | 1.00x |
+| network x6, `--adc-decimation 8` | 38,443,217 | 96,000,004 | 2.50 | 56,998 | 1.243 s | 0.80x | 2.06x |
+| network x6, `--adc-decimation 32` | 38,208,038 | 96,000,010 | 2.51 | 14,256 | 0.926 s | 1.08x | 2.77x |
+| front_driveline x1, default | 7,054,642 | 16,000,003 | 2.27 | — | 0.299 s | 3.35x | 1.00x |
+| front_driveline x1, `--adc-decimation 8` | 6,402,378 | 16,000,000 | 2.50 | — | 0.070 s | 14.2x | 4.24x |
+| dashboard x1, default | 6,301,749 | 16,000,001 | 2.54 | — | 0.052 s | 19.2x | 1.00x |
+| dashboard x1, `--adc-decimation 8` | 6,264,525 | 16,000,000 | 2.55 | — | 0.021 s | 48.4x | 2.52x |
 
-The idle loop costs 5 instructions / 8 cycles per iteration (taken `B` pays
-the +2 pipeline refill); the pll170 loop costs 5 / 12 (plus 4 ART-miss
-cycles on the taken branch at LATENCY=4). Against the pre-model baseline
-measured on the same host and binary configuration (1.00 CPI: x6 no-batch
-1.697 s / 0.59x, pll170 no-batch 2.858 s / 0.35x), realistic pacing executes
-fewer instructions per simulated second, so fixed-simulation-time throughput
-improved even though per-instruction host cost rose (memoized cycle LUT and
-cached clock/ACR keep the added timing work to a few loads and compares).
-The six-board no-batch interpreter path (0.67x) remains below real time and
-is the standing optimization target; batching covers it by 250x or more on
-loop-dominated firmware.
+All runs stop at the 1 s simulated-time deadline (`time_ns: 1000000187–1000000249;
+the sub-microsecond overshoot is atomic event completion at the frontier)
+with `cycles >= instructions` everywhere. CPI sits near 2.4–2.5 because
+the firmware runs PLL clocks with flash wait states, not because of host
+behavior. Single boards are far above realtime on their own (dashboard:
+19x); the network runs 2.4x slower per instruction than the sum of its
+boards (17.6M scheduler frontiers for 39.8M instructions, 244k event
+callbacks at default), which is why the ADC event path dominates the
+tradeoff: decimation removes conversions, DMA transfers, ISR entries, and
+queue operations while the conversion schedule itself never drifts, so
+`cycles` totals agree to within 8 of 96M across all three network runs.
+At `--adc-decimation 32` the network crosses realtime (1.08x) with a 2.77x
+speedup; per-board instruction streams are unchanged apart from the
+decimated ISR slices (see the decimation contract under
+[Diagnostics and peripheral work](#diagnostics-and-peripheral-work)).
+Host, compiler, power mode, and firmware affect these numbers — compare
+only runs made under the same conditions, and never against the retired
+1-CPI figures below (equal instruction counts now advance more simulated
+time).
+
+### Synthetic smoke benchmark (no PER checkout)
+
+`tools/bench_real_timing.py` generates hand-assembled Thumb fixtures (an
+idle `4x NOP + B` flash loop at reset 16 MHz, and a variant that programs
+`FLASH_ACR=0x304` then a 170 MHz HSE-PLL before spinning the same loop)
+and runs 1 s single-board and synthetic six-board workloads, batching on
+and off. It is a portability smoke test for environments without the PER
+firmware checkout — not the reference workload. It asserts
+`cycles >= instructions` and the 1 s deadline window on every case and
+prints instructions / cycles / CPI / wall time / throughput.
 
 ### Pre-model baseline (one cycle per instruction, stale)
 
@@ -82,29 +107,12 @@ comparable.
 
 ## Reproduce the benchmark
 
-Without the PER firmware checkout, run the runnable reference (needs only the
-just-built binary):
+With the PER firmware checkout, use the six-board network directly (this is
+the reference workload tabulated above). Use a fresh optimized build and the
+same firmware, compiler, power mode, and command line for every comparison:
 
 ```bash
-python3 tools/bench_real_timing.py ./build-release/fil --reps 3
-```
-
-It generates its own fixtures, asserts `cycles >= instructions` and the 1 s
-deadline window on every case, and prints instructions / cycles / CPI /
-wall time / throughput. With the PER checkout, use the six-board network below
-and expect `cycles >= instructions` with per-board instruction counts that
-vary with firmware CPI instead of the fixed stale 16M/board.
-
-Use a fresh optimized build and the same firmware, compiler, power mode, and command
-line for every comparison:
-
-```bash
-cmake -S . -B build-release -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DFIL_ENABLE_IPO=ON \
-  -DFIL_BUILD_TESTS=ON
-cmake --build build-release
-ctest --test-dir build-release --output-on-failure
+make BUILD_DIR=build-release BUILD_TYPE=Release IPO=ON test
 
 for run in 1 2 3; do
   /usr/bin/time -p ./build-release/fil run-network \
@@ -113,29 +121,42 @@ for run in 1 2 3; do
     --max-instructions 50000000 \
     --quantum 1024 \
     --strict-mmio
-done
+ done
 ```
 
-Record wall time and verify the emulator result. Under the retired 1-CPI
-model this was exactly `instructions: 96000000 / cycles: 96000000 /
-time_ns: 1000000000` at 16M/board; under the real-timing model expect
-`time_ns: 1000000000` with `cycles >= instructions` and per-board counts set
-by firmware CPI (loads 2, calls/branches 3-4, flash stalls at high clocks).
+Append `--adc-decimation 8` (or `32`) to reproduce the decimated rows.
+Record wall time and verify the emulator result: expect
+`time_ns: 1000000187`–`1000000249` with `cycles >= instructions` and
+per-board counts set by firmware CPI (loads 2, calls/branches 3-4, flash
+stalls at high clocks). Throughput is `simulated seconds / wall seconds`.
+Keep tracing off: instruction tracing writes one record per instruction and
+intentionally disables batching.
 
-Throughput is `simulated seconds / wall seconds`. Keep tracing off: instruction
-tracing writes one record per instruction and intentionally disables batching.
-Use `--no-loop-batching` to measure the interpreter and scheduler without loop
-acceleration.
-
-The single-board control is:
+The single-board controls are:
 
 ```bash
-/usr/bin/time -p ./build-release/fil run configs/boards/g4_testing.json \
+/usr/bin/time -p ./build-release/fil run configs/boards/front_driveline.json \
   --duration-ms 1000 \
   --max-instructions 50000000 \
-  --strict-mmio \
-  --no-loop-batching
+  --strict-mmio
+/usr/bin/time -p ./build-release/fil run configs/boards/dashboard.json \
+  --duration-ms 1000 \
+  --max-instructions 50000000 \
+  --strict-mmio
 ```
+
+Without the PER firmware checkout, the Makefile benchmark target builds
+first and generates its own synthetic fixtures (no PER needed):
+
+```bash
+make BUILD_DIR=build-release BUILD_TYPE=Release benchmark BENCH_REPS=3
+```
+
+It asserts `cycles >= instructions` and the 1 s deadline window on every
+case, and prints instructions / cycles / CPI / wall time / throughput.
+Treat it as a smoke test: its idle-loop fixtures behave nothing like ADC+
+DMA motor-control firmware, so do not compare its wall times with the
+network rows above.
 
 ## How the optimizations work
 
@@ -259,6 +280,22 @@ skipping it.
   conversions continue to schedule every event.
 - **DMAMUX route cache.** ADC requests use a generation-tagged route table instead
   of scanning all selectors. Any selector write rebuilds the complete table.
+- **ADC scan decimation (`--adc-decimation N`, opt-in fidelity tradeoff).**
+  Continuous-mode ADCs keep 1 of every N scans: the conversion schedule
+  still advances on time (no clock drift, kept scans land on their exact
+  deadlines), but skipped scans perform no DR/ISR writes, raise no EOC/EOS,
+  trigger no DMA or interrupt callbacks, and record no sample history or
+  trace. Whole decimated gaps collapse into a single event whose span
+  repeats the live scan period, so event-queue work also divides by N.
+  Decisions are per scan, preserving multi-rank DMA alignment, and
+  single-shot conversions are never skipped. Firmware observes sample data
+  coarsened to one scan per N periods (DR holds the last kept value) and
+  ADC timing rewrites during a gap take effect at the next kept scan at the
+  latest. Factor 1 (default) preserves current behavior exactly. On the
+  six-board vehicle network (continuous ADC+DMA on every board), N=8 reaches
+  about 2.2x end-to-end (0.79x realtime) and N=32 about 3.0x (1.09x realtime,
+  faster than realtime) on Apple M3 / Release+IPO, with instruction, cycle,
+  and `time_ns` totals unchanged apart from the decimated ISR stream.
 
 ## Build optimization
 
@@ -266,32 +303,32 @@ Release builds enable IPO/LTO when supported. Debug and sanitizer builds remain
 unoptimized and do not use IPO. Clang PGO can additionally optimize dispatch,
 branch layout, and scheduler code for representative workloads.
 
+Run the staged Makefile workflow with Clang/AppleClang and a representative
+workload. The example network needs the external PER firmware checkout; replace the
+training arguments with a local workload if needed:
+
 ```bash
-cmake -S . -B build-pgo-generate -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DFIL_ENABLE_IPO=OFF \
-  -DFIL_BUILD_TESTS=OFF \
-  -DFIL_PGO_GENERATE=ON
-cmake --build build-pgo-generate
-
-LLVM_PROFILE_FILE=/tmp/fil-per.profraw \
-  ./build-pgo-generate/fil run-network configs/networks/per_vehicle.json \
-    --duration-ms 1000 --max-instructions 50000000 \
-    --quantum 1024 --strict-mmio
-xcrun llvm-profdata merge -output=/tmp/fil-per.profdata /tmp/fil-per.profraw
-
-cmake -S . -B build-pgo -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DFIL_ENABLE_IPO=ON \
-  -DFIL_BUILD_TESTS=ON \
-  -DFIL_PGO_PROFILE=/tmp/fil-per.profdata
-cmake --build build-pgo
-ctest --test-dir build-pgo --output-on-failure
+make clean-pgo
+make pgo-generate PGO_CXX=clang++
+make pgo-train PGO_TRAIN_ARGS='run-network configs/networks/per_vehicle.json --duration-ms 1000 --max-instructions 50000000 --quantum 1024 --strict-mmio'
+make pgo-merge
+make pgo-test
 ```
 
-Use `llvm-profdata` directly on non-Apple systems. Profiles are tied to the compiler
-and instrumented binary; retrain after material source or toolchain changes. PGO
-generation/use modes are mutually exclusive and cannot be combined with sanitizers.
+The instrumented Release build (IPO off) and optimized profile-use Release build
+(IPO on) use separate `build-pgo-generate/` and `build-pgo/` directories. Training
+writes `fil-<pid>.profraw` files under the instrumented directory. The merged
+profile defaults to `build-pgo-generate/fil.profdata`. The Makefile uses
+`llvm-profdata` on `PATH`, falling back to `xcrun llvm-profdata` on macOS, and
+checks that its reported LLVM major version matches `PGO_CXX`. Keep both tools from
+the same LLVM release; override `PGO_CXX` and `LLVM_PROFDATA` together if needed.
+`make pgo-use` builds with the merged profile, and `make pgo-test` also runs CTest.
+Set `PGO_PROFILE` to move the merged profile.
+
+Start with `make clean-pgo` to avoid mixing stale profiles. Profiles are tied to the
+compiler, instrumented binary, and source; use the same `PGO_CXX` for both phases
+and retrain after material code/toolchain changes. CMake rejects GCC PGO and
+sanitizer/PGO combinations. See `make help` for all staged PGO targets.
 
 ## Correctness checks
 

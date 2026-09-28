@@ -68,7 +68,15 @@ struct EventLoop::Impl {
     [[nodiscard]] SimTimeNs timeFor(const EventOwner owner) const noexcept {
         if (owner == shared_event_owner) return shared_now;
         const auto found = owner_now.find(owner);
-        return found == owner_now.end() ? shared_now : found->second;
+        if (found == owner_now.end()) return shared_now;
+        // Owner clocks never read behind the shared clock: runDueEvents used
+        // to force every owner forward on each call, which cost a map walk
+        // per scheduler frontier. Clamping here returns the same value that
+        // eager walk would have produced (no owner read can intervene between
+        // a rewind and the next frontier advance without passing through a
+        // runDueEvents that re-syncs first), while frontiers with no owner
+        // activity skip the walk entirely.
+        return std::max(found->second, shared_now);
     }
 
     void setTime(const EventOwner owner, const SimTimeNs time) {
@@ -204,10 +212,8 @@ EventRunResult EventLoop::runDueEvents(const SimTimeNs deadline) {
         impl_->discardDeadGlobalFront();
         if (impl_->events.empty() || impl_->events.top()->at > deadline) {
             impl_->shared_now = deadline;
-            for (auto& [owner, time] : impl_->owner_now) {
-                static_cast<void>(owner);
-                time = std::max(time, deadline);
-            }
+            // Owner clocks are clamped to the shared clock on read
+            // (see timeFor), so no per-frontier map walk is needed here.
             result.stopped_at = deadline;
             return result;
         }

@@ -398,6 +398,7 @@ ExitCode runBoardCommand(
     bool detect_spin = false;
     bool enable_loop_batching = true;
     bool allow_breakpoint = false;
+    unsigned int adc_decimation = 1U;
 
     for (std::size_t index = 2; index < args.size(); ++index) {
         const std::string_view option = args[index];
@@ -405,7 +406,7 @@ ExitCode runBoardCommand(
             if (index + 1 >= args.size()) return std::nullopt;
             return args[++index];
         };
-        if (option == "--duration-ms" || option == "--max-instructions" || option == "--stop-address") {
+        if (option == "--duration-ms" || option == "--max-instructions" || option == "--stop-address" || option == "--adc-decimation") {
             const auto value = valueAfter();
             if (!value) {
                 err << "fil: " << option << " requires a value\n";
@@ -418,6 +419,13 @@ ExitCode runBoardCommand(
             }
             if (option == "--duration-ms") duration_ms = parsed.value();
             else if (option == "--max-instructions") max_instructions = parsed.value();
+            else if (option == "--adc-decimation") {
+                if (parsed.value() == 0U || parsed.value() > 1024U) {
+                    err << "fil: --adc-decimation requires a factor in [1, 1024]\n";
+                    return ExitCode::usage_error;
+                }
+                adc_decimation = static_cast<unsigned int>(parsed.value());
+            }
             else {
                 if (parsed.value() > std::numeric_limits<std::uint32_t>::max()) {
                     err << "fil: --stop-address exceeds 32-bit target address space\n";
@@ -472,6 +480,7 @@ ExitCode runBoardCommand(
     options.trace_instructions = trace_instructions;
     options.detect_spin = detect_spin;
     options.enable_loop_batching = enable_loop_batching;
+    options.adc_decimation = adc_decimation;
     options.stop_address = stop_address;
     if (stop_symbol) {
         const auto& symbols = board.value()->image().symbols();
@@ -789,6 +798,7 @@ ExitCode runNetworkCommand(
     bool enable_loop_batching = true;
     bool enable_transactional_slices = false;
     bool allow_breakpoint = false;
+    unsigned int adc_decimation = 1U;
     std::vector<PendingCanInjection> injections;
 
     for (std::size_t index = 2; index < args.size(); ++index) {
@@ -797,7 +807,7 @@ ExitCode runNetworkCommand(
             if (index + 1 >= args.size()) return std::nullopt;
             return args[++index];
         };
-        if (option == "--duration-ms" || option == "--max-instructions" || option == "--quantum") {
+        if (option == "--duration-ms" || option == "--max-instructions" || option == "--quantum" || option == "--adc-decimation") {
             const auto value = valueAfter();
             if (!value) {
                 err << "fil: " << option << " requires a value\n";
@@ -810,6 +820,13 @@ ExitCode runNetworkCommand(
             }
             if (option == "--duration-ms") duration_ms = parsed.value();
             else if (option == "--max-instructions") max_instructions = parsed.value();
+            else if (option == "--adc-decimation") {
+                if (parsed.value() == 0U || parsed.value() > 1024U) {
+                    err << "fil: --adc-decimation requires a factor in [1, 1024]\n";
+                    return ExitCode::usage_error;
+                }
+                adc_decimation = static_cast<unsigned int>(parsed.value());
+            }
             else quantum = parsed.value();
         } else if (option == "--trace" || option == "--inject-can") {
             const auto value = valueAfter();
@@ -887,6 +904,7 @@ ExitCode runNetworkCommand(
     options.detect_spin = detect_spin;
     options.enable_loop_batching = enable_loop_batching;
     options.enable_transactional_slices = enable_transactional_slices;
+    options.adc_decimation = adc_decimation;
     auto result = world.value()->run(options);
     if (!result) {
         err << "fil: " << formatError(result.error()) << '\n';
@@ -1230,7 +1248,7 @@ void printHelp(std::ostream& out) {
         << "Run options:\n"
         << "  --duration-ms N --max-instructions N --trace FILE --trace-instr\n"
         << "  --strict-mmio --stop-address ADDR --stop-at-symbol NAME --allow-breakpoint\n"
-        << "  --detect-spin --no-loop-batching\n\n"
+        << "  --detect-spin --no-loop-batching --adc-decimation N\n\n"
         << "ST-Link comparison options:\n"
         << "  --flash --memory ADDR:LENGTH --register NAME --ignore-register NAME\n"
         << "  --stop-address ADDR --stop-at-symbol NAME --max-instructions N\n"
@@ -1238,6 +1256,7 @@ void printHelp(std::ostream& out) {
         << "Network options:\n"
         << "  --duration-ms N --max-instructions N --quantum N --trace FILE\n"
         << "  --strict-mmio --trace-instr --detect-spin --no-loop-batching --allow-breakpoint\n"
+        << "  --adc-decimation N (keep 1 of N continuous ADC scans)\n"
         << "  --transactional-slices (experimental parallel lane epochs)\n"
         << "  --inject-can BUS[@TIME_MS]:ID:HEXDATA\n\n"
         << "Watch-network options:\n"

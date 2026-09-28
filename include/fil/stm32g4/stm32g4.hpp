@@ -61,6 +61,16 @@ public:
     /** @brief Enables or disables retained per-conversion ADC sample history on every ADC. */
     void setAdcDiagnosticsEnabled(bool enabled);
 
+    /**
+     * @brief Sets the continuous-scan decimation factor on every ADC.
+     *
+     * Factor 1 preserves current behavior. Higher factors keep conversion
+     * timing but skip DR/ISR, DMA, interrupt, and history side effects for
+     * N-1 of N scans (see AdcPeripheral::setDecimation). Persists across
+     * peripheral resets like other host-side attachments.
+     */
+    void setAdcDecimation(unsigned int factor);
+
     /** @brief Qualifies every peripheral trace source as `prefix.device`. */
     void setTraceSourcePrefix(std::string_view prefix);
 

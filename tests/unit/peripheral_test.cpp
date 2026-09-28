@@ -500,6 +500,116 @@ TEST(PeripheralTest, CompletesDmaAndWatchdogSideEffects) {
         << "watchdog requests reset at deterministic timeout";
 }
 
+TEST(PeripheralTest, DecimatesContinuousAdcScansWithoutDriftingSchedule) {
+    fil::sim::EventLoop loop;
+    fil::sim::TraceRecorder trace;
+    trace.setEnabled(false);
+    fil::stm32g4::AdcPeripheral adc("ADC1", &loop, &trace);
+    adc.setConversionDelay(5'000);
+    adc.setDecimation(4);
+    EXPECT_TRUE(adc.decimation() == 4U) << "decimation factor is retained";
+    adc.setChannelProvider([&](const unsigned int, const fil::sim::SimTimeNs now) {
+        return static_cast<std::uint16_t>(now / 5'000U);
+    });
+    int interrupts = 0;
+    adc.setInterruptCallback([&]() { ++interrupts; });
+    EXPECT_TRUE(
+        adc.write(0x04, fil::mem::AccessSize::word, (1U << 2U) | (1U << 3U), write_context)
+                .hasValue() &&
+            adc.write(0x0c, fil::mem::AccessSize::word, 1U << 13U, write_context).hasValue())
+        << "enables EOC/EOS interrupts and continuous mode";
+    EXPECT_TRUE(
+        adc.write(0x08, fil::mem::AccessSize::word, 1U | (1U << 2U), write_context).hasValue())
+        << "starts decimated continuous ADC";
+
+    EXPECT_TRUE(loop.runDueEvents(5'000).events_executed == 1 && interrupts == 1)
+        << "kept scan zero materializes on schedule";
+    const auto first = adc.read(0x40, fil::mem::AccessSize::word, read_context);
+    EXPECT_TRUE(first && first.value() == 1U) << "DR holds scan zero value";
+    EXPECT_TRUE(loop.runDueEvents(19'999).events_executed == 0)
+        << "skipped scans enqueue no per-conversion events";
+    EXPECT_TRUE(loop.runDueEvents(20'000).events_executed == 1 && interrupts == 1)
+        << "decimation gap lands without side effects";
+    const auto flags = adc.read(0, fil::mem::AccessSize::word, read_context);
+    EXPECT_TRUE(flags && (flags.value() & ((1U << 2U) | (1U << 3U))) == 0U)
+        << "skipped scans raise no EOC/EOS flags";
+    EXPECT_TRUE(loop.runDueEvents(25'000).events_executed == 1 && interrupts == 2)
+        << "kept scan four materializes without phase drift";
+    const auto kept = adc.read(0x40, fil::mem::AccessSize::word, read_context);
+    EXPECT_TRUE(kept && kept.value() == 5U)
+        << "kept scans observe exact scheduled timestamps";
+    EXPECT_TRUE(adc.samples().size() == 2U && adc.samples()[1].time_ns == 25'000)
+        << "sample history records kept scans only";
+}
+
+TEST(PeripheralTest, DecimationSkipsMultiRankScansAsWholeScans) {
+    fil::sim::EventLoop loop;
+    fil::sim::TraceRecorder trace;
+    trace.setEnabled(false);
+    fil::stm32g4::AdcPeripheral adc("ADC1", &loop, &trace);
+    adc.setConversionDelay(5'000);
+    adc.setDecimation(2);
+    adc.setChannelValue(2, 2002U);
+    adc.setChannelValue(3, 3003U);
+    std::vector<unsigned int> converted;
+    adc.setSampleCallback([&](const fil::stm32g4::AdcSample& sample) {
+        converted.push_back(sample.channel);
+    });
+    const std::uint32_t sequence = 1U | (2U << 6U) | (3U << 12U);
+    EXPECT_TRUE(
+        adc.write(0x0c, fil::mem::AccessSize::word, 1U << 13U, write_context).hasValue() &&
+        adc.write(0x30, fil::mem::AccessSize::word, sequence, write_context).hasValue())
+        << "configures continuous two-rank ADC sequence";
+    EXPECT_TRUE(
+        adc.write(0x08, fil::mem::AccessSize::word, 1U | (1U << 2U), write_context).hasValue())
+        << "starts decimated ADC sequence";
+
+    EXPECT_TRUE(loop.runDueEvents(10'000).events_executed == 2 && converted.size() == 2U)
+        << "kept scan converts every rank in order";
+    EXPECT_TRUE((converted == std::vector<unsigned int>{2U, 3U}))
+        << "rank order matches the configured sequence";
+    EXPECT_TRUE(loop.runDueEvents(20'000).events_executed == 1 && converted.size() == 2U)
+        << "skipped scan jumps in one event without DMA requests";
+    EXPECT_TRUE(loop.runDueEvents(30'000).events_executed == 2 && converted.size() == 4U)
+        << "next kept scan resumes on schedule";
+    EXPECT_TRUE((converted == std::vector<unsigned int>{2U, 3U, 2U, 3U}))
+        << "decimation preserves multi-rank DMA alignment";
+    const auto data = adc.read(0x40, fil::mem::AccessSize::word, read_context);
+    EXPECT_TRUE(data && data.value() == 3003U) << "DR holds the last kept rank value";
+}
+
+TEST(PeripheralTest, DecimationNeverSkipsSingleShotAdc) {
+    fil::sim::EventLoop loop;
+    fil::sim::TraceRecorder trace;
+    trace.setEnabled(false);
+    fil::stm32g4::AdcPeripheral adc("ADC1", &loop, &trace);
+    adc.setConversionDelay(5'000);
+    adc.setDecimation(4);
+    adc.setChannelValue(0, 1234);
+    int interrupts = 0;
+    adc.setInterruptCallback([&]() { ++interrupts; });
+    EXPECT_TRUE(
+        adc.write(0x04, fil::mem::AccessSize::word, 1U << 2U, write_context).hasValue())
+        << "enables single-shot EOC interrupt";
+    for (int shot = 0; shot < 3; ++shot) {
+        EXPECT_TRUE(
+            adc.write(0x08, fil::mem::AccessSize::word, 1U | (1U << 2U), write_context)
+                .hasValue())
+            << "starts single-shot ADC";
+        EXPECT_TRUE(loop.runDueEvents(loop.now() + 5'000).events_executed == 1)
+            << "single-shot conversion keeps its exact event";
+    }
+    EXPECT_TRUE(interrupts == 3) << "decimation never skips single-shot conversions";
+    const auto data = adc.read(0x40, fil::mem::AccessSize::word, read_context);
+    EXPECT_TRUE(data && data.value() == 1234U) << "single-shot DR is unaffected";
+}
+
+TEST(PeripheralTest, DecimationFactorZeroMeansOne) {
+    fil::stm32g4::AdcPeripheral adc;
+    adc.setDecimation(0);
+    EXPECT_TRUE(adc.decimation() == 1U) << "zero decimation clamps to exact mode";
+}
+
 } // namespace
 
 /** @brief Runs STM32G4 peripheral foundation unit tests. */

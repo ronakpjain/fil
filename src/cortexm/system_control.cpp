@@ -48,6 +48,7 @@ void SystemControl::reset(const std::uint32_t vector_base) {
     systick_pending_ = false;
     external_pending_enabled_ = false;
     reset_requested_ = false;
+    noteSelectionChanged();
 }
 
 void SystemControl::advanceCycles(const std::uint64_t cycles) {
@@ -55,6 +56,7 @@ void SystemControl::advanceCycles(const std::uint64_t cycles) {
     if ((systick_ctrl_ & 1U) == 0 || systick_load_ == 0 || cycles == 0) {
         return;
     }
+    const bool was_pending = systick_pending_;
 
     const std::uint32_t period = systick_load_ + 1U;
     if (systick_cycles_to_wrap_ == 0U) systick_cycles_to_wrap_ = period;
@@ -80,6 +82,7 @@ void SystemControl::advanceCycles(const std::uint64_t cycles) {
         systick_cycles_to_wrap_ = period;
     }
     systick_value_ = systick_cycles_to_wrap_ - 1U;
+    if (systick_pending_ && !was_pending) noteSelectionChanged();
 }
 
 std::optional<std::uint64_t> SystemControl::cyclesUntilSysTickInterrupt() const noexcept {
@@ -100,6 +103,7 @@ void SystemControl::pend(const std::uint16_t exception_number) {
         nvic_pending_[irq / 32U] |= std::uint32_t{1} << (irq % 32U);
         refreshPendingSummary();
     }
+    noteSelectionChanged();
 }
 
 void SystemControl::setInterruptLine(const std::uint16_t irq, const bool asserted) {
@@ -125,10 +129,12 @@ void SystemControl::clearPending(const std::uint16_t exception_number) {
         nvic_pending_[irq / 32U] &= ~(std::uint32_t{1} << (irq % 32U));
         refreshPendingSummary();
     }
+    noteSelectionChanged();
 }
 
 void SystemControl::enter(const std::uint16_t exception_number) {
     active_exception_ = exception_number;
+    noteSelectionChanged();
     if (exception_number >= 16U && exception_number < 256U) {
         const std::uint16_t irq = exception_number - 16U;
         nvic_active_[irq / 32U] |= std::uint32_t{1} << (irq % 32U);
@@ -138,6 +144,7 @@ void SystemControl::enter(const std::uint16_t exception_number) {
 
 void SystemControl::resume(const std::uint16_t exception_number) noexcept {
     active_exception_ = exception_number;
+    noteSelectionChanged();
 }
 
 void SystemControl::leave(const std::uint16_t exception_number) {
@@ -147,6 +154,7 @@ void SystemControl::leave(const std::uint16_t exception_number) {
     }
     if (active_exception_ == exception_number) active_exception_ = 0;
     refreshPendingSummary();
+    noteSelectionChanged();
 }
 
 void SystemControl::refreshPendingSummary() noexcept {
@@ -158,6 +166,7 @@ void SystemControl::refreshPendingSummary() noexcept {
             external_pending_enabled_ = true;
         }
     }
+    noteSelectionChanged();
 }
 
 bool SystemControl::isPending(const std::uint16_t exception_number) const noexcept {
@@ -186,6 +195,38 @@ std::uint8_t SystemControl::priority(const std::uint16_t exception_number) const
 }
 
 std::optional<std::uint16_t> SystemControl::nextPending(
+    const std::uint32_t primask,
+    const std::uint32_t basepri,
+    const std::uint32_t faultmask
+) const {
+    const PendingSelection& cached = selection_cache_;
+    if (cached.valid && cached.primask == primask && cached.basepri == basepri
+        && cached.faultmask == faultmask
+        && cached.active_exception == active_exception_
+        && cached.pendsv == pendsv_pending_ && cached.systick == systick_pending_
+        && cached.external == external_pending_enabled_
+        && cached.generation == selection_generation_) {
+        if (!cached.has_value) return std::nullopt;
+        return cached.value;
+    }
+    const auto selected = selectPendingUncached(primask, basepri, faultmask);
+    PendingSelection fresh;
+    fresh.valid = true;
+    fresh.has_value = selected.has_value();
+    fresh.value = selected.value_or(0U);
+    fresh.primask = primask;
+    fresh.basepri = basepri;
+    fresh.faultmask = faultmask;
+    fresh.active_exception = active_exception_;
+    fresh.pendsv = pendsv_pending_;
+    fresh.systick = systick_pending_;
+    fresh.external = external_pending_enabled_;
+    fresh.generation = selection_generation_;
+    selection_cache_ = fresh;
+    return selected;
+}
+
+std::optional<std::uint16_t> SystemControl::selectPendingUncached(
     const std::uint32_t primask,
     const std::uint32_t basepri,
     const std::uint32_t faultmask
@@ -326,6 +367,14 @@ void SystemControl::writeWord(
         || (offset >= 0xe180U && offset < 0xe1a0U)
         || (offset >= 0xe200U && offset < 0xe220U)
         || (offset >= 0xe280U && offset < 0xe2a0U);
+    // SysTick control, NVIC priorities, STIR, ICSR, and SHPR all feed
+    // exception selection (enable/pending state, priorities, or PendSV and
+    // SysTick flags); ISER/ICER/ISPR/ICPR already mark through refresh.
+    const bool mutates_selection = mutates_external_pending
+        || offset == 0xe010U || offset == 0xe014U || offset == 0xe018U
+        || (offset >= 0xe400U && offset < 0xe4f0U)
+        || offset == 0xef00U || offset == 0xed04U
+        || (offset >= 0xed18U && offset < 0xed24U);
     if (offset == 0x1000U) dwt_ctrl_ = merge(dwt_ctrl_);
     else if (offset == 0x1004U) dwt_cyccnt_ = merge(dwt_cyccnt_);
     else if (offset == 0xe010U) {
@@ -385,6 +434,7 @@ void SystemControl::writeWord(
     else if (offset == 0xedfcU) demcr_ = merge(demcr_);
     else if (offset == 0xef34U) fpccr_ = merge(fpccr_);
     if (mutates_external_pending) refreshPendingSummary();
+    else if (mutates_selection) noteSelectionChanged();
 }
 
 mem::MemoryResult<std::uint64_t> SystemControl::read(

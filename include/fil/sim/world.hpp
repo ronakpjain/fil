@@ -42,6 +42,7 @@ struct WorldRunOptions {
     bool enable_loop_batching{true}; ///< Fast-forward jointly proven side-effect-free loops.
     bool enable_transactional_slices{false}; ///< Execute experimental reversible lane epochs.
     bool stop_on_board_failure{true}; ///< Stop immediately instead of finishing other boards.
+    unsigned int adc_decimation{1}; ///< Keep 1 of N continuous ADC scans on every board.
 };
 
 /** @brief Accumulated outcome for one board in a world run. */

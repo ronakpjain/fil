@@ -147,6 +147,19 @@ private:
     [[nodiscard]] bool isPending(std::uint16_t exception_number) const noexcept;
     [[nodiscard]] bool isEnabled(std::uint16_t exception_number) const noexcept;
     void refreshPendingSummary() noexcept;
+    /**
+     * @brief Marks cached exception selection stale after a state change.
+     *
+     * Every mutation sites that feeds nextPending() funnels through here:
+     * NVIC enable/pending/active/line/priority writes, PendSV/SysTick pend
+     * and clear, SysTick wrap edges, exception enter/resume/leave, and
+     * reset. Over-marking only costs a rescan; under-marking would be a
+     * correctness bug, so new mutation sites must call this.
+     */
+    void noteSelectionChanged() noexcept {
+        ++selection_generation_;
+        selection_cache_.valid = false;
+    }
 
     std::array<std::uint32_t, 8> nvic_enable_{};
     std::array<std::uint32_t, 8> nvic_pending_{};
@@ -180,6 +193,30 @@ private:
     bool systick_pending_{false};
     bool external_pending_enabled_{false};
     bool reset_requested_{false};
+    // Memoized nextPending() selection. The settle path queries selection
+    // with identical masks for long stretches between pend/enter/leave and
+    // priority/enable writes; the key pins every input so a hit returns the
+    // exact value a full scan would produce.
+    std::uint64_t selection_generation_{0};
+    struct PendingSelection {
+        bool valid{false};
+        bool has_value{false};
+        std::uint16_t value{0};
+        std::uint32_t primask{0};
+        std::uint32_t basepri{0};
+        std::uint32_t faultmask{0};
+        std::uint16_t active_exception{0};
+        bool pendsv{false};
+        bool systick{false};
+        bool external{false};
+        std::uint64_t generation{0};
+    };
+    mutable PendingSelection selection_cache_{};
+    [[nodiscard]] std::optional<std::uint16_t> selectPendingUncached(
+        std::uint32_t primask,
+        std::uint32_t basepri,
+        std::uint32_t faultmask
+    ) const;
 };
 
 } // namespace fil::cortexm

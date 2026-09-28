@@ -471,6 +471,10 @@ void Stm32G4::setAdcDiagnosticsEnabled(const bool enabled) {
     dma2_.setTransferHistoryEnabled(enabled);
 }
 
+void Stm32G4::setAdcDecimation(const unsigned int factor) {
+    for (auto& device : adc_) device->setDecimation(factor);
+}
+
 void Stm32G4::setTraceSourcePrefix(const std::string_view prefix) {
     for (RegisterPeripheral* device : std::array<RegisterPeripheral*, 11>{
              &rcc_, &flash_, &crc_, &pwr_, &dma1_, &dma2_, &dmamux_, &iwdg_, &wwdg_,

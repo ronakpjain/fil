@@ -730,6 +730,7 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
     aggregate.reason = BoardStopReason::instruction_budget;
     std::optional<std::uint32_t> proven_spin_pc;
     std::uint64_t proven_spin_instructions = 0U;
+    peripherals_->setAdcDecimation(options.adc_decimation);
     const SimTimeNs deadline = options.duration_ns == 0U
         ? 0U : saturatingAdd(event_loop_->now(), options.duration_ns);
 

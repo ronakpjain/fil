@@ -161,6 +161,8 @@ void AdcPeripheral::storeRegister(
 void AdcPeripheral::onReset() {
     cancelConversion();
     sequence_rank_ = 0U;
+    scan_index_ = 0U;
+    skip_scan_ = false;
 }
 
 unsigned int AdcPeripheral::sequenceLength() const noexcept {
@@ -234,6 +236,8 @@ bool AdcPeripheral::lazyConversionEligible() const noexcept {
 void AdcPeripheral::startConversion() {
     cancelConversion();
     sequence_rank_ = 0U;
+    scan_index_ = 0U;
+    skip_scan_ = false;
     if (eventLoop() == nullptr) {
         materializeConversion(currentTime(), true);
         setRegister(cr, registerValue(cr) & ~adstart);
@@ -247,11 +251,25 @@ void AdcPeripheral::startConversion() {
 }
 
 void AdcPeripheral::completeConversion() {
-    materializeConversion(currentTime(), true);
     const bool sequence_complete = sequence_rank_ + 1U >= sequenceLength();
+    // Decimation is evaluated at scan granularity so multi-rank DMA
+    // alignment is preserved: a skipped scan advances ranks and time
+    // exactly as usual but leaves DR/ISR, DMA, interrupts, and sample
+    // history untouched. Single-shot conversions always materialize.
+    bool keep = true;
+    if (continuousMode() && decimation_ > 1U) {
+        if (sequence_rank_ == 0U) skip_scan_ = (scan_index_ % decimation_) != 0U;
+        keep = !skip_scan_;
+    }
+    if (keep) materializeConversion(currentTime(), true);
     sequence_rank_ = sequence_complete ? 0U : sequence_rank_ + 1U;
+    if (sequence_complete) {
+        ++scan_index_;
+        beginNextScan();
+        return;
+    }
 
-    if ((!sequence_complete || continuousMode()) && (registerValue(cr) & adstart) != 0U) {
+    if ((registerValue(cr) & adstart) != 0U) {
         const sim::SimTimeNs delay = conversionDelayForRank(sequence_rank_);
         if (delay > std::numeric_limits<sim::SimTimeNs>::max() - currentTime()) {
             throw std::overflow_error("ADC conversion time overflow");
@@ -260,6 +278,70 @@ void AdcPeripheral::completeConversion() {
     } else {
         setRegister(cr, registerValue(cr) & ~adstart);
     }
+}
+
+void AdcPeripheral::completeSkippedScans(const unsigned int skipped) {
+    sequence_rank_ = 0U;
+    scan_index_ += skipped;
+    beginNextScan();
+}
+
+void AdcPeripheral::beginNextScan() {
+    sequence_rank_ = 0U;
+    if (!continuousMode() || (registerValue(cr) & adstart) == 0U) {
+        setRegister(cr, registerValue(cr) & ~adstart);
+        return;
+    }
+    // Jump the whole decimated gap in one event: scans scan_index_ .. the
+    // next kept scan are unobservable while skipped, so their internal
+    // event granularity collapses. The span repeats the live scan period;
+    // timing rewrites during a gap land at the next kept scan at latest.
+    if (decimation_ > 1U) {
+        const unsigned int upcoming = static_cast<unsigned int>(
+            scan_index_ % decimation_);
+        if (upcoming != 0U) {
+            skip_scan_ = true;
+            armSkippedScans(decimation_ - upcoming);
+            return;
+        }
+    }
+    skip_scan_ = false;
+    const sim::SimTimeNs delay = conversionDelayForRank(0U);
+    if (delay > std::numeric_limits<sim::SimTimeNs>::max() - currentTime()) {
+        throw std::overflow_error("ADC conversion time overflow");
+    }
+    armNextConversion(currentTime() + delay);
+}
+
+void AdcPeripheral::armSkippedScans(const unsigned int count) {
+    const sim::SimTimeNs now = currentTime();
+    const unsigned int length = sequenceLength();
+    sim::SimTimeNs period = 0U;
+    bool representable = length > 0U && count > 0U;
+    for (unsigned int rank = 0U; rank < length && representable; ++rank) {
+        const sim::SimTimeNs delay = conversionDelayForRank(rank);
+        representable = delay <= std::numeric_limits<sim::SimTimeNs>::max() - period;
+        period += delay;
+    }
+    representable = representable
+        && period > 0U
+        && count <= std::numeric_limits<sim::SimTimeNs>::max() / period
+        && count * period <= std::numeric_limits<sim::SimTimeNs>::max() - now;
+    if (!representable || eventLoop() == nullptr) {
+        // Degrades to per-rank arming; the rank path already skips the
+        // side effects for this scan.
+        armNextConversion(now + conversionDelayForRank(0U));
+        return;
+    }
+    next_conversion_ns_ = now + count * period;
+    if (lazyConversionEligible()) {
+        conversion_event_.cancel();
+        return;
+    }
+    static_cast<void>(conversion_event_.scheduleAt(next_conversion_ns_.value(), [this, count]() {
+        next_conversion_ns_.reset();
+        completeSkippedScans(count);
+    }));
 }
 
 void AdcPeripheral::materializeConversion(
