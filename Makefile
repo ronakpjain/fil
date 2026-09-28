@@ -47,7 +47,8 @@ PGO_PATH = $(call root_path,$(PGO_BUILD_DIR))
 PGO_PROFILE ?= $(PGO_GENERATE_BUILD_DIR)/fil.profdata
 PGO_PROFILE_PATH = $(call root_path,$(PGO_PROFILE))
 PGO_PROFILE_PATTERN ?= $(PGO_GENERATE_BUILD_DIR)/fil-%p.profraw
-PGO_TRAIN_ARGS ?=
+# Representative default; override for a local firmware checkout or workload.
+PGO_TRAIN_ARGS ?= run-network configs/networks/per_vehicle.json --duration-ms 1000 --max-instructions 50000000 --quantum 1024 --strict-mmio
 PGO_CXX ?= clang++
 
 ifeq ($(strip $(LLVM_PROFDATA)),)
@@ -250,7 +251,13 @@ pgo-use: pgo-merge
 pgo-test: pgo-use
 	$(CTEST) --test-dir "$(PGO_PATH)" --output-on-failure -C Release $(CTEST_ARGS)
 
-pgo: pgo-test
+# Run a complete PGO cycle; validate the workload before removing prior PGO outputs.
+pgo:
+	@test -n "$(strip $(PGO_TRAIN_ARGS))" || { \
+		echo "Set PGO_TRAIN_ARGS to representative fil arguments (for example: run-network ...)." >&2; exit 2; }
+	$(MAKE) clean-pgo
+	$(MAKE) pgo-train
+	$(MAKE) pgo-test
 
 clean-pgo:
 	$(MAKE) clean BUILD_DIR="$(PGO_GENERATE_BUILD_DIR)"
@@ -269,8 +276,9 @@ help:
 	  '                make disasm-window [ELF=...] [DISASM_ADDR=...] [DISASM_COUNT=...]' \
 	  '                make compare-stlink CONFIRM_STLINK=YES [COMPARE_CONFIG=...] [COMPARE_ARGS="..."]' \
 	  '                make docs | firmware-tests (rewrites fixture ELFs) | benchmark [BENCH_REPS=3]' \
-	  'PGO:            make clean-pgo; make pgo-generate' \
-	  '                make pgo-train PGO_TRAIN_ARGS="run-network ..."; make pgo-merge' \
-	  '                make pgo-use | pgo-test | pgo' \
+	  'PGO:            make pgo (full cycle; default: six-board PER workload)' \
+	  '                Override workload with PGO_TRAIN_ARGS="run-network ..."' \
+	  '                Stages: pgo-generate | pgo-train | pgo-merge | pgo-use | pgo-test' \
+	  '                Set PGO_CXX/LLVM_PROFDATA to matching LLVM versions' \
 	  'Cleanup:        make clean [BUILD_DIR=...] | clean-pgo | clean-all' \
 	  'Options:        BUILD_DIR=build GENERATOR=Ninja JOBS=8 BUILD_TYPE=Release'
