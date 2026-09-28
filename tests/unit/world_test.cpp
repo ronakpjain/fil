@@ -199,7 +199,7 @@ TEST(WorldTest, StopsWatchNetworkWhenAllBoardsReachTerminalBoundaries) {
     const std::string path = network_path.string();
     const std::string_view args[]{
         "watch-network", path, "--duration-ms", "5", "--refresh-ms", "2",
-        "--live-filter", "can_rx",
+        "--adc-decimation", "4", "--trace-instr", "--live-filter", "can_rx",
     };
     std::ostringstream out;
     std::ostringstream err;
@@ -209,6 +209,14 @@ TEST(WorldTest, StopsWatchNetworkWhenAllBoardsReachTerminalBoundaries) {
     EXPECT_EQ(result, fil::cli::ExitCode::success);
     EXPECT_NE(out.str().find("watching network fixture-network"), std::string::npos);
     EXPECT_TRUE(err.str().empty());
+}
+
+TEST(WorldTest, RejectsInvalidWatchNetworkAdcDecimation) {
+    const std::string_view args[]{"watch-network", "missing.json", "--adc-decimation", "0"};
+    std::ostringstream out;
+    std::ostringstream err;
+    EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::usage_error);
+    EXPECT_NE(err.str().find("[1, 1024]"), std::string::npos);
 }
 
 TEST(WorldTest, StopsWatchNetworkFromStdin) {

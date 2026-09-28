@@ -990,8 +990,11 @@ ExitCode watchNetworkCommand(
     std::uint64_t quantum = 1'024U;
     std::optional<std::uint64_t> duration_ns;
     std::uint64_t refresh_ms = 1U;
+    unsigned int adc_decimation = 1U;
     bool strict_mmio = false;
     bool enable_loop_batching = true;
+    bool trace_instructions = false;
+    bool detect_spin = false;
     bool wall_pacing = true;
     bool custom_live_filters = false;
     std::vector<std::string> live_filters{"can_tx"};
@@ -1003,7 +1006,8 @@ ExitCode watchNetworkCommand(
             return args[++index];
         };
         if (option == "--max-instructions" || option == "--quantum"
-            || option == "--duration-ms" || option == "--refresh-ms") {
+            || option == "--duration-ms" || option == "--refresh-ms"
+            || option == "--adc-decimation") {
             const auto value = valueAfter();
             if (!value) {
                 err << "fil: " << option << " requires a value\n";
@@ -1017,7 +1021,13 @@ ExitCode watchNetworkCommand(
             }
             if (option == "--max-instructions") max_instructions = parsed.value();
             else if (option == "--quantum") quantum = parsed.value();
-            else if (option == "--duration-ms") {
+            else if (option == "--adc-decimation") {
+                if (parsed.value() < 1U || parsed.value() > 1024U) {
+                    err << "fil: --adc-decimation requires a factor in [1, 1024]\n";
+                    return ExitCode::usage_error;
+                }
+                adc_decimation = static_cast<unsigned int>(parsed.value());
+            } else if (option == "--duration-ms") {
                 if (parsed.value() > std::numeric_limits<std::uint64_t>::max() / 1'000'000ULL) {
                     err << "fil: duration overflows nanoseconds\n";
                     return ExitCode::usage_error;
@@ -1049,6 +1059,8 @@ ExitCode watchNetworkCommand(
         } else if (option == "--strict-mmio") strict_mmio = true;
         else if (option == "--lenient-mmio") strict_mmio = false;
         else if (option == "--no-wall-pacing") wall_pacing = false;
+        else if (option == "--trace-instr") trace_instructions = true;
+        else if (option == "--detect-spin") detect_spin = true;
         else if (option == "--no-loop-batching") enable_loop_batching = false;
         else if (option != "--control-stdin") {
             err << "fil: unknown watch-network option: " << option << '\n';
@@ -1103,6 +1115,9 @@ ExitCode watchNetworkCommand(
         options.max_instructions_per_board = max_instructions;
         options.instruction_quantum = quantum;
         options.enable_loop_batching = enable_loop_batching;
+        options.adc_decimation = adc_decimation;
+        options.trace_instructions = trace_instructions;
+        options.detect_spin = detect_spin;
         auto result = world.value()->run(options);
         if (!result || !result.value().succeeded()) {
             if (!result) err << "fil: " << formatError(result.error()) << '\n';
@@ -1261,7 +1276,9 @@ void printHelp(std::ostream& out) {
         << "  --inject-can BUS[@TIME_MS]:ID:HEXDATA\n\n"
         << "Watch-network options:\n"
         << "  --duration-ms N --refresh-ms N --max-instructions N --quantum N\n"
-        << "  --live-filter TYPE --strict-mmio --no-loop-batching --control-stdin\n"
+        << "  --adc-decimation N (keep 1 of N continuous ADC scans)\n"
+        << "  --live-filter TYPE --strict-mmio --trace-instr --detect-spin\n"
+        << "  --no-loop-batching --control-stdin\n"
         << "  --no-wall-pacing (watch runs slices back-to-back instead of real time)\n"
         << "  watch also stops early when all boards reach terminal CPU boundaries\n"
         << "  stdin: BUS:ID:HEXDATA, adc BOARD INSTANCE CHANNEL VALUE,\n"

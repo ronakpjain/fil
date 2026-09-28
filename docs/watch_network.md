@@ -83,9 +83,12 @@ error and ignored without stopping the simulation.
 | `--live-filter TYPE` | Print one exact trace event type. Repeat to select more than one type. |
 | `--max-instructions N` | Set the per-board instruction budget used for each run slice. |
 | `--quantum N` | Set the deterministic network scheduling quantum; defaults to `1024`. |
+| `--adc-decimation N` | Keep one of every `N` continuous ADC scans; factor 1–1024, default 1. |
+| `--trace-instr` | Emit instruction trace events; add `--live-filter instr` to print them. |
+| `--detect-spin` | Enable spin-loop detection; off by default. |
 | `--strict-mmio` | Treat accesses outside modeled MMIO blocks as faults. |
 | `--lenient-mmio` | Use lenient MMIO handling; this is the default. |
-| `--no-loop-batching` | Disable proven-loop batching. |
+| `--no-loop-batching` | Disable proven-loop batching; on by default. |
 | `--control-stdin` | Explicitly marks standard input as the control channel; standard input is monitored by default. |
 
 When `--duration-ms` is present, standard-input EOF does not end the run; the
