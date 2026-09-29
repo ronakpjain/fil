@@ -148,7 +148,9 @@ Result<void> World::initialize(const bool strict_mmio) {
                     record.time_ns,
                     bus_name + "/" + record.node,
                     record.direction == devices::CanTraceRecord::Direction::transmit,
-                    frame
+                    frame,
+                    bus_name,
+                    record.node
                 ));
             }
         );

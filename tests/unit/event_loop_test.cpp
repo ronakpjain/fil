@@ -265,18 +265,23 @@ TEST(EventLoopTest, SerializesStableTraceRecords) {
 
 TEST(EventLoopTest, NotifiesTraceObserverAfterAppendingRecord) {
     fil::sim::TraceRecorder trace;
-    const fil::sim::TraceRecord* observed = nullptr;
-    trace.setObserver([&observed](const fil::sim::TraceRecord& record) { observed = &record; });
+    bool notified = false;
+    fil::sim::TraceRecord observed;
+    trace.setObserver([&](const fil::sim::TraceRecord& record) {
+        EXPECT_FALSE(trace.records().empty());
+        observed = record;
+        notified = true;
+    });
 
     static_cast<void>(trace.record(4, "board", "can_tx"));
-    ASSERT_NE(observed, nullptr);
-    EXPECT_EQ(observed, &trace.records().back());
-    EXPECT_EQ(observed->time_ns, 4U);
+    ASSERT_TRUE(notified);
+    EXPECT_EQ(observed.sequence, trace.records().back().sequence);
+    EXPECT_EQ(observed.time_ns, 4U);
 
     trace.setEnabled(false);
-    observed = nullptr;
+    notified = false;
     static_cast<void>(trace.record(5, "board", "hidden"));
-    EXPECT_EQ(observed, nullptr);
+    EXPECT_FALSE(notified);
 }
 
 TEST(EventLoopTest, DisablesTraceCollectionWithoutDisturbingSequence) {

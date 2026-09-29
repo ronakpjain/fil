@@ -25,6 +25,7 @@ add_executable(fil_tests
     unit/stimulus_test.cpp
     unit/stm32g4_test.cpp
     unit/timing_test.cpp
+    unit/trace_test.cpp
     unit/world_test.cpp
     unit/world_time_test.cpp
 )

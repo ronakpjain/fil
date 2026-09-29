@@ -87,7 +87,9 @@ public:
         SimTimeNs time_ns,
         std::string source,
         bool transmit,
-        const CanTraceFrame& frame
+        const CanTraceFrame& frame,
+        std::string bus = {},
+        std::string origin = {}
     );
 
     /** @brief Gets immutable records in deterministic insertion order. */

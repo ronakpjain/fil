@@ -55,7 +55,10 @@ std::uint64_t TraceRecorder::record(
     records_.push_back(TraceRecord{
         time_ns, sequence, std::move(source), std::move(type), std::move(fields),
     });
-    if (observer_) observer_(records_.back());
+    if (observer_) {
+        const TraceRecord observed = records_.back();
+        observer_(observed);
+    }
     return sequence;
 }
 
@@ -63,7 +66,9 @@ std::uint64_t TraceRecorder::recordCanFrame(
     const SimTimeNs time_ns,
     std::string source,
     const bool transmit,
-    const CanTraceFrame& frame
+    const CanTraceFrame& frame,
+    std::string bus,
+    std::string origin
 ) {
     if (!enabled_) return next_sequence_;
     // Skip field formatting for types no consumer selected; record() would
@@ -71,20 +76,18 @@ std::uint64_t TraceRecorder::recordCanFrame(
     if (!passesFilter(transmit ? "can_tx" : "can_rx")) return next_sequence_++;
     std::ostringstream id;
     id << "0x" << std::hex << frame.id;
-    return record(
-        time_ns,
-        std::move(source),
-        transmit ? "can_tx" : "can_rx",
-        {
-            {"id", id.str()},
-            {"extended", booleanText(frame.extended)},
-            {"fd", booleanText(frame.fd)},
-            {"brs", booleanText(frame.brs)},
-            {"dlc", std::to_string(frame.dlc)},
-            {"length", std::to_string(frame.data.size())},
-            {"data", hexBytes(frame.data)},
-        }
-    );
+    std::vector<TraceField> fields{
+        {"id", id.str()},
+        {"extended", booleanText(frame.extended)},
+        {"fd", booleanText(frame.fd)},
+        {"brs", booleanText(frame.brs)},
+        {"dlc", std::to_string(frame.dlc)},
+        {"length", std::to_string(frame.data.size())},
+        {"data", hexBytes(frame.data)},
+    };
+    if (!bus.empty()) fields.emplace_back("bus", std::move(bus));
+    if (!origin.empty()) fields.emplace_back("origin", std::move(origin));
+    return record(time_ns, std::move(source), transmit ? "can_tx" : "can_rx", std::move(fields));
 }
 
 void TraceRecorder::clear() noexcept {
