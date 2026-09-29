@@ -1,7 +1,7 @@
 #pragma once
 
 /** @file config.hpp
- *  @brief Versioned MCU and board configuration models and loaders.
+ *  @brief Versioned MCU, board, and network configuration models and loaders.
  */
 
 #include "fil/common/result.hpp"
@@ -119,6 +119,7 @@ struct NetworkConfig {
     std::filesystem::path source_path;                    ///< Absolute source config path.
     std::vector<CanBusConfig> buses;                       ///< Declared virtual CAN buses.
     std::vector<std::filesystem::path> board_paths;        ///< Resolved board config paths.
+    std::vector<std::filesystem::path> stimulus_paths;     ///< Resolved timed input script paths.
 };
 
 /**

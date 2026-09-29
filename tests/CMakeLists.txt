@@ -22,6 +22,7 @@ add_executable(fil_tests
     unit/scheduler_tick_test.cpp
     unit/smoke_test.cpp
     unit/startup_runtime_test.cpp
+    unit/stimulus_test.cpp
     unit/stm32g4_test.cpp
     unit/timing_test.cpp
     unit/world_test.cpp

@@ -1,6 +1,7 @@
 #include "fil/config/config.hpp"
 
 #include "fil/common/format.hpp"
+#include "json_internal.hpp"
 
 #include <charconv>
 #include <cctype>
@@ -13,15 +14,7 @@
 #include <vector>
 
 namespace fil::config {
-namespace {
-
-struct JsonValue {
-    using Object = std::vector<std::pair<std::string, JsonValue>>;
-    using Array = std::vector<JsonValue>;
-    using Storage = std::variant<std::nullptr_t, bool, std::uint64_t, std::string, Object, Array>;
-
-    Storage storage;
-};
+namespace detail {
 
 class JsonParser {
 public:
@@ -536,6 +529,11 @@ std::filesystem::path resolveRelative(
     return (config_path.parent_path() / referenced_path).lexically_normal();
 }
 
+} // namespace detail
+
+namespace {
+using namespace detail;
+
 /// @brief Parses the board `gpio` object keyed by pin name.
 Result<std::vector<GpioPinConfig>> parseGpio(
     const JsonValue& value,
@@ -745,6 +743,8 @@ Result<std::vector<SpiConfig>> parseSpi(
 
 } // namespace
 
+using namespace detail;
+
 Result<std::uint64_t> parseUnsigned(const std::string_view text) {
     if (text.empty()) {
         return Error{ErrorCategory::invalid_argument, "numeric value is empty", std::nullopt};
@@ -945,7 +945,9 @@ Result<NetworkConfig> loadNetworkConfig(const std::filesystem::path& path) {
     if (!json) return json.error();
     auto object = requireObject(json.value(), source_path.value(), "network config root");
     if (!object) return object.error();
-    auto unknown = rejectUnknown(*object.value(), source_path.value(), {"schema_version", "name", "buses", "boards"});
+    auto unknown = rejectUnknown(
+        *object.value(), source_path.value(), {"schema_version", "name", "buses", "boards", "stimuli"}
+    );
     if (!unknown) return unknown.error();
     auto schema = validateSchema(*object.value(), source_path.value());
     if (!schema) return schema.error();
@@ -990,6 +992,17 @@ Result<NetworkConfig> loadNetworkConfig(const std::filesystem::path& path) {
         auto board_path = stringValue(board, source_path.value(), "boards[]");
         if (!board_path) return board_path.error();
         config.board_paths.push_back(resolveRelative(source_path.value(), board_path.value()));
+    }
+    if (const JsonValue* stimuli = find(*object.value(), "stimuli")) {
+        auto paths = requireArray(*stimuli, source_path.value(), "key 'stimuli'");
+        if (!paths) return paths.error();
+        for (const JsonValue& stimulus : *paths.value()) {
+            auto stimulus_path = stringValue(stimulus, source_path.value(), "stimuli[]");
+            if (!stimulus_path) return stimulus_path.error();
+            config.stimulus_paths.push_back(
+                resolveRelative(source_path.value(), stimulus_path.value())
+            );
+        }
     }
     return config;
 }
@@ -1039,7 +1052,12 @@ std::string normalize(const NetworkConfig& config) {
     }
     output << "boards: " << config.board_paths.size() << '\n';
     for (const auto& board : config.board_paths) output << "board: " << board.string() << '\n';
+    output << "stimulus_scripts: " << config.stimulus_paths.size() << '\n';
+    for (const auto& stimulus : config.stimulus_paths) {
+        output << "stimulus: " << stimulus.string() << '\n';
+    }
     return output.str();
 }
+
 
 } // namespace fil::config

@@ -125,6 +125,7 @@ TEST(ConfigTest, LoadsNetworkConfig) {
   "schema_version":1,
   "name":"vehicle",
   "buses":{"vehicle":{"type":"can","bitrate":500000}},
+  "stimuli":["stimuli/startup.json"],
   "boards":["boards/a.json","boards/b.json"]
 })"
     );
@@ -134,6 +135,10 @@ TEST(ConfigTest, LoadsNetworkConfig) {
     EXPECT_TRUE(network && network.value().board_paths[1] ==
                                (files.root() / "boards/b.json").lexically_normal())
         << "resolves network board paths against network config";
+    EXPECT_TRUE(network && network.value().stimulus_paths.size() == 1U &&
+                network.value().stimulus_paths[0] ==
+                    (files.root() / "stimuli/startup.json").lexically_normal())
+        << "resolves network stimulus-script paths against network config";
 }
 
 /// @brief Verifies strict schema and JSON failures.

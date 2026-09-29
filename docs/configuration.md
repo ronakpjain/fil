@@ -45,7 +45,7 @@ A board binds one MCU, one firmware ELF, run defaults, and deterministic externa
     "PA0": {"mode": "input", "value": true, "trace": false}
   },
   "can": {
-    "FDCAN1": {"bus": "vehicle", "loopback": false}
+    "FDCAN1": {"bus": "vcan", "loopback": false}
   },
   "usart": {
     "USART1": {"rx": [72, 105], "tx_log": "logs/usart1.bin"}
@@ -100,18 +100,46 @@ A network declares named CAN buses and a stable board order:
   "schema_version": 1,
   "name": "per_vehicle",
   "buses": {
-    "vehicle": {"type": "can", "bitrate": 500000}
+    "vcan": {"type": "can", "bitrate": 500000},
+    "mcan": {"type": "can", "bitrate": 500000}
   },
   "boards": [
     "../boards/dashboard.json",
     "../boards/main_module.json"
-  ]
+  ],
+  "stimuli": ["../stimuli/startup.json"]
 }
 ```
 
 At least one board is required. Only `type: "can"` is supported, bitrate must be nonzero, board names must be unique, and every board CAN attachment must name a declared bus. Board array order is the deterministic round-robin scheduling order. Bitrate is currently topology metadata; virtual CAN delivery is synchronous and does not model wire time or arbitration.
 
 The repository provides `configs/networks/per_vehicle.json` for application firmware and `configs/networks/per_vehicle_bootloaders.json` for the six vehicle bootloaders. The bootloader board configs use vector base `0x08000000`; application configs use `0x08008000`. These ELF paths target a sibling PER checkout and must exist to run the networks.
+
+## Stimulus scripts
+
+A network's optional `stimuli` array contains paths to versioned JSON stimulus scripts. Paths are resolved relative to the network file. `run-network` and `watch-network` validate each script's targets and schedule its events relative to simulation time zero before emulation begins. Independent script files can be composed in one network, and event order is deterministic for events with equal timestamps.
+
+```json
+{
+  "schema_version": 1,
+  "name": "startup",
+  "events": [
+    {"type":"gpio", "at_ms":0, "board":"main_module", "pin":"PB9", "value":true},
+    {"type":"adc", "at_ms":0, "board":"dashboard", "instance":"ADC1", "channel":9, "value":650},
+    {"type":"can", "at_ms":500, "repeat":{"every_ms":500,"count":5}, "bus":"mcan", "id":"0x231", "data":[0,41,0,0]},
+    {"type":"usart", "at_ms":100, "board":"dashboard", "instance":"USART1", "bytes":[72,105]}
+  ]
+}
+```
+
+Each event requires `at_ms` and a `type`:
+
+- `can`: requires `bus`, `id`, and a `data` byte array. `extended`, `fd`, and `brs` are optional; an ID above `0x7ff` defaults to extended format. CAN-FD payload sizes follow the legal DLC lengths.
+- `gpio`: requires a board instance name, `pin` (`PA0` through `PG15`), and `value` (`true`, `false`, or `"release"` to remove an external override).
+- `adc`: requires a board, ADC `instance`, channel 0–19, and sample `value` 0–4095.
+- `usart_rx` (also accepted as `usart`): requires a board, USART `instance`, and a byte array to append to its receive queue.
+
+Any event may include `repeat: {"every_ms": interval, "count": total}`; count includes the initial event. Repeats are finite and use millisecond intervals. All target names are checked against the loaded network before any event from that script is queued. `inspect-config` accepts stimulus-script files directly. For a complete example, see `configs/networks/per_vehicle_ready_to_drive.json` and `configs/stimuli/per_car_ready_to_drive.json`; this script drives the real PER dashboard/main-module firmware inputs while injecting inverter feedback on a separate MCAN bus.
 
 ## Inspection and execution
 
@@ -138,8 +166,8 @@ CLI options override run defaults without modifying JSON:
   --duration-ms 100 \
   --max-instructions 5000000 \
   --quantum 1024 \
-  --inject-can vehicle@5:0x123:0102 \
-  --inject-can vehicle@20:0x456:aabb
+  --inject-can vcan@5:0x123:0102 \
+  --inject-can vcan@20:0x456:aabb
 ```
 
 For `run-network`, `--duration-ms` is a shared simulated-time deadline and

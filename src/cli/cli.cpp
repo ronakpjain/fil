@@ -7,6 +7,7 @@
 #include "fil/elf/elf_loader.hpp"
 #include "fil/hardware/comparison.hpp"
 #include "fil/sim/board.hpp"
+#include "fil/sim/stimulus.hpp"
 #include "fil/sim/world.hpp"
 #include "fil/stm32g4/stm32g4.hpp"
 
@@ -778,6 +779,19 @@ ExitCode compareStlinkCommand(
     return ExitCode::success;
 }
 
+Result<void> scheduleConfiguredStimuli(
+    const config::NetworkConfig& network,
+    sim::World& world
+) {
+    for (const std::filesystem::path& path : network.stimulus_paths) {
+        auto script = sim::loadStimulusScript(path);
+        if (!script) return script.error();
+        auto scheduled = sim::scheduleStimulusScript(script.value(), world);
+        if (!scheduled) return scheduled.error();
+    }
+    return {};
+}
+
 ExitCode runNetworkCommand(
     const std::span<const std::string_view> args,
     std::ostream& out,
@@ -874,6 +888,11 @@ ExitCode runNetworkCommand(
         err << "fil: " << formatError(world.error()) << '\n';
         return world.error().category == ErrorCategory::config
             ? ExitCode::config_error : ExitCode::runtime_error;
+    }
+    auto scheduled_stimuli = scheduleConfiguredStimuli(network_config.value(), *world.value());
+    if (!scheduled_stimuli) {
+        err << "fil: " << formatError(scheduled_stimuli.error()) << '\n';
+        return ExitCode::config_error;
     }
     world.value()->setDiagnosticsEnabled(trace_path.has_value());
 
@@ -1080,6 +1099,11 @@ ExitCode watchNetworkCommand(
             ? ExitCode::config_error : ExitCode::runtime_error;
     }
 
+    auto scheduled_stimuli = scheduleConfiguredStimuli(network_config.value(), *world.value());
+    if (!scheduled_stimuli) {
+        err << "fil: " << formatError(scheduled_stimuli.error()) << '\n';
+        return ExitCode::config_error;
+    }
     world.value()->setDiagnosticsEnabled(true);
     // Record only what the live view selected: the hot peripheral and
     // exception types would otherwise be formatted, stored, and discarded
@@ -1253,12 +1277,12 @@ void printHelp(std::ostream& out) {
         << "  fil --help\n"
         << "  fil --version\n\n"
         << "Commands:\n"
-        << "  inspect-config <config.json>  Validate and normalize an MCU or board config\n"
+        << "  inspect-config <config.json>  Validate and normalize an MCU, board, network, or stimulus input\n"
         << "  inspect-elf <firmware.elf>     Inspect an ELF32 ARM firmware image\n"
         << "  disasm-window <firmware.elf>   Decode a bounded Thumb instruction window\n"
         << "  run <board.json> [options]     Execute one firmware board deterministically\n"
-        << "  run-network <network.json>     Execute a deterministic multi-board CAN network\n"
-        << "  watch-network <network.json>   Run a CAN network with stdin/stdout control\n"
+        << "  run-network <network.json>     Execute a deterministic network and its attached stimuli\n"
+        << "  watch-network <network.json>   Run a network and stimuli with stdin/stdout control\n"
         << "  compare-stlink <board.json>    Compare emulator state with STM32G4 hardware\n\n"
         << "Run options:\n"
         << "  --duration-ms N --max-instructions N --trace FILE --trace-instr\n"
@@ -1342,10 +1366,17 @@ ExitCode run(
             return ExitCode::success;
         }
 
-        err << "fil: config is not a valid board, MCU, or network config\n"
+        auto stimulus = sim::loadStimulusScript(args[1]);
+        if (stimulus) {
+            out << sim::normalizeStimulusScript(stimulus.value());
+            return ExitCode::success;
+        }
+
+        err << "fil: input is not a valid board, MCU, network, or stimulus script\n"
             << "  board: " << formatError(board.error()) << '\n'
             << "  mcu: " << formatError(mcu.error()) << '\n'
-            << "  network: " << formatError(network.error()) << '\n';
+            << "  network: " << formatError(network.error()) << '\n'
+            << "  stimulus: " << formatError(stimulus.error()) << '\n';
         return ExitCode::config_error;
     }
 

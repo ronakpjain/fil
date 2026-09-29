@@ -113,6 +113,7 @@ add_library(fil_core STATIC
     src/sim/event_loop.cpp
     src/sim/board.cpp
     src/sim/trace.cpp
+    src/sim/stimulus.cpp
     src/sim/worker_pool.cpp
     src/sim/world.cpp
     src/stm32g4/adc.cpp
@@ -273,7 +274,7 @@ if(FIL_BUILD_TESTS)
         if(FIL_PER_NETWORK_COMPLETE)
             set(per_network_json "{\n  \"schema_version\": 1,\n  \"name\": \"per_vehicle_smoke\",\n")
             string(APPEND per_network_json
-                "  \"buses\": {\"vehicle\": {\"type\": \"can\", \"bitrate\": 500000}},\n"
+                "  \"buses\": {\"vcan\": {\"type\": \"can\", \"bitrate\": 500000}, \"mcan\": {\"type\": \"can\", \"bitrate\": 500000}},\n"
             )
             string(APPEND per_network_json "  \"boards\": [")
             set(per_network_board_index 0)

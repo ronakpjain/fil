@@ -67,6 +67,7 @@ void AdcPeripheral::setChannelValue(const unsigned int channel, const std::uint1
     synchronizeLazyConversions();
     if (channel < channel_values_.size()) {
         channel_values_[channel] = static_cast<std::uint16_t>(std::min<std::uint16_t>(value, 0x0fffU));
+        channel_overrides_[channel] = true;
     }
 }
 
@@ -349,9 +350,9 @@ void AdcPeripheral::materializeConversion(
     const bool observable
 ) {
     const unsigned int channel = channelForRank(sequence_rank_);
-    const std::uint16_t value = channel_provider_
-        ? channel_provider_(channel, completion_time)
-        : channel_values_[channel];
+    const std::uint16_t value = channel_overrides_[channel] || !channel_provider_
+        ? channel_values_[channel]
+        : channel_provider_(channel, completion_time);
     const AdcSample sample{completion_time, channel, value};
     setRegister(dr, value);
     const bool sequence_complete = sequence_rank_ + 1U >= sequenceLength();

@@ -605,6 +605,7 @@ public:
         const mem::AccessContext& context
     ) override;
 
+    /** Sets a persistent external channel value that takes precedence over the configured provider. */
     void setChannelValue(unsigned int channel, std::uint16_t value);
     void setChannelProvider(ChannelProvider provider);
     void setSampleCallback(SampleCallback callback);
@@ -677,6 +678,7 @@ private:
     void cancelConversion() noexcept;
 
     std::array<std::uint16_t, 20> channel_values_{};
+    std::array<bool, 20> channel_overrides_{};
     ChannelProvider channel_provider_;
     SampleCallback sample_callback_;
     InterruptCallback interrupt_callback_;

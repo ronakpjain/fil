@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "name": "per_vehicle",
+  "name": "per_vehicle_ready_to_drive",
   "buses": {
     "vcan": {"type": "can", "bitrate": 500000},
     "mcan": {"type": "can", "bitrate": 500000}
@@ -13,5 +13,5 @@
     "../boards/front_driveline.json",
     "../boards/rear_driveline.json"
   ],
-  "stimuli": []
+  "stimuli": ["../stimuli/per_car_ready_to_drive.json"]
 }
