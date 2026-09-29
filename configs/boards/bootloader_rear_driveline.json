@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "name": "bootloader_rear_driveline",
+  "mcu": "../mcus/stm32g474retx.json",
+  "elf": "../../../../PER/Projects/monorepo/firmware/output/bootloader_REAR_DRIVELINE/bootloader_REAR_DRIVELINE.elf",
+  "vector_base": "0x08000000",
+  "can": {"FDCAN2": {"bus": "vehicle"}}
+}

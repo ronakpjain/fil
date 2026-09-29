@@ -111,7 +111,7 @@ A network declares named CAN buses and a stable board order:
 
 At least one board is required. Only `type: "can"` is supported, bitrate must be nonzero, board names must be unique, and every board CAN attachment must name a declared bus. Board array order is the deterministic round-robin scheduling order. Bitrate is currently topology metadata; virtual CAN delivery is synchronous and does not model wire time or arbitration.
 
-The repository provides `configs/networks/per_vehicle.json` and board files for `g4_testing`, `dashboard`, `main_module`, `torque_vector`, `a_box`, `front_driveline`, and `rear_driveline`. Their ELF paths target a sibling PER checkout and must exist to run them.
+The repository provides `configs/networks/per_vehicle.json` for application firmware and `configs/networks/per_vehicle_bootloaders.json` for the six vehicle bootloaders. The bootloader board configs use vector base `0x08000000`; application configs use `0x08008000`. These ELF paths target a sibling PER checkout and must exist to run the networks.
 
 ## Inspection and execution
 
@@ -121,6 +121,7 @@ Validate and print a normalized summary without starting emulation:
 ./build/fil inspect-config configs/mcus/stm32g474retx.json
 ./build/fil inspect-config configs/boards/g4_testing.json
 ./build/fil inspect-config configs/networks/per_vehicle.json
+./build/fil inspect-config configs/networks/per_vehicle_bootloaders.json
 ./build/fil inspect-elf path/to/firmware.elf
 ./build/fil disasm-window path/to/firmware.elf --addr 0x08001234 --count 32
 ```

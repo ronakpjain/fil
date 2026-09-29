@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "name": "per_vehicle_bootloaders",
+  "buses": {"vehicle": {"type": "can", "bitrate": 500000}},
+  "boards": [
+    "../boards/bootloader_dashboard.json",
+    "../boards/bootloader_main_module.json",
+    "../boards/bootloader_torque_vector.json",
+    "../boards/bootloader_a_box.json",
+    "../boards/bootloader_front_driveline.json",
+    "../boards/bootloader_rear_driveline.json"
+  ]
+}
