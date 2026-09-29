@@ -18,5 +18,16 @@
 
     {"type": "gpio", "at_ms": 2500, "board": "dashboard", "pin": "PB14", "value": false},
     {"type": "gpio", "at_ms": 2600, "board": "dashboard", "pin": "PB14", "value": true}
+  ],
+  "expect": [
+    {"type": "can", "bus": "mcan", "id": "0x111", "data": [0, 0, 0, 0, 0, 0, 0, 0], "at_ms": 90, "window_ms": 30},
+    {"type": "can", "bus": "mcan", "id": "0x112", "data": [0, 0, 0, 0, 0, 0, 0, 0], "at_ms": 90, "window_ms": 30},
+    {"type": "can", "bus": "mcan", "id": "0x113", "data": [0, 0, 0, 0, 0, 0, 0, 0], "at_ms": 90, "window_ms": 30},
+    {"type": "can", "bus": "mcan", "id": "0x114", "data": [0, 0, 0, 0, 0, 0, 0, 0], "at_ms": 90, "window_ms": 30},
+    {"type": "can", "bus": "mcan", "id": "0x111", "data": [0, 7, 0, 0, 92, 8, 12, 254], "at_ms": 5000, "window_ms": 200},
+    {"type": "can", "bus": "mcan", "id": "0x112", "data": [0, 7, 0, 0, 92, 8, 12, 254], "at_ms": 5000, "window_ms": 200},
+    {"type": "can", "bus": "mcan", "id": "0x113", "data": [0, 7, 0, 0, 92, 8, 12, 254], "at_ms": 5000, "window_ms": 200},
+    {"type": "can", "bus": "mcan", "id": "0x114", "data": [0, 7, 0, 0, 92, 8, 12, 254], "at_ms": 5000, "window_ms": 200},
+    {"type": "can", "bus": "vcan", "id": "0x46", "data": [5], "at_ms": 5000, "window_ms": 200}
   ]
 }
