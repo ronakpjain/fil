@@ -779,15 +779,33 @@ ExitCode compareStlinkCommand(
     return ExitCode::success;
 }
 
+class ScopedTraceObserverReset {
+public:
+    explicit ScopedTraceObserverReset(sim::TraceRecorder& trace) : trace_(&trace) {}
+    ~ScopedTraceObserverReset() { trace_->setObserver({}); }
+    ScopedTraceObserverReset(const ScopedTraceObserverReset&) = delete;
+    ScopedTraceObserverReset& operator=(const ScopedTraceObserverReset&) = delete;
+
+private:
+    sim::TraceRecorder* trace_;
+};
+
 Result<void> scheduleConfiguredStimuli(
     const config::NetworkConfig& network,
-    sim::World& world
+    sim::World& world,
+    std::vector<sim::CanExpectationCheck>& expectations
 ) {
-    for (const std::filesystem::path& path : network.stimulus_paths) {
+    for (std::size_t stimulus_index = 0; stimulus_index < network.stimulus_paths.size(); ++stimulus_index) {
+        const std::filesystem::path& path = network.stimulus_paths[stimulus_index];
         auto script = sim::loadStimulusScript(path);
         if (!script) return script.error();
         auto scheduled = sim::scheduleStimulusScript(script.value(), world);
         if (!scheduled) return scheduled.error();
+        for (std::size_t index = 0; index < script.value().expect.size(); ++index) {
+            expectations.push_back(sim::CanExpectationCheck{
+                script.value().name, index, script.value().expect[index], stimulus_index
+            });
+        }
     }
     return {};
 }
@@ -889,12 +907,21 @@ ExitCode runNetworkCommand(
         return world.error().category == ErrorCategory::config
             ? ExitCode::config_error : ExitCode::runtime_error;
     }
-    auto scheduled_stimuli = scheduleConfiguredStimuli(network_config.value(), *world.value());
+    std::vector<sim::CanExpectationCheck> expectations;
+    auto scheduled_stimuli = scheduleConfiguredStimuli(network_config.value(), *world.value(), expectations);
     if (!scheduled_stimuli) {
         err << "fil: " << formatError(scheduled_stimuli.error()) << '\n';
         return ExitCode::config_error;
     }
-    world.value()->setDiagnosticsEnabled(trace_path.has_value());
+    // Expectations need trace recording even without a requested trace artifact.
+    world.value()->setDiagnosticsEnabled(trace_path.has_value() || !expectations.empty());
+    sim::CanExpectationEvaluator expectation_evaluator(world.value()->trace(), expectations);
+    ScopedTraceObserverReset observer_reset(world.value()->trace());
+    if (!expectations.empty()) {
+        world.value()->trace().setObserver([&expectation_evaluator](const sim::TraceRecord& record) {
+            expectation_evaluator.observe(record);
+        });
+    }
 
     for (const PendingCanInjection& injection : injections) {
         devices::VirtualCanBus* bus = world.value()->canBus(injection.bus);
@@ -915,6 +942,10 @@ ExitCode runNetworkCommand(
         ));
     }
 
+    if (!expectations.empty()) expectation_evaluator.begin(
+        world.value()->eventLoop().now(), world.value()->eventLoop()
+    );
+
     sim::WorldRunOptions options;
     options.duration_ns = duration_ms * 1'000'000ULL;
     options.max_instructions_per_board = max_instructions;
@@ -926,10 +957,13 @@ ExitCode runNetworkCommand(
     options.adc_decimation = adc_decimation;
     auto result = world.value()->run(options);
     if (!result) {
+        if (!expectations.empty()) expectation_evaluator.finish(world.value()->eventLoop().now());
         err << "fil: " << formatError(result.error()) << '\n';
         return result.error().category == ErrorCategory::invalid_argument
             ? ExitCode::usage_error : ExitCode::runtime_error;
     }
+
+    if (!expectations.empty()) expectation_evaluator.finish(result.value().end_time_ns);
 
     out << "network: " << network_config.value().name << '\n'
         << "stop: " << sim::worldStopReasonName(result.value().reason) << '\n'
@@ -948,6 +982,21 @@ ExitCode runNetworkCommand(
         << "transactional_instructions: "
         << result.value().transactional_instructions << '\n'
         << "lockstep_bursts: " << result.value().lockstep_bursts << '\n';
+    const bool unmet_expectation = expectation_evaluator.hasFailures();
+    for (std::size_t index = 0; index < expectations.size(); ++index) {
+        const auto& check = expectations[index];
+        out << "expect " << check.script << " CAN " << check.expectation.bus << " id=0x"
+            << std::hex << check.expectation.id << std::dec << " window_ms=["
+            << check.expectation.at_ms << ','
+            << (check.expectation.at_ms + check.expectation.window_ms) << "]: "
+            << expectation_evaluator.status(index) << '\n';
+        if (expectation_evaluator.status(index) == "fail"
+            || expectation_evaluator.status(index) == "incomplete") {
+            err << "fil: unmet CAN output expectation in stimulus '" << check.script
+                << "' for bus '" << check.expectation.bus << "' id 0x" << std::hex
+                << check.expectation.id << std::dec << '\n';
+        }
+    }
     for (const auto& board : result.value().boards) {
         out << "board " << board.name
             << ": stop=" << sim::boardStopReasonName(board.result.reason)
@@ -987,7 +1036,7 @@ ExitCode runNetworkCommand(
             }
         }
     }
-    if (!result.value().succeeded() || unexpected_breakpoint) {
+    if (!result.value().succeeded() || unexpected_breakpoint || unmet_expectation) {
         err << "fil: network stopped with " << sim::worldStopReasonName(result.value().reason) << '\n';
         if (unexpected_breakpoint) err << "fil: a board reached an unrequested breakpoint\n";
         return ExitCode::runtime_error;
@@ -1064,7 +1113,7 @@ ExitCode watchNetworkCommand(
                 }
                 refresh_ms = parsed.value();
             }
-        } else if (option == "--live-filter") {
+        } else if (option == "--live-filter" || option == "--trace-type") {
             const auto value = valueAfter();
             if (!value || value->empty()) {
                 err << "fil: --live-filter requires a value\n";
@@ -1099,21 +1148,37 @@ ExitCode watchNetworkCommand(
             ? ExitCode::config_error : ExitCode::runtime_error;
     }
 
-    auto scheduled_stimuli = scheduleConfiguredStimuli(network_config.value(), *world.value());
+    std::vector<sim::CanExpectationCheck> expectations;
+    auto scheduled_stimuli = scheduleConfiguredStimuli(
+        network_config.value(), *world.value(), expectations
+    );
     if (!scheduled_stimuli) {
         err << "fil: " << formatError(scheduled_stimuli.error()) << '\n';
         return ExitCode::config_error;
     }
     world.value()->setDiagnosticsEnabled(true);
-    // Record only what the live view selected: the hot peripheral and
-    // exception types would otherwise be formatted, stored, and discarded
-    // once per event (hundreds of thousands per simulated second).
-    world.value()->trace().setTypeAllowlist(live_filters);
-    world.value()->trace().setObserver([&out, &live_filters](const sim::TraceRecord& record) {
+    sim::CanExpectationEvaluator expectation_evaluator(world.value()->trace(), expectations);
+    ScopedTraceObserverReset observer_reset(world.value()->trace());
+    std::vector<std::string> recorded_types = live_filters;
+    if (!expectations.empty()) {
+        // CAN transmit records are evaluator input even when the live display
+        // filter excludes them; lifecycle records remain serializable/selectable.
+        recorded_types.emplace_back("can_tx");
+        recorded_types.emplace_back("expectation_pending");
+        recorded_types.emplace_back("expectation_pass");
+        recorded_types.emplace_back("expectation_fail");
+        recorded_types.emplace_back("expectation_incomplete");
+    }
+    world.value()->trace().setTypeAllowlist(std::move(recorded_types));
+    world.value()->trace().setObserver([&out, &live_filters, &expectation_evaluator](const sim::TraceRecord& record) {
         if (std::find(live_filters.begin(), live_filters.end(), record.type) != live_filters.end()) {
             printLiveTraceRecord(out, record);
         }
+        expectation_evaluator.observe(record);
     });
+    if (!expectations.empty()) expectation_evaluator.begin(
+        world.value()->eventLoop().now(), world.value()->eventLoop()
+    );
     out << "watching network " << network_config.value().name << '\n' << std::flush;
 
     const sim::SimTimeNs started_at = world.value()->eventLoop().now();
@@ -1144,6 +1209,7 @@ ExitCode watchNetworkCommand(
         options.detect_spin = detect_spin;
         auto result = world.value()->run(options);
         if (!result || !result.value().succeeded()) {
+            if (!expectations.empty()) expectation_evaluator.finish(world.value()->eventLoop().now());
             if (!result) err << "fil: " << formatError(result.error()) << '\n';
             else err << "fil: watch stopped with "
                      << sim::worldStopReasonName(result.value().reason) << '\n';
@@ -1175,6 +1241,7 @@ ExitCode watchNetworkCommand(
             ? 1
             : ::poll(&input, 1, wall_pacing ? 0 : static_cast<int>(refresh_ms));
         if (ready < 0) {
+            if (!expectations.empty()) expectation_evaluator.finish(world.value()->eventLoop().now());
             err << "fil: failed to poll stdin\n";
             return ExitCode::runtime_error;
         }
@@ -1258,6 +1325,7 @@ ExitCode watchNetworkCommand(
             );
         }
     }
+    if (!expectations.empty()) expectation_evaluator.finish(world.value()->eventLoop().now());
     // Total-duration exactness: the per-slice sleeps keep phase within a
     // fraction of a slice, but the last sleep's wake jitter is never
     // corrected inside the loop. Sync once to the absolute deadline so the
@@ -1301,7 +1369,7 @@ void printHelp(std::ostream& out) {
         << "Watch-network options:\n"
         << "  --duration-ms N --refresh-ms N --max-instructions N --quantum N\n"
         << "  --adc-decimation N (keep 1 of N continuous ADC scans)\n"
-        << "  --live-filter TYPE --strict-mmio --trace-instr --detect-spin\n"
+        << "  --trace-type TYPE (alias: --live-filter; repeatable) --strict-mmio --trace-instr --detect-spin\n"
         << "  --no-loop-batching --control-stdin\n"
         << "  --no-wall-pacing (watch runs slices back-to-back instead of real time)\n"
         << "  watch also stops early when all boards reach terminal CPU boundaries\n"

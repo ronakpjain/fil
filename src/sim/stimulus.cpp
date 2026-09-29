@@ -4,6 +4,7 @@
 #include "fil/devices/can_bus.hpp"
 #include "fil/sim/board.hpp"
 #include "fil/sim/world.hpp"
+#include "fil/sim/trace.hpp"
 #include "fil/stm32g4/peripheral.hpp"
 #include "fil/stm32g4/stm32g4.hpp"
 #include "../config/json_internal.hpp"
@@ -13,6 +14,7 @@
 #include <limits>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 
@@ -259,6 +261,46 @@ Result<StimulusEvent> parseEvent(const JsonValue& value, const std::filesystem::
     return event;
 }
 
+Result<CanExpectation> parseExpectation(const JsonValue& value, const std::filesystem::path& path) {
+    auto object = requireObject(value, path, "CAN output expectation");
+    if (!object) return object.error();
+    auto unknown = rejectUnknown(*object.value(), path,
+        {"type", "bus", "id", "data", "extended", "at_ms", "window_ms"});
+    if (!unknown) return unknown.error();
+    auto type = requireString(*object.value(), path, "type");
+    auto bus = requireString(*object.value(), path, "bus");
+    auto id = requireUnsigned(*object.value(), path, "id");
+    auto data_field = requireField(*object.value(), path, "data");
+    auto at_ms = requireUnsigned(*object.value(), path, "at_ms");
+    auto window_ms = requireUnsigned(*object.value(), path, "window_ms");
+    if (!type) return type.error();
+    if (!bus) return bus.error();
+    if (!id) return id.error();
+    if (!data_field) return data_field.error();
+    if (!at_ms) return at_ms.error();
+    if (!window_ms) return window_ms.error();
+    if (type.value() != "can" || id.value() > 0x1fffffffU
+        || at_ms.value() > std::numeric_limits<std::uint64_t>::max() / ns_per_ms
+        || window_ms.value() > std::numeric_limits<std::uint64_t>::max() / ns_per_ms - at_ms.value()) {
+        return configError(path, "CAN expectation requires type 'can', a 29-bit ID, and a representable inclusive time window");
+    }
+    auto data = parseBytes(*data_field.value(), path, "data", 64U);
+    if (!data) return data.error();
+    bool extended = id.value() > 0x7ffU;
+    if (const JsonValue* field = find(*object.value(), "extended")) {
+        auto parsed = booleanValue(*field, path, "extended");
+        if (!parsed) return parsed.error();
+        extended = parsed.value();
+    }
+    if ((!extended && id.value() > 0x7ffU)) return configError(path, "standard CAN identifiers must fit in 11 bits");
+    const std::size_t length = data.value().size();
+    const bool valid_fd_length = length <= 8U || length == 12U || length == 16U || length == 20U
+        || length == 24U || length == 32U || length == 48U || length == 64U;
+    if (!valid_fd_length) return configError(path, "CAN expectation payload length must be classic 0..8 or a legal CAN-FD length");
+    return CanExpectation{std::move(bus).value(), static_cast<std::uint32_t>(id.value()), extended,
+        std::move(data).value(), at_ms.value(), window_ms.value()};
+}
+
 Error targetError(const StimulusScript& script, std::string message) {
     return Error{
         ErrorCategory::config,
@@ -344,7 +386,7 @@ Result<StimulusScript> loadStimulusScript(const std::filesystem::path& path) {
     if (!json) return json.error();
     auto object = requireObject(json.value(), source_path.value(), "stimulus script root");
     if (!object) return object.error();
-    auto unknown = rejectUnknown(*object.value(), source_path.value(), {"schema_version", "name", "events"});
+    auto unknown = rejectUnknown(*object.value(), source_path.value(), {"schema_version", "name", "events", "expect"});
     if (!unknown) return unknown.error();
     auto schema = validateSchema(*object.value(), source_path.value());
     if (!schema) return schema.error();
@@ -365,6 +407,15 @@ Result<StimulusScript> loadStimulusScript(const std::filesystem::path& path) {
         auto parsed = parseEvent(event, source_path.value());
         if (!parsed) return parsed.error();
         script.events.push_back(std::move(parsed).value());
+    }
+    if (const JsonValue* expect = find(*object.value(), "expect")) {
+        auto entries = requireArray(*expect, source_path.value(), "key 'expect'");
+        if (!entries) return entries.error();
+        for (const JsonValue& entry : *entries.value()) {
+            auto parsed = parseExpectation(entry, source_path.value());
+            if (!parsed) return parsed.error();
+            script.expect.push_back(std::move(parsed).value());
+        }
     }
     return script;
 }
@@ -393,6 +444,12 @@ Result<void> scheduleStimulusScript(const StimulusScript& script, World& world) 
         });
     }
 
+    for (const CanExpectation& expectation : script.expect) {
+        if (world.canBus(expectation.bus) == nullptr) {
+            return targetError(script, "stimulus '" + script.name + "' expectation names undeclared CAN bus '" + expectation.bus + "'");
+        }
+    }
+
     for (const BoundEvent& event : bound_events) {
         auto apply = std::make_shared<const std::function<void()>>(event.apply);
         for (std::uint32_t index = 0U; index < event.repeat_count; ++index) {
@@ -402,6 +459,181 @@ Result<void> scheduleStimulusScript(const StimulusScript& script, World& world) 
         }
     }
     return {};
+}
+
+bool matchesCanExpectation(const CanExpectation& expectation, const TraceRecord& record) {
+    if (expectation.at_ms > std::numeric_limits<std::uint64_t>::max() / ns_per_ms
+        || expectation.window_ms > std::numeric_limits<std::uint64_t>::max() / ns_per_ms - expectation.at_ms) {
+        return false;
+    }
+    const std::uint64_t start_ns = expectation.at_ms * ns_per_ms;
+    const std::uint64_t end_ns = (expectation.at_ms + expectation.window_ms) * ns_per_ms;
+    if (record.type != "can_tx" || record.time_ns < start_ns || record.time_ns > end_ns) return false;
+    const auto field = [&](const std::string_view name) -> const std::string* {
+        const auto found = std::find_if(record.fields.begin(), record.fields.end(),
+            [&](const TraceField& item) { return item.first == name; });
+        return found == record.fields.end() ? nullptr : &found->second;
+    };
+    const std::string* bus = field("bus");
+    const std::string* origin = field("origin");
+    const std::string* id = field("id");
+    const std::string* extended = field("extended");
+    const std::string* data = field("data");
+    std::ostringstream encoded_id;
+    encoded_id << "0x" << std::hex << expectation.id;
+    return bus != nullptr && origin != nullptr && *bus == expectation.bus
+        && *origin != "external" && id != nullptr && extended != nullptr && data != nullptr
+        && *id == encoded_id.str()
+        && *extended == (expectation.extended ? "true" : "false")
+        && *data == TraceRecorder::hexBytes(expectation.data);
+}
+
+CanExpectationEvaluator::CanExpectationEvaluator(
+    TraceRecorder& trace,
+    std::vector<CanExpectationCheck> checks
+) : trace_(&trace) {
+    checks_.reserve(checks.size());
+    for (CanExpectationCheck& check : checks) {
+        const CanExpectation& expectation = check.expectation;
+        if (expectation.at_ms > std::numeric_limits<std::uint64_t>::max() / ns_per_ms
+            || expectation.window_ms
+                > std::numeric_limits<std::uint64_t>::max() / ns_per_ms - expectation.at_ms) {
+            throw std::invalid_argument("CAN expectation time window overflows simulated time");
+        }
+        const std::uint64_t end_ns = (expectation.at_ms + expectation.window_ms) * ns_per_ms;
+        if (end_ns == std::numeric_limits<std::uint64_t>::max()) {
+            throw std::invalid_argument("CAN expectation deadline overflows simulated time");
+        }
+        checks_.push_back(CheckState{std::move(check), "pending"});
+    }
+}
+
+CanExpectationEvaluator::~CanExpectationEvaluator() {
+    cancelDeadlines();
+}
+
+void CanExpectationEvaluator::begin(const std::uint64_t now_ns, EventLoop& loop) {
+    if (now_ns != loop.now()) {
+        throw std::invalid_argument("CAN expectation start time must equal the event-loop time");
+    }
+    if (started_ || finished_) return;
+    started_ = true;
+    loop_ = &loop;
+    for (std::size_t index = 0; index < checks_.size(); ++index) {
+        CheckState& state = checks_[index];
+        emit(state, "pending", loop.now());
+        const std::uint64_t end_ns = (state.check.expectation.at_ms
+            + state.check.expectation.window_ms) * ns_per_ms;
+        // Window endpoints are inclusive; finalize at the next representable ns.
+        const std::uint64_t deadline_ns = end_ns + 1U;
+        if (deadline_ns > loop.now()) {
+            deadline_events_.push_back(loop.scheduleAt(deadline_ns, [this, deadline_ns] {
+                advance(deadline_ns);
+            }));
+        }
+    }
+    // A caller may start after some/all windows. Do not queue callbacks in the past.
+    advance(loop.now());
+}
+
+void CanExpectationEvaluator::observe(const TraceRecord& record) {
+    if (!started_ || finished_ || record.type != "can_tx") return;
+    // Emitting lifecycle records can grow/reallocate the recorder's vector;
+    // keep a stable snapshot while callbacks recurse through the observer.
+    const TraceRecord snapshot = record;
+    for (CheckState& state : checks_) {
+        if (state.status != "pending"
+            || !matchesCanExpectation(state.check.expectation, snapshot)) continue;
+        state.status = "pass";
+        emit(state, "pass", snapshot.time_ns, &snapshot);
+    }
+}
+
+void CanExpectationEvaluator::advance(const std::uint64_t now_ns) {
+    if (!started_ || finished_) return;
+    if (loop_ != nullptr && now_ns != loop_->now()) {
+        throw std::invalid_argument("CAN expectation advance time must equal the event-loop time");
+    }
+    for (CheckState& state : checks_) {
+        if (state.status != "pending") continue;
+        const std::uint64_t end_ns = (state.check.expectation.at_ms
+            + state.check.expectation.window_ms) * ns_per_ms;
+        if (now_ns > end_ns) {
+            state.status = "fail";
+            emit(state, "fail", now_ns);
+        }
+    }
+}
+
+void CanExpectationEvaluator::finish(const std::uint64_t now_ns) {
+    if (!started_ || finished_) return;
+    if (loop_ != nullptr && now_ns != loop_->now()) {
+        throw std::invalid_argument("CAN expectation finish time must equal the event-loop time");
+    }
+    advance(loop_ == nullptr ? now_ns : loop_->now());
+    for (CheckState& state : checks_) {
+        if (state.status != "pending") continue;
+        state.status = "incomplete";
+        emit(state, "incomplete", loop_ == nullptr ? now_ns : loop_->now());
+    }
+    finished_ = true;
+    cancelDeadlines();
+}
+
+bool CanExpectationEvaluator::hasFailures() const noexcept {
+    return std::any_of(checks_.begin(), checks_.end(), [](const CheckState& state) {
+        return state.status == "fail" || state.status == "incomplete";
+    });
+}
+
+std::string_view CanExpectationEvaluator::status(const std::size_t index) const noexcept {
+    return index < checks_.size() ? std::string_view{checks_[index].status} : std::string_view{};
+}
+
+void CanExpectationEvaluator::cancelDeadlines() noexcept {
+    if (loop_ != nullptr) {
+        for (const EventId id : deadline_events_) static_cast<void>(loop_->cancel(id));
+    }
+    deadline_events_.clear();
+}
+
+void CanExpectationEvaluator::emit(
+    CheckState& state,
+    const std::string_view status,
+    const std::uint64_t time_ns,
+    const TraceRecord* matched
+) {
+    std::ostringstream expected_id;
+    expected_id << "0x" << std::hex << state.check.expectation.id;
+    const CanExpectation& expectation = state.check.expectation;
+    std::vector<TraceField> fields{
+        {"check_id", "stimulus/" + std::to_string(state.check.stimulus_index) + "/"
+            + state.check.script + "/expect/" + std::to_string(state.check.index)},
+        {"script", state.check.script},
+        {"stimulus_index", std::to_string(state.check.stimulus_index)},
+        {"expect_index", std::to_string(state.check.index)},
+        {"status", std::string(status)},
+        {"expected_bus", expectation.bus},
+        {"expected_id", expected_id.str()},
+        {"expected_extended", expectation.extended ? "true" : "false"},
+        {"expected_data", TraceRecorder::hexBytes(expectation.data)},
+        {"window_start_ns", std::to_string(expectation.at_ms * ns_per_ms)},
+        {"window_end_ns", std::to_string((expectation.at_ms + expectation.window_ms) * ns_per_ms)},
+    };
+    if (matched != nullptr) {
+        const auto field = [&](const std::string_view name) -> std::string {
+            const auto found = std::find_if(matched->fields.begin(), matched->fields.end(),
+                [&](const TraceField& item) { return item.first == name; });
+            return found == matched->fields.end() ? std::string{} : found->second;
+        };
+        fields.emplace_back("matched_bus", field("bus"));
+        fields.emplace_back("matched_id", field("id"));
+        fields.emplace_back("matched_data", field("data"));
+        fields.emplace_back("matched_origin", field("origin"));
+        fields.emplace_back("matched_time_ns", std::to_string(matched->time_ns));
+    }
+    static_cast<void>(trace_->record(time_ns, "expectation/" + state.check.script,
+        "expectation_" + std::string(status), std::move(fields)));
 }
 
 std::string normalizeStimulusScript(const StimulusScript& script) {

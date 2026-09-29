@@ -25,7 +25,7 @@ ctest --test-dir build --output-on-failure
 
 The tests cover ELF/config parsing, memory and MMIO faults, Thumb decode/execution,
 Cortex-M exceptions, peripheral register behavior, deterministic events and traces,
-CAN delivery, single- and multi-board scheduling, worker rollback, and exact-state
+CAN delivery and stimulus output-window checks, single- and multi-board scheduling, worker rollback, and exact-state
 loop batching. Firmware fixtures exercise reset, `.data` copying, `.bss` clearing,
 hard-float startup, SysTick scheduling, and deterministic breakpoint boundaries.
 
@@ -95,7 +95,7 @@ only for firmware files that exist; the full six-board network test requires all
 six non-test board images. `CTEST_ARGS='-LE long'` skips the longer integration case.
 
 CMake adds ELF inspection, strict-MMIO board smoke runs, a one-second `g4_testing`
-run, and the six-board CAN network test when the required files exist. The network
+run, and the six-board CAN network test when the required files exist. Stimulus `expect` entries can assert firmware-originated CAN output within inclusive simulated-time windows. The network
 test verifies firmware-originated transmit and receive records in a generated JSONL
 trace. Use `-L per -LE long` for the short subset.
 

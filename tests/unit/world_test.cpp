@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -49,18 +50,50 @@ public:
         return config;
     }
 
+    [[nodiscard]] std::filesystem::path writeStimulus(const std::string_view content) const {
+        return writeStimulusAs("expectation.json", content);
+    }
+
+    [[nodiscard]] std::filesystem::path writeStimulusAs(
+        const std::filesystem::path& relative, const std::string_view content
+    ) const {
+        return directory_.write(relative, content);
+    }
+
     [[nodiscard]] std::filesystem::path writeNetwork(
-        const std::vector<std::filesystem::path>& boards
+        const std::vector<std::filesystem::path>& boards,
+        const std::filesystem::path& stimulus = {},
+        const bool include_nested_bus = false
+    ) const {
+        std::vector<std::filesystem::path> stimuli;
+        if (!stimulus.empty()) stimuli.push_back(stimulus);
+        return writeNetworkWithStimuli(boards, stimuli, include_nested_bus);
+    }
+
+    [[nodiscard]] std::filesystem::path writeNetworkWithStimuli(
+        const std::vector<std::filesystem::path>& boards,
+        const std::vector<std::filesystem::path>& stimuli,
+        const bool include_nested_bus = false
     ) const {
         std::ostringstream json;
         json << "{\n  \"schema_version\": 1,\n  \"name\": \"fixture-network\",\n"
-             << "  \"buses\": {\"vehicle\": {\"type\": \"can\", \"bitrate\": 500000}},\n"
-             << "  \"boards\": [";
+             << "  \"buses\": {\"vehicle\": {\"type\": \"can\", \"bitrate\": 500000}";
+        if (include_nested_bus) json << ", \"vehicle/sub\": {\"type\": \"can\", \"bitrate\": 500000}";
+        json << "},\n  \"boards\": [";
         for (std::size_t index = 0; index < boards.size(); ++index) {
             if (index != 0U) json << ", ";
             json << '"' << boards[index].string() << '"';
         }
-        json << "]\n}\n";
+        json << ']';
+        if (!stimuli.empty()) {
+            json << ",\n  \"stimuli\": [";
+            for (std::size_t index = 0; index < stimuli.size(); ++index) {
+                if (index != 0U) json << ", ";
+                json << '"' << stimuli[index].string() << '"';
+            }
+            json << ']';
+        }
+        json << "\n}\n";
         return directory_.write("network.json", json.str());
     }
 
@@ -211,6 +244,69 @@ TEST(WorldTest, StopsWatchNetworkWhenAllBoardsReachTerminalBoundaries) {
     EXPECT_TRUE(err.str().empty());
 }
 
+TEST(WorldTest, WatchNetworkStreamsExpectationPendingAndIncompleteLive) {
+    TempWorldConfigs files;
+    const auto stimulus = files.writeStimulus(R"({
+  "schema_version": 1, "name": "live", "events": [
+    {"type":"usart","at_ms":0,"board":"watch-live","instance":"USART1","bytes":[]}
+  ], "expect": [
+    {"type":"can","bus":"vehicle","id":"0x321","data":[1],"at_ms":100,"window_ms":10}
+  ]
+})");
+    const auto network_path = files.writeNetwork(
+        {files.writeBoard("watch-live.json", "watch-live")}, stimulus);
+    const std::string path = network_path.string();
+    const std::string_view args[]{"watch-network", path, "--no-wall-pacing",
+        "--trace-type", "expectation_pending", "--trace-type", "expectation_incomplete"};
+    std::istringstream input{"quit\n"};
+    std::ostringstream out;
+    std::ostringstream err;
+    std::streambuf* const original_input = std::cin.rdbuf(input.rdbuf());
+    const auto result = fil::cli::run(args, out, err);
+    std::cin.rdbuf(original_input);
+    std::cin.clear();
+
+    EXPECT_EQ(result, fil::cli::ExitCode::success);
+    EXPECT_NE(out.str().find("expectation_pending"), std::string::npos);
+    EXPECT_NE(out.str().find("expectation_incomplete"), std::string::npos);
+    EXPECT_NE(out.str().find("live/expect/0"), std::string::npos);
+    EXPECT_TRUE(err.str().empty());
+}
+
+TEST(WorldTest, ExpectationCheckIdsDistinguishDuplicateScriptsAndAttachments) {
+    TempWorldConfigs files;
+    const std::string_view script = R"({
+  "schema_version": 1, "name": "same-name", "events": [
+    {"type":"usart","at_ms":0,"board":"duplicate-checks","instance":"USART1","bytes":[]}
+  ], "expect": [
+    {"type":"can","bus":"vehicle","id":"0x321","data":[1],"at_ms":100,"window_ms":10}
+  ]
+})";
+    const auto first = files.writeStimulusAs("first.json", script);
+    const auto second = files.writeStimulusAs("second.json", script);
+    const auto network_path = files.writeNetworkWithStimuli(
+        {files.writeBoard("duplicate-checks.json", "duplicate-checks")},
+        {first, second, first});
+    const std::string path = network_path.string();
+    const std::string_view args[]{"watch-network", path, "--no-wall-pacing",
+        "--trace-type", "expectation_pending", "--trace-type", "expectation_incomplete"};
+    std::istringstream input{"quit\n"};
+    std::ostringstream out;
+    std::ostringstream err;
+    std::streambuf* const original_input = std::cin.rdbuf(input.rdbuf());
+    const auto result = fil::cli::run(args, out, err);
+    std::cin.rdbuf(original_input);
+    std::cin.clear();
+
+    EXPECT_EQ(result, fil::cli::ExitCode::success);
+    for (const std::string_view check_id : {
+            "stimulus/0/same-name/expect/0", "stimulus/1/same-name/expect/0",
+            "stimulus/2/same-name/expect/0"}) {
+        EXPECT_NE(out.str().find(check_id), std::string::npos);
+    }
+    EXPECT_TRUE(err.str().empty());
+}
+
 TEST(WorldTest, RejectsInvalidWatchNetworkAdcDecimation) {
     const std::string_view args[]{"watch-network", "missing.json", "--adc-decimation", "0"};
     std::ostringstream out;
@@ -234,7 +330,57 @@ TEST(WorldTest, StopsWatchNetworkFromStdin) {
     std::cin.clear();
 
     EXPECT_EQ(result, fil::cli::ExitCode::success);
+    EXPECT_EQ(out.str().find("expectation_"), std::string::npos);
     EXPECT_TRUE(err.str().empty());
+}
+
+TEST(WorldTest, NestedBusInjectionDoesNotSatisfyParentBusExpectation) {
+    TempWorldConfigs files;
+    const auto stimulus = files.writeStimulus(R"({
+  "schema_version": 1, "name": "must-transmit", "events": [
+    {"type":"can","at_ms":0,"bus":"vehicle/sub","id":"0x123","data":[1]}
+  ], "expect": [
+    {"type":"can","bus":"vehicle","id":"0x123","data":[1],"at_ms":0,"window_ms":0}
+  ]
+})");
+    const auto network = files.writeNetwork(
+        {files.writeBoard("inject-alpha.json", "inject-alpha", "vehicle/sub")}, stimulus, true);
+    const std::string path = network.string();
+    const std::string_view args[]{"run-network", path, "--duration-ms", "0",
+        "--max-instructions", "10", "--inject-can", "vehicle/sub@0:0x123:01"};
+    std::ostringstream out;
+    std::ostringstream err;
+    EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::runtime_error);
+    EXPECT_NE(out.str().find("window_ms=[0,0]: fail"), std::string::npos);
+    EXPECT_NE(err.str().find("unmet CAN output expectation"), std::string::npos);
+}
+
+TEST(WorldTest, CanOutputTraceCarriesExactBusAndFirmwareOrigin) {
+    TempWorldConfigs files;
+    auto network = files.network({files.writeBoard("nested.json", "nested", "vehicle/sub")});
+    network.buses.push_back({"vehicle/sub", 500000U});
+    auto world = fil::sim::World::load(network);
+    ASSERT_TRUE(world.hasValue()) << (world ? "" : world.error().message);
+    auto* bus = world.value()->canBus("vehicle/sub");
+    ASSERT_NE(bus, nullptr);
+    const auto sender = bus->attach("firmware/node", false,
+        [](const fil::devices::CanFrame&, std::uint64_t) {});
+    ASSERT_TRUE(sender.hasValue());
+    fil::devices::CanFrame frame;
+    frame.id = 0x123U;
+    frame.dlc = 1U;
+    frame.data[0] = 1U;
+    ASSERT_TRUE(bus->send(sender.value(), frame, 0U).hasValue());
+    const auto found = std::find_if(world.value()->trace().records().begin(),
+        world.value()->trace().records().end(), [](const fil::sim::TraceRecord& record) {
+            if (record.type != "can_tx") return false;
+            const auto has = [&](const std::string_view key, const std::string_view value) {
+                return std::find(record.fields.begin(), record.fields.end(),
+                    fil::sim::TraceField{std::string(key), std::string(value)}) != record.fields.end();
+            };
+            return has("bus", "vehicle/sub") && has("origin", "firmware/node");
+        });
+    EXPECT_NE(found, world.value()->trace().records().end());
 }
 
 TEST(WorldTest, ExecutesRunNetworkCli) {

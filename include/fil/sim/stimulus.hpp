@@ -5,7 +5,9 @@
  */
 
 #include "fil/common/result.hpp"
+#include "fil/sim/event_loop.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -16,6 +18,8 @@
 namespace fil::sim {
 
 class World;
+struct TraceRecord;
+class TraceRecorder;
 
 /** @brief External CAN frame injected into a named virtual bus. */
 struct CanStimulus {
@@ -61,11 +65,22 @@ struct StimulusEvent {
     StimulusInput input;                 ///< CAN, GPIO, ADC, or USART input.
 };
 
+/** @brief Expected firmware-originated CAN frame within an inclusive time interval. */
+struct CanExpectation {
+    std::string bus;                 ///< Network-local CAN bus name.
+    std::uint32_t id{0};            ///< Standard or extended identifier.
+    bool extended{false};           ///< Identifier format.
+    std::vector<std::uint8_t> data; ///< Exact expected payload.
+    std::uint64_t at_ms{0};          ///< Inclusive start relative to simulation time zero.
+    std::uint64_t window_ms{0};      ///< Inclusive end offset from at_ms.
+};
+
 /** @brief A deterministic, timed input script attached to a network. */
 struct StimulusScript {
     std::string name;                     ///< Stable script name.
     std::filesystem::path source_path;    ///< Absolute source file path.
     std::vector<StimulusEvent> events;    ///< Timed external inputs.
+    std::vector<CanExpectation> expect;   ///< Optional firmware output requirements.
 };
 
 /** @brief Loads and validates a versioned timed input script. */
@@ -73,6 +88,57 @@ struct StimulusScript {
 
 /** @brief Validates targets and schedules every input in a loaded script. */
 [[nodiscard]] Result<void> scheduleStimulusScript(const StimulusScript& script, World& world);
+
+/** @brief Tests a CAN transmit trace record against exact bus/origin/frame/window criteria. */
+[[nodiscard]] bool matchesCanExpectation(const CanExpectation& expectation, const TraceRecord& record);
+
+/** @brief Stable script/check pair used by CLI expectation evaluation. */
+struct CanExpectationCheck {
+    std::string script;
+    std::size_t index{0};
+    CanExpectation expectation;
+    std::size_t stimulus_index{0}; ///< Zero-based attachment position in the network config.
+};
+
+/**
+ * @brief Emits and tracks live CAN expectation lifecycle trace records.
+ *
+ * The referenced TraceRecorder and EventLoop must outlive this evaluator.
+ * The evaluator is non-copyable/non-movable because deadline callbacks refer to
+ * its stable address; destruction cancels any outstanding callbacks.
+ */
+class CanExpectationEvaluator {
+public:
+    CanExpectationEvaluator(TraceRecorder& trace, std::vector<CanExpectationCheck> checks);
+    ~CanExpectationEvaluator();
+    CanExpectationEvaluator(const CanExpectationEvaluator&) = delete;
+    CanExpectationEvaluator& operator=(const CanExpectationEvaluator&) = delete;
+    CanExpectationEvaluator(CanExpectationEvaluator&&) = delete;
+    CanExpectationEvaluator& operator=(CanExpectationEvaluator&&) = delete;
+
+    void begin(std::uint64_t now_ns, EventLoop& loop);
+    void observe(const TraceRecord& record);
+    void advance(std::uint64_t now_ns);
+    void finish(std::uint64_t now_ns);
+    [[nodiscard]] bool hasFailures() const noexcept;
+    [[nodiscard]] std::string_view status(std::size_t index) const noexcept;
+
+private:
+    struct CheckState {
+        CanExpectationCheck check;
+        std::string status{"pending"};
+    };
+
+    void emit(CheckState& state, std::string_view status, std::uint64_t time_ns,
+        const TraceRecord* matched = nullptr);
+    void cancelDeadlines() noexcept;
+    TraceRecorder* trace_{nullptr};
+    EventLoop* loop_{nullptr};
+    std::vector<EventId> deadline_events_;
+    std::vector<CheckState> checks_;
+    bool started_{false};
+    bool finished_{false};
+};
 
 /** @brief Produces stable human-readable output for a stimulus script. */
 [[nodiscard]] std::string normalizeStimulusScript(const StimulusScript& script);
