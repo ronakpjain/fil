@@ -2,6 +2,10 @@
 
 #include "fil/cpu/decoder.hpp"
 #include "fil/cpu/jit.hpp"
+#if FIL_HAS_LLVM_JIT
+#include "fil/cpu/llvm_jit.hpp"
+#include <vector>
+#endif
 #include "fil/elf/elf_loader.hpp"
 #include "fil/mem/memory_bus.hpp"
 
@@ -244,8 +248,93 @@ bool RunResult::succeeded() const noexcept {
         && reason != StopReason::invalid_state;
 }
 
+struct CortexM4::NativeState {
+#if FIL_HAS_LLVM_JIT
+    std::unique_ptr<LlvmJit> compiler;
+    std::vector<std::shared_ptr<const NativeJitKernel>> kernels;
+#endif
+};
+
 CortexM4::CortexM4(mem::MemoryBus& memory) noexcept : memory_(memory) {
     assert(decoderTablesHaveNoOverlaps());
+}
+
+CortexM4::~CortexM4() = default;
+
+bool CortexM4::nativeJitAvailable() noexcept {
+    return FIL_HAS_LLVM_JIT != 0;
+}
+
+bool CortexM4::ensureNativeCompiler() {
+#if FIL_HAS_LLVM_JIT
+    if (!native_state_) {
+        native_state_ = std::make_unique<NativeState>();
+        native_state_->compiler = LlvmJit::create(native_jit_error_);
+        if (!native_state_->compiler) ++jit_stats_.native_compilation_failures;
+    }
+    return native_state_->compiler
+        && native_state_->kernels.size() < max_native_kernels;
+#else
+    return false;
+#endif
+}
+
+bool CortexM4::executeNativeInstruction(InstructionCacheEntry& entry) {
+#if FIL_HAS_LLVM_JIT
+    if (state_.it_state != 0U || state_.pending_exception || state_.pending_exc_return) return false;
+    if (entry.native_function) {
+        entry.native_function(&state_, 1U);
+        ++jit_stats_.native_executions;
+        ++jit_stats_.native_instructions;
+        return true;
+    }
+    if (entry.native_attempted) return false;
+    if (entry.native_hits < native_compile_threshold) {
+        ++entry.native_hits;
+        return false;
+    }
+    entry.native_attempted = true;
+    const NativeJitInstruction instruction{entry.decoded, entry.pc, entry.size};
+    if (!LlvmJit::supports(instruction) || !ensureNativeCompiler()) return false;
+    auto kernel = native_state_->compiler->compile(
+        std::span<const NativeJitInstruction>{&instruction, 1U}, native_jit_error_);
+    if (!kernel || !kernel->entryPoint()) {
+        ++jit_stats_.native_compilation_failures;
+        return false;
+    }
+    entry.native_function = kernel->entryPoint();
+    native_state_->kernels.push_back(std::move(kernel));
+    ++jit_stats_.native_compilations;
+    entry.native_function(&state_, 1U);
+    ++jit_stats_.native_executions;
+    ++jit_stats_.native_instructions;
+    return true;
+#else
+    static_cast<void>(entry);
+    return false;
+#endif
+}
+
+void CortexM4::prepareNativeBlock(JitBlockEntry& entry) {
+#if FIL_HAS_LLVM_JIT
+    std::array<NativeJitInstruction, JitStepOutcome::max_block> instructions{};
+    for (std::uint8_t i = 0U; i < entry.count; ++i) {
+        instructions[i] = {entry.ops[i], entry.pcs[i], entry.sizes[i]};
+        if (!LlvmJit::supports(instructions[i])) return;
+    }
+    if (!ensureNativeCompiler()) return;
+    auto kernel = native_state_->compiler->compile(
+        std::span<const NativeJitInstruction>{instructions.data(), entry.count}, native_jit_error_);
+    if (!kernel || !kernel->entryPoint()) {
+        ++jit_stats_.native_compilation_failures;
+        return;
+    }
+    entry.native_function = kernel->entryPoint();
+    native_state_->kernels.push_back(std::move(kernel));
+    ++jit_stats_.native_compilations;
+#else
+    static_cast<void>(entry);
+#endif
 }
 
 bool CortexM4::reset(const elf::ElfImage& image) noexcept {
@@ -373,6 +462,9 @@ FastStepResult CortexM4::stepFastImpl(const bool use_jit) {
             capture(last_diagnostic_);
             return result;
         }
+        cache.native_function = nullptr;
+        cache.native_hits = 0U;
+        cache.native_attempted = false;
         cache.generation = execution_generation;
         cache.pc = pc;
         cache.raw = result.raw;
@@ -432,9 +524,12 @@ FastStepResult CortexM4::stepFastImpl(const bool use_jit) {
     if (condition_passed) [[likely]] {
         bool jit_handled = false;
         if (use_jit && !was_in_it) {
-            const auto fast = static_cast<JitFast>(cache.jit_fast);
-            jit_handled = fast != JitFast::generic
-                && executeJitFast(*decoded, fast, pc);
+            jit_handled = executeNativeInstruction(cache);
+            if (!jit_handled) {
+                const auto fast = static_cast<JitFast>(cache.jit_fast);
+                jit_handled = fast != JitFast::generic
+                    && executeJitFast(*decoded, fast, pc);
+            }
         }
         if (!jit_handled) stop = execute(*decoded, last_diagnostic_);
     }
@@ -617,6 +712,9 @@ std::optional<DecodedInstruction> CortexM4::fetchDecode(
     const auto decoded = wide ? decode32(first.value(), second_halfword)
                                : decode16(first.value());
     if (!decoded) return std::nullopt;
+    cache.native_function = nullptr;
+    cache.native_hits = 0U;
+    cache.native_attempted = false;
     cache.generation = generation;
     cache.pc = pc;
     cache.raw = raw;
@@ -705,6 +803,7 @@ bool CortexM4::prepareJitBlock() {
     fresh.valid = true;
     slot = fresh;
     ++jit_stats_.compilations;
+    prepareNativeBlock(slot);
     return true;
 }
 
@@ -726,6 +825,34 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlock(
     bool last_suppress = false;
     const std::uint8_t execution_count = static_cast<std::uint8_t>(
         std::min<std::size_t>(max_instructions, slot.count));
+#if FIL_HAS_LLVM_JIT
+    if (slot.native_function && state_.it_state == 0U) {
+        // Only independently lowered, pure unconditional instructions reach
+        // this path. The scheduler still controls the allowed prefix length.
+        slot.native_function(&state_, execution_count);
+        for (std::uint8_t i = 0U; i < execution_count; ++i) {
+            out.pcs[i] = slot.pcs[i];
+            out.sizes[i] = slot.sizes[i];
+            total_cycles += slot.base_cycles[i];
+        }
+        const auto last = static_cast<std::size_t>(execution_count - 1U);
+        if (state_.r[15] != slot.pcs[last] + slot.sizes[last]) {
+            total_cycles += slot.branch_penalty[last];
+        }
+        out.count = execution_count;
+        out.result.instructions = execution_count;
+        out.result.instruction_address = slot.pcs[last];
+        out.result.raw = slot.raws[last];
+        out.result.instruction_size = slot.sizes[last];
+        out.result.cycles = static_cast<std::uint16_t>(total_cycles);
+        out.result.suppress_loop_observation = slot.ops[last].kind == InstrKind::bl;
+        ++jit_stats_.block_executions;
+        jit_stats_.block_instructions += execution_count;
+        ++jit_stats_.native_executions;
+        jit_stats_.native_instructions += execution_count;
+        return out;
+    }
+#endif
     for (std::uint8_t i = 0; i < execution_count; ++i) {
         const DecodedInstruction& op = slot.ops[i];
         const std::uint32_t pc = slot.pcs[i];
