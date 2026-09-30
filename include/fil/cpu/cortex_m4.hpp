@@ -8,6 +8,7 @@
 #include "fil/mem/address.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -186,6 +187,9 @@ public:
      */
     [[nodiscard]] FastStepResult stepFast();
 
+    /** @brief Executes one cached, specialized instruction or interprets exactly one step. */
+    [[nodiscard]] FastStepResult stepJitFast();
+
     /** @brief Gets the diagnostic captured by the most recent failed fast step. */
     [[nodiscard]] const DiagnosticSnapshot& lastDiagnostic() const noexcept {
         return last_diagnostic_;
@@ -209,6 +213,68 @@ public:
     /** @brief Executes until budget exhaustion, breakpoint, halt, or a fault. */
     [[nodiscard]] RunResult run(std::uint64_t instruction_budget);
 
+    /** @brief Aggregated multi-instruction step produced by the hot-path JIT. */
+    struct JitStepOutcome {
+        FastStepResult result{};
+        // Per-instruction PCs/sizes for host fetch-stall accounting.
+        static constexpr std::size_t max_block = 16U;
+        std::array<std::uint32_t, max_block> pcs{};
+        std::array<std::uint8_t, max_block> sizes{};
+        std::uint8_t count{0};
+    };
+
+    /** @brief Read-only metadata and conservative CPU-cycle bound for a JIT prefix. */
+    struct JitBlockPreview {
+        std::array<std::uint32_t, JitStepOutcome::max_block> pcs{};
+        std::array<std::uint8_t, JitStepOutcome::max_block> sizes{};
+        std::uint8_t count{0};
+        std::uint64_t max_cycles{0};
+        /** True only for a memory-free, non-faulting prefix with fixed cycle cost. */
+        bool cycles_exact{true};
+    };
+
+    /**
+     * @brief Tries to execute a cached hot-path block (0 = fallback).
+     *
+     * Returns nullopt when no compiled block covers the current PC or the
+     * architectural state forbids block execution (IT active, pending
+     * exception, invalid Thumb state). Otherwise executes the block with
+     * exact per-instruction semantics, precise MMIO-restart partial counts,
+     * and fault diagnostics identical to repeated stepFast() calls.
+     */
+    [[nodiscard]] std::optional<JitStepOutcome> tryStepJitBlock(
+        std::size_t max_instructions = JitStepOutcome::max_block);
+
+    /**
+     * @brief Previews a ready block prefix without executing it.
+     *
+     * Returns nullopt for unavailable blocks, zero-length requests, or any
+     * selected prefix containing a memory instruction. max_cycles includes
+     * maximum modeled divide latency and the possible control-flow refill.
+     */
+    [[nodiscard]] std::optional<JitBlockPreview> peekJitBlock(
+        std::size_t max_instructions = JitStepOutcome::max_block) const noexcept;
+
+    /**
+     * @brief Whether a compiled JIT block covers the current PC.
+     *
+     * Cheap lockstep probe for the world burst gate: true only when a
+     * cached block for the current entry PC is valid for the current
+     * execution generation and block execution is architecturally allowed
+     * (Thumb state, no active IT block, no pending exception traffic).
+     */
+    [[nodiscard]] bool jitBlockReady() const noexcept;
+
+    /** @brief Advances hotness and prepares a block without changing guest CPU state. */
+    [[nodiscard]] bool prepareJitBlock();
+    struct JitStats {
+        std::uint64_t block_executions{0};
+        std::uint64_t block_instructions{0};
+        std::uint64_t fallbacks{0};
+        std::uint64_t compilations{0};
+    };
+    [[nodiscard]] JitStats jitStats() const noexcept { return jit_stats_; }
+
     /**
      * @brief Provides FPCCR (ASPEN) reads for automatic CONTROL.FPCA maintenance.
      * May remain unset (unit tests); FP ownership tracking then assumes ASPEN.
@@ -228,6 +294,7 @@ private:
         // cost is resolved live via divideCycles().
         std::uint16_t base_cycles{1};
         bool divide_form{false};
+        std::uint8_t jit_fast{0};
     };
 
     static constexpr std::size_t instruction_cache_entries = 16384U;
@@ -243,6 +310,61 @@ private:
     CpuState state_{};
     std::array<InstructionCacheEntry, instruction_cache_entries> instruction_cache_{};
     DiagnosticSnapshot last_diagnostic_{};
+
+    // Hot-path JIT: direct-mapped block cache keyed by entry PC.
+    // Per-op metadata is fully precomputed at compile time so block
+    // execution pays no classification, flag-suppression, or dispatch
+    // switches for inlined integer ops.
+    enum class JitFast : std::uint8_t {
+        generic,
+        nop,
+        b,
+        bl,
+        cbz,
+        cbnz,
+        mov_imm,
+        mov_reg,
+        movw,
+        movt,
+        add_imm,
+        add_reg,
+        sub_imm,
+        sub_reg,
+        cmp_imm,
+        cmp_reg,
+        logic_reg,
+        mul_reg,
+        shift,
+    };
+    struct JitBlockEntry {
+        std::uint64_t generation{0};
+        std::uint32_t pc{0};
+        std::uint8_t count{0};
+        bool valid{false};
+        bool attempted{false};
+        std::array<DecodedInstruction, JitStepOutcome::max_block> ops{};
+        std::array<std::uint32_t, JitStepOutcome::max_block> pcs{};
+        std::array<std::uint8_t, JitStepOutcome::max_block> sizes{};
+        std::array<std::uint32_t, JitStepOutcome::max_block> raws{};
+        std::array<std::uint16_t, JitStepOutcome::max_block> base_cycles{};
+        std::array<bool, JitStepOutcome::max_block> divide_form{};
+        std::array<JitFast, JitStepOutcome::max_block> fast{};
+        std::array<bool, JitStepOutcome::max_block> is_memory{};
+        std::array<bool, JitStepOutcome::max_block> is_terminator{};
+        std::array<std::uint16_t, JitStepOutcome::max_block> branch_penalty{};
+    };
+    static constexpr std::size_t jit_block_entries = 1024U;
+    std::array<JitBlockEntry, jit_block_entries> jit_blocks_{};
+    std::array<std::uint16_t, jit_block_entries> jit_hot_{};
+    JitStats jit_stats_{};
+    static constexpr std::uint16_t jit_compile_threshold = 50U;
+
+    [[nodiscard]] FastStepResult stepFastImpl(bool use_jit);
+    [[nodiscard]] bool executeJitFast(const DecodedInstruction& op, JitFast fast,
+                                      std::uint32_t pc) noexcept;
+    [[nodiscard]] std::optional<DecodedInstruction> fetchDecode(
+        std::uint32_t pc, std::uint32_t& raw_out, std::uint8_t& size_out);
+    [[nodiscard]] static JitFast classifyJitFast(const DecodedInstruction& op) noexcept;
 };
 
 /** @brief Stable lowercase name for diagnostics and tests. */

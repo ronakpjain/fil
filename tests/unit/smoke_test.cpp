@@ -22,6 +22,8 @@ TEST(SmokeTest, HelpIsSuccessful) {
     EXPECT_TRUE(result == fil::cli::ExitCode::success) << "--help returns success";
     EXPECT_TRUE(out.str().find("Usage:") != std::string::npos) << "--help prints usage";
     EXPECT_TRUE(err.str().empty()) << "--help does not print an error";
+    EXPECT_NE(out.str().find("--jit"), std::string::npos);
+    EXPECT_EQ(out.str().find("--no-jit"), std::string::npos);
 }
 
 /// @brief Verifies unknown commands produce a usage error.
@@ -36,6 +38,24 @@ TEST(SmokeTest, UnknownCommandIsAUsageError) {
     EXPECT_TRUE(out.str().empty()) << "unknown command does not print normal output";
     EXPECT_TRUE(err.str().find("unknown command") != std::string::npos)
         << "unknown command prints a diagnostic";
+}
+
+TEST(SmokeTest, JitIsTheOnlyExplicitJitOption) {
+    for (const std::string_view command : {"run", "run-network", "watch-network"}) {
+        for (const std::string_view option : {"--jit", "--no-jit"}) {
+            const std::string_view args[]{command, "missing-jit-config.json", option};
+            std::ostringstream out;
+            std::ostringstream err;
+            const auto result = fil::cli::run(args, out, err);
+            if (option == "--jit") {
+                EXPECT_NE(result, fil::cli::ExitCode::usage_error);
+                EXPECT_EQ(err.str().find("unknown"), std::string::npos);
+            } else {
+                EXPECT_EQ(result, fil::cli::ExitCode::usage_error);
+                EXPECT_NE(err.str().find("unknown"), std::string::npos);
+            }
+        }
+    }
 }
 
 TEST(SmokeTest, RejectsInvalidWatchRefreshInterval) {

@@ -152,8 +152,72 @@ SimTimeNs Board::accountCycles(const std::uint64_t cycles) {
     return elapsed;
 }
 
-cpu::FastStepResult Board::stepWithFetchTiming() {
-    auto result = cpu_->stepFast();
+cpu::FastStepResult Board::stepWithFetchTiming(
+    const bool allow_jit_block, const std::optional<SimTimeNs> deadline,
+    const std::size_t max_instructions, const bool block_prevalidated) {
+    std::size_t jit_limit = max_instructions;
+    if (allow_jit_block && jit_limit > 1U && !block_prevalidated && !boundaryWorkPending()) {
+        static_cast<void>(cpu_->prepareJitBlock());
+        // Do not execute memory/MMIO ahead of board time. Only a pure integer
+        // block with a conservative completion before every boundary may batch.
+        const auto preview = cpu_->peekJitBlock(jit_limit);
+        if (!preview) {
+            jit_limit = 1U;
+        } else {
+            const auto& flash = peripherals_->flash();
+            std::uint64_t cycles = preview->max_cycles;
+            bool have_fetch = have_last_fetch_;
+            std::uint32_t fetch_end = last_fetch_end_;
+            for (std::uint8_t i = 0U; i < preview->count; ++i) {
+                const bool sequential = have_fetch && preview->pcs[i] == fetch_end;
+                cycles += flash.fetchStallCycles(preview->pcs[i], sequential);
+                fetch_end = preview->pcs[i] + preview->sizes[i];
+                have_fetch = true;
+            }
+            const SimTimeNs now = event_loop_->now();
+            const SimTimeNs elapsed = elapsedForCycles(cycles);
+            auto horizon = deadline;
+            if (const auto event = event_loop_->nextScheduledTime();
+                event && (!horizon || *event < *horizon)) horizon = event;
+            const auto systick = system_->cyclesUntilSysTickInterrupt();
+            if ((horizon && (*horizon <= now || elapsed >= *horizon - now))
+                || (systick && cycles >= *systick)) {
+                jit_limit = 1U;
+            }
+        }
+    }
+    if (allow_jit_block && jit_limit > 1U && !boundaryWorkPending()) {
+        if (auto jit = cpu_->tryStepJitBlock(jit_limit)) {
+            // Fold ART flash stalls per instruction in the block.
+            auto& flash = peripherals_->flash();
+            std::uint32_t extra = 0U;
+            for (std::uint8_t i = 0; i < jit->count; ++i) {
+                const std::uint64_t generation = flash.acrGeneration();
+                if (generation != cached_flash_acr_generation_) {
+                    cached_flash_acr_generation_ = generation;
+                    cached_flash_ws_ = flash.waitStates();
+                    cached_flash_art_hit_capable_ = flash.prefetchEnabled()
+                        || flash.instructionCacheEnabled();
+                    invalidateLoopObservations();
+                }
+                if (cached_flash_ws_ == 0U) {
+                    last_fetch_end_ = jit->pcs[i] + jit->sizes[i];
+                    have_last_fetch_ = true;
+                    continue;
+                }
+                const bool sequential = have_last_fetch_
+                    && jit->pcs[i] == last_fetch_end_;
+                last_fetch_end_ = jit->pcs[i] + jit->sizes[i];
+                have_last_fetch_ = true;
+                if (sequential && cached_flash_art_hit_capable_) continue;
+                extra += flash.fetchStallCycles(jit->pcs[i], sequential);
+            }
+            cpu::FastStepResult result = jit->result;
+            result.cycles = static_cast<std::uint16_t>(result.cycles + extra);
+            return result;
+        }
+    }
+    auto result = allow_jit_block ? cpu_->stepJitFast() : cpu_->stepFast();
     if (result.instructions == 0U || result.instruction_size == 0U) return result;
     const auto& flash = peripherals_->flash();
     const std::uint64_t generation = flash.acrGeneration();
@@ -198,6 +262,38 @@ std::optional<Board::PredictedCost> Board::peekPredictedCost() const noexcept {
     return cost;
 }
 
+std::optional<Board::PredictedBlockCost> Board::peekPredictedBlockCost(
+    const std::size_t max_instructions, const std::optional<SimTimeNs> deadline) {
+    if (max_instructions < 2U || boundaryWorkPending()) return std::nullopt;
+    if (!cpu_->prepareJitBlock()) return std::nullopt;
+    const auto preview = cpu_->peekJitBlock(max_instructions);
+    if (!preview || !preview->cycles_exact || preview->count < 2U) return std::nullopt;
+    const auto& flash = peripherals_->flash();
+    PredictedBlockCost predicted;
+    predicted.instructions = preview->count;
+    predicted.cost.cycles = preview->max_cycles;
+    predicted.cost.frequency = peripherals_->rcc().systemClockHz();
+    predicted.cost.fraction = time_fraction_;
+    bool have_fetch = have_last_fetch_;
+    std::uint32_t fetch_end = last_fetch_end_;
+    for (std::uint8_t i = 0U; i < preview->count; ++i) {
+        predicted.cost.cycles += flash.fetchStallCycles(
+            preview->pcs[i], have_fetch && preview->pcs[i] == fetch_end);
+        fetch_end = preview->pcs[i] + preview->sizes[i];
+        have_fetch = true;
+    }
+    if (predicted.cost.frequency == 0U) return std::nullopt;
+    const auto systick = system_->cyclesUntilSysTickInterrupt();
+    if (systick && predicted.cost.cycles >= *systick) return std::nullopt;
+    auto horizon = deadline;
+    if (const auto event = event_loop_->nextScheduledTime();
+        event && (!horizon || *event < *horizon)) horizon = event;
+    const auto now = event_loop_->now();
+    if (horizon && (*horizon <= now
+        || elapsedForCycles(predicted.cost.cycles) >= *horizon - now)) return std::nullopt;
+    return predicted;
+}
+
 SimTimeNs Board::advanceTime(const std::uint64_t cycles) {
     const SimTimeNs elapsed = accountCycles(cycles);
     const auto events = event_loop_->advanceBy(elapsed);
@@ -207,8 +303,13 @@ SimTimeNs Board::advanceTime(const std::uint64_t cycles) {
     return elapsed;
 }
 
-Board::ConcurrentStepResult Board::beginConcurrentStep(const bool trace_instructions) {
-    auto result = stepWithFetchTiming();
+Board::ConcurrentStepResult Board::beginConcurrentStep(
+    const bool trace_instructions, const bool allow_jit, const std::size_t max_instructions) {
+    // General concurrent dispatch stays single-step: another lane can add a
+    // new event while it is in flight. Only the synchronized world burst can
+    // supply a larger, prevalidated pure fixed-cost block limit.
+    auto result = stepWithFetchTiming(!trace_instructions && allow_jit,
+        std::nullopt, max_instructions, max_instructions > 1U);
     if (trace_instructions) {
         trace_->record(
             event_loop_->now(), config_.name, "instr",
@@ -587,7 +688,8 @@ BoardRunResult Board::runWorkerSlice(
     const std::uint64_t instruction_budget,
     const SimTimeNs deadline_ns,
     const bool enable_loop_batching,
-    const bool trap_all_mmio
+    const bool trap_all_mmio,
+    const bool enable_jit
 ) {
     BoardRunResult aggregate;
     aggregate.reason = BoardStopReason::instruction_budget;
@@ -641,7 +743,11 @@ BoardRunResult Board::runWorkerSlice(
             break;
         }
 
-        const cpu::FastStepResult result = stepWithFetchTiming();
+        const cpu::FastStepResult result = stepWithFetchTiming(
+            enable_jit, deadline_ns,
+            enable_loop_batching ? 1U : static_cast<std::size_t>(std::min<std::uint64_t>(
+                instruction_budget - aggregate.instructions,
+                cpu::CortexM4::JitStepOutcome::max_block)));
         aggregate.diagnostic.instruction_address = result.instruction_address;
         aggregate.diagnostic.raw = result.raw;
         aggregate.diagnostic.instruction_size = result.instruction_size;
@@ -746,7 +852,16 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
             aggregate.message = "simulated-time budget exhausted";
             break;
         }
-        auto result = stepWithFetchTiming();
+        const bool jit_ok = !options.trace_instructions && options.enable_jit;
+        // Proven loop batching already amortizes idle loops; avoid competing
+        // block preparation/preview overhead when that path is enabled.
+        const std::size_t jit_limit = options.stop_address || options.detect_spin
+            || options.enable_loop_batching
+            ? 1U : static_cast<std::size_t>(std::min<std::uint64_t>(
+                options.max_instructions - aggregate.instructions,
+                cpu::CortexM4::JitStepOutcome::max_block));
+        auto result = stepWithFetchTiming(jit_ok,
+            deadline == 0U ? std::nullopt : std::optional<SimTimeNs>{deadline}, jit_limit);
         aggregate.instructions += result.instructions;
         aggregate.cycles += result.cycles;
         aggregate.diagnostic.instruction_address = result.instruction_address;

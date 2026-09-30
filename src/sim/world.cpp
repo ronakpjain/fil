@@ -275,6 +275,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
     for (const auto& entry : boards_) lane_boards.push_back(entry->board.get());
     std::vector<std::uint64_t> planned_iterations(boards_.size(), 0U);
     std::vector<Board::ConcurrentStepResult> burst_steps(boards_.size());
+    std::vector<std::size_t> burst_block_limits(boards_.size(), 1U);
     std::unique_ptr<LaneWorkerPool> worker_pool;
     ConcurrentEventGuard concurrent_guard;
     if (options.enable_transactional_slices && boards_.size() > 1U
@@ -544,37 +545,79 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
             ++output.lockstep_bursts;
             for (; completed_rounds < 64U; ++completed_rounds) {
                 const SimTimeNs round_start = event_loop_.now();
-                // Variable-CPI prediction: every lane forecasts its exact
-                // next-instruction cost (pipeline class + ART flash stall).
-                // Any unpredictable lane or divergent cost falls back to
-                // the exact general scheduler. Lanes are compared on clock
-                // frequency and time numerators so the gate performs one ns
-                // division per round instead of one per lane; mixed-clock
-                // lanes use the general scheduler. Predictions are exact,
-                // so no post-step rollback is needed.
-                const auto first_cost = lane_boards.front()->peekPredictedCost();
-                if (!first_cost || first_cost->frequency == 0U) break;
-                const std::uint64_t numerator = first_cost->cycles
-                        * 1'000'000'000ULL + first_cost->fraction;
-                bool same_elapsed = true;
-                for (std::size_t index = 1; index < boards_.size(); ++index) {
-                    const auto other = lane_boards[index]->peekPredictedCost();
-                    same_elapsed = same_elapsed && other
-                        && other->frequency == first_cost->frequency
-                        && other->cycles * 1'000'000'000ULL + other->fraction
-                            == numerator;
+                std::fill(burst_block_limits.begin(), burst_block_limits.end(), 1U);
+                SimTimeNs elapsed = 0U;
+                bool synchronized_blocks = false;
+                if (options.enable_jit) {
+                    const auto block_deadline = deadline == 0U
+                        ? std::nullopt : std::optional<SimTimeNs>{deadline};
+                    const auto remaining = options.max_instructions_per_board
+                        - output.boards.front().result.instructions;
+                    const auto first_block = lane_boards.front()->peekPredictedBlockCost(
+                        static_cast<std::size_t>(std::min<std::uint64_t>(remaining,
+                            cpu::CortexM4::JitStepOutcome::max_block)), block_deadline);
+                    if (first_block) {
+                        const auto& first = first_block->cost;
+                        const std::uint64_t numerator = first.cycles
+                            * 1'000'000'000ULL + first.fraction;
+                        synchronized_blocks = true;
+                        burst_block_limits[0] = first_block->instructions;
+                        for (std::size_t index = 1U; index < boards_.size(); ++index) {
+                            const auto lane_remaining = options.max_instructions_per_board
+                                - output.boards[index].result.instructions;
+                            const auto other = lane_boards[index]->peekPredictedBlockCost(
+                                static_cast<std::size_t>(std::min<std::uint64_t>(lane_remaining,
+                                    cpu::CortexM4::JitStepOutcome::max_block)), block_deadline);
+                            if (!other || other->cost.frequency != first.frequency
+                                || other->cost.cycles * 1'000'000'000ULL + other->cost.fraction
+                                    != numerator) {
+                                synchronized_blocks = false;
+                                break;
+                            }
+                            burst_block_limits[index] = other->instructions;
+                        }
+                        if (synchronized_blocks) elapsed = numerator / first.frequency;
+                    }
                 }
-                if (!same_elapsed) break;
-                const SimTimeNs elapsed = numerator / first_cost->frequency;
-                if (elapsed == 0U
-                    || (deadline != 0U && elapsed > deadline - round_start)) break;
+                if (!synchronized_blocks) {
+                    std::fill(burst_block_limits.begin(), burst_block_limits.end(), 1U);
+                    // Variable-CPI prediction: every lane forecasts its exact
+                    // next-instruction cost (pipeline class + ART flash stall).
+                    // Any unpredictable lane or divergent cost falls back to
+                    // the exact general scheduler. Lanes are compared on clock
+                    // frequency and time numerators so the gate performs one ns
+                    // division per round instead of one per lane; mixed-clock
+                    // lanes use the general scheduler. Predictions are exact,
+                    // so no post-step rollback is needed.
+                    const auto first_cost = lane_boards.front()->peekPredictedCost();
+                    if (!first_cost || first_cost->frequency == 0U) break;
+                    const std::uint64_t numerator = first_cost->cycles
+                            * 1'000'000'000ULL + first_cost->fraction;
+                    bool same_elapsed = true;
+                    for (std::size_t index = 1; index < boards_.size(); ++index) {
+                        const auto other = lane_boards[index]->peekPredictedCost();
+                        same_elapsed = same_elapsed && other
+                            && other->frequency == first_cost->frequency
+                            && other->cycles * 1'000'000'000ULL + other->fraction
+                                == numerator;
+                    }
+                    if (!same_elapsed) break;
+                    elapsed = numerator / first_cost->frequency;
+                    if (elapsed == 0U
+                        || (deadline != 0U && elapsed > deadline - round_start)) break;
+                }
 
                 for (std::size_t index = 0; index < boards_.size(); ++index) {
                     auto owner_scope = event_loop_.useOwner(static_cast<EventOwner>(index));
-                    burst_steps[index] = lane_boards[index]->beginConcurrentStep(false);
+                    burst_steps[index] = lane_boards[index]->beginConcurrentStep(
+                        false, options.enable_jit, burst_block_limits[index]);
                     ++output.dispatches;
                     ++output.exact_dispatches;
                 }
+                // Larger blocks are admitted only when every lane has a pure,
+                // fixed-cost prefix with the same exact completion time and no
+                // intervening event/interrupt/deadline. No lane can create a
+                // new MMIO event or start its next dispatch inside another's block.
                 const SimTimeNs completion = saturatingAdd(round_start, elapsed);
                 const auto events = event_loop_.runDueEvents(completion);
                 output.event_callbacks = saturatingAdd(
@@ -730,7 +773,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                 const auto run_slice = [&](const std::size_t index) {
                     slices[index] = boards_[index]->board->runWorkerSlice(
                         static_cast<EventOwner>(index), slice_instructions,
-                        slice_deadline, false, true
+                        slice_deadline, false, true, options.enable_jit
                     );
                 };
                 if (worker_pool) worker_pool->run(run_slice);
@@ -895,7 +938,8 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                 }
 
                 auto owner_scope = event_loop_.useOwner(static_cast<EventOwner>(index));
-                state.step = board.beginConcurrentStep(options.trace_instructions);
+                state.step = board.beginConcurrentStep(
+                    options.trace_instructions, options.enable_jit);
                 state.ready_time_ns = saturatingAdd(now, state.step->elapsed_ns);
                 state.in_flight = true;
                 ++state.same_time_dispatches;

@@ -1,9 +1,11 @@
 #include "fil/cpu/cortex_m4.hpp"
 
 #include "fil/cpu/decoder.hpp"
+#include "fil/cpu/jit.hpp"
 #include "fil/elf/elf_loader.hpp"
 #include "fil/mem/memory_bus.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <iomanip>
@@ -55,7 +57,95 @@ constexpr std::uint32_t xpsr_it_mask = (0x3U << 25U) | (0x3fU << 10U);
     return output.str();
 }
 
+inline void jitSetNz(CpuState& state, const std::uint32_t value) noexcept {
+    state.xpsr &= ~(xpsr_n | xpsr_z);
+    if ((value & 0x80000000U) != 0U) state.xpsr |= xpsr_n;
+    if (value == 0U) state.xpsr |= xpsr_z;
+}
+
+inline void jitSetNzc(CpuState& state, const std::uint32_t value, const bool carry) noexcept {
+    jitSetNz(state, value);
+    state.xpsr &= ~xpsr_c;
+    if (carry) state.xpsr |= xpsr_c;
+}
+
+inline void jitSetNzcv(CpuState& state, const AddResult& result) noexcept {
+    state.xpsr &= ~(xpsr_n | xpsr_z | xpsr_c | xpsr_v);
+    if (result.n) state.xpsr |= xpsr_n;
+    if (result.z) state.xpsr |= xpsr_z;
+    if (result.c) state.xpsr |= xpsr_c;
+    if (result.v) state.xpsr |= xpsr_v;
+}
+
 } // namespace
+
+CortexM4::JitFast CortexM4::classifyJitFast(const DecodedInstruction& op) noexcept {
+    // Inlined handlers require unconditional (non-IT) integer ops; anything
+    // else stays on the exact generic execute() path.
+    if (op.condition != Condition::al) return JitFast::generic;
+    switch (op.kind) {
+    case InstrKind::nop:
+        return JitFast::nop;
+    case InstrKind::b:
+        return JitFast::b;
+    case InstrKind::bl:
+        return JitFast::bl;
+    case InstrKind::cbz:
+        return JitFast::cbz;
+    case InstrKind::cbnz:
+        return JitFast::cbnz;
+    case InstrKind::mov:
+        if (op.rd == 15U || op.rm == 15U) return JitFast::generic;
+        if (op.form == OperandForm::immediate) return JitFast::mov_imm;
+        return op.form == OperandForm::register_value
+            ? JitFast::mov_reg : JitFast::generic;
+    case InstrKind::movw:
+        return op.rd != 15U ? JitFast::movw : JitFast::generic;
+    case InstrKind::movt:
+        return op.rd != 15U ? JitFast::movt : JitFast::generic;
+    case InstrKind::add:
+    case InstrKind::adc:
+        if (op.rd == 15U) return JitFast::generic;
+        if (op.form == OperandForm::immediate) return JitFast::add_imm;
+        return op.form == OperandForm::register_value
+            ? JitFast::add_reg : JitFast::generic;
+    case InstrKind::sub:
+    case InstrKind::sbc:
+        if (op.rd == 15U) return JitFast::generic;
+        if (op.form == OperandForm::immediate) return JitFast::sub_imm;
+        return op.form == OperandForm::register_value
+            ? JitFast::sub_reg : JitFast::generic;
+    case InstrKind::cmp:
+    case InstrKind::cmn:
+        if (op.form == OperandForm::immediate) return JitFast::cmp_imm;
+        return op.form == OperandForm::register_value
+            ? JitFast::cmp_reg : JitFast::generic;
+    case InstrKind::and_:
+    case InstrKind::orr:
+    case InstrKind::eor:
+    case InstrKind::bic:
+    case InstrKind::mvn:
+    case InstrKind::orn:
+        return op.form == OperandForm::register_value && op.rd != 15U
+            && op.rn != 15U && op.rm != 15U
+            ? JitFast::logic_reg : JitFast::generic;
+    case InstrKind::mul:
+        return op.form == OperandForm::register_value && op.rd != 15U
+            && op.rn != 15U && op.rm != 15U
+            ? JitFast::mul_reg : JitFast::generic;
+    case InstrKind::lsl:
+    case InstrKind::lsr:
+    case InstrKind::asr:
+    case InstrKind::ror:
+    case InstrKind::rrx:
+        return op.rd != 15U && op.rn != 15U && op.rm != 15U
+            && (op.form == OperandForm::immediate
+                || op.form == OperandForm::register_value)
+            ? JitFast::shift : JitFast::generic;
+    default:
+        return JitFast::generic;
+    }
+}
 
 bool CpuState::reset(const elf::ElfImage& image) noexcept {
     *this = CpuState{};
@@ -174,6 +264,14 @@ void CortexM4::captureDiagnostic(DiagnosticSnapshot& diagnostic) const {
 }
 
 FastStepResult CortexM4::stepFast() {
+    return stepFastImpl(false);
+}
+
+FastStepResult CortexM4::stepJitFast() {
+    return stepFastImpl(true);
+}
+
+FastStepResult CortexM4::stepFastImpl(const bool use_jit) {
     FastStepResult result;
     if (state_.halted) [[unlikely]] {
         result.reason = StopReason::halted;
@@ -284,6 +382,7 @@ FastStepResult CortexM4::stepFast() {
             || newly_decoded->kind == InstrKind::sdiv;
         cache.base_cycles = cache.divide_form
             ? 7U : basePipelineCycles(*newly_decoded);
+        cache.jit_fast = static_cast<std::uint8_t>(classifyJitFast(*newly_decoded));
         decoded = &cache.decoded;
     }
     result.instruction_size = instruction_size;
@@ -331,7 +430,13 @@ FastStepResult CortexM4::stepFast() {
 
     StopReason stop = StopReason::step_complete;
     if (condition_passed) [[likely]] {
-        stop = execute(*decoded, last_diagnostic_);
+        bool jit_handled = false;
+        if (use_jit && !was_in_it) {
+            const auto fast = static_cast<JitFast>(cache.jit_fast);
+            jit_handled = fast != JitFast::generic
+                && executeJitFast(*decoded, fast, pc);
+        }
+        if (!jit_handled) stop = execute(*decoded, last_diagnostic_);
     }
     if (decoded->kind != InstrKind::it && was_in_it) state_.advanceIt();
 
@@ -359,6 +464,453 @@ FastStepResult CortexM4::stepFast() {
         capture(last_diagnostic_);
     }
     return result;
+}
+
+bool CortexM4::executeJitFast(
+    const DecodedInstruction& op, const JitFast fast, const std::uint32_t pc
+) noexcept {
+    switch (fast) {
+    case JitFast::nop:
+        return true;
+    case JitFast::b:
+        state_.r[15] = static_cast<std::uint32_t>(
+            static_cast<std::int64_t>(pc) + 4 + op.branch_offset
+        ) & ~std::uint32_t{1};
+        return true;
+    case JitFast::bl:
+        state_.r[14] = state_.r[15] | 1U;
+        state_.r[15] = static_cast<std::uint32_t>(
+            static_cast<std::int64_t>(pc) + 4 + op.branch_offset
+        ) & ~std::uint32_t{1};
+        return true;
+    case JitFast::cbz:
+    case JitFast::cbnz: {
+        const bool zero = state_.readRegister(op.rn) == 0U;
+        const bool take = fast == JitFast::cbz ? zero : !zero;
+        if (take) state_.r[15] = (pc + 4U + op.imm) & ~std::uint32_t{1};
+        return true;
+    }
+    case JitFast::mov_reg: {
+        const ShiftResult shifted = shiftC(
+            state_.readRegister(op.rm), op.shift_type, op.shift_amount,
+            (state_.xpsr & xpsr_c) != 0U);
+        state_.writeRegister(op.rd, shifted.value);
+        if (op.set_flags) jitSetNzc(state_, shifted.value, shifted.carry);
+        return true;
+    }
+    case JitFast::mov_imm:
+        state_.writeRegister(op.rd, op.imm);
+        if (op.set_flags) {
+            const bool carry = op.immediate_carry_valid
+                ? op.immediate_carry : (state_.xpsr & xpsr_c) != 0U;
+            jitSetNzc(state_, op.imm, carry);
+        }
+        return true;
+    case JitFast::movw:
+        state_.writeRegister(op.rd, op.imm);
+        return true;
+    case JitFast::movt: {
+        const std::uint32_t value = (state_.readRegister(op.rd) & 0xffffU)
+            | (op.imm << 16U);
+        state_.writeRegister(op.rd, value);
+        return true;
+    }
+    case JitFast::add_reg:
+    case JitFast::sub_reg:
+    case JitFast::add_imm:
+    case JitFast::sub_imm: {
+        std::uint32_t left = state_.readRegister(op.rn);
+        if (op.rn == 15U && op.form == OperandForm::immediate) {
+            left &= ~std::uint32_t{3};
+        }
+        const bool subtract = fast == JitFast::sub_imm || fast == JitFast::sub_reg;
+        const std::uint32_t right = fast == JitFast::add_reg || fast == JitFast::sub_reg
+            ? shiftC(state_.readRegister(op.rm), op.shift_type, op.shift_amount,
+                     (state_.xpsr & xpsr_c) != 0U).value
+            : op.imm;
+        const bool carry_in = op.kind == InstrKind::adc || op.kind == InstrKind::sbc
+            ? (state_.xpsr & xpsr_c) != 0U : subtract;
+        const AddResult sum = addWithCarry(left, subtract ? ~right : right, carry_in);
+        state_.writeRegister(op.rd, sum.value);
+        if (op.set_flags) jitSetNzcv(state_, sum);
+        return true;
+    }
+    case JitFast::cmp_imm:
+    case JitFast::cmp_reg: {
+        const std::uint32_t left = state_.readRegister(op.rn);
+        const std::uint32_t right = fast == JitFast::cmp_reg
+            ? shiftC(state_.readRegister(op.rm), op.shift_type, op.shift_amount,
+                     (state_.xpsr & xpsr_c) != 0U).value
+            : op.imm;
+        const AddResult sum = op.kind == InstrKind::cmp
+            ? addWithCarry(left, ~right, true)
+            : addWithCarry(left, right, false);
+        jitSetNzcv(state_, sum);
+        return true;
+    }
+    case JitFast::logic_reg: {
+        const std::uint32_t left = state_.readRegister(op.rn);
+        const ShiftResult shifted = shiftC(
+            state_.readRegister(op.rm), op.shift_type, op.shift_amount,
+            (state_.xpsr & xpsr_c) != 0U);
+        std::uint32_t value = 0U;
+        if (op.kind == InstrKind::and_) value = left & shifted.value;
+        if (op.kind == InstrKind::orr) value = left | shifted.value;
+        if (op.kind == InstrKind::eor) value = left ^ shifted.value;
+        if (op.kind == InstrKind::bic) value = left & ~shifted.value;
+        if (op.kind == InstrKind::mvn) value = ~shifted.value;
+        if (op.kind == InstrKind::orn) value = left | ~shifted.value;
+        state_.writeRegister(op.rd, value);
+        if (op.set_flags) jitSetNzc(state_, value, shifted.carry);
+        return true;
+    }
+    case JitFast::mul_reg: {
+        const std::uint64_t product = static_cast<std::uint64_t>(state_.readRegister(op.rn))
+            * state_.readRegister(op.rm);
+        const std::uint32_t value = static_cast<std::uint32_t>(product);
+        state_.writeRegister(op.rd, value);
+        if (op.set_flags) jitSetNz(state_, value);
+        return true;
+    }
+    case JitFast::shift: {
+        const bool immediate = op.form == OperandForm::immediate;
+        const std::uint32_t value = immediate
+            ? state_.readRegister(op.rm) : state_.readRegister(op.rn);
+        const std::uint32_t amount = immediate ? op.shift_amount
+            : (state_.readRegister(op.rm) & 0xffU);
+        const ShiftResult shifted = shiftC(
+            value, op.shift_type, amount, (state_.xpsr & xpsr_c) != 0U);
+        state_.writeRegister(op.rd, shifted.value);
+        if (op.set_flags) jitSetNzc(state_, shifted.value, shifted.carry);
+        return true;
+    }
+    case JitFast::generic:
+        return false;
+    }
+    return false;
+}
+
+std::optional<DecodedInstruction> CortexM4::fetchDecode(
+    const std::uint32_t pc, std::uint32_t& raw_out, std::uint8_t& size_out) {
+    const std::uint64_t generation = memory_.executionGeneration();
+    auto& cache = instruction_cache_[(pc >> 1U) & (instruction_cache_entries - 1U)];
+    if (cache.generation == generation && cache.pc == pc) {
+        raw_out = cache.raw;
+        size_out = cache.size;
+        return cache.decoded;
+    }
+    const mem::AccessContext fetch_context{mem::AccessType::instruction_fetch, pc};
+    const auto first = memory_.read16(pc, fetch_context);
+    if (!first) return std::nullopt;
+    const bool wide = is32BitThumbPrefix(first.value());
+    const std::uint8_t size = wide ? 4U : 2U;
+    std::uint16_t second_halfword = 0;
+    if (wide) {
+        if (pc > std::numeric_limits<std::uint32_t>::max() - 2U) return std::nullopt;
+        const auto second = memory_.read16(pc + 2U, fetch_context);
+        if (!second) return std::nullopt;
+        second_halfword = second.value();
+    }
+    const std::uint32_t raw = wide
+        ? (static_cast<std::uint32_t>(first.value()) << 16U) | second_halfword
+        : first.value();
+    const auto decoded = wide ? decode32(first.value(), second_halfword)
+                               : decode16(first.value());
+    if (!decoded) return std::nullopt;
+    cache.generation = generation;
+    cache.pc = pc;
+    cache.raw = raw;
+    cache.decoded = *decoded;
+    cache.size = size;
+    cache.divide_form = decoded->kind == InstrKind::udiv
+        || decoded->kind == InstrKind::sdiv;
+    cache.base_cycles = cache.divide_form ? 7U : basePipelineCycles(*decoded);
+    cache.jit_fast = static_cast<std::uint8_t>(classifyJitFast(*decoded));
+    raw_out = raw;
+    size_out = size;
+    return *decoded;
+}
+
+bool CortexM4::jitBlockReady() const noexcept {
+    if (state_.halted) return false;
+    if (!state_.thumb || (state_.xpsr & xpsr_t) == 0U) return false;
+    const std::uint32_t entry_pc = state_.r[15];
+    if ((entry_pc & 1U) != 0U) return false;
+    if (inItBlock(state_.it_state)) return false;
+    if (state_.pending_exception || state_.pending_exc_return) return false;
+    const auto& slot = jit_blocks_[(entry_pc >> 1U) & (jit_block_entries - 1U)];
+    return slot.valid && slot.pc == entry_pc
+        && slot.generation == memory_.executionGeneration();
+}
+
+bool CortexM4::prepareJitBlock() {
+    if (state_.halted || !state_.thumb || (state_.xpsr & xpsr_t) == 0U) return false;
+    const std::uint32_t entry_pc = state_.r[15];
+    if ((entry_pc & 1U) != 0U || inItBlock(state_.it_state)
+        || state_.pending_exception || state_.pending_exc_return) return false;
+
+    const std::uint64_t generation = memory_.executionGeneration();
+    auto& slot = jit_blocks_[(entry_pc >> 1U) & (jit_block_entries - 1U)];
+    const std::size_t hot_index = (entry_pc >> 1U) & (jit_block_entries - 1U);
+    const bool matching_attempt = slot.attempted && slot.pc == entry_pc
+        && slot.generation == generation;
+    if (matching_attempt) return slot.valid;
+    if (jit_hot_[hot_index] < jit_compile_threshold) {
+        ++jit_hot_[hot_index];
+        return false;
+    }
+
+    JitBlockEntry fresh{};
+    fresh.pc = entry_pc;
+    fresh.generation = generation;
+    fresh.attempted = true;
+    std::uint32_t pc = entry_pc;
+    for (std::size_t i = 0; i < JitStepOutcome::max_block; ++i) {
+        std::uint32_t raw = 0;
+        std::uint8_t size = 0;
+        auto decoded = fetchDecode(pc, raw, size);
+        if (!decoded) break;
+        const JitBoundary boundary = classifyJitBoundary(*decoded);
+        if (boundary == JitBoundary::exception_or_system
+            || boundary == JitBoundary::floating_point
+            || boundary == JitBoundary::unsupported || decoded->kind == InstrKind::it) {
+            break;
+        }
+        fresh.ops[fresh.count] = *decoded;
+        fresh.pcs[fresh.count] = pc;
+        fresh.sizes[fresh.count] = size;
+        fresh.raws[fresh.count] = raw;
+        const bool div = decoded->kind == InstrKind::udiv
+            || decoded->kind == InstrKind::sdiv;
+        fresh.divide_form[fresh.count] = div;
+        fresh.base_cycles[fresh.count] = div ? 7U : basePipelineCycles(*decoded);
+        fresh.fast[fresh.count] = classifyJitFast(*decoded);
+        const bool touches_memory = boundary == JitBoundary::memory_may_trap
+            || decoded->kind == InstrKind::ldr || decoded->kind == InstrKind::ldm
+            || decoded->kind == InstrKind::pop;
+        fresh.is_memory[fresh.count] = touches_memory;
+        fresh.is_terminator[fresh.count] = boundary == JitBoundary::control_flow;
+        fresh.branch_penalty[fresh.count] = boundary == JitBoundary::control_flow
+            ? takenBranchPenalty(decoded->kind) : 0U;
+        ++fresh.count;
+        if (boundary == JitBoundary::control_flow) break;
+        pc += size;
+    }
+    if (fresh.count < 2U) {
+        // Remember failed/single-op compilation for this PC/generation; repeated
+        // safe preflights do not repeatedly fetch and classify the same bytes.
+        slot = fresh;
+        return false;
+    }
+    fresh.valid = true;
+    slot = fresh;
+    ++jit_stats_.compilations;
+    return true;
+}
+
+std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlock(
+    const std::size_t max_instructions) {
+    if (max_instructions == 0U || !prepareJitBlock()) {
+        if (max_instructions != 0U) ++jit_stats_.fallbacks;
+        return std::nullopt;
+    }
+    const std::uint32_t entry_pc = state_.r[15];
+    const std::uint64_t generation = memory_.executionGeneration();
+    auto& slot = jit_blocks_[(entry_pc >> 1U) & (jit_block_entries - 1U)];
+    // Execute the cached block with exact single-step semantics.
+    JitStepOutcome out{};
+    std::uint32_t total_cycles = 0;
+    std::uint32_t last_pc = entry_pc;
+    std::uint32_t last_raw = slot.raws[0];
+    std::uint8_t last_size = slot.sizes[0];
+    bool last_suppress = false;
+    const std::uint8_t execution_count = static_cast<std::uint8_t>(
+        std::min<std::size_t>(max_instructions, slot.count));
+    for (std::uint8_t i = 0; i < execution_count; ++i) {
+        const DecodedInstruction& op = slot.ops[i];
+        const std::uint32_t pc = slot.pcs[i];
+        // A committed write may have changed executable memory. Never run
+        // another instruction decoded from the previous execution generation.
+        if (memory_.executionGeneration() != generation) break;
+        // Self-modifying code or eviction aborts precisely at the boundary.
+        if (state_.r[15] != pc) break;
+        if (inItBlock(state_.it_state)) break;
+        if (state_.pending_exception || state_.pending_exc_return) break;
+        const std::uint8_t size = slot.sizes[i];
+        const JitFast fast = slot.fast[i];
+        // Save the exact pre-instruction state: execute() may report a
+        // synchronization trap after the sequential PC has been installed.
+        std::optional<CpuState> checkpoint;
+        if (slot.is_memory[i] && memory_.mmioTrapping()) checkpoint = state_;
+        state_.instruction_address = pc;
+        state_.r[15] = pc + size;
+        if (fast != JitFast::generic) {
+            // The shared handler keeps single-step and block ALU semantics aligned.
+            const bool handled = executeJitFast(op, fast, pc);
+            assert(handled);
+            static_cast<void>(handled);
+            std::uint16_t cycles = slot.base_cycles[i];
+            if (state_.r[15] != pc + size) {
+                cycles = static_cast<std::uint16_t>(
+                    cycles + slot.branch_penalty[i]);
+            }
+            total_cycles += cycles;
+            last_pc = pc;
+            last_raw = slot.raws[i];
+            last_size = size;
+            const bool sret_fast =
+                (op.kind == InstrKind::pop || op.kind == InstrKind::ldm)
+                && (op.register_list & (std::uint16_t{1U} << 15U)) != 0U;
+            last_suppress = op.kind == InstrKind::bl || op.kind == InstrKind::blx
+                || (op.kind == InstrKind::bx && op.rm == 14U)
+                || (op.kind == InstrKind::mov && op.rd == 15U && op.rm == 14U)
+                || sret_fast;
+            out.pcs[out.count] = pc;
+            out.sizes[out.count] = size;
+            ++out.count;
+            if (slot.is_terminator[i]) break;
+            continue;
+        }
+        const bool cond_pass = conditionPasses(op.condition, state_.xpsr);
+        std::uint16_t base = 1U;
+        if (cond_pass) {
+            base = slot.divide_form[i]
+                ? divideCycles(state_.readRegister(op.rm))
+                : slot.base_cycles[i];
+        }
+        if (!cond_pass) {
+            state_.r[15] = pc + size;
+            total_cycles += 1U;
+            last_pc = pc;
+            last_raw = slot.raws[i];
+            last_size = size;
+            last_suppress = false;
+            out.pcs[out.count] = pc;
+            out.sizes[out.count] = size;
+            ++out.count;
+            continue;
+        }
+        const StopReason stop = execute(op, last_diagnostic_);
+        std::uint16_t cycles = base;
+        if (stop == StopReason::step_complete && state_.r[15] != pc + size) {
+            cycles = static_cast<std::uint16_t>(
+                cycles + slot.branch_penalty[i]);
+        }
+        if (stop == StopReason::synchronization_required) {
+            if (checkpoint) state_ = *checkpoint;
+            last_diagnostic_.instruction_address = pc;
+            last_diagnostic_.raw = slot.raws[i];
+            last_diagnostic_.instruction_size = size;
+            capture(last_diagnostic_);
+            if (out.count == 0U) {
+                // Nothing committed: report the trap like a single step.
+                out.result.reason = StopReason::synchronization_required;
+                out.result.instruction_address = pc;
+                out.result.raw = slot.raws[i];
+                out.result.instruction_size = size;
+                out.result.instructions = 0;
+                out.result.cycles = 0;
+                return out;
+            }
+            break; // Commit prefix, trap on next interpreter step.
+        }
+        if (stop != StopReason::step_complete) {
+            last_diagnostic_.instruction_address = pc;
+            last_diagnostic_.raw = slot.raws[i];
+            last_diagnostic_.instruction_size = size;
+            capture(last_diagnostic_);
+            total_cycles += cycles;
+            last_pc = pc;
+            last_raw = slot.raws[i];
+            last_size = size;
+            out.pcs[out.count] = pc;
+            out.sizes[out.count] = size;
+            ++out.count;
+            out.result.reason = stop;
+            out.result.instruction_address = last_pc;
+            out.result.raw = last_raw;
+            out.result.instruction_size = last_size;
+            out.result.instructions = out.count;
+            out.result.cycles = static_cast<std::uint16_t>(total_cycles);
+            const bool sret = (op.kind == InstrKind::pop || op.kind == InstrKind::ldm)
+                && (op.register_list & (std::uint16_t{1U} << 15U)) != 0U;
+            out.result.suppress_loop_observation = op.kind == InstrKind::bl
+                || op.kind == InstrKind::blx
+                || (op.kind == InstrKind::bx && op.rm == 14U)
+                || (op.kind == InstrKind::mov && op.rd == 15U && op.rm == 14U)
+                || sret;
+            ++jit_stats_.block_executions;
+            jit_stats_.block_instructions += out.count;
+            return out;
+        }
+        total_cycles += cycles;
+        last_pc = pc;
+        last_raw = slot.raws[i];
+        last_size = size;
+        const bool sret2 = (op.kind == InstrKind::pop || op.kind == InstrKind::ldm)
+            && (op.register_list & (std::uint16_t{1U} << 15U)) != 0U;
+        last_suppress = op.kind == InstrKind::bl || op.kind == InstrKind::blx
+            || (op.kind == InstrKind::bx && op.rm == 14U)
+            || (op.kind == InstrKind::mov && op.rd == 15U && op.rm == 14U)
+            || sret2;
+        out.pcs[out.count] = pc;
+        out.sizes[out.count] = size;
+        ++out.count;
+        if (slot.is_terminator[i]) break;
+    }
+    if (out.count == 0U) {
+        ++jit_stats_.fallbacks;
+        return std::nullopt;
+    }
+    out.result.reason = StopReason::step_complete;
+    out.result.instruction_address = last_pc;
+    out.result.raw = last_raw;
+    out.result.instruction_size = last_size;
+    out.result.instructions = out.count;
+    out.result.cycles = static_cast<std::uint16_t>(total_cycles);
+    out.result.suppress_loop_observation = last_suppress;
+    ++jit_stats_.block_executions;
+    jit_stats_.block_instructions += out.count;
+    return out;
+}
+
+std::optional<CortexM4::JitBlockPreview> CortexM4::peekJitBlock(
+    const std::size_t max_instructions) const noexcept {
+    if (max_instructions == 0U || !jitBlockReady()) return std::nullopt;
+    const std::uint32_t entry_pc = state_.r[15];
+    const auto& slot = jit_blocks_[(entry_pc >> 1U) & (jit_block_entries - 1U)];
+    const std::size_t count = std::min<std::size_t>(max_instructions, slot.count);
+    if (count == 0U) return std::nullopt;
+
+    JitBlockPreview preview{};
+    for (std::size_t i = 0; i < count; ++i) {
+        // Preview must not allow speculative MMIO or RAM side effects.
+        if (slot.is_memory[i]) return std::nullopt;
+        preview.pcs[i] = slot.pcs[i];
+        preview.sizes[i] = slot.sizes[i];
+        // divideCycles ranges from 2 (zero divisor) through 12 cycles;
+        // use its modeled maximum without speculatively reading registers.
+        const std::uint64_t base = slot.divide_form[i]
+            ? 12U : slot.base_cycles[i];
+        std::uint16_t penalty = slot.branch_penalty[i];
+        const auto& op = slot.ops[i];
+        bool exact = !slot.divide_form[i] && op.condition == Condition::al;
+        if (slot.is_terminator[i]) {
+            if (exact && (op.kind == InstrKind::b || op.kind == InstrKind::bl)) {
+                const auto target = static_cast<std::uint32_t>(
+                    static_cast<std::int64_t>(slot.pcs[i]) + 4 + op.branch_offset)
+                    & ~std::uint32_t{1};
+                if (target == slot.pcs[i] + slot.sizes[i]) penalty = 0U;
+            } else {
+                // Register/conditional targets can depend on earlier ops.
+                exact = false;
+            }
+        }
+        preview.max_cycles += base + penalty;
+        preview.cycles_exact = preview.cycles_exact && exact;
+    }
+    preview.count = static_cast<std::uint8_t>(count);
+    return preview;
 }
 
 bool CortexM4::peekPredictableCycles(std::uint16_t& cycles_out) const noexcept {

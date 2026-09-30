@@ -398,6 +398,7 @@ ExitCode runBoardCommand(
     bool trace_instructions = false;
     bool detect_spin = false;
     bool enable_loop_batching = true;
+    bool enable_jit = false;
     bool allow_breakpoint = false;
     unsigned int adc_decimation = 1U;
 
@@ -449,6 +450,7 @@ ExitCode runBoardCommand(
         else if (option == "--no-detect-spin") detect_spin = false;
         else if (option == "--loop-batching") enable_loop_batching = true;
         else if (option == "--no-loop-batching") enable_loop_batching = false;
+        else if (option == "--jit") enable_jit = true;
         else if (option == "--allow-breakpoint") allow_breakpoint = true;
         else {
             err << "fil: unknown run option: " << option << '\n';
@@ -481,6 +483,7 @@ ExitCode runBoardCommand(
     options.trace_instructions = trace_instructions;
     options.detect_spin = detect_spin;
     options.enable_loop_batching = enable_loop_batching;
+    options.enable_jit = enable_jit;
     options.adc_decimation = adc_decimation;
     options.stop_address = stop_address;
     if (stop_symbol) {
@@ -828,6 +831,7 @@ ExitCode runNetworkCommand(
     bool trace_instructions = false;
     bool detect_spin = false;
     bool enable_loop_batching = true;
+    bool enable_jit = false;
     bool enable_transactional_slices = false;
     bool allow_breakpoint = false;
     unsigned int adc_decimation = 1U;
@@ -883,6 +887,7 @@ ExitCode runNetworkCommand(
         else if (option == "--no-detect-spin") detect_spin = false;
         else if (option == "--loop-batching") enable_loop_batching = true;
         else if (option == "--no-loop-batching") enable_loop_batching = false;
+        else if (option == "--jit") enable_jit = true;
         else if (option == "--transactional-slices") enable_transactional_slices = true;
         else if (option == "--no-transactional-slices") enable_transactional_slices = false;
         else if (option == "--allow-breakpoint") allow_breakpoint = true;
@@ -953,6 +958,7 @@ ExitCode runNetworkCommand(
     options.trace_instructions = trace_instructions;
     options.detect_spin = detect_spin;
     options.enable_loop_batching = enable_loop_batching;
+    options.enable_jit = enable_jit;
     options.enable_transactional_slices = enable_transactional_slices;
     options.adc_decimation = adc_decimation;
     auto result = world.value()->run(options);
@@ -1061,6 +1067,7 @@ ExitCode watchNetworkCommand(
     unsigned int adc_decimation = 1U;
     bool strict_mmio = false;
     bool enable_loop_batching = true;
+    bool enable_jit = false;
     bool trace_instructions = false;
     bool detect_spin = false;
     bool wall_pacing = true;
@@ -1130,6 +1137,7 @@ ExitCode watchNetworkCommand(
         else if (option == "--trace-instr") trace_instructions = true;
         else if (option == "--detect-spin") detect_spin = true;
         else if (option == "--no-loop-batching") enable_loop_batching = false;
+        else if (option == "--jit") enable_jit = true;
         else if (option != "--control-stdin") {
             err << "fil: unknown watch-network option: " << option << '\n';
             return ExitCode::usage_error;
@@ -1204,6 +1212,7 @@ ExitCode watchNetworkCommand(
         options.max_instructions_per_board = max_instructions;
         options.instruction_quantum = quantum;
         options.enable_loop_batching = enable_loop_batching;
+        options.enable_jit = enable_jit;
         options.adc_decimation = adc_decimation;
         options.trace_instructions = trace_instructions;
         options.detect_spin = detect_spin;
@@ -1355,14 +1364,14 @@ void printHelp(std::ostream& out) {
         << "Run options:\n"
         << "  --duration-ms N --max-instructions N --trace FILE --trace-instr\n"
         << "  --strict-mmio --stop-address ADDR --stop-at-symbol NAME --allow-breakpoint\n"
-        << "  --detect-spin --no-loop-batching --adc-decimation N\n\n"
+        << "  --detect-spin --no-loop-batching --jit --adc-decimation N\n\n"
         << "ST-Link comparison options:\n"
         << "  --flash --memory ADDR:LENGTH --register NAME --ignore-register NAME\n"
         << "  --stop-address ADDR --stop-at-symbol NAME --max-instructions N\n"
         << "  --serial ID --openocd PATH --timeout-ms N --artifacts DIRECTORY\n\n"
         << "Network options:\n"
         << "  --duration-ms N --max-instructions N --quantum N --trace FILE\n"
-        << "  --strict-mmio --trace-instr --detect-spin --no-loop-batching --allow-breakpoint\n"
+        << "  --strict-mmio --trace-instr --detect-spin --no-loop-batching --jit --allow-breakpoint\n"
         << "  --adc-decimation N (keep 1 of N continuous ADC scans)\n"
         << "  --transactional-slices (experimental parallel lane epochs)\n"
         << "  --inject-can BUS[@TIME_MS]:ID:HEXDATA\n\n"
@@ -1370,7 +1379,7 @@ void printHelp(std::ostream& out) {
         << "  --duration-ms N --refresh-ms N --max-instructions N --quantum N\n"
         << "  --adc-decimation N (keep 1 of N continuous ADC scans)\n"
         << "  --trace-type TYPE (alias: --live-filter; repeatable) --strict-mmio --trace-instr --detect-spin\n"
-        << "  --no-loop-batching --control-stdin\n"
+        << "  --no-loop-batching --jit --control-stdin\n"
         << "  --no-wall-pacing (watch runs slices back-to-back instead of real time)\n"
         << "  watch also stops early when all boards reach terminal CPU boundaries\n"
         << "  stdin: BUS:ID:HEXDATA, adc BOARD INSTANCE CHANNEL VALUE,\n"

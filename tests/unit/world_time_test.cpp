@@ -438,4 +438,181 @@ TEST(WorldTimeTest, AcceleratedLoopsPreserveSysTickAndExceptionEntry) {
         << "batching preserves SysTick exception-entry and return trace ordering";
 }
 
+void warmJit(fil::sim::Board& board) {
+    const auto initial = board.cpu().state();
+    for (unsigned int i = 0U; i < 60U; ++i) {
+        board.cpu().state() = initial;
+        static_cast<void>(board.cpu().tryStepJitBlock());
+    }
+    board.cpu().state() = initial;
+}
+
+TEST(WorldTimeTest, SynchronizedPureJitBlocksMatchInterpreter) {
+    TempWorldTimeConfigs files;
+    const auto config = files.network({
+        files.writeBoard("sync-alpha.json", "sync-alpha"),
+        files.writeBoard("sync-beta.json", "sync-beta")});
+    auto exact = fil::sim::World::load(config);
+    auto jit = fil::sim::World::load(config);
+    ASSERT_TRUE(exact && jit);
+    for (const auto name : {"sync-alpha", "sync-beta"}) {
+        ASSERT_TRUE(installIdleLoop(*exact.value(), name, 6U));
+        ASSERT_TRUE(installIdleLoop(*jit.value(), name, 6U));
+    }
+    const auto schedule = [](fil::sim::World& world) {
+        static_cast<void>(world.eventLoop().scheduleAt(100U, [&world] {
+            world.trace().record(world.eventLoop().now(), "test", "synchronized-wake",
+                {{"pc", std::to_string(world.board("sync-alpha")->cpu().state().r[15])}});
+            static_cast<void>(world.eventLoop().scheduleAt(150U, [&world] {
+                world.board("sync-beta")->cpu().state().r[0] = 42U;
+                world.trace().record(world.eventLoop().now(), "test", "synchronized-followup",
+                    {{"pc", std::to_string(world.board("sync-beta")->cpu().state().r[15])}});
+            }));
+        }));
+    };
+    schedule(*exact.value());
+    schedule(*jit.value());
+    auto options = runOptions(1'000'000U);
+    options.max_instructions_per_board = 5'003U;
+    options.enable_loop_batching = false;
+    options.enable_jit = false;
+    const auto reference = exact.value()->run(options);
+    options.enable_jit = true;
+    const auto result = jit.value()->run(options);
+    ASSERT_TRUE(reference && result);
+    EXPECT_EQ(result.value().reason, reference.value().reason);
+    EXPECT_EQ(result.value().instructions, reference.value().instructions);
+    EXPECT_EQ(result.value().cycles, reference.value().cycles);
+    EXPECT_EQ(result.value().end_time_ns, reference.value().end_time_ns);
+    EXPECT_LT(result.value().dispatches, reference.value().dispatches);
+    EXPECT_GT(jit.value()->board("sync-alpha")->cpu().jitStats().compilations, 0U);
+    EXPECT_GT(jit.value()->board("sync-alpha")->cpu().jitStats().block_instructions,
+        jit.value()->board("sync-alpha")->cpu().jitStats().block_executions);
+    EXPECT_EQ(jit.value()->trace().jsonLines(), exact.value()->trace().jsonLines());
+    for (const auto name : {"sync-alpha", "sync-beta"}) {
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(jit.value()->board(name)->cpu().state(),
+            exact.value()->board(name)->cpu().state()));
+    }
+}
+
+TEST(WorldTimeTest, JitPreservesDivergentLaneClocksAndBlockCosts) {
+    TempWorldTimeConfigs files;
+    const auto config = files.network({
+        files.writeBoard("mixed-alpha.json", "mixed-alpha"),
+        files.writeBoard("mixed-beta.json", "mixed-beta")});
+    auto exact = fil::sim::World::load(config);
+    auto jit = fil::sim::World::load(config);
+    ASSERT_TRUE(exact && jit);
+    for (auto* world : {exact.value().get(), jit.value().get()}) {
+        ASSERT_TRUE(installIdleLoop(*world, "mixed-alpha", 6U));
+        ASSERT_TRUE(installIdleLoop(*world, "mixed-beta", 4U));
+        ASSERT_TRUE(selectExtremePllClock(*world, "mixed-beta"));
+    }
+    warmJit(*jit.value()->board("mixed-alpha"));
+    warmJit(*jit.value()->board("mixed-beta"));
+    auto options = runOptions(100'001U);
+    options.max_instructions_per_board = 501U;
+    options.enable_loop_batching = false;
+    options.enable_jit = false;
+    const auto reference = exact.value()->run(options);
+    options.enable_jit = true;
+    const auto result = jit.value()->run(options);
+    ASSERT_TRUE(reference && result);
+    EXPECT_EQ(result.value().instructions, reference.value().instructions);
+    EXPECT_EQ(result.value().cycles, reference.value().cycles);
+    EXPECT_EQ(result.value().end_time_ns, reference.value().end_time_ns);
+    for (const auto name : {"mixed-alpha", "mixed-beta"}) {
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(jit.value()->board(name)->cpu().state(),
+            exact.value()->board(name)->cpu().state()));
+    }
+    EXPECT_EQ(jit.value()->trace().jsonLines(), exact.value()->trace().jsonLines());
+}
+
+TEST(WorldTimeTest, StandaloneJitBlocksPreserveSysTickBoundaries) {
+    TempWorldTimeConfigs files;
+    const auto config = files.network({files.writeBoard("jit-tick.json", "jit-tick")});
+    auto exact = fil::sim::World::load(config);
+    auto jit = fil::sim::World::load(config);
+    ASSERT_TRUE(exact && jit);
+    ASSERT_TRUE(configureSysTickIdleLoop(*exact.value(), "jit-tick", 6U));
+    ASSERT_TRUE(configureSysTickIdleLoop(*jit.value(), "jit-tick", 6U));
+    warmJit(*jit.value()->board("jit-tick"));
+    fil::sim::BoardRunOptions options;
+    options.max_instructions = 1'000U;
+    options.duration_ns = 10'001U;
+    options.enable_loop_batching = false;
+    options.enable_jit = false;
+    const auto reference = exact.value()->board("jit-tick")->run(options);
+    options.enable_jit = true;
+    const auto result = jit.value()->board("jit-tick")->run(options);
+    EXPECT_EQ(result.instructions, reference.instructions);
+    EXPECT_EQ(result.cycles, reference.cycles);
+    EXPECT_EQ(result.time_ns, reference.time_ns);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(jit.value()->board("jit-tick")->cpu().state(),
+        exact.value()->board("jit-tick")->cpu().state()));
+    EXPECT_GT(jit.value()->board("jit-tick")->cpu().state().r[6], 0U);
+    EXPECT_EQ(jit.value()->trace().jsonLines(), exact.value()->trace().jsonLines());
+}
+
+TEST(WorldTimeTest, JitPreservesSmallBudgetsEventsAndSysTick) {
+    TempWorldTimeConfigs files;
+    const auto config = files.network({
+        files.writeBoard("jit-alpha.json", "jit-alpha"),
+        files.writeBoard("jit-beta.json", "jit-beta")});
+    for (const bool tick : {false, true}) {
+        auto exact = fil::sim::World::load(config);
+        auto jit = fil::sim::World::load(config);
+        ASSERT_TRUE(exact && jit);
+        for (const auto name : {"jit-alpha", "jit-beta"}) {
+            if (tick) {
+                ASSERT_TRUE(configureSysTickIdleLoop(*exact.value(), name, 6U));
+                ASSERT_TRUE(configureSysTickIdleLoop(*jit.value(), name, 6U));
+            } else {
+                ASSERT_TRUE(installIdleLoop(*exact.value(), name, 6U));
+                ASSERT_TRUE(installIdleLoop(*jit.value(), name, 6U));
+            }
+            warmJit(*jit.value()->board(name));
+            ASSERT_TRUE(jit.value()->board(name)->cpu().jitBlockReady());
+        }
+        const auto schedule = [](fil::sim::World& world) {
+            static_cast<void>(world.eventLoop().scheduleAt(100U, [&world] {
+                world.board("jit-alpha")->cpu().state().r[0] += 1U;
+                world.trace().record(world.eventLoop().now(), "test", "jit-boundary",
+                    {{"beta_pc", std::to_string(world.board("jit-beta")->cpu().state().r[15])}});
+                // A callback can add a new boundary after dispatch. Lanes
+                // must not have executed an entire block across this event.
+                static_cast<void>(world.eventLoop().scheduleAt(150U, [&world] {
+                    world.board("jit-beta")->cpu().state().r[0] += 2U;
+                    world.trace().record(world.eventLoop().now(), "test", "jit-new-boundary",
+                        {{"beta_pc", std::to_string(world.board("jit-beta")->cpu().state().r[15])}});
+                }));
+            }));
+        };
+        schedule(*exact.value());
+        schedule(*jit.value());
+        auto options = runOptions(tick ? 10'001U : 100'000U);
+        options.max_instructions_per_board = tick ? 1'000U : 3U;
+        options.enable_loop_batching = false;
+        options.enable_jit = false;
+        const auto reference = exact.value()->run(options);
+        options.enable_jit = true;
+        const auto result = jit.value()->run(options);
+        ASSERT_TRUE(reference && result);
+        EXPECT_EQ(result.value().reason, reference.value().reason);
+        EXPECT_EQ(result.value().instructions, reference.value().instructions);
+        EXPECT_EQ(result.value().cycles, reference.value().cycles);
+        EXPECT_EQ(result.value().end_time_ns, reference.value().end_time_ns);
+        for (const auto name : {"jit-alpha", "jit-beta"}) {
+            EXPECT_TRUE(fil::cpu::bitwiseEqual(jit.value()->board(name)->cpu().state(),
+                exact.value()->board(name)->cpu().state()));
+        }
+        EXPECT_EQ(jit.value()->trace().jsonLines(), exact.value()->trace().jsonLines());
+        EXPECT_GT(jit.value()->board("jit-alpha")->cpu().jitStats().block_executions, 0U);
+        if (tick) EXPECT_GT(jit.value()->board("jit-alpha")->cpu().state().r[6], 0U);
+        else for (const auto& board : result.value().boards) {
+            EXPECT_EQ(board.result.instructions, 3U);
+        }
+    }
+}
+
 } // namespace

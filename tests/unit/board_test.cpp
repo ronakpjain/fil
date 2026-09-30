@@ -77,6 +77,103 @@ bool installIdleLoop(fil::sim::Board& board) {
     return board.memory().loadBytes(start, code).hasValue();
 }
 
+bool installAndWarmJitLoop(fil::sim::Board& board, const bool mmio = false) {
+    const auto initial = board.cpu().state();
+    const std::uint32_t start = initial.r[15];
+    std::vector<std::uint8_t> code{
+        0x01U, 0x30U, // adds r0, #1
+        0x01U, 0x30U, // adds r0, #1
+        0x01U, 0x30U, // adds r0, #1
+        0xfbU, 0xe7U, // b start
+    };
+    if (mmio) { code[4] = 0x0aU; code[5] = 0x68U; } // ldr r2, [r1]
+    if (!board.memory().loadBytes(start, code)) return false;
+    for (unsigned int i = 0U; i < 60U; ++i) {
+        board.cpu().state() = initial;
+        board.cpu().state().r[1] = 0xe0001004U; // DWT_CYCCNT
+        static_cast<void>(board.cpu().tryStepJitBlock());
+    }
+    board.cpu().state() = initial;
+    board.cpu().state().r[1] = 0xe0001004U;
+    return board.cpu().jitBlockReady();
+}
+
+TEST(BoardTest, JitPreservesScheduledEventAndDeadlineBoundaries) {
+    auto exact = fil::sim::Board::load(fixtureBoard());
+    auto jit = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(exact && jit);
+    ASSERT_TRUE(installAndWarmJitLoop(*exact.value()));
+    ASSERT_TRUE(installAndWarmJitLoop(*jit.value()));
+    std::uint32_t exact_observed = 0U;
+    std::uint32_t jit_observed = 0U;
+    static_cast<void>(exact.value()->eventLoop().scheduleAt(100U, [&] {
+        exact_observed = exact.value()->cpu().state().r[0];
+        exact.value()->cpu().state().r[0] += 10U;
+    }));
+    static_cast<void>(jit.value()->eventLoop().scheduleAt(100U, [&] {
+        jit_observed = jit.value()->cpu().state().r[0];
+        jit.value()->cpu().state().r[0] += 10U;
+    }));
+    fil::sim::BoardRunOptions options;
+    options.enable_loop_batching = false;
+    options.max_instructions = 1'000U;
+    options.duration_ns = 1'001U;
+    options.enable_jit = false;
+    const auto reference = exact.value()->run(options);
+    options.enable_jit = true;
+    const auto result = jit.value()->run(options);
+    EXPECT_EQ(jit_observed, exact_observed);
+    EXPECT_EQ(result.reason, reference.reason);
+    EXPECT_EQ(result.instructions, reference.instructions);
+    EXPECT_EQ(result.cycles, reference.cycles);
+    EXPECT_EQ(result.time_ns, reference.time_ns);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(jit.value()->cpu().state(), exact.value()->cpu().state()));
+}
+
+TEST(BoardTest, JitStopsBeforeInteriorTargetAndHonorsSmallBudget) {
+    for (const bool stop_at_target : {false, true}) {
+        auto board = fil::sim::Board::load(fixtureBoard());
+        ASSERT_TRUE(board);
+        ASSERT_TRUE(installAndWarmJitLoop(*board.value()));
+        const auto start = board.value()->cpu().state().r[15];
+        fil::sim::BoardRunOptions options;
+        options.enable_loop_batching = false;
+        options.duration_ns = 0U;
+        options.max_instructions = stop_at_target ? 100U : 2U;
+        options.enable_jit = true;
+        if (stop_at_target) options.stop_address = start + 2U;
+        const auto result = board.value()->run(options);
+        EXPECT_EQ(result.reason, stop_at_target
+            ? fil::sim::BoardStopReason::target_reached
+            : fil::sim::BoardStopReason::instruction_budget);
+        EXPECT_EQ(result.instructions, stop_at_target ? 1U : 2U);
+        EXPECT_EQ(board.value()->cpu().state().r[15], start + (stop_at_target ? 2U : 4U));
+    }
+}
+
+TEST(BoardTest, JitTimesMmioAfterCommittedAluPrefix) {
+    auto exact = fil::sim::Board::load(fixtureBoard());
+    auto jit = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(exact && jit);
+    ASSERT_TRUE(installAndWarmJitLoop(*exact.value(), true));
+    ASSERT_TRUE(installAndWarmJitLoop(*jit.value(), true));
+    ASSERT_TRUE(exact.value()->memory().write32(0xe0001000U, 1U));
+    ASSERT_TRUE(jit.value()->memory().write32(0xe0001000U, 1U));
+    fil::sim::BoardRunOptions options;
+    options.enable_loop_batching = false;
+    options.max_instructions = 19U;
+    options.duration_ns = 0U;
+    options.enable_jit = false;
+    const auto reference = exact.value()->run(options);
+    options.enable_jit = true;
+    const auto result = jit.value()->run(options);
+    EXPECT_EQ(result.instructions, reference.instructions);
+    EXPECT_EQ(result.cycles, reference.cycles);
+    EXPECT_EQ(result.time_ns, reference.time_ns);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(jit.value()->cpu().state(), exact.value()->cpu().state()));
+    EXPECT_GT(jit.value()->cpu().state().r[2], 0U);
+}
+
 TEST(BoardTest, LoopBatchingMatchesExactBoardExecution) {
     auto exact = fil::sim::Board::load(fixtureBoard());
     auto batched = fil::sim::Board::load(fixtureBoard());

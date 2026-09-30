@@ -54,6 +54,7 @@ struct BoardRunOptions {
     bool detect_spin{false};                     ///< Stop on a proven exact-state loop.
     std::uint64_t spin_threshold{1'000'000};     ///< Logical instructions in a repeated exact-state loop.
     bool enable_loop_batching{true};             ///< Fast-forward proven side-effect-free loops.
+    bool enable_jit{false};                      ///< Opt-in cached hot-path compilation.
     unsigned int adc_decimation{1}; ///< Keep 1 of N continuous ADC scans; higher skips side effects.
 };
 
@@ -100,7 +101,8 @@ public:
         std::uint64_t instruction_budget,
         SimTimeNs deadline_ns,
         bool enable_loop_batching = true,
-        bool trap_all_mmio = false
+        bool trap_all_mmio = false,
+        bool enable_jit = false
     );
 
     /** @brief Captures reversible CPU, RAM, system, scheduler, and lane-clock state. */
@@ -191,9 +193,15 @@ private:
      * cached with generation checks to keep the per-instruction overhead
      * to a few loads and compares.
      */
-    [[nodiscard]] cpu::FastStepResult stepWithFetchTiming();
+    [[nodiscard]] cpu::FastStepResult stepWithFetchTiming(
+        bool allow_jit_block = false,
+        std::optional<SimTimeNs> deadline = std::nullopt,
+        std::size_t max_instructions = cpu::CortexM4::JitStepOutcome::max_block,
+        bool block_prevalidated = false);
     /** Executes one instruction and accrues board-local cycles without moving shared time. */
-    [[nodiscard]] ConcurrentStepResult beginConcurrentStep(bool trace_instructions);
+    [[nodiscard]] ConcurrentStepResult beginConcurrentStep(
+        bool trace_instructions, bool allow_jit = false,
+        std::size_t max_instructions = 1U);
     /** @brief Exact next-instruction cost inputs for the burst gate. */
     struct PredictedCost {
         std::uint64_t cycles{0};    ///< Pipeline + ART flash stall cycles.
@@ -215,6 +223,13 @@ private:
      * performs a single ns division per burst round.
      */
     [[nodiscard]] std::optional<PredictedCost> peekPredictedCost() const noexcept;
+    struct PredictedBlockCost {
+        PredictedCost cost;
+        std::uint8_t instructions{0U};
+    };
+    /** Pure, fixed-cost blocks that finish before every observable boundary. */
+    [[nodiscard]] std::optional<PredictedBlockCost> peekPredictedBlockCost(
+        std::size_t max_instructions, std::optional<SimTimeNs> deadline);
     /** Applies exception/reset effects due at the just-completed instruction boundary. */
     [[nodiscard]] bool boundaryWorkPending() const noexcept;
     [[nodiscard]] std::optional<BoundaryStop> settleInstructionBoundary();
