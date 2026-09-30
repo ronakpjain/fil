@@ -251,7 +251,11 @@ bool RunResult::succeeded() const noexcept {
 struct CortexM4::NativeState {
 #if FIL_HAS_LLVM_JIT
     std::unique_ptr<LlvmJit> compiler;
-    std::vector<std::shared_ptr<const NativeJitKernel>> kernels;
+    struct Resident {
+        std::shared_ptr<const NativeJitKernel> kernel;
+        std::uint64_t last_used{0};
+    };
+    std::vector<Resident> kernels;
 #endif
 };
 
@@ -272,17 +276,67 @@ bool CortexM4::ensureNativeCompiler() {
         native_state_->compiler = LlvmJit::create(native_jit_error_);
         if (!native_state_->compiler) ++jit_stats_.native_compilation_failures;
     }
-    return native_state_->compiler
-        && native_state_->kernels.size() < max_native_kernels;
+    if (!native_state_->compiler) return false;
+    if (native_state_->kernels.size() < max_native_kernels) return true;
+    const auto victim = std::min_element(native_state_->kernels.begin(),
+        native_state_->kernels.end(),
+        [](const auto& a, const auto& b) { return a.last_used < b.last_used; });
+    // Admission hysteresis: do not evict the actively used working set.
+    return native_clock_ - victim->last_used >= native_compile_threshold;
 #else
     return false;
 #endif
 }
 
+std::uint8_t CortexM4::retainNativeKernel(std::shared_ptr<const NativeJitKernel> kernel) {
+#if FIL_HAS_LLVM_JIT
+    auto& residents = native_state_->kernels;
+    if (residents.size() < max_native_kernels) {
+        residents.push_back({std::move(kernel), native_clock_});
+        return static_cast<std::uint8_t>(residents.size() - 1U);
+    }
+    const auto victim = std::min_element(residents.begin(), residents.end(),
+        [](const auto& a, const auto& b) { return a.last_used < b.last_used; });
+    const auto slot = static_cast<std::uint8_t>(victim - residents.begin());
+    const auto old_function = victim->kernel->entryPoint();
+    // Clear every raw entry point before releasing its ORC resources. Evicted
+    // sites must pass their hotness gates again rather than immediately churn.
+    for (auto& entry : instruction_cache_) {
+        if (entry.native_function != old_function) continue;
+        entry.native_function = nullptr;
+        entry.native_hits = 0U;
+        entry.native_attempted = false;
+    }
+    for (auto& entry : jit_blocks_) {
+        if (entry.native_function != old_function) continue;
+        entry.native_function = nullptr;
+        entry.native_count = 0U;
+        entry.native_hits = 0U;
+        entry.native_attempted = false;
+    }
+    *victim = {std::move(kernel), native_clock_};
+    ++jit_stats_.native_evictions;
+    return slot;
+#else
+    static_cast<void>(kernel);
+    return 0U;
+#endif
+}
+
+void CortexM4::touchNativeKernel(const std::uint8_t slot) noexcept {
+#if FIL_HAS_LLVM_JIT
+    native_state_->kernels[slot].last_used = native_clock_;
+#else
+    static_cast<void>(slot);
+#endif
+}
+
 bool CortexM4::executeNativeInstruction(InstructionCacheEntry& entry) {
 #if FIL_HAS_LLVM_JIT
+    ++native_clock_;
     if (state_.it_state != 0U || state_.pending_exception || state_.pending_exc_return) return false;
     if (entry.native_function) {
+        touchNativeKernel(entry.native_slot);
         entry.native_function(&state_, 1U);
         ++jit_stats_.native_executions;
         ++jit_stats_.native_instructions;
@@ -295,7 +349,12 @@ bool CortexM4::executeNativeInstruction(InstructionCacheEntry& entry) {
     }
     entry.native_attempted = true;
     const NativeJitInstruction instruction{entry.decoded, entry.pc, entry.size};
-    if (!LlvmJit::supports(instruction) || !ensureNativeCompiler()) return false;
+    if (!LlvmJit::supports(instruction)) return false;
+    if (!ensureNativeCompiler()) {
+        entry.native_hits = 0U;
+        entry.native_attempted = false;
+        return false;
+    }
     auto kernel = native_state_->compiler->compile(
         std::span<const NativeJitInstruction>{&instruction, 1U}, native_jit_error_);
     if (!kernel || !kernel->entryPoint()) {
@@ -303,7 +362,7 @@ bool CortexM4::executeNativeInstruction(InstructionCacheEntry& entry) {
         return false;
     }
     entry.native_function = kernel->entryPoint();
-    native_state_->kernels.push_back(std::move(kernel));
+    entry.native_slot = retainNativeKernel(std::move(kernel));
     ++jit_stats_.native_compilations;
     entry.native_function(&state_, 1U);
     ++jit_stats_.native_executions;
@@ -316,21 +375,33 @@ bool CortexM4::executeNativeInstruction(InstructionCacheEntry& entry) {
 }
 
 void CortexM4::prepareNativeBlock(JitBlockEntry& entry) {
+    entry.native_attempted = true;
 #if FIL_HAS_LLVM_JIT
     std::array<NativeJitInstruction, JitStepOutcome::max_block> instructions{};
-    for (std::uint8_t i = 0U; i < entry.count; ++i) {
-        instructions[i] = {entry.ops[i], entry.pcs[i], entry.sizes[i]};
-        if (!LlvmJit::supports(instructions[i])) return;
+    std::uint8_t supported_count = 0U;
+    for (; supported_count < entry.count; ++supported_count) {
+        instructions[supported_count] = {entry.ops[supported_count],
+            entry.pcs[supported_count], entry.sizes[supported_count]};
+        if (!LlvmJit::supports(instructions[supported_count])) break;
     }
-    if (!ensureNativeCompiler()) return;
+    // Spend scarce native slots on multi-instruction kernels. Short mixed
+    // prefixes retain cached execution; sustained hot singles use their own gate.
+    if (supported_count == 0U
+        || (supported_count < entry.count && supported_count < 4U)) return;
+    if (!ensureNativeCompiler()) {
+        entry.native_hits = 0U;
+        entry.native_attempted = false;
+        return;
+    }
     auto kernel = native_state_->compiler->compile(
-        std::span<const NativeJitInstruction>{instructions.data(), entry.count}, native_jit_error_);
+        std::span<const NativeJitInstruction>{instructions.data(), supported_count}, native_jit_error_);
     if (!kernel || !kernel->entryPoint()) {
         ++jit_stats_.native_compilation_failures;
         return;
     }
     entry.native_function = kernel->entryPoint();
-    native_state_->kernels.push_back(std::move(kernel));
+    entry.native_count = supported_count;
+    entry.native_slot = retainNativeKernel(std::move(kernel));
     ++jit_stats_.native_compilations;
 #else
     static_cast<void>(entry);
@@ -803,12 +874,14 @@ bool CortexM4::prepareJitBlock() {
     fresh.valid = true;
     slot = fresh;
     ++jit_stats_.compilations;
-    prepareNativeBlock(slot);
     return true;
 }
 
 std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlock(
     const std::size_t max_instructions) {
+#if FIL_HAS_LLVM_JIT
+    if (max_instructions != 0U) ++native_clock_;
+#endif
     if (max_instructions == 0U || !prepareJitBlock()) {
         if (max_instructions != 0U) ++jit_stats_.fallbacks;
         return std::nullopt;
@@ -826,34 +899,37 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlock(
     const std::uint8_t execution_count = static_cast<std::uint8_t>(
         std::min<std::size_t>(max_instructions, slot.count));
 #if FIL_HAS_LLVM_JIT
+    // Previews alone must not spend native slots. Compile only a block that
+    // is actually admitted for multi-instruction execution by the scheduler.
+    if (execution_count > 1U && !slot.native_function && !slot.native_attempted) {
+        if (slot.native_hits < native_block_compile_threshold) ++slot.native_hits;
+        else prepareNativeBlock(slot);
+    }
     if (slot.native_function && state_.it_state == 0U) {
         // Only independently lowered, pure unconditional instructions reach
         // this path. The scheduler still controls the allowed prefix length.
-        slot.native_function(&state_, execution_count);
-        for (std::uint8_t i = 0U; i < execution_count; ++i) {
+        const auto native_count = std::min(execution_count, slot.native_count);
+        touchNativeKernel(slot.native_slot);
+        slot.native_function(&state_, native_count);
+        for (std::uint8_t i = 0U; i < native_count; ++i) {
             out.pcs[i] = slot.pcs[i];
             out.sizes[i] = slot.sizes[i];
             total_cycles += slot.base_cycles[i];
         }
-        const auto last = static_cast<std::size_t>(execution_count - 1U);
+        const auto last = static_cast<std::size_t>(native_count - 1U);
         if (state_.r[15] != slot.pcs[last] + slot.sizes[last]) {
             total_cycles += slot.branch_penalty[last];
         }
-        out.count = execution_count;
-        out.result.instructions = execution_count;
-        out.result.instruction_address = slot.pcs[last];
-        out.result.raw = slot.raws[last];
-        out.result.instruction_size = slot.sizes[last];
-        out.result.cycles = static_cast<std::uint16_t>(total_cycles);
-        out.result.suppress_loop_observation = slot.ops[last].kind == InstrKind::bl;
-        ++jit_stats_.block_executions;
-        jit_stats_.block_instructions += execution_count;
+        out.count = native_count;
+        last_pc = slot.pcs[last];
+        last_raw = slot.raws[last];
+        last_size = slot.sizes[last];
+        last_suppress = slot.ops[last].kind == InstrKind::bl;
         ++jit_stats_.native_executions;
-        jit_stats_.native_instructions += execution_count;
-        return out;
+        jit_stats_.native_instructions += native_count;
     }
 #endif
-    for (std::uint8_t i = 0; i < execution_count; ++i) {
+    for (std::uint8_t i = out.count; i < execution_count; ++i) {
         const DecodedInstruction& op = slot.ops[i];
         const std::uint32_t pc = slot.pcs[i];
         // A committed write may have changed executable memory. Never run

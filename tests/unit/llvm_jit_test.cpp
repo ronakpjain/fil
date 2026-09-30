@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -269,7 +270,7 @@ TEST(LlvmJitIntegrationTest, CompiledBranchFaultOnNextDispatchMatchesInterpreter
     native.state() = initial;
     reference.state() = initial;
     std::optional<fil::cpu::CortexM4::JitStepOutcome> branch;
-    for (int i = 0; i < 150 && native.jitStats().native_executions == 0U; ++i) {
+    for (int i = 0; i < 1024 && native.jitStats().native_executions == 0U; ++i) {
         native.state() = initial;
         branch = native.tryStepJitBlock(2U);
     }
@@ -322,7 +323,7 @@ TEST(LlvmJitIntegrationTest, CompiledBranchReportsExactCyclesAndFallthroughState
         cycles = static_cast<std::uint16_t>(cycles + step.cycles);
     }
     std::optional<fil::cpu::CortexM4::JitStepOutcome> outcome;
-    for (int i = 0; i < 150 && native.jitStats().native_executions == 0U; ++i) {
+    for (int i = 0; i < 1024 && native.jitStats().native_executions == 0U; ++i) {
         native.state() = initial;
         outcome = native.tryStepJitBlock(2U);
     }
@@ -353,7 +354,7 @@ TEST(LlvmJitIntegrationTest, SingleInstructionNativeHotPathInvalidatesAfterExecu
     initial.msp = ram + 0xf0U;
     initial.r[13] = initial.msp;
     std::optional<fil::cpu::FastStepResult> last;
-    for (int i = 0; i < 150 && jit.jitStats().native_executions == 0U; ++i) {
+    for (int i = 0; i < 20000 && jit.jitStats().native_executions == 0U; ++i) {
         jit.state() = initial;
         last = jit.stepJitFast();
     }
@@ -375,7 +376,7 @@ TEST(LlvmJitIntegrationTest, SingleInstructionNativeHotPathInvalidatesAfterExecu
     EXPECT_EQ(actual.instruction_size, expected.instruction_size);
     EXPECT_EQ(actual.cycles, expected.cycles);
     EXPECT_TRUE(fil::cpu::bitwiseEqual(jit.state(), reference.state()));
-    for (int i = 0; i < 150 && jit.jitStats().native_executions == executions_before; ++i) {
+    for (int i = 0; i < 20000 && jit.jitStats().native_executions == executions_before; ++i) {
         jit.state() = initial;
         static_cast<void>(jit.stepJitFast());
     }
@@ -412,7 +413,7 @@ TEST(LlvmJitIntegrationTest, HotCappedNativeBlockMatchesInterpreterAndTracksNati
     }
 
     std::optional<fil::cpu::CortexM4::JitStepOutcome> result;
-    for (int i = 0; i < 128; ++i) {
+    for (int i = 0; i < 1024; ++i) {
         cpu.state() = initial;
         result = cpu.tryStepJitBlock(2U);
         if (cpu.jitStats().native_executions != 0U) break;
@@ -437,5 +438,189 @@ TEST(LlvmJitIntegrationTest, HotCappedNativeBlockMatchesInterpreterAndTracksNati
         if (guard == 3) cpu.state().halted = true;
         EXPECT_FALSE(cpu.tryStepJitBlock(1U).has_value()) << "guard=" << guard;
     }
+}
+TEST(LlvmJitIntegrationTest, MixedBlockNativePrefixPreservesSuffixAndLimits) {
+    constexpr std::uint32_t ram = 0x20000000U;
+    for (const bool unsupported_first : {false, true}) {
+        fil::mem::MemoryBus bus;
+        ASSERT_TRUE(bus.mapRam(ram, 256U, "mixed-native", true).hasValue());
+        // Four supported ops; register ADDS (not lowered); NOP; BKPT.
+        std::array<std::uint8_t, 14> code{0x01, 0x20, 0x01, 0x30,
+            0x00, 0xbf, 0x00, 0xbf, 0x40, 0x18, 0x00, 0xbf, 0x00, 0xbe};
+        if (unsupported_first) {
+            code[0] = 0x40; code[1] = 0x18;
+        }
+        ASSERT_TRUE(bus.loadBytes(ram, code).hasValue());
+        fil::cpu::CortexM4 cpu(bus), reference(bus);
+        fil::cpu::CpuState initial{};
+        initial.r[15] = ram;
+        initial.r[1] = 7U;
+        for (int warm = 0; warm < 1024; ++warm) {
+            cpu.state() = initial;
+            static_cast<void>(cpu.tryStepJitBlock(6U));
+        }
+        EXPECT_EQ(cpu.jitStats().native_compilations, unsupported_first ? 0U : 1U);
+        for (std::size_t limit = 1; limit <= 6; ++limit) {
+            cpu.state() = reference.state() = initial;
+            std::uint16_t cycles = 0;
+            for (std::size_t i = 0; i < limit; ++i) {
+                const auto step = reference.stepFast();
+                ASSERT_EQ(step.reason, fil::cpu::StopReason::step_complete);
+                cycles = static_cast<std::uint16_t>(cycles + step.cycles);
+            }
+            const auto before = cpu.jitStats();
+            const auto result = cpu.tryStepJitBlock(limit);
+            ASSERT_TRUE(result);
+            EXPECT_EQ(result->count, limit);
+            EXPECT_EQ(result->result.instructions, limit);
+            EXPECT_EQ(result->result.cycles, cycles);
+            EXPECT_EQ(result->result.instruction_address, reference.state().instruction_address);
+            EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()));
+            EXPECT_EQ(result->result.instruction_size, 2U);
+            EXPECT_EQ(result->result.raw, static_cast<std::uint32_t>(code[2 * (limit - 1)])
+                | (static_cast<std::uint32_t>(code[2 * (limit - 1) + 1]) << 8U));
+            for (std::size_t i = 0; i < limit; ++i) {
+                EXPECT_EQ(result->pcs[i], ram + 2U * i);
+                EXPECT_EQ(result->sizes[i], 2U);
+            }
+            EXPECT_EQ(cpu.jitStats().native_instructions - before.native_instructions,
+                unsupported_first ? 0U : std::min<std::size_t>(limit, 4U));
+            EXPECT_EQ(cpu.jitStats().block_instructions - before.block_instructions, limit);
+        }
+    }
+}
+TEST(LlvmJitIntegrationTest, NativeBlockAdmissionRequiresActualMultiInstructionUse) {
+    constexpr std::uint32_t ram = 0x20000000U;
+    fil::mem::MemoryBus bus;
+    ASSERT_TRUE(bus.mapRam(ram, 256U, "native-admission", true).hasValue());
+    const std::array<std::uint8_t, 10> code{1, 0x20, 1, 0x30,
+        0, 0xbf, 0, 0xbf, 0, 0xbe};
+    ASSERT_TRUE(bus.loadBytes(ram, code).hasValue());
+    fil::cpu::CortexM4 cpu(bus);
+    fil::cpu::CpuState initial{};
+    initial.r[15] = ram;
+    cpu.state() = initial;
+    for (int i = 0; i < 2000; ++i) {
+        static_cast<void>(cpu.prepareJitBlock());
+        static_cast<void>(cpu.peekJitBlock(4U));
+        cpu.state() = initial;
+        static_cast<void>(cpu.tryStepJitBlock(1U));
+    }
+    EXPECT_EQ(cpu.jitStats().native_compilations, 0U);
+    for (int i = 0; i < 512; ++i) {
+        cpu.state() = initial;
+        ASSERT_TRUE(cpu.tryStepJitBlock(4U));
+    }
+    EXPECT_EQ(cpu.jitStats().native_compilations, 0U);
+    cpu.state() = initial;
+    ASSERT_TRUE(cpu.tryStepJitBlock(4U));
+    EXPECT_EQ(cpu.jitStats().native_compilations, 1U);
+    EXPECT_EQ(cpu.jitStats().native_instructions, 4U);
+}
+
+TEST(LlvmJitIntegrationTest, EvictedNativeBlockRewarmsWithoutStaleEntryPoint) {
+    constexpr std::uint32_t ram = 0x20000000U;
+    fil::mem::MemoryBus bus;
+    ASSERT_TRUE(bus.mapRam(ram, 1024U, "mixed-lru", true).hasValue());
+    std::array<std::uint8_t, 164> code{};
+    const std::array<std::uint8_t, 10> block{1, 0x20, 1, 0x30,
+        0, 0xbf, 0, 0xbf, 0, 0xbe};
+    std::copy(block.begin(), block.end(), code.begin());
+    for (std::size_t i = 0; i < 33; ++i) {
+        code[32 + i * 4] = static_cast<std::uint8_t>(i + 1);
+        code[33 + i * 4] = 0x20;
+        code[34 + i * 4] = 0; code[35 + i * 4] = 0xbe;
+    }
+    ASSERT_TRUE(bus.loadBytes(ram, code).hasValue());
+    fil::cpu::CortexM4 cpu(bus);
+    const auto step_single = [&](std::size_t site) {
+        cpu.state() = fil::cpu::CpuState{};
+        cpu.state().r[15] = ram + 32U + static_cast<std::uint32_t>(site * 4U);
+        EXPECT_EQ(cpu.stepJitFast().reason, fil::cpu::StopReason::step_complete);
+        EXPECT_EQ(cpu.state().r[0], site + 1U);
+    };
+    const auto step_block = [&] {
+        cpu.state() = fil::cpu::CpuState{};
+        cpu.state().r[15] = ram;
+        const auto result = cpu.tryStepJitBlock(4U);
+        if (result) {
+            EXPECT_EQ(result->count, 4U);
+            EXPECT_EQ(cpu.state().r[0], 2U);
+        }
+    };
+    for (int i = 0; i < 600; ++i) step_block();
+    ASSERT_EQ(cpu.jitStats().native_compilations, 1U);
+    for (std::size_t site = 0; site < 31; ++site) {
+        const auto before = cpu.jitStats().native_compilations;
+        for (int i = 0; i < 20000 && cpu.jitStats().native_compilations == before; ++i) {
+            step_single(site);
+            if (i % 100 == 0) step_block(); // Block touch must affect LRU.
+        }
+        ASSERT_EQ(cpu.jitStats().native_compilations, before + 1U);
+    }
+    ASSERT_EQ(cpu.jitStats().native_evictions, 0U);
+    auto before = cpu.jitStats();
+    step_block();
+    EXPECT_EQ(cpu.jitStats().native_instructions, before.native_instructions + 4U);
+    // Keep every single resident recent, but stop touching the block.
+    for (int i = 0; i < 20000 && cpu.jitStats().native_compilations == before.native_compilations; ++i) {
+        step_single(31);
+        if (i % 100 == 0) for (std::size_t site = 0; site < 31; ++site) step_single(site);
+    }
+    ASSERT_EQ(cpu.jitStats().native_evictions, 1U);
+    before = cpu.jitStats();
+    step_block();
+    EXPECT_EQ(cpu.jitStats().native_instructions, before.native_instructions);
+    for (int i = 0; i < 20000 && cpu.jitStats().native_compilations == before.native_compilations; ++i) step_block();
+    EXPECT_EQ(cpu.jitStats().native_compilations, before.native_compilations + 1U);
+    EXPECT_EQ(cpu.jitStats().native_evictions, 2U);
+    before = cpu.jitStats();
+    step_block();
+    EXPECT_EQ(cpu.jitStats().native_instructions, before.native_instructions + 4U);
+}
+
+TEST(LlvmJitIntegrationTest, LruRetainsRecentKernelAndEvictedSitesRewarm) {
+    constexpr std::uint32_t ram = 0x20000000U;
+    fil::mem::MemoryBus bus;
+    ASSERT_TRUE(bus.mapRam(ram, 512U, "lru-native", true).hasValue());
+    std::array<std::uint8_t, 132> code{};
+    for (std::size_t i = 0; i < 33; ++i) {
+        code[i * 4] = static_cast<std::uint8_t>(i + 1);
+        code[i * 4 + 1] = 0x20; // MOVS r0,#(i+1)
+        code[i * 4 + 2] = 0x00; code[i * 4 + 3] = 0xbe;
+    }
+    ASSERT_TRUE(bus.loadBytes(ram, code).hasValue());
+    fil::cpu::CortexM4 cpu(bus);
+    const auto step_site = [&](std::size_t site) {
+        cpu.state() = fil::cpu::CpuState{};
+        cpu.state().r[15] = ram + static_cast<std::uint32_t>(site * 4);
+        const auto result = cpu.stepJitFast();
+        EXPECT_EQ(result.reason, fil::cpu::StopReason::step_complete);
+        EXPECT_EQ(cpu.state().r[0], site + 1U);
+    };
+    for (std::size_t site = 0; site < 33; ++site) {
+        const auto before = cpu.jitStats().native_compilations;
+        for (int warm = 0; warm < 20000 && cpu.jitStats().native_compilations == before; ++warm) {
+            step_site(site);
+            if (site != 0 && warm % 100 == 0) step_site(0); // Keep anchor MRU.
+        }
+        ASSERT_EQ(cpu.jitStats().native_compilations, before + 1U) << "site=" << site;
+    }
+    ASSERT_EQ(cpu.jitStats().native_evictions, 1U);
+    auto before = cpu.jitStats();
+    step_site(0);
+    EXPECT_EQ(cpu.jitStats().native_executions, before.native_executions + 1U);
+    EXPECT_EQ(cpu.jitStats().native_compilations, before.native_compilations);
+    // Site one is LRU, not the recently touched anchor. Its raw pointer must
+    // have been cleared before its ORC resource was removed.
+    before = cpu.jitStats();
+    step_site(1);
+    EXPECT_EQ(cpu.jitStats().native_executions, before.native_executions);
+    for (int warm = 0; warm < 20000 && cpu.jitStats().native_compilations == before.native_compilations; ++warm) {
+        step_site(1);
+        if (warm % 100 == 0) step_site(0);
+    }
+    EXPECT_EQ(cpu.jitStats().native_compilations, before.native_compilations + 1U);
+    EXPECT_EQ(cpu.jitStats().native_evictions, 2U);
 }
 #endif // FIL_HAS_LLVM_JIT

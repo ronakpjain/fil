@@ -387,7 +387,8 @@ void printNativeJitStats(std::ostream& out, const cpu::CortexM4& cpu, const std:
         << " compilations=" << stats.native_compilations
         << " executions=" << stats.native_executions
         << " instructions=" << stats.native_instructions
-        << " failures=" << stats.native_compilation_failures << '\n';
+        << " failures=" << stats.native_compilation_failures
+        << " evictions=" << stats.native_evictions << '\n';
     if (!cpu.nativeJitError().empty()) out << "native_jit_error: " << cpu.nativeJitError() << '\n';
 }
 

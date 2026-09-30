@@ -285,6 +285,7 @@ public:
         std::uint64_t native_executions{0};
         std::uint64_t native_instructions{0};
         std::uint64_t native_compilation_failures{0};
+        std::uint64_t native_evictions{0};
     };
     [[nodiscard]] JitStats jitStats() const noexcept { return jit_stats_; }
     [[nodiscard]] const std::string& nativeJitError() const noexcept { return native_jit_error_; }
@@ -311,6 +312,7 @@ private:
         bool divide_form{false};
         std::uint8_t jit_fast{0};
         NativeFunction native_function{nullptr};
+        std::uint8_t native_slot{0U};
         std::uint16_t native_hits{0U};
         bool native_attempted{false};
     };
@@ -361,6 +363,10 @@ private:
         bool valid{false};
         bool attempted{false};
         NativeFunction native_function{nullptr};
+        std::uint8_t native_count{0}; ///< Pure supported prefix; suffix uses cached handlers.
+        std::uint8_t native_slot{0U};
+        std::uint16_t native_hits{0U};
+        bool native_attempted{false};
         std::array<DecodedInstruction, JitStepOutcome::max_block> ops{};
         std::array<std::uint32_t, JitStepOutcome::max_block> pcs{};
         std::array<std::uint8_t, JitStepOutcome::max_block> sizes{};
@@ -377,12 +383,16 @@ private:
     std::array<std::uint16_t, jit_block_entries> jit_hot_{};
     JitStats jit_stats_{};
     static constexpr std::uint16_t jit_compile_threshold = 50U;
-    static constexpr std::uint16_t native_compile_threshold = 128U;
+    static constexpr std::uint16_t native_compile_threshold = 16384U;
+    static constexpr std::uint16_t native_block_compile_threshold = 512U;
     static constexpr std::size_t max_native_kernels = 32U;
     struct NativeState;
     std::unique_ptr<NativeState> native_state_;
+    std::uint64_t native_clock_{0}; ///< Eligible JIT dispatches, not simulated time.
     std::string native_jit_error_;
     [[nodiscard]] bool ensureNativeCompiler();
+    [[nodiscard]] std::uint8_t retainNativeKernel(std::shared_ptr<const NativeJitKernel> kernel);
+    void touchNativeKernel(std::uint8_t slot) noexcept;
     [[nodiscard]] bool executeNativeInstruction(InstructionCacheEntry& entry);
     void prepareNativeBlock(JitBlockEntry& entry);
 
