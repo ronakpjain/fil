@@ -164,6 +164,16 @@ TEST(MemoryBusTest, DispatchesMmioIndivisibly) {
         << "rejects cross-boundary MMIO before dispatch";
 }
 
+/** @brief Verifies explicit little-endian byte decoding for every access width. */
+TEST(MemoryBusTest, DecodesLittleEndianBytesAtEveryWidth) {
+    constexpr std::uint8_t bytes[] = {0x10U, 0x32U, 0x54U, 0x76U,
+                                      0x98U, 0xbaU, 0xdcU, 0xfeU};
+    EXPECT_TRUE(fil::mem::detail::decodeLittleEndianBytes(bytes, 1U) == 0x10U);
+    EXPECT_TRUE(fil::mem::detail::decodeLittleEndianBytes(bytes, 2U) == 0x3210U);
+    EXPECT_TRUE(fil::mem::detail::decodeLittleEndianBytes(bytes, 4U) == 0x76543210U);
+    EXPECT_TRUE(fil::mem::detail::decodeLittleEndianBytes(bytes, 8U) == 0xfedcba9876543210ULL);
+}
+
 /** @brief Verifies shared access-width helpers cover every MMIO width. */
 TEST(MemoryBusTest, ValidatesAccessWidthUtilities) {
     using fil::mem::AccessSize;
@@ -296,6 +306,237 @@ TEST(MemoryBusTest, TracksReversibleLoopMemoryEffects) {
                 !bus.sideEffectsRestoredSince(expired_checkpoint) &&
                 !bus.restoreSideEffects(expired_checkpoint))
         << "fails closed when a checkpoint exceeds the mutation journal";
+}
+
+TEST(MemoryBusTest, OptionalTrackingPreservesArchitecturalMemoryAndFailsClosed) {
+    using fil::mem::AccessContext;
+    using fil::mem::AccessType;
+    using fil::mem::MemoryBus;
+
+    MemoryBus bus;
+    ASSERT_TRUE(bus.mapRam(0x20000000U, 32U, "ram").hasValue());
+    ASSERT_TRUE(bus.mapRam(0x20000100U, 32U, "executable", true).hasValue());
+    RecordingMmio device;
+    ASSERT_TRUE(bus.mapMmio(0x40000000U, 16U, device, "device").hasValue());
+    ASSERT_TRUE(bus.write32(0x20000000U, 0x12345678U));
+    ASSERT_TRUE(bus.write32(0x20000100U, 0xabcdef01U));
+
+    const auto execution_before = bus.executionGeneration();
+    const auto effects_before = bus.sideEffectGeneration();
+    bus.setReadFootprintTracking(false);
+    const auto data = bus.read32(0x20000000U, {AccessType::data_read, 0x08000100U});
+    const auto instruction = bus.read16(
+        0x20000100U, {AccessType::instruction_fetch, 0x08000102U});
+    const auto fault = bus.read32(0x60000000U, {AccessType::data_read, 0x08000104U});
+    ASSERT_TRUE(data && instruction && !fault);
+    EXPECT_EQ(data.value(), 0x12345678U);
+    EXPECT_EQ(instruction.value(), 0xabcdef01U & 0xffffU);
+    EXPECT_EQ(fault.fault().reason, fil::mem::BusFaultReason::unmapped);
+    const auto missed_reads = bus.takeReadFootprint();
+    EXPECT_FALSE(missed_reads.complete);
+    EXPECT_EQ(missed_reads.words, MemoryBus::ReadFootprint{}.words);
+    EXPECT_EQ(bus.executionGeneration(), execution_before);
+    EXPECT_EQ(bus.sideEffectGeneration(), effects_before);
+
+    bus.setReadFootprintTracking(true);
+    static_cast<void>(bus.read32(0x20000000U, {AccessType::data_read, 0x08000100U}));
+    const auto complete_reads = bus.takeReadFootprint();
+    EXPECT_TRUE(complete_reads.complete);
+    EXPECT_NE(complete_reads.words, MemoryBus::ReadFootprint{}.words);
+
+    // A checkpoint spanning disabled journaling cannot restore or certify a
+    // write, even after tracking is re-enabled.
+    const auto checkpoint = bus.sideEffectCheckpoint();
+    const auto footprint = complete_reads;
+    bus.setWriteJournalTracking(false);
+    const auto before_ram_write = bus.sideEffectGeneration();
+    const auto before_exec_write = bus.executionGeneration();
+    ASSERT_TRUE(bus.write32(0x20000000U, 0x87654321U));
+    ASSERT_TRUE(bus.tryFastWriteWords(0x20000100U, 1U,
+        std::array<std::uint32_t, 1>{0x10203040U}.data(), {}));
+    EXPECT_EQ(bus.sideEffectGeneration(), before_ram_write + 8U);
+    EXPECT_EQ(bus.executionGeneration(), before_exec_write + 1U);
+    EXPECT_EQ(bus.read32(0x20000000U).value(), 0x87654321U);
+    EXPECT_FALSE(bus.canRestoreSideEffects(checkpoint));
+    EXPECT_FALSE(bus.restoreSideEffects(checkpoint));
+    EXPECT_FALSE(bus.sideEffectsRestoredSince(checkpoint));
+    EXPECT_FALSE(bus.sideEffectsCompatibleSince(checkpoint, footprint));
+
+    bus.setWriteJournalTracking(true);
+    EXPECT_FALSE(bus.canRestoreSideEffects(checkpoint));
+    EXPECT_EQ(bus.read32(0x20000100U).value(), 0x10203040U);
+    EXPECT_EQ(bus.executionGeneration(), before_exec_write + 1U);
+
+    // A read made while tracking is disabled marks the resulting footprint
+    // incomplete; such a footprint cannot approve overlapping external writes.
+    bus.setReadFootprintTracking(false);
+    static_cast<void>(bus.read32(0x20000000U, {AccessType::data_read, 0x08000100U}));
+    const auto incomplete = bus.takeReadFootprint();
+    bus.setReadFootprintTracking(true);
+    const auto external_checkpoint = bus.sideEffectCheckpoint();
+    ASSERT_TRUE(bus.write8(0x20000000U, 0x55U, {AccessType::data_write, 0U}));
+    EXPECT_FALSE(bus.sideEffectsCompatibleSince(external_checkpoint, incomplete));
+}
+
+TEST(MemoryBusTest, UnjournaledWordStoresMatchBytewiseArchitecturalEffects) {
+    using fil::mem::AccessSize;
+    using fil::mem::MemoryBus;
+
+    MemoryBus tracked;
+    MemoryBus unjournaled;
+    ASSERT_TRUE(tracked.mapRam(0x20000000U, 32U, "ram").hasValue());
+    ASSERT_TRUE(unjournaled.mapRam(0x20000000U, 32U, "ram").hasValue());
+    ASSERT_TRUE(tracked.mapRam(0x20000100U, 32U, "exec", true).hasValue());
+    ASSERT_TRUE(unjournaled.mapRam(0x20000100U, 32U, "exec", true).hasValue());
+    ASSERT_TRUE(tracked.write32(0x20000000U, 0x11223344U));
+    ASSERT_TRUE(unjournaled.write32(0x20000000U, 0x11223344U));
+    unjournaled.setWriteJournalTracking(false);
+
+    // Exercise 0..4 changed bytes through both the dedicated 32-bit and
+    // width-generic word fast paths, including unaligned backing addresses.
+    for (std::uint32_t changed = 0U; changed <= 4U; ++changed) {
+        const std::uint32_t old_value = tracked.read32(0x20000001U).value();
+        std::uint32_t new_value = old_value;
+        for (std::uint32_t byte = 0U; byte < changed; ++byte) {
+            new_value ^= 0xffU << (byte * 8U);
+        }
+        const auto tracked_checkpoint = tracked.sideEffectCheckpoint();
+        const auto fast_checkpoint = unjournaled.sideEffectCheckpoint();
+        const auto tracked_effects = tracked.sideEffectGeneration();
+        const auto fast_effects = unjournaled.sideEffectGeneration();
+        const auto tracked_exec = tracked.executionGeneration();
+        const auto fast_exec = unjournaled.executionGeneration();
+        if ((changed & 1U) == 0U) {
+            ASSERT_TRUE(tracked.tryFastWrite32(0x20000001U, new_value, {}));
+            ASSERT_TRUE(unjournaled.tryFastWrite32(0x20000001U, new_value, {}));
+        } else {
+            ASSERT_TRUE(tracked.tryFastWrite(0x20000001U, AccessSize::word, new_value, {}));
+            ASSERT_TRUE(unjournaled.tryFastWrite(0x20000001U, AccessSize::word, new_value, {}));
+        }
+        EXPECT_EQ(tracked.read32(0x20000001U).value(), new_value);
+        EXPECT_EQ(unjournaled.read32(0x20000001U).value(), new_value);
+        EXPECT_EQ(tracked.sideEffectGeneration() - tracked_effects, changed);
+        EXPECT_EQ(unjournaled.sideEffectGeneration() - fast_effects, changed);
+        EXPECT_EQ(tracked.sideEffectCheckpoint().mutation_sequence
+                      - tracked_checkpoint.mutation_sequence, changed);
+        EXPECT_EQ(unjournaled.sideEffectCheckpoint().mutation_sequence
+                      - fast_checkpoint.mutation_sequence, changed);
+        EXPECT_EQ(tracked.executionGeneration(), tracked_exec);
+        EXPECT_EQ(unjournaled.executionGeneration(), fast_exec);
+    }
+
+    // Executable stores still invalidate code even when their bytes are
+    // unchanged, while byte mutation counters remain unchanged.
+    const auto exec_before = unjournaled.executionGeneration();
+    const auto tracked_exec_before = tracked.executionGeneration();
+    const auto seq_before = unjournaled.sideEffectCheckpoint().mutation_sequence;
+    const auto tracked_seq_before = tracked.sideEffectCheckpoint().mutation_sequence;
+    const auto effects_before = unjournaled.sideEffectGeneration();
+    const auto tracked_effects_before = tracked.sideEffectGeneration();
+    ASSERT_TRUE(unjournaled.tryFastWrite32(0x20000100U, 0U, {}));
+    ASSERT_TRUE(tracked.tryFastWrite32(0x20000100U, 0U, {}));
+    EXPECT_EQ(unjournaled.executionGeneration(), exec_before + 1U);
+    EXPECT_EQ(tracked.executionGeneration(), tracked_exec_before + 1U);
+    EXPECT_EQ(unjournaled.sideEffectCheckpoint().mutation_sequence, seq_before);
+    EXPECT_EQ(tracked.sideEffectCheckpoint().mutation_sequence, tracked_seq_before);
+    EXPECT_EQ(unjournaled.sideEffectGeneration(), effects_before);
+    EXPECT_EQ(tracked.sideEffectGeneration(), tracked_effects_before);
+
+    // Checked range rejection remains before the word helper and has no state
+    // effects; disabling journaling does not widen a backing access.
+    const auto crossing_seq = unjournaled.sideEffectCheckpoint().mutation_sequence;
+    const auto crossing_effects = unjournaled.sideEffectGeneration();
+    EXPECT_FALSE(unjournaled.tryFastWrite32(0x2000001eU, 0xdeadbeefU, {}));
+    EXPECT_EQ(unjournaled.sideEffectCheckpoint().mutation_sequence, crossing_seq);
+    EXPECT_EQ(unjournaled.sideEffectGeneration(), crossing_effects);
+
+    const auto stale_checkpoint = unjournaled.sideEffectCheckpoint();
+    unjournaled.setWriteJournalTracking(true);
+    EXPECT_FALSE(unjournaled.canRestoreSideEffects(stale_checkpoint));
+    const auto rollback_checkpoint = unjournaled.sideEffectCheckpoint();
+    const auto original_word = unjournaled.read32(0x20000004U).value();
+    ASSERT_TRUE(unjournaled.write32(0x20000004U, 0xaabbccddU));
+    ASSERT_TRUE(unjournaled.restoreSideEffects(rollback_checkpoint));
+    EXPECT_EQ(unjournaled.read32(0x20000004U).value(), original_word);
+}
+
+TEST(MemoryBusTest, TrackingScopeRestoresSettingsOnExit) {
+    fil::mem::MemoryBus bus;
+    bus.setReadFootprintTracking(false);
+    {
+        fil::mem::MemoryBus::TrackingScope tracking(bus, true, false);
+        EXPECT_TRUE(bus.readFootprintTracking());
+        EXPECT_FALSE(bus.writeJournalTracking());
+    }
+    EXPECT_FALSE(bus.readFootprintTracking());
+    EXPECT_TRUE(bus.writeJournalTracking());
+}
+
+TEST(MemoryBusTest, ReversibleRamOnlyRejectsNonRamStoresBeforeMutation) {
+    using fil::mem::AccessContext;
+    using fil::mem::AccessSize;
+    using fil::mem::AccessType;
+    using fil::mem::BusFaultReason;
+    using fil::mem::MemoryBus;
+
+    MemoryBus bus;
+    RecordingMmio device;
+    ASSERT_TRUE(bus.mapRam(0x20000000U, 16U, "ordinary-ram").hasValue());
+    ASSERT_TRUE(bus.mapRam(0x20000100U, 16U, "executable-ram", true).hasValue());
+    ASSERT_TRUE(bus.mapFlash(0x08000000U, 16U, "writable-flash").hasValue());
+    ASSERT_TRUE(bus.mapRom(0x08000100U, 16U, "readonly-rom").hasValue());
+    ASSERT_TRUE(bus.mapAlias(0x00000000U, 0x20000000U, 16U, "ram-alias").hasValue());
+    ASSERT_TRUE(bus.mapAlias(0x00000100U, 0x08000000U, 16U, "flash-alias").hasValue());
+    ASSERT_TRUE(bus.mapAlias(0x00000200U, 0x08000100U, 16U, "readonly-alias").hasValue());
+    ASSERT_TRUE(bus.mapMmio(0x40000000U, 16U, device, "device").hasValue());
+
+    bus.setReversibleRamOnly(true);
+    EXPECT_TRUE(bus.reversibleRamOnly());
+    const auto checkpoint = bus.sideEffectCheckpoint();
+    EXPECT_TRUE(bus.write32(0x00000000U, 0x11223344U).hasValue())
+        << "alias-resolved ordinary RAM remains writable";
+    EXPECT_TRUE(bus.read32(0x20000000U).value() == 0x11223344U)
+        << "RAM alias mutates its backing bytes";
+
+    const auto reject = [](const auto& result) {
+        return !result && result.fault().reason == BusFaultReason::synchronization_required;
+    };
+    EXPECT_TRUE(reject(bus.write32(0x20000100U, 0x55667788U)))
+        << "rejects executable RAM";
+    EXPECT_TRUE(reject(bus.write32(0x08000000U, 0xaabbccddU)))
+        << "rejects writable flash";
+    EXPECT_TRUE(reject(bus.write32(0x00000100U, 0xaabbccddU)))
+        << "checks the backing kind after alias translation";
+    const auto readonly = bus.write32(0x00000200U, 0xaabbccddU);
+    EXPECT_TRUE(!readonly && readonly.fault().reason == BusFaultReason::write_protected)
+        << "preserves backing write protection through aliases in reversible mode";
+    EXPECT_TRUE(reject(bus.write64(0x40000000U, 0x123456789abcdef0ULL)))
+        << "generic-width fallback rejects MMIO before dispatch";
+    EXPECT_TRUE(device.write_count == 0) << "MMIO device receives no rejected store";
+
+    std::uint32_t fast_value = 0xaabbccddU;
+    EXPECT_TRUE(!bus.tryFastWrite32(0x08000000U, fast_value, {}))
+        << "fast 32-bit path declines restricted flash";
+    EXPECT_TRUE(!bus.tryFastWrite(0x20000100U, AccessSize::byte, 0x5aU, {}))
+        << "generic fast path declines executable RAM";
+    const std::uint32_t words[] = {0x01020304U, 0x05060708U};
+    EXPECT_TRUE(!bus.tryFastWriteWords(0x2000000cU, 2U, words, {}))
+        << "bulk fast path rejects a range crossing the RAM boundary";
+    EXPECT_TRUE(bus.read32(0x2000000cU).value() == 0U)
+        << "crossing bulk write leaves its in-range prefix unchanged";
+
+    EXPECT_TRUE(bus.restoreSideEffects(checkpoint))
+        << "rollback reverses the permitted RAM alias mutation";
+    EXPECT_TRUE(bus.read32(0x20000000U).value() == 0U)
+        << "rollback restores the original RAM bytes";
+    EXPECT_TRUE(bus.canRestoreSideEffects(bus.sideEffectCheckpoint()))
+        << "checkpoint restoration remains available";
+    static_assert(MemoryBus::max_reversible_ram_mutations == 1024U);
+
+    bus.setReversibleRamOnly(false);
+    EXPECT_TRUE(!bus.reversibleRamOnly());
+    EXPECT_TRUE(bus.write32(0x08000000U, 0x12345678U).hasValue())
+        << "disabling restriction restores ordinary writable-flash semantics";
 }
 
 TEST(MemoryBusTest, TrapsSharedMmioBeforeDeviceSideEffects) {

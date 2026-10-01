@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -22,6 +23,19 @@ class ElfImage;
 }
 
 namespace fil::mem {
+
+namespace detail {
+/** @brief Decodes little-endian bytes independently of host byte order. */
+[[nodiscard]] constexpr std::uint64_t decodeLittleEndianBytes(
+    const std::uint8_t* bytes, std::size_t width
+) noexcept {
+    std::uint64_t value = 0U;
+    for (std::size_t index = 0U; index < width; ++index) {
+        value |= static_cast<std::uint64_t>(bytes[index]) << (index * 8U);
+    }
+    return value;
+}
+} // namespace detail
 
 /**
  * @brief Holds either a completed memory value or a structured BusFault.
@@ -140,13 +154,33 @@ public:
  */
 class MemoryBus {
 public:
+    /** @brief Conservative maximum RAM mutations in one reversible capsule. */
+    static constexpr std::size_t max_reversible_ram_mutations = 1024U;
+
     struct SideEffectCheckpoint {
         std::uint64_t mutation_sequence{0};
         std::uint64_t mmio_generation{0};
+        std::uint64_t journal_generation{0};
     };
     struct ReadFootprint {
         static constexpr std::size_t word_count = 4U;
         std::array<std::uint64_t, word_count> words{};
+        // False means some reads in this footprint interval were not tracked.
+        bool complete{true};
+    };
+    /** @brief Restores memory-tracking settings even when a run exits exceptionally. */
+    class TrackingScope {
+    public:
+        TrackingScope(MemoryBus& bus, bool read_footprints, bool write_journal) noexcept;
+        ~TrackingScope();
+        TrackingScope(const TrackingScope&) = delete;
+        TrackingScope& operator=(const TrackingScope&) = delete;
+        TrackingScope(TrackingScope&&) = delete;
+        TrackingScope& operator=(TrackingScope&&) = delete;
+    private:
+        MemoryBus& bus_;
+        bool previous_read_footprints_;
+        bool previous_write_journal_;
     };
     /** @brief Constructs an empty address map. */
     MemoryBus();
@@ -237,6 +271,61 @@ public:
         std::uint32_t address, std::uint64_t value, AccessContext context = {AccessType::data_write, 0}
     );
 
+    /**
+     * @brief Backed-memory-only 32-bit load without fault allocation.
+     *
+     * Replicates read32()'s inline fast path (RAM/ROM/flash, readable,
+     * range-contained) including the read footprint. Returns false for MMIO,
+     * unmapped, or faulting addresses; the caller then uses the exact slow
+     * path. No observable state changes on false.
+     */
+    [[nodiscard]] bool tryFastRead32(
+        std::uint32_t address, std::uint32_t& value_out, AccessContext context) const noexcept;
+    /**
+     * @brief Backed-memory-only 32-bit store without fault allocation.
+     *
+     * Replicates write32()'s inline fast path (RAM/ROM/flash, writable,
+     * range-contained) including journaling and generation bumps. Returns
+     * false for MMIO, read-only, or faulting addresses with no state change.
+     */
+    [[nodiscard]] bool tryFastWrite32(
+        std::uint32_t address, std::uint32_t value, AccessContext context) noexcept;
+    /**
+     * @brief Side-effect-free backed-range probe for multi-word fast paths.
+     *
+     * True only when [address, address+size) lies in one readable (or
+     * writable, for stores) RAM/ROM/flash range, i.e. a subsequent sequence
+     * of tryFast* accesses cannot fault, trap, or touch MMIO. No footprint,
+     * journal, or generation side effects.
+     */
+    [[nodiscard]] bool isBackedRange(
+        std::uint32_t address, std::uint32_t size, bool is_store) const noexcept;
+    /**
+     * @brief Width-generic backed-memory-only access without fault allocation.
+     *
+     * Same contract as tryFastRead32/Write32 for byte/halfword/word widths.
+     * False leaves all state untouched.
+     */
+    [[nodiscard]] bool tryFastRead(
+        std::uint32_t address, AccessSize size, std::uint64_t& value_out,
+        AccessContext context) const noexcept;
+    [[nodiscard]] bool tryFastWrite(
+        std::uint32_t address, AccessSize size, std::uint64_t value,
+        AccessContext context) noexcept;
+    /**
+     * @brief Single-probe bulk word transfer for multi-register handlers.
+     *
+     * One region lookup covers `count` consecutive words; false leaves all
+     * state untouched, success performs every word (journal/footprint per
+     * word, identical to sequential tryFastWrite32/Read32 calls).
+     */
+    [[nodiscard]] bool tryFastReadWords(
+        std::uint32_t address, std::uint32_t count, std::uint32_t* values_out,
+        AccessContext context) const noexcept;
+    [[nodiscard]] bool tryFastWriteWords(
+        std::uint32_t address, std::uint32_t count, const std::uint32_t* values,
+        AccessContext context) noexcept;
+
     /** @brief Gets mapped ranges sorted by base address. */
     [[nodiscard]] std::vector<MemoryRegionInfo> regions() const;
 
@@ -245,6 +334,20 @@ public:
      * Allocation-free equivalent of scanning regions(); for hot per-exception checks.
      */
     [[nodiscard]] bool containsWritableRange(std::uint32_t address, std::uint64_t size) const noexcept;
+
+    /** @brief Enables/disables conservative data-read footprint collection (enabled by default). */
+    void setReadFootprintTracking(bool enabled) noexcept;
+    [[nodiscard]] bool readFootprintTracking() const noexcept { return read_footprint_tracking_; }
+
+    /** @brief Enables/disables reversible RAM mutation journaling (enabled by default). */
+    void setWriteJournalTracking(bool enabled) noexcept;
+    [[nodiscard]] bool writeJournalTracking() const noexcept { return write_journal_tracking_; }
+
+    /** @brief Restricts stores to non-executable RAM for reversible capsules. */
+    void setReversibleRamOnly(bool enabled) noexcept { reversible_ram_only_ = enabled; }
+
+    /** @brief Whether stores are currently restricted to non-executable RAM. */
+    [[nodiscard]] bool reversibleRamOnly() const noexcept { return reversible_ram_only_; }
 
     /** @brief Makes shared MMIO return a side-effect-free worker synchronization fault. */
     void setSharedMmioTrapping(bool enabled) noexcept { trap_shared_mmio_ = enabled; }
@@ -295,7 +398,8 @@ public:
     [[nodiscard]] ReadFootprint takeReadFootprint() noexcept;
     [[nodiscard]] ReadFootprint readFootprint() const noexcept { return read_footprint_; }
     void restoreReadFootprint(const ReadFootprint& footprint) noexcept {
-        read_footprint_ = footprint;
+        read_footprint_ = read_footprint_tracking_ ? footprint : ReadFootprint{};
+        if (!read_footprint_tracking_) read_footprint_.complete = false;
     }
 
     /** @brief Checks restored CPU writes and external writes against a read footprint. */
@@ -327,6 +431,10 @@ private:
     [[nodiscard]] static bool footprintContains(
         const ReadFootprint& footprint, std::uint32_t address
     ) noexcept;
+    void recordMutation(std::uint32_t address, std::uint8_t old_value, bool external) noexcept;
+    [[nodiscard]] bool storeUnjournaledWord(
+        Region& region, std::size_t offset, std::uint32_t value
+    ) noexcept;
 
     [[nodiscard]] MemoryResult<std::uint64_t> read(
         std::uint32_t address, AccessSize size, const AccessContext& context, unsigned int alias_depth
@@ -348,11 +456,15 @@ private:
     mutable std::uint64_t side_effect_generation_{1};
     mutable std::uint64_t mmio_generation_{1};
     std::uint64_t mutation_sequence_{0};
+    std::uint64_t journal_generation_{1};
+    bool write_journal_tracking_{true};
     static constexpr std::size_t mutation_journal_capacity = 8192U;
     std::array<BackedMutation, mutation_journal_capacity> mutation_journal_{};
     mutable ReadFootprint read_footprint_{};
+    bool read_footprint_tracking_{true};
     bool trap_shared_mmio_{false};
     bool trap_all_mmio_{false};
+    bool reversible_ram_only_{false};
 };
 
 } // namespace fil::mem

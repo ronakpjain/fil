@@ -64,6 +64,66 @@ MemoryBus::~MemoryBus() = default;
 MemoryBus::MemoryBus(MemoryBus&&) noexcept = default;
 MemoryBus& MemoryBus::operator=(MemoryBus&&) noexcept = default;
 
+MemoryBus::TrackingScope::TrackingScope(
+    MemoryBus& bus, const bool read_footprints, const bool write_journal
+) noexcept
+    : bus_(bus), previous_read_footprints_(bus.readFootprintTracking()),
+      previous_write_journal_(bus.writeJournalTracking()) {
+    bus_.setReadFootprintTracking(read_footprints);
+    bus_.setWriteJournalTracking(write_journal);
+}
+
+MemoryBus::TrackingScope::~TrackingScope() {
+    bus_.setWriteJournalTracking(previous_write_journal_);
+    bus_.setReadFootprintTracking(previous_read_footprints_);
+}
+
+void MemoryBus::setReadFootprintTracking(const bool enabled) noexcept {
+    if (read_footprint_tracking_ == enabled) return;
+    read_footprint_tracking_ = enabled;
+    read_footprint_ = ReadFootprint{};
+    read_footprint_.complete = enabled;
+}
+
+void MemoryBus::setWriteJournalTracking(const bool enabled) noexcept {
+    if (write_journal_tracking_ == enabled) return;
+    write_journal_tracking_ = enabled;
+    ++journal_generation_;
+}
+
+void MemoryBus::recordMutation(
+    const std::uint32_t address, const std::uint8_t old_value, const bool external
+) noexcept {
+    ++mutation_sequence_;
+    if (write_journal_tracking_) {
+        mutation_journal_[(mutation_sequence_ - 1U) % mutation_journal_capacity] =
+            BackedMutation{mutation_sequence_, address, old_value, external};
+    }
+}
+
+bool MemoryBus::storeUnjournaledWord(
+    Region& region, const std::size_t offset, const std::uint32_t value
+) noexcept {
+    if (write_journal_tracking_) return false;
+    if constexpr (std::endian::native == std::endian::little) {
+        std::uint32_t old_value = 0U;
+        std::memcpy(&old_value, region.bytes.data() + offset, sizeof(old_value));
+        std::uint32_t difference = old_value ^ value;
+        std::uint64_t changed_bytes = 0U;
+        for (unsigned int byte = 0U; byte < sizeof(value); ++byte) {
+            changed_bytes += (difference & 0xffU) != 0U;
+            difference >>= 8U;
+        }
+        if (changed_bytes != 0U) {
+            std::memcpy(region.bytes.data() + offset, &value, sizeof(value));
+            mutation_sequence_ += changed_bytes;
+            side_effect_generation_ += changed_bytes;
+        }
+        return true;
+    }
+    return false;
+}
+
 Result<void> MemoryBus::addRegion(std::unique_ptr<Region> region) {
     if (!validRange(region->info.base, region->info.size)) {
         return mapError("memory region '" + region->info.name + "' has an empty or wrapping range");
@@ -211,11 +271,8 @@ Result<void> MemoryBus::loadBytes(
     const std::size_t offset = address - region->info.base;
     for (std::size_t index = 0; index < bytes.size(); ++index) {
         if (region->bytes[offset + index] != bytes[index]) {
-            ++mutation_sequence_;
-            mutation_journal_[(mutation_sequence_ - 1U) % mutation_journal_capacity] = BackedMutation{
-                mutation_sequence_, address + static_cast<std::uint32_t>(index),
-                region->bytes[offset + index], true,
-            };
+            recordMutation(address + static_cast<std::uint32_t>(index),
+                region->bytes[offset + index], true);
             ++side_effect_generation_;
         }
     }
@@ -316,7 +373,8 @@ MemoryResult<std::uint64_t> MemoryBus::read(
         return result;
     }
 
-    if (context.type == AccessType::data_read && context.pc != 0U) {
+    if (read_footprint_tracking_
+        && context.type == AccessType::data_read && context.pc != 0U) {
         addReadFootprint(read_footprint_, address);
     }
     const std::size_t offset = address - region->info.base;
@@ -351,13 +409,6 @@ MemoryResult<std::uint64_t> MemoryBus::write(
             "memory write crosses a region boundary"
         );
     }
-    if (!region->info.writable) {
-        return makeFault(
-            BusFaultReason::write_protected, address, size, context, region->info.name,
-            "memory region is not writable"
-        );
-    }
-
     if (region->info.kind == RegionKind::alias) {
         if (alias_depth >= maximum_alias_depth) {
             return makeFault(
@@ -367,6 +418,19 @@ MemoryResult<std::uint64_t> MemoryBus::write(
         }
         const std::uint32_t translated = region->alias_target + (address - region->info.base);
         return write(translated, size, value, context, alias_depth + 1U);
+    }
+    if (!region->info.writable) {
+        return makeFault(
+            BusFaultReason::write_protected, address, size, context, region->info.name,
+            "memory region is not writable"
+        );
+    }
+    if (reversible_ram_only_
+        && (region->info.kind != RegionKind::ram || region->info.executable)) {
+        return makeFault(
+            BusFaultReason::synchronization_required, address, size, context,
+            region->info.name, "store requires coordinator synchronization outside reversible RAM"
+        );
     }
     if (region->info.kind == RegionKind::mmio) {
         const std::uint32_t offset = address - region->info.base;
@@ -392,11 +456,7 @@ MemoryResult<std::uint64_t> MemoryBus::write(
     for (std::uint32_t index = 0; index < width; ++index) {
         const auto byte = static_cast<std::uint8_t>(value >> (index * 8U));
         if (region->bytes[offset + index] != byte) {
-            ++mutation_sequence_;
-            mutation_journal_[(mutation_sequence_ - 1U) % mutation_journal_capacity] = BackedMutation{
-                mutation_sequence_, address + index, region->bytes[offset + index],
-                context.pc == 0U,
-            };
+            recordMutation(address + index, region->bytes[offset + index], context.pc == 0U);
             ++side_effect_generation_;
         }
         region->bytes[offset + index] = byte;
@@ -411,6 +471,10 @@ MemoryResult<std::uint8_t> MemoryBus::read8(
     const std::uint32_t address,
     const AccessContext context
 ) const {
+    std::uint64_t value = 0U;
+    if (tryFastRead(address, AccessSize::byte, value, context)) {
+        return static_cast<std::uint8_t>(value);
+    }
     auto result = read(address, AccessSize::byte, context, 0);
     if (!result) return result.fault();
     return static_cast<std::uint8_t>(result.value());
@@ -420,6 +484,10 @@ MemoryResult<std::uint16_t> MemoryBus::read16(
     const std::uint32_t address,
     const AccessContext context
 ) const {
+    std::uint64_t value = 0U;
+    if (tryFastRead(address, AccessSize::halfword, value, context)) {
+        return static_cast<std::uint16_t>(value);
+    }
     auto result = read(address, AccessSize::halfword, context, 0);
     if (!result) return result.fault();
     return static_cast<std::uint16_t>(result.value());
@@ -429,29 +497,8 @@ MemoryResult<std::uint32_t> MemoryBus::read32(
     const std::uint32_t address,
     const AccessContext context
 ) const {
-    const Region* region = find(address);
-    if (region != nullptr
-        && (region->info.kind == RegionKind::ram
-            || region->info.kind == RegionKind::rom
-            || region->info.kind == RegionKind::flash)
-        && region->info.readable
-        && region->containsRange(address, sizeof(std::uint32_t))
-        && (context.type != AccessType::instruction_fetch
-            || region->info.executable)) {
-        if (context.type == AccessType::data_read && context.pc != 0U) {
-            addReadFootprint(read_footprint_, address);
-        }
-        std::uint32_t value = 0U;
-        const std::size_t offset = address - region->info.base;
-        std::memcpy(&value, region->bytes.data() + offset, sizeof(value));
-        if constexpr (std::endian::native == std::endian::big) {
-            value = ((value & 0x000000ffU) << 24U)
-                | ((value & 0x0000ff00U) << 8U)
-                | ((value & 0x00ff0000U) >> 8U)
-                | ((value & 0xff000000U) >> 24U);
-        }
-        return value;
-    }
+    std::uint32_t value = 0U;
+    if (tryFastRead32(address, value, context)) return value;
 
     auto result = read(address, AccessSize::word, context, 0);
     if (!result) return result.fault();
@@ -470,6 +517,7 @@ MemoryResult<std::uint64_t> MemoryBus::write8(
     const std::uint8_t value,
     const AccessContext context
 ) {
+    if (tryFastWrite(address, AccessSize::byte, value, context)) return std::uint64_t{0};
     return write(address, AccessSize::byte, value, context, 0);
 }
 
@@ -478,6 +526,7 @@ MemoryResult<std::uint64_t> MemoryBus::write16(
     const std::uint16_t value,
     const AccessContext context
 ) {
+    if (tryFastWrite(address, AccessSize::halfword, value, context)) return std::uint64_t{0};
     return write(address, AccessSize::halfword, value, context, 0);
 }
 
@@ -486,29 +535,8 @@ MemoryResult<std::uint64_t> MemoryBus::write32(
     const std::uint32_t value,
     const AccessContext context
 ) {
-    Region* region = find(address);
-    if (region != nullptr
-        && (region->info.kind == RegionKind::ram
-            || region->info.kind == RegionKind::rom
-            || region->info.kind == RegionKind::flash)
-        && region->info.writable
-        && region->containsRange(address, sizeof(value))) {
-        const std::size_t offset = address - region->info.base;
-        for (std::uint32_t index = 0U; index < sizeof(value); ++index) {
-            const auto byte = static_cast<std::uint8_t>(value >> (index * 8U));
-            if (region->bytes[offset + index] == byte) continue;
-            ++mutation_sequence_;
-            mutation_journal_[(mutation_sequence_ - 1U) % mutation_journal_capacity] =
-                BackedMutation{
-                    mutation_sequence_, address + index,
-                    region->bytes[offset + index], context.pc == 0U,
-                };
-            ++side_effect_generation_;
-            region->bytes[offset + index] = byte;
-        }
-        if (region->info.executable) ++execution_generation_;
-        return std::uint64_t{0};
-    }
+    // Shared inline path with tryFastWrite32.
+    if (tryFastWrite32(address, value, context)) return std::uint64_t{0};
     return write(address, AccessSize::word, value, context, 0);
 }
 
@@ -518,6 +546,231 @@ MemoryResult<std::uint64_t> MemoryBus::write64(
     const AccessContext context
 ) {
     return write(address, AccessSize::doubleword, value, context, 0);
+}
+
+bool MemoryBus::tryFastRead32(
+    const std::uint32_t address,
+    std::uint32_t& value_out,
+    const AccessContext context
+) const noexcept {
+    const Region* region = find(address);
+    if (region == nullptr
+        || (region->info.kind != RegionKind::ram
+            && region->info.kind != RegionKind::rom
+            && region->info.kind != RegionKind::flash)
+        || !region->info.readable
+        || !region->containsRange(address, sizeof(std::uint32_t))
+        || (context.type == AccessType::instruction_fetch && !region->info.executable)) {
+        return false;
+    }
+    if (read_footprint_tracking_
+        && context.type == AccessType::data_read && context.pc != 0U) {
+        addReadFootprint(read_footprint_, address);
+    }
+    std::uint32_t value = 0U;
+    const std::size_t offset = address - region->info.base;
+    std::memcpy(&value, region->bytes.data() + offset, sizeof(value));
+    if constexpr (std::endian::native == std::endian::big) {
+        value = ((value & 0x000000ffU) << 24U)
+            | ((value & 0x0000ff00U) << 8U)
+            | ((value & 0x00ff0000U) >> 8U)
+            | ((value & 0xff000000U) >> 24U);
+    }
+    value_out = value;
+    return true;
+}
+
+bool MemoryBus::tryFastWrite32(
+    const std::uint32_t address,
+    const std::uint32_t value,
+    const AccessContext context
+) noexcept {    Region* region = find(address);
+    if (region == nullptr
+        || (region->info.kind != RegionKind::ram
+            && region->info.kind != RegionKind::rom
+            && region->info.kind != RegionKind::flash)
+        || !region->info.writable
+        || !region->containsRange(address, sizeof(value))
+        || (reversible_ram_only_
+            && (region->info.kind != RegionKind::ram || region->info.executable))) {
+        return false;
+    }
+    const std::size_t offset = address - region->info.base;
+    if (storeUnjournaledWord(*region, offset, value)) {
+        if (region->info.executable) ++execution_generation_;
+        return true;
+    }
+    for (std::uint32_t index = 0U; index < sizeof(value); ++index) {
+        const auto byte = static_cast<std::uint8_t>(value >> (index * 8U));
+        if (region->bytes[offset + index] == byte) continue;
+        recordMutation(address + index, region->bytes[offset + index], context.pc == 0U);
+        ++side_effect_generation_;
+        region->bytes[offset + index] = byte;
+    }
+    if (region->info.executable) ++execution_generation_;
+    return true;
+}
+
+bool MemoryBus::isBackedRange(
+    const std::uint32_t address,
+    const std::uint32_t size,
+    const bool is_store
+) const noexcept {
+    if (size == 0U) return false;
+    const Region* region = find(address);
+    if (region == nullptr
+        || (region->info.kind != RegionKind::ram
+            && region->info.kind != RegionKind::rom
+            && region->info.kind != RegionKind::flash)
+        || (is_store ? !region->info.writable : !region->info.readable)
+        || !region->containsRange(address, size)) {
+        return false;
+    }
+    return true;
+}
+
+bool MemoryBus::tryFastRead(
+    const std::uint32_t address,
+    const AccessSize size,
+    std::uint64_t& value_out,
+    const AccessContext context
+) const noexcept {
+    const std::uint32_t width = static_cast<std::uint32_t>(size);
+    if (width != 1U && width != 2U && width != 4U) return false;
+    const Region* region = find(address);
+    if (region == nullptr
+        || (region->info.kind != RegionKind::ram
+            && region->info.kind != RegionKind::rom
+            && region->info.kind != RegionKind::flash)
+        || !region->info.readable
+        || !region->containsRange(address, width)
+        || (context.type == AccessType::instruction_fetch && !region->info.executable)) {
+        return false;
+    }
+    if (read_footprint_tracking_
+        && context.type == AccessType::data_read && context.pc != 0U) {
+        addReadFootprint(read_footprint_, address);
+    }
+    const std::size_t offset = address - region->info.base;
+    std::uint64_t value = 0U;
+    if constexpr (std::endian::native == std::endian::little) {
+        // memcpy is the unmodified hot path on the usual little-endian target.
+        std::memcpy(&value, region->bytes.data() + offset, width);
+    } else {
+        value = detail::decodeLittleEndianBytes(region->bytes.data() + offset, width);
+    }
+    value_out = value;
+    return true;
+}
+
+bool MemoryBus::tryFastWrite(
+    const std::uint32_t address,
+    const AccessSize size,
+    const std::uint64_t value,
+    const AccessContext context
+) noexcept {
+    const std::uint32_t width = static_cast<std::uint32_t>(size);
+    if (width != 1U && width != 2U && width != 4U) return false;
+    Region* region = find(address);
+    if (region == nullptr
+        || (region->info.kind != RegionKind::ram
+            && region->info.kind != RegionKind::rom
+            && region->info.kind != RegionKind::flash)
+        || !region->info.writable
+        || !region->containsRange(address, width)
+        || (reversible_ram_only_
+            && (region->info.kind != RegionKind::ram || region->info.executable))) {
+        return false;
+    }
+    const std::size_t offset = address - region->info.base;
+    if (width == sizeof(std::uint32_t)
+        && storeUnjournaledWord(*region, offset, static_cast<std::uint32_t>(value))) {
+        if (region->info.executable) ++execution_generation_;
+        return true;
+    }
+    for (std::uint32_t index = 0U; index < width; ++index) {
+        const auto byte = static_cast<std::uint8_t>(value >> (index * 8U));
+        if (region->bytes[offset + index] == byte) continue;
+        recordMutation(address + index, region->bytes[offset + index], context.pc == 0U);
+        ++side_effect_generation_;
+        region->bytes[offset + index] = byte;
+    }
+    if (region->info.executable) ++execution_generation_;
+    return true;
+}
+
+bool MemoryBus::tryFastReadWords(
+    const std::uint32_t address,
+    const std::uint32_t count,
+    std::uint32_t* values_out,
+    const AccessContext context
+) const noexcept {
+    if (count == 0U || values_out == nullptr) return false;
+    const std::uint64_t span = static_cast<std::uint64_t>(count) * 4U;
+    if (span > std::numeric_limits<std::uint32_t>::max()) return false;
+    const Region* region = find(address);
+    if (region == nullptr
+        || (region->info.kind != RegionKind::ram
+            && region->info.kind != RegionKind::rom
+            && region->info.kind != RegionKind::flash)
+        || !region->info.readable
+        || !region->containsRange(address, static_cast<std::uint32_t>(span))) {
+        return false;
+    }
+    const bool footprint = read_footprint_tracking_
+        && context.type == AccessType::data_read && context.pc != 0U;
+    const std::size_t base = address - region->info.base;
+    for (std::uint32_t w = 0U; w < count; ++w) {
+        if (footprint) addReadFootprint(read_footprint_, address + w * 4U);
+        std::uint32_t value = 0U;
+        std::memcpy(&value, region->bytes.data() + base + w * 4U, sizeof(value));
+        if constexpr (std::endian::native == std::endian::big) {
+            value = ((value & 0x000000ffU) << 24U)
+                | ((value & 0x0000ff00U) << 8U)
+                | ((value & 0x00ff0000U) >> 8U)
+                | ((value & 0xff000000U) >> 24U);
+        }
+        values_out[w] = value;
+    }
+    return true;
+}
+
+bool MemoryBus::tryFastWriteWords(
+    const std::uint32_t address,
+    const std::uint32_t count,
+    const std::uint32_t* values,
+    const AccessContext context
+) noexcept {
+    if (count == 0U || values == nullptr) return false;
+    const std::uint64_t span = static_cast<std::uint64_t>(count) * 4U;
+    if (span > std::numeric_limits<std::uint32_t>::max()) return false;
+    Region* region = find(address);
+    if (region == nullptr
+        || (region->info.kind != RegionKind::ram
+            && region->info.kind != RegionKind::rom
+            && region->info.kind != RegionKind::flash)
+        || !region->info.writable
+        || !region->containsRange(address, static_cast<std::uint32_t>(span))
+        || (reversible_ram_only_
+            && (region->info.kind != RegionKind::ram || region->info.executable))) {
+        return false;
+    }
+    const std::size_t base = address - region->info.base;
+    for (std::uint32_t w = 0U; w < count; ++w) {
+        const std::uint32_t value = values[w];
+        const std::size_t offset = base + w * 4U;
+        if (storeUnjournaledWord(*region, offset, value)) continue;
+        for (std::uint32_t index = 0U; index < 4U; ++index) {
+            const auto byte = static_cast<std::uint8_t>(value >> (index * 8U));
+            const std::size_t at = base + w * 4U + index;
+            if (region->bytes[at] == byte) continue;
+            recordMutation(address + w * 4U + index, region->bytes[at], context.pc == 0U);
+            ++side_effect_generation_;
+            region->bytes[at] = byte;
+        }
+    }
+    if (region->info.executable) ++execution_generation_;
+    return true;
 }
 
 std::vector<MemoryRegionInfo> MemoryBus::regions() const {
@@ -573,18 +826,21 @@ bool MemoryBus::footprintContains(
 
 MemoryBus::ReadFootprint MemoryBus::takeReadFootprint() noexcept {
     ReadFootprint result = read_footprint_;
-    read_footprint_ = {};
+    read_footprint_ = ReadFootprint{};
+    read_footprint_.complete = read_footprint_tracking_;
     return result;
 }
 
 MemoryBus::SideEffectCheckpoint MemoryBus::sideEffectCheckpoint() const noexcept {
-    return SideEffectCheckpoint{mutation_sequence_, mmio_generation_};
+    return SideEffectCheckpoint{mutation_sequence_, mmio_generation_, journal_generation_};
 }
 
 bool MemoryBus::sideEffectsRestoredSince(const SideEffectCheckpoint checkpoint) const {
-    if (checkpoint.mmio_generation != mmio_generation_) return false;
+    if (checkpoint.mmio_generation != mmio_generation_
+        || checkpoint.journal_generation != journal_generation_) return false;
     if (checkpoint.mutation_sequence == mutation_sequence_) return true;
-    if (mutation_sequence_ - checkpoint.mutation_sequence > mutation_journal_capacity) {
+    if (!write_journal_tracking_ || checkpoint.mutation_sequence > mutation_sequence_
+        || mutation_sequence_ - checkpoint.mutation_sequence > mutation_journal_capacity) {
         return false;
     }
 
@@ -618,11 +874,12 @@ bool MemoryBus::sideEffectsRestoredSince(const SideEffectCheckpoint checkpoint) 
 bool MemoryBus::sideEffectsCompatibleSince(
     const SideEffectCheckpoint checkpoint, const ReadFootprint& footprint
 ) const {
-    if (checkpoint.mmio_generation != mmio_generation_) return false;
+    if (checkpoint.mmio_generation != mmio_generation_
+        || checkpoint.journal_generation != journal_generation_) return false;
     if (checkpoint.mutation_sequence == mutation_sequence_) return true;
-    if (checkpoint.mutation_sequence > mutation_sequence_
-        || mutation_sequence_ - checkpoint.mutation_sequence
-            > mutation_journal_capacity) {
+    if (!footprint.complete || !write_journal_tracking_
+        || checkpoint.mutation_sequence > mutation_sequence_
+        || mutation_sequence_ - checkpoint.mutation_sequence > mutation_journal_capacity) {
         return false;
     }
 
@@ -662,10 +919,12 @@ bool MemoryBus::sideEffectsCompatibleSince(
 bool MemoryBus::canRestoreSideEffects(
     const SideEffectCheckpoint checkpoint
 ) const noexcept {
-    return checkpoint.mmio_generation == mmio_generation_
-        && checkpoint.mutation_sequence <= mutation_sequence_
-        && mutation_sequence_ - checkpoint.mutation_sequence
-            <= mutation_journal_capacity;
+    if (checkpoint.mmio_generation != mmio_generation_
+        || checkpoint.journal_generation != journal_generation_
+        || checkpoint.mutation_sequence > mutation_sequence_) return false;
+    if (checkpoint.mutation_sequence == mutation_sequence_) return true;
+    return write_journal_tracking_
+        && mutation_sequence_ - checkpoint.mutation_sequence <= mutation_journal_capacity;
 }
 
 bool MemoryBus::restoreSideEffects(const SideEffectCheckpoint checkpoint) {
