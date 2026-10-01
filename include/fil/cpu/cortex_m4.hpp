@@ -365,7 +365,8 @@ public:
     [[nodiscard]] bool jitBlockReady() const noexcept;
 
     /** @brief Advances hotness and prepares a block without changing guest CPU state. */
-    [[nodiscard]] bool prepareJitBlock();
+    /** Reversible spans may opt into single-instruction branch/call links. */
+    [[nodiscard]] bool prepareJitBlock(bool allow_single = false);
     struct JitStats {
         std::uint64_t block_executions{0};
         std::uint64_t block_instructions{0};

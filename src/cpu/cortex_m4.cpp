@@ -1407,7 +1407,7 @@ bool CortexM4::jitBlockReady() const noexcept {
         && slot.generation == memory_.executionGeneration();
 }
 
-bool CortexM4::prepareJitBlock() {
+bool CortexM4::prepareJitBlock(const bool allow_single) {
     if (state_.halted || !state_.thumb || (state_.xpsr & xpsr_t) == 0U) return false;
     const std::uint32_t entry_pc = state_.r[15];
     if ((entry_pc & 1U) != 0U || inItBlock(state_.it_state)
@@ -1418,7 +1418,12 @@ bool CortexM4::prepareJitBlock() {
     const std::size_t hot_index = jitBlockIndex(entry_pc);
     const bool matching_attempt = slot.attempted && slot.pc == entry_pc
         && slot.generation == generation;
-    if (matching_attempt) return slot.valid;
+    if (matching_attempt) {
+        if (slot.valid) return allow_single || slot.count >= 2U;
+        // A previously rejected one-op region can link reversible capsules
+        // across an otherwise supported BL/branch without scalar dispatch.
+        if (!allow_single || slot.count != 1U) return false;
+    }
     if (jit_hot_[hot_index] < jit_compile_threshold) {
         ++jit_hot_[hot_index];
         return false;
@@ -1473,7 +1478,7 @@ bool CortexM4::prepareJitBlock() {
         if (terminates) break;
         pc += size;
     }
-    if (fresh.count < 2U) {
+    if (fresh.count == 0U || (!allow_single && fresh.count < 2U)) {
         // Remember failed/single-op compilation for this PC/generation; repeated
         // safe preflights do not repeatedly fetch and classify the same bytes.
         slot = fresh;
@@ -1594,7 +1599,7 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepPreparedJitBlock(
 
 std::optional<CortexM4::TimedJitStepOutcome> CortexM4::tryStepReversibleJitBlock(
     const std::size_t max_instructions) {
-    if (max_instructions == 0U || !prepareJitBlock()) return std::nullopt;
+    if (max_instructions == 0U || !prepareJitBlock(true)) return std::nullopt;
     if (memory_.reversibleRamOnly() && memory_.allMmioTrapping()) {
         return executeTrustedReversibleJitBlock(max_instructions);
     }
@@ -1609,7 +1614,7 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::tryStepReversibleJitBlock
 std::optional<CortexM4::TimedJitStepOutcome> CortexM4::tryStepBudgetedReversibleJitBlock(
     const std::size_t max_instructions, ReversibleCycleBudget& budget) {
     if (max_instructions == 0U || !memory_.reversibleRamOnly()
-        || !memory_.allMmioTrapping() || !prepareJitBlock()) return std::nullopt;
+        || !memory_.allMmioTrapping() || !prepareJitBlock(true)) return std::nullopt;
     return executeTrustedReversibleJitBlock(max_instructions, &budget);
 }
 
@@ -1881,6 +1886,7 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlockImpl(
         if (slot.is_memory[i] && !fast_only) out.memory_free = false;
         const std::uint8_t size = slot.sizes[i];
         const JitFast fast = slot.fast[i];
+        const std::uint32_t previous_instruction_address = state_.instruction_address;
         state_.instruction_address = pc;
         state_.r[15] = pc + size;
         if (fast != JitFast::generic) {
@@ -1907,7 +1913,6 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlockImpl(
             // backed access cannot trap), so none is taken here.
             const std::uint16_t op_cycles = slot.divide_form[i]
                 ? divideCycles(state_.readRegister(op.rm)) : slot.base_cycles[i];
-            const std::uint32_t previous_instruction_address = state_.instruction_address;
             const bool handled = executeJitFast(op, fast, pc);
             if (!handled) {
                 state_.r[15] = pc;

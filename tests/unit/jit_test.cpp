@@ -76,6 +76,55 @@ public:
     int reads{0};
 };
 
+TEST(JitTest, DecliningStandaloneReversibleBranchRestoresEntireEntryState) {
+    auto bus = basicBus();
+    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0x4700U})));
+    fil::cpu::CortexM4 cpu(bus);
+    prepare(cpu);
+    cpu.state().r[0] = flash_base + 8U; // BX to ARM state must decline.
+    cpu.state().instruction_address = flash_base - 2U;
+    for (unsigned i = 0U; i < 70U; ++i) static_cast<void>(cpu.prepareJitBlock(true));
+    ASSERT_TRUE(cpu.prepareJitBlock(true));
+    const auto initial = cpu.state();
+    // Exercise the non-trusted fast-only path, not the RAM guard's executor.
+    ASSERT_FALSE(bus.reversibleRamOnly());
+    EXPECT_FALSE(cpu.tryStepReversibleJitBlock(1U));
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), initial));
+}
+
+TEST(JitTest, ReversibleSpanLinksStandaloneCallWithoutChangingOrdinaryAdmission) {
+    auto bus = basicBus();
+    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0xf000U, 0xf802U, 0xbf00U, 0xe7feU, 0xbf00U})));
+    fil::cpu::CortexM4 cpu(bus);
+    fil::cpu::CortexM4 reference(bus);
+    prepare(cpu);
+    prepare(reference);
+    for (unsigned i = 0U; i < 70U; ++i) EXPECT_FALSE(cpu.prepareJitBlock());
+    ASSERT_TRUE(cpu.prepareJitBlock(true));
+    EXPECT_FALSE(cpu.prepareJitBlock()) << "ordinary compilation still rejects one-op blocks";
+    const auto expected = reference.stepFast();
+    ASSERT_EQ(expected.instructions, 1U);
+    bus.setReversibleRamOnly(true);
+    bus.setAllMmioTrapping(true);
+    FakeFetchStalls stalls{3U, 0U};
+    fil::cpu::CortexM4::ReversibleCycleBudget budget;
+    budget.context = &stalls;
+    budget.fetch_stall = fakeFetchStall;
+    budget.remaining_cycles = expected.cycles + stalls.nonsequential - 1U;
+    const auto initial = cpu.state();
+    EXPECT_FALSE(cpu.tryStepBudgetedReversibleJitBlock(1U, budget));
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), initial));
+    budget.remaining_cycles = expected.cycles + stalls.nonsequential;
+    const auto result = cpu.tryStepBudgetedReversibleJitBlock(1U, budget);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->execution.count, 1U);
+    EXPECT_EQ(result->execution.result.cycles, expected.cycles);
+    EXPECT_EQ(budget.total_instruction_cycles[0], expected.cycles + stalls.nonsequential);
+    EXPECT_EQ(budget.remaining_cycles, 0U);
+    EXPECT_EQ(budget.fetch_end, flash_base + 4U);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()));
+}
+
 TEST(JitTest, ReversibleTimedBlockCommitsFastPrefixWithExactCosts) {
     auto bus = basicBus();
     // ADDS r0,#1; BEQ (not taken); UDIV r2,r5,r6; STR r0,[r1];
