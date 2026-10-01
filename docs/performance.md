@@ -26,11 +26,11 @@ all runtime/build flags, actual defaults, and recommended command presets.
 | CPU hot paths | Specialized integer handlers, prepared block metadata, and guarded backed-memory multi-word paths avoid repeated generic dispatch. Unsupported, faulting, or MMIO work retains ordinary execution. |
 | Pending-exception selection cache | Reuses exact exception selection for unchanged CPU masks and system-control generation. Selection-affecting mutations invalidate the cache; the cached takable-pending check avoids rescanning priorities without suppressing eligible exceptions. |
 | Native compilation pipeline | Uses LLVM's O0 module pipeline to limit optimization-pass overhead for small integer kernels. This is a compile-time/runtime tradeoff, not evidence of an end-to-end firmware speedup. |
-| Event-aware scheduling | Bounds execution by events, interrupts, instruction budgets, and simulated-time deadlines. |
+| Event-aware scheduling | Bounds execution by events, interrupts, instruction budgets, and simulated-time deadlines. Event insertion prunes retired owner-queue heads so global-only dispatch does not retain every completed ADC callback until shutdown; live event ordering and conversion effects are unchanged. |
 | Loop batching | Batches proven repeated loops; unproven paths execute normally. Disable with `--no-loop-batching`. `--detect-spin` requests loop detection; `--trace-instr` retains instruction-level execution. |
 | Cached JIT handlers | `--jit` opts into specialized handlers and prepared blocks, with fallback for unsupported or unsafe operations. |
 | Native LLVM JIT | Emits host machine code for a conservative integer subset when LLVM support is available. Memory/MMIO, system, and floating-point operations retain existing paths. Lazy initialization, hotness gates, and a 32-kernel LRU with admission hysteresis bound retained kernels and reduce startup/churn costs; they do not guarantee profitability. See [Native LLVM JIT](llvm-jit.md). |
-| Exact network fast path | With loop batching, tracing, spin detection, and speculative modes disabled, up to 64 lanes use compact single-instruction dispatch without loop-proof state. |
+| Exact network fast path | With loop batching, tracing, spin detection, and speculative modes disabled, up to 64 lanes use compact single-instruction dispatch without loop-proof state. Networks of up to eight boards use a fixed-width timestamp reduction, retaining all tied completions and deterministic board ordering. |
 | Transactional lane slices | Opt-in reversible parallel epochs commit only admissible work; observation-sensitive work falls back. Requires multiple boards without tracing or spin detection for worker execution. |
 | Deferred pure / RAM prefixes | Opt-in delayed evaluation and reversible private-RAM spans reduce eager dispatch where boundary proofs permit. These are experiments, not defaults or native RAM JIT kernels. |
 | Build optimization | Release, supported IPO/LTO, and representative optional Clang PGO reduce host overhead without changing modeled ADC fidelity. |
@@ -59,6 +59,9 @@ The target cleans old PGO outputs, builds, trains, merges profiles, rebuilds wit
 - Override training with `PGO_TRAIN_ARGS='run-network ...'`.
 - Use matching `PGO_CXX` and `LLVM_PROFDATA` versions.
 - Retrain after material code, firmware, or toolchain changes.
+- Match the scheduling mode too. For compact exact-network measurements, train
+  with `PGO_TRAIN_ARGS='run-network configs/networks/per_vehicle.json --duration-ms 5000 --max-instructions 1000000000 --quantum 1024 --strict-mmio --jit --no-loop-batching --adc-decimation 1'`.
+  This retains every ADC conversion and does not itself establish realtime throughput.
 - Individual stages: `pgo-generate`, `pgo-train`, `pgo-merge`, `pgo-use`, `pgo-test`.
 
 ## Network comparison

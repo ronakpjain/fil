@@ -473,6 +473,54 @@ void warmJit(fil::sim::Board& board) {
     board.cpu().state() = initial;
 }
 
+TEST(WorldTimeTest, CompactFrontierMatchesGeneralSchedulerAcrossPaddingBoundary) {
+    for (const std::size_t count : {1U, 6U, 8U, 9U}) {
+        SCOPED_TRACE(count);
+        TempWorldTimeConfigs files;
+        std::vector<std::filesystem::path> paths;
+        std::vector<std::string> names;
+        for (std::size_t i = 0U; i < count; ++i) {
+            names.push_back("lane-" + std::to_string(i));
+            paths.push_back(files.writeBoard(names.back() + ".json", names.back()));
+        }
+        const auto config = files.network(paths);
+        auto compact = fil::sim::World::load(config);
+        auto general = fil::sim::World::load(config);
+        ASSERT_TRUE(compact && general);
+        for (auto* world : {compact.value().get(), general.value().get()}) {
+            for (std::size_t i = 0U; i < count; ++i) {
+                ASSERT_TRUE(installIdleLoop(*world, names[i], static_cast<unsigned int>(i % 3U + 1U)));
+            }
+            static_cast<void>(world->eventLoop().scheduleAt(125U, [world, names] {
+                for (const auto& name : names) {
+                    world->trace().record(world->eventLoop().now(), name, "frontier-observe",
+                        {{"pc", std::to_string(world->board(name)->cpu().state().r[15])}});
+                }
+                static_cast<void>(world->eventLoop().scheduleAt(125U, [world] {
+                    EXPECT_EQ(world->eventLoop().now(), 125U);
+                    world->trace().record(world->eventLoop().now(), "test", "frontier-tie");
+                }));
+            }));
+        }
+        auto options = runOptions(10'000U);
+        options.max_instructions_per_board = 103U;
+        options.enable_loop_batching = false;
+        const auto result = compact.value()->run(options);
+        options.enable_loop_batching = true;
+        const auto reference = general.value()->run(options);
+        ASSERT_TRUE(result && reference);
+        EXPECT_EQ(result.value().reason, reference.value().reason);
+        EXPECT_EQ(result.value().instructions, reference.value().instructions);
+        EXPECT_EQ(result.value().cycles, reference.value().cycles);
+        EXPECT_EQ(result.value().end_time_ns, reference.value().end_time_ns);
+        EXPECT_EQ(compact.value()->trace().jsonLines(), general.value()->trace().jsonLines());
+        for (const auto& name : names) {
+            EXPECT_TRUE(fil::cpu::bitwiseEqual(compact.value()->board(name)->cpu().state(),
+                general.value()->board(name)->cpu().state()));
+        }
+    }
+}
+
 TEST(WorldTimeTest, SynchronizedPureJitBlocksMatchInterpreter) {
     TempWorldTimeConfigs files;
     const auto config = files.network({

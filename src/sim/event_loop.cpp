@@ -181,7 +181,12 @@ EventId EventLoop::scheduleAt(const SimTimeNs at, EventCallback callback) {
         at, id, impl_->next_sequence++, owner, std::move(callback), true,
     });
     impl_->events.push(event);
-    impl_->owner_events[owner].push(event);
+    auto& owner_queue = impl_->owner_events[owner];
+    // Global dispatch retires events without popping their owner-queue copy.
+    // Exact network runs may never query owner queues, so prune retired heads
+    // here rather than retaining every conversion until loop destruction.
+    Impl::discardDeadFront(owner_queue);
+    owner_queue.push(event);
     impl_->live_events.emplace(id, std::move(event));
     ++impl_->owner_generation[owner];
     return id;

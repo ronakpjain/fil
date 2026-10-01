@@ -29,6 +29,19 @@ Error runtimeError(std::string message) {
     return Error{ErrorCategory::runtime, std::move(message), std::nullopt};
 }
 
+// Small networks use a fixed-width timestamp reduction. Padding with the
+// inactive sentinel permits unrolled/vectorized selection without changing
+// equal-time board ordering; the caller masks out inactive lanes.
+std::pair<SimTimeNs, std::uint64_t> smallNetworkFrontier(const SimTimeNs* times) {
+    SimTimeNs next = std::numeric_limits<SimTimeNs>::max();
+    for (std::size_t i = 0U; i < 8U; ++i) next = std::min(next, times[i]);
+    std::uint64_t mask = 0U;
+    for (std::size_t i = 0U; i < 8U; ++i) {
+        mask |= static_cast<std::uint64_t>(times[i] == next) << i;
+    }
+    return {next, mask};
+}
+
 struct ConcurrentEventGuard {
     EventLoop* loop{nullptr};
     ~ConcurrentEventGuard() {
@@ -491,7 +504,8 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
         std::vector<ExactLane> lanes(boards_.size());
         // Frontier selection reads only contiguous timestamps, not the
         // larger lane/counter records. Inactive lanes use the maximum time.
-        std::vector<SimTimeNs> completion_times(lanes.size(), std::numeric_limits<SimTimeNs>::max());
+        std::vector<SimTimeNs> completion_times(std::max(lanes.size(), std::size_t{8U}),
+                                              std::numeric_limits<SimTimeNs>::max());
         const std::uint64_t all_lanes = lanes.size() == 64U
             ? std::numeric_limits<std::uint64_t>::max()
             : (std::uint64_t{1U} << lanes.size()) - 1U;
@@ -622,12 +636,18 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
             }
             SimTimeNs next_completion = std::numeric_limits<SimTimeNs>::max();
             completing = 0U;
-            for (std::size_t index = 0U; index < completion_times.size(); ++index) {
-                const auto at = completion_times[index];
-                if (at <= next_completion) {
-                    if (at < next_completion) completing = 0U;
-                    next_completion = at;
-                    completing |= std::uint64_t{1U} << index;
+            if (lanes.size() <= 8U) {
+                const auto frontier = smallNetworkFrontier(completion_times.data());
+                next_completion = frontier.first;
+                completing = frontier.second;
+            } else {
+                for (std::size_t index = 0U; index < completion_times.size(); ++index) {
+                    const auto at = completion_times[index];
+                    if (at <= next_completion) {
+                        if (at < next_completion) completing = 0U;
+                        next_completion = at;
+                        completing |= std::uint64_t{1U} << index;
+                    }
                 }
             }
             completing &= in_flight;

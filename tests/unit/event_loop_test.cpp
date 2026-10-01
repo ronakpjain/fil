@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -70,6 +71,35 @@ TEST(EventLoopTest, TracksLocalAndSharedEventOwnership) {
                      3U,
                  }))
         << "nested events inherit their callback owner deterministically";
+}
+
+TEST(EventLoopTest, InsertionPrunesGloballyRetiredOwnerCallbacks) {
+    for (const fil::sim::EventOwner owner : {0U, 63U, 64U, 1000U}) {
+        SCOPED_TRACE(owner);
+        fil::sim::EventLoop loop;
+        std::vector<int> order;
+        auto payload = std::make_shared<int>(1);
+        const std::weak_ptr<int> lifetime = payload;
+        {
+            auto scope = loop.useOwner(owner);
+            static_cast<void>(loop.scheduleAt(5U, [payload, &order] {
+                order.push_back(*payload);
+            }));
+        }
+        payload.reset();
+        EXPECT_EQ(loop.runDueEvents(5U).events_executed, 1U);
+        {
+            auto scope = loop.useOwner(owner);
+            static_cast<void>(loop.scheduleAt(10U, [&order] { order.push_back(2); }));
+            static_cast<void>(loop.scheduleAt(10U, [&order] { order.push_back(3); }));
+        }
+        EXPECT_TRUE(lifetime.expired()) << "retired callback captures must not accumulate";
+        EXPECT_EQ(loop.pending(), 2U);
+        EXPECT_EQ(loop.nextScheduledTime(owner), 10U);
+        EXPECT_EQ(loop.runOwnedEvents(owner, 10U).events_executed, 2U);
+        EXPECT_EQ(order, (std::vector<int>{1, 2, 3}));
+        EXPECT_EQ(loop.runDueEvents(10U).events_executed, 0U);
+    }
 }
 
 TEST(EventLoopTest, AdvancesOneOwnerIndependently) {
