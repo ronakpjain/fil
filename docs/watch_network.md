@@ -3,7 +3,7 @@
 `fil watch-network` runs a configured multi-board CAN network in short simulated-time
 slices, prints selected trace events as they occur, and accepts CAN frames on
 standard input. It is intended for interactive diagnostics and host-driven testing;
-use [`run-network`](../README.md#run-firmware) with `--trace` when a persistent,
+use [`run-network`](options.md#network-only) with `--trace` when a persistent,
 byte-reproducible JSONL artifact is required.
 
 ## Start a monitor
@@ -80,16 +80,21 @@ error and ignored without stopping the simulation.
 | `--duration-ms N` | Stop after at most `N` milliseconds of simulated time; `0` runs without a simulated-time limit. The monitor also stops if all boards reach terminal CPU boundaries. Without a duration, it runs until `quit`, `exit`, standard-input EOF, or all boards stop. |
 | `--refresh-ms N` | Run and poll input in slices of `N` simulated milliseconds; defaults to `1` and must be nonzero. |
 | `--no-wall-pacing` | Run slices back-to-back instead of pacing simulation time to wall-clock time. Pacing is on by default. |
-| `--live-filter TYPE` | Print one exact trace event type. Repeat to select more than one type. |
+| `--live-filter TYPE` / `--trace-type TYPE` | Print one exact trace event type. Repeat to select more than one type; default `can_tx`. |
 | `--max-instructions N` | Set the per-board instruction budget used for each run slice. |
 | `--quantum N` | Set the deterministic network scheduling quantum; defaults to `1024`. |
 | `--adc-decimation N` | Keep one of every `N` continuous ADC scans; factor 1–1024, default 1. |
+| `--trace FILE` | Also write a persistent JSONL trace; unset by default. |
+| `--jit` | Opt into experimental cached/native execution; off by default, not a speed guarantee. |
 | `--trace-instr` | Emit instruction trace events; add `--live-filter instr` to print them. |
 | `--detect-spin` | Enable spin-loop detection; off by default. |
 | `--strict-mmio` | Treat accesses outside modeled MMIO blocks as faults. |
 | `--lenient-mmio` | Use lenient MMIO handling; this is the default. |
-| `--no-loop-batching` | Disable proven-loop batching; on by default. |
-| `--control-stdin` | Explicitly marks standard input as the control channel; standard input is monitored by default. |
+| `--no-loop-batching` | Disable proven-loop batching; batching is on by default. |
+| `--control-stdin` | Accepted compatibility marker; standard input is always monitored. |
+
+See [Options and recommended defaults](options.md) for the complete build/CLI
+reference. Experimental network scheduler flags are not accepted by this command.
 
 When `--duration-ms` is present, standard-input EOF does not end the run; the
 network continues toward the requested simulated-time limit unless all boards

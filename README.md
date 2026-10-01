@@ -19,6 +19,8 @@ make test
 The checked-in board/network configurations reference firmware in a sibling PER
 checkout. `make benchmark` instead generates synthetic fixtures and requires no
 PER firmware. Run `make help` for build, sanitizer, PGO, and CLI shortcuts.
+See [Options and recommended defaults](docs/options.md) for the complete command
+and build reference, including experimental modes and Make-wrapper differences.
 
 ## Model and interfaces
 
@@ -40,6 +42,11 @@ target; flashing requires explicit `--flash`. See [Configuration](docs/configura
 [Hardware comparison](docs/hardware_comparison.md) for contracts and safety.
 
 ## Performance
+
+Our recommended baseline is Release + supported IPO, interpreter execution,
+proven-loop batching, and ADC decimation 1. Use strict MMIO for validation;
+the compatibility CLI default is lenient. Keep JIT and speculative schedulers
+opt-in until matching real-firmware measurements justify them.
 
 The default run preserves modeled instruction, event, and peripheral behavior.
 Decoded-instruction and memory caches, bounded scheduler bursts, event ownership,
