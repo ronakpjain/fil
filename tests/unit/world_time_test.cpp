@@ -6,7 +6,9 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -261,6 +263,30 @@ TEST(WorldTimeTest, ConcurrentScheduleIsByteDeterministic) {
         << "same-time CPU starts use stable configuration order at each virtual frontier";
 }
 
+TEST(WorldTimeTest, LockstepRequiresAProvenPureBlock) {
+    TempWorldTimeConfigs files;
+    const auto config = files.network({
+        files.writeBoard("single-alpha.json", "single-alpha"),
+        files.writeBoard("single-beta.json", "single-beta")});
+    auto lockstep = fil::sim::World::load(config);
+    auto exact = fil::sim::World::load(config);
+    ASSERT_TRUE(lockstep && exact);
+
+    auto options = runOptions(0U);
+    options.max_instructions_per_board = 10U;
+    options.enable_jit = false;
+    const auto lockstep_result = lockstep.value()->run(options);
+    options.detect_spin = true; // Disables bursts; retains exact dispatch timing.
+    const auto exact_result = exact.value()->run(options);
+    ASSERT_TRUE(lockstep_result && exact_result);
+    EXPECT_EQ(lockstep_result.value().instructions, exact_result.value().instructions);
+    EXPECT_EQ(lockstep_result.value().cycles, exact_result.value().cycles);
+    EXPECT_EQ(lockstep_result.value().end_time_ns, exact_result.value().end_time_ns);
+    EXPECT_EQ(lockstep_result.value().lockstep_bursts, 0U)
+        << "scalar per-instruction predictions do not prove actual completion time";
+    EXPECT_EQ(lockstep.value()->trace().jsonLines(), exact.value()->trace().jsonLines());
+}
+
 TEST(WorldTimeTest, SharedEventsKeepTheirExactDeadlines) {
     TempWorldTimeConfigs files;
     const auto alpha = files.writeBoard("alpha.json", "alpha");
@@ -484,12 +510,105 @@ TEST(WorldTimeTest, SynchronizedPureJitBlocksMatchInterpreter) {
     EXPECT_EQ(result.value().instructions, reference.value().instructions);
     EXPECT_EQ(result.value().cycles, reference.value().cycles);
     EXPECT_EQ(result.value().end_time_ns, reference.value().end_time_ns);
-    EXPECT_LT(result.value().dispatches, reference.value().dispatches);
-    EXPECT_GT(jit.value()->board("sync-alpha")->cpu().jitStats().compilations, 0U);
-    EXPECT_GT(jit.value()->board("sync-alpha")->cpu().jitStats().block_instructions,
-        jit.value()->board("sync-alpha")->cpu().jitStats().block_executions);
+    EXPECT_EQ(result.value().dispatches, reference.value().dispatches);
+    EXPECT_EQ(result.value().exact_dispatches, result.value().instructions);
+    EXPECT_EQ(jit.value()->board("sync-alpha")->cpu().jitStats().block_executions, 0U);
     EXPECT_EQ(jit.value()->trace().jsonLines(), exact.value()->trace().jsonLines());
     for (const auto name : {"sync-alpha", "sync-beta"}) {
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(jit.value()->board(name)->cpu().state(),
+            exact.value()->board(name)->cpu().state()));
+    }
+}
+
+TEST(WorldTimeTest, SynchronizedJitAdmitsDifferentPurePrefixLengths) {
+    TempWorldTimeConfigs files;
+    const auto config = files.network({
+        files.writeBoard("prefix-long.json", "prefix-long"),
+        files.writeBoard("prefix-short.json", "prefix-short")});
+    auto exact = fil::sim::World::load(config);
+    auto jit = fil::sim::World::load(config);
+    ASSERT_TRUE(exact && jit);
+    for (auto* world : {exact.value().get(), jit.value().get()}) {
+        // Five one-cycle NOPs cost the same as one NOP plus a taken branch
+        // (one + four cycles), but the two lanes need different prefix lengths.
+        ASSERT_TRUE(installIdleLoop(*world, "prefix-long", 5U));
+        ASSERT_TRUE(installIdleLoop(*world, "prefix-short", 1U));
+    }
+    warmJit(*jit.value()->board("prefix-long"));
+    warmJit(*jit.value()->board("prefix-short"));
+    ASSERT_TRUE(jit.value()->board("prefix-long")->cpu().jitBlockReady());
+    ASSERT_TRUE(jit.value()->board("prefix-short")->cpu().jitBlockReady());
+    const auto long_preview = jit.value()->board("prefix-long")->cpu().peekJitBlock();
+    const auto short_preview = jit.value()->board("prefix-short")->cpu().peekJitBlock();
+    ASSERT_TRUE(long_preview && short_preview);
+    EXPECT_FALSE(jit.value()->eventLoop().nextScheduledTime().has_value());
+    EXPECT_EQ(long_preview->count, 6U);
+    EXPECT_EQ(short_preview->count, 2U);
+    EXPECT_EQ(long_preview->max_cycles, 9U);
+    EXPECT_EQ(short_preview->max_cycles, 5U);
+    EXPECT_TRUE(long_preview->cycles_exact && short_preview->cycles_exact);
+
+    auto options = runOptions(0U);
+    options.max_instructions_per_board = 100U;
+    options.enable_loop_batching = false;
+    options.enable_jit = false;
+    const auto reference = exact.value()->run(options);
+    options.enable_jit = true;
+    const auto result = jit.value()->run(options);
+    ASSERT_TRUE(reference && result);
+    EXPECT_EQ(result.value().reason, reference.value().reason);
+    EXPECT_EQ(result.value().instructions, reference.value().instructions);
+    EXPECT_EQ(result.value().cycles, reference.value().cycles);
+    EXPECT_EQ(result.value().end_time_ns, reference.value().end_time_ns);
+    EXPECT_EQ(result.value().dispatches, reference.value().dispatches)
+        << "no-loop-batching dispatches one instruction per board even with JIT";
+    EXPECT_EQ(result.value().exact_dispatches, result.value().instructions);
+    EXPECT_EQ(jit.value()->trace().jsonLines(), exact.value()->trace().jsonLines());
+    for (const auto name : {"prefix-long", "prefix-short"}) {
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(jit.value()->board(name)->cpu().state(),
+            exact.value()->board(name)->cpu().state()));
+    }
+}
+
+TEST(WorldTimeTest, SynchronizedJitMatchesMemoryStepToPureBatch) {
+    constexpr std::uint32_t data_address = 0x20000000U;
+    TempWorldTimeConfigs files;
+    const auto config = files.network({
+        files.writeBoard("memory-step.json", "memory-step"),
+        files.writeBoard("pure-batch.json", "pure-batch")});
+    auto exact = fil::sim::World::load(config);
+    auto jit = fil::sim::World::load(config);
+    ASSERT_TRUE(exact && jit);
+    for (auto* world : {exact.value().get(), jit.value().get()}) {
+        auto* memory_board = world->board("memory-step");
+        ASSERT_NE(memory_board, nullptr);
+        const auto start = memory_board->cpu().state().r[15] & ~1U;
+        // LDR r0,[r1]; B start. The LDR is one exact two-cycle RAM access.
+        const std::vector<std::uint8_t> memory_code{0x08U, 0x68U, 0xfdU, 0xe7U};
+        ASSERT_TRUE(memory_board->memory().loadBytes(start, memory_code).hasValue());
+        ASSERT_TRUE(memory_board->memory().write32(data_address, 0x12345678U).hasValue());
+        memory_board->cpu().state().r[1] = data_address;
+        ASSERT_TRUE(installIdleLoop(*world, "pure-batch", 2U));
+    }
+    warmJit(*jit.value()->board("memory-step"));
+    warmJit(*jit.value()->board("pure-batch"));
+
+    auto options = runOptions(0U);
+    options.max_instructions_per_board = 100U;
+    options.enable_loop_batching = false;
+    options.enable_jit = false;
+    const auto reference = exact.value()->run(options);
+    options.enable_jit = true;
+    const auto result = jit.value()->run(options);
+    ASSERT_TRUE(reference && result);
+    EXPECT_EQ(result.value().instructions, reference.value().instructions);
+    EXPECT_EQ(result.value().cycles, reference.value().cycles);
+    EXPECT_EQ(result.value().end_time_ns, reference.value().end_time_ns);
+    EXPECT_GE(result.value().dispatches, reference.value().dispatches)
+        << "a memory step must not share a frontier with another lane's pure batch";
+    EXPECT_EQ(jit.value()->board("memory-step")->cpu().state().r[0], 0x12345678U);
+    EXPECT_EQ(jit.value()->trace().jsonLines(), exact.value()->trace().jsonLines());
+    for (const auto name : {"memory-step", "pure-batch"}) {
         EXPECT_TRUE(fil::cpu::bitwiseEqual(jit.value()->board(name)->cpu().state(),
             exact.value()->board(name)->cpu().state()));
     }
@@ -611,6 +730,146 @@ TEST(WorldTimeTest, JitPreservesSmallBudgetsEventsAndSysTick) {
         if (tick) EXPECT_GT(jit.value()->board("jit-alpha")->cpu().state().r[6], 0U);
         else for (const auto& board : result.value().boards) {
             EXPECT_EQ(board.result.instructions, 3U);
+        }
+    }
+}
+
+TEST(WorldTimeTest, ExactSchedulerRestoresMemoryTrackingWhenCallbacksThrow) {
+    TempWorldTimeConfigs files;
+    auto world = fil::sim::World::load(files.network({
+        files.writeBoard("tracking-alpha.json", "tracking-alpha")}));
+    ASSERT_TRUE(world);
+    ASSERT_TRUE(installIdleLoop(*world.value(), "tracking-alpha", 2U));
+    auto& memory = world.value()->board("tracking-alpha")->memory();
+    ASSERT_TRUE(memory.readFootprintTracking());
+    ASSERT_TRUE(memory.writeJournalTracking());
+    static_cast<void>(world.value()->eventLoop().scheduleAt(1U, [&memory] {
+        EXPECT_FALSE(memory.readFootprintTracking());
+        EXPECT_FALSE(memory.writeJournalTracking());
+        ASSERT_TRUE(memory.write32(0x20000000U, 123U).hasValue());
+        throw std::runtime_error("test callback failure");
+    }));
+    auto options = runOptions(1'000U);
+    options.enable_loop_batching = false;
+    EXPECT_THROW(static_cast<void>(world.value()->run(options)), std::runtime_error);
+    EXPECT_TRUE(memory.readFootprintTracking());
+    EXPECT_TRUE(memory.writeJournalTracking());
+    ASSERT_TRUE(memory.read32(0x20000000U).hasValue());
+    EXPECT_EQ(memory.read32(0x20000000U).value(), 123U);
+}
+
+TEST(WorldTimeTest, CompactExactSchedulerMatchesGeneralWithEventsAndZeroTimeSteps) {
+    TempWorldTimeConfigs files;
+    const auto config = files.network({
+        files.writeBoard("compact-alpha.json", "compact-alpha"),
+        files.writeBoard("compact-beta.json", "compact-beta")});
+    for (const bool extreme_clock : {false, true}) {
+        for (const bool jit : {false, true}) {
+            auto exact = fil::sim::World::load(config);
+            auto general = fil::sim::World::load(config);
+            ASSERT_TRUE(exact && general);
+            for (auto* world : {exact.value().get(), general.value().get()}) {
+                ASSERT_TRUE(installIdleLoop(*world, "compact-alpha", 2U));
+                ASSERT_TRUE(installIdleLoop(*world, "compact-beta", 5U));
+                if (extreme_clock) {
+                    ASSERT_TRUE(selectExtremePllClock(*world, "compact-alpha"));
+                    ASSERT_TRUE(selectExtremePllClock(*world, "compact-beta"));
+                }
+                static_cast<void>(world->eventLoop().scheduleAt(100U, [world] {
+                    world->trace().record(world->eventLoop().now(), "test", "observation",
+                        {{"alpha_pc", std::to_string(world->board("compact-alpha")->cpu().state().r[15])},
+                         {"beta_pc", std::to_string(world->board("compact-beta")->cpu().state().r[15])}});
+                    static_cast<void>(world->eventLoop().scheduleAt(101U, [world] {
+                        world->board("compact-beta")->cpu().state().r[0] += 2U;
+                        world->trace().record(world->eventLoop().now(), "test", "nested-observation",
+                            {{"alpha_pc", std::to_string(world->board("compact-alpha")->cpu().state().r[15])}});
+                    }));
+                }));
+            }
+            auto options = runOptions(1'001U);
+            options.max_instructions_per_board = 5'000U;
+            options.instruction_quantum = 1U;
+            options.enable_loop_batching = false;
+            options.enable_jit = jit;
+            const auto candidate = exact.value()->run(options);
+            // Spin observation selects the original general scheduler, with
+            // batching disabled and an unreachable spin-stop threshold.
+            options.detect_spin = true;
+            options.spin_threshold = std::numeric_limits<std::uint64_t>::max();
+            const auto reference = general.value()->run(options);
+            ASSERT_TRUE(candidate && reference);
+            EXPECT_EQ(candidate.value().reason, reference.value().reason);
+            EXPECT_EQ(candidate.value().end_time_ns, reference.value().end_time_ns);
+            EXPECT_EQ(candidate.value().instructions, reference.value().instructions);
+            EXPECT_EQ(candidate.value().cycles, reference.value().cycles);
+            EXPECT_EQ(candidate.value().rounds, reference.value().rounds);
+            EXPECT_EQ(candidate.value().dispatches, reference.value().dispatches);
+            EXPECT_EQ(candidate.value().event_callbacks, reference.value().event_callbacks);
+            EXPECT_EQ(exact.value()->trace().jsonLines(), general.value()->trace().jsonLines());
+            for (std::size_t index = 0U; index < candidate.value().boards.size(); ++index) {
+                const auto& actual = candidate.value().boards[index];
+                const auto& expected = reference.value().boards[index];
+                EXPECT_EQ(actual.result.instructions, expected.result.instructions);
+                EXPECT_EQ(actual.result.cycles, expected.result.cycles);
+                EXPECT_EQ(actual.result.time_ns, expected.result.time_ns);
+                EXPECT_EQ(actual.result.diagnostic.raw, expected.result.diagnostic.raw);
+                EXPECT_TRUE(fil::cpu::bitwiseEqual(exact.value()->board(actual.name)->cpu().state(),
+                    general.value()->board(expected.name)->cpu().state()));
+            }
+        }
+    }
+}
+
+TEST(WorldTimeTest, CompactExactSchedulerPreservesFailureDrainingAndBudgets) {
+    TempWorldTimeConfigs files;
+    const auto config = files.network({
+        files.writeBoard("drain-alpha.json", "drain-alpha"),
+        files.writeBoard("drain-beta.json", "drain-beta")});
+    for (const bool stop_on_failure : {false, true}) {
+        for (const auto budget : {0U, 1U, 7U}) {
+            auto exact = fil::sim::World::load(config);
+            auto general = fil::sim::World::load(config);
+            ASSERT_TRUE(exact && general);
+            for (auto* world : {exact.value().get(), general.value().get()}) {
+                ASSERT_TRUE(installIdleLoop(*world, "drain-alpha", 0U));
+                ASSERT_TRUE(installIdleLoop(*world, "drain-beta", 5U));
+                static_cast<void>(world->eventLoop().scheduleAt(150U, [world] {
+                    // Replace alpha's next branch with an undefined instruction
+                    // while beta still has an instruction in flight.
+                    auto* board = world->board("drain-alpha");
+                    ASSERT_TRUE(board->memory().loadBytes(board->cpu().state().r[15],
+                        std::vector<std::uint8_t>{0xffU, 0xffU, 0xffU, 0xffU}).hasValue());
+                }));
+            }
+            auto options = runOptions(10'000U);
+            options.max_instructions_per_board = budget;
+            options.enable_loop_batching = false;
+            options.enable_jit = true;
+            options.stop_on_board_failure = stop_on_failure;
+            const auto candidate = exact.value()->run(options);
+            options.detect_spin = true;
+            options.spin_threshold = std::numeric_limits<std::uint64_t>::max();
+            const auto reference = general.value()->run(options);
+            ASSERT_TRUE(candidate && reference);
+            EXPECT_EQ(candidate.value().reason, reference.value().reason);
+            EXPECT_EQ(candidate.value().end_time_ns, reference.value().end_time_ns);
+            EXPECT_EQ(candidate.value().instructions, reference.value().instructions);
+            EXPECT_EQ(candidate.value().cycles, reference.value().cycles);
+            EXPECT_EQ(exact.value()->trace().jsonLines(), general.value()->trace().jsonLines());
+            for (std::size_t index = 0U; index < candidate.value().boards.size(); ++index) {
+                const auto& actual = candidate.value().boards[index];
+                const auto& expected = reference.value().boards[index];
+                EXPECT_EQ(actual.terminal, expected.terminal);
+                EXPECT_EQ(actual.result.reason, expected.result.reason);
+                EXPECT_EQ(actual.result.instructions, expected.result.instructions);
+                EXPECT_EQ(actual.result.cycles, expected.result.cycles);
+                EXPECT_EQ(actual.result.time_ns, expected.result.time_ns);
+                EXPECT_EQ(actual.result.diagnostic.instruction_address,
+                    expected.result.diagnostic.instruction_address);
+                EXPECT_EQ(actual.result.diagnostic.raw, expected.result.diagnostic.raw);
+                EXPECT_TRUE(fil::cpu::bitwiseEqual(exact.value()->board(actual.name)->cpu().state(),
+                    general.value()->board(expected.name)->cpu().state()));
+            }
         }
     }
 }

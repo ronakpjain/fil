@@ -9,6 +9,7 @@ add_executable(fil_tests
     unit/cortexm_test.cpp
     unit/cpu_step_test.cpp
     unit/decoder_test.cpp
+    unit/deferred_prefix_test.cpp
     unit/elf_loader_test.cpp
     unit/event_loop_test.cpp
     unit/exceptions_test.cpp

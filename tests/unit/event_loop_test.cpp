@@ -106,6 +106,42 @@ TEST(EventLoopTest, AdvancesOneOwnerIndependently) {
         << "global execution skips an owner event already committed locally";
 }
 
+TEST(EventLoopTest, DenseAndSparseOwnerClocksPreserveRewindAndSharedClamp) {
+    for (const fil::sim::EventOwner owner : {0U, 63U, 64U, 1000U}) {
+        fil::sim::EventLoop loop;
+        const auto initial = loop.ownerCheckpoint(owner);
+        static_cast<void>(loop.runOwnedEvents(owner, 20U));
+        EXPECT_EQ(loop.now(owner), 20U);
+        EXPECT_TRUE(loop.restoreOwnerCheckpoint(initial));
+        EXPECT_EQ(loop.now(owner), 0U);
+        static_cast<void>(loop.runDueEvents(10U));
+        EXPECT_EQ(loop.now(owner), 10U);
+        static_cast<void>(loop.runOwnedEvents(owner, 30U));
+        EXPECT_EQ(loop.now(owner), 30U);
+        EXPECT_EQ(loop.now(), 10U);
+        static_cast<void>(loop.runDueEvents(40U));
+        EXPECT_EQ(loop.now(owner), 40U);
+    }
+}
+
+TEST(EventLoopTest, DenseAndSparseQueuesPreserveCancellationAndClear) {
+    for (const fil::sim::EventOwner owner : {0U, 63U, 64U, 1000U}) {
+        fil::sim::EventLoop loop;
+        unsigned calls = 0U;
+        {
+            auto scope = loop.useOwner(owner);
+            const auto canceled = loop.scheduleAt(5U, [&] { ++calls; });
+            static_cast<void>(loop.scheduleAt(10U, [&] { ++calls; }));
+            EXPECT_TRUE(loop.cancel(canceled));
+        }
+        EXPECT_EQ(loop.nextScheduledTime(owner), 10U);
+        loop.clear();
+        EXPECT_FALSE(loop.nextScheduledTime(owner).has_value());
+        EXPECT_EQ(loop.runOwnedEvents(owner, 20U).events_executed, 0U);
+        EXPECT_EQ(calls, 0U);
+    }
+}
+
 TEST(EventLoopTest, ReusesPersistentLaneWorkers) {
     fil::sim::LaneWorkerPool workers(4U);
     std::array<std::atomic<unsigned int>, 4> calls{};

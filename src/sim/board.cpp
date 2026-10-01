@@ -9,12 +9,28 @@
 
 #include <algorithm>
 #include <limits>
+#include <stdexcept>
 #include <utility>
 
 namespace fil::sim {
 namespace {
 
 constexpr std::uint64_t nanoseconds_per_second = 1'000'000'000ULL;
+
+struct ReversibleMemoryGuard {
+    mem::MemoryBus& memory;
+    bool all_trapping;
+    bool ram_only;
+    explicit ReversibleMemoryGuard(mem::MemoryBus& bus)
+        : memory(bus), all_trapping(bus.allMmioTrapping()), ram_only(bus.reversibleRamOnly()) {
+        memory.setAllMmioTrapping(true);
+        memory.setReversibleRamOnly(true);
+    }
+    ~ReversibleMemoryGuard() {
+        memory.setAllMmioTrapping(all_trapping);
+        memory.setReversibleRamOnly(ram_only);
+    }
+};
 
 Error runtimeError(std::string message) {
     return Error{ErrorCategory::runtime, std::move(message), std::nullopt};
@@ -140,84 +156,47 @@ SimTimeNs Board::accountCycles(const std::uint64_t cycles) {
     system_->advanceCycles(cycles);
     // Cached-clock fast path: the RCC value changes only on firmware clock
     // writes, so the common case is one inline load plus one compare.
-    // The 64-bit divide stays exact (fractional-ns remainder preserved).
+    // Small cycle counts convert divide-free via the remainder table
+    // (remainder + carry < 2*F resolves with one compare); only large
+    // loop-skip jumps pay a real division. Exact in both cases.
     const std::uint64_t frequency = peripherals_->rcc().systemClockHz();
     if (frequency != cached_clock_hz_) {
         cached_clock_hz_ = frequency;
         invalidateLoopObservations();
     }
+    if (frequency == 0U) {
+        time_fraction_ = 0U;
+        return 0U;
+    }
+    if (cycle_table_hz_ != frequency) rebuildCycleTable(frequency);
+    if (cycles < cycle_table_size) {
+        const auto& entry = cycle_table_[static_cast<std::size_t>(cycles)];
+        const std::uint64_t carried = entry.remainder + time_fraction_;
+        if (carried >= frequency) {
+            time_fraction_ = carried - frequency;
+            return entry.quotient + 1U;
+        }
+        time_fraction_ = carried;
+        return entry.quotient;
+    }
     const std::uint64_t numerator = cycles * nanoseconds_per_second + time_fraction_;
-    const SimTimeNs elapsed = frequency == 0 ? 0 : numerator / frequency;
-    time_fraction_ = frequency == 0 ? 0 : numerator % frequency;
+    const SimTimeNs elapsed = numerator / frequency;
+    time_fraction_ = numerator % frequency;
     return elapsed;
 }
 
 cpu::FastStepResult Board::stepWithFetchTiming(
     const bool allow_jit_block, const std::optional<SimTimeNs> deadline,
     const std::size_t max_instructions, const bool block_prevalidated) {
-    std::size_t jit_limit = max_instructions;
-    if (allow_jit_block && jit_limit > 1U && !block_prevalidated && !boundaryWorkPending()) {
-        static_cast<void>(cpu_->prepareJitBlock());
-        // Do not execute memory/MMIO ahead of board time. Only a pure integer
-        // block with a conservative completion before every boundary may batch.
-        const auto preview = cpu_->peekJitBlock(jit_limit);
-        if (!preview) {
-            jit_limit = 1U;
-        } else {
-            const auto& flash = peripherals_->flash();
-            std::uint64_t cycles = preview->max_cycles;
-            bool have_fetch = have_last_fetch_;
-            std::uint32_t fetch_end = last_fetch_end_;
-            for (std::uint8_t i = 0U; i < preview->count; ++i) {
-                const bool sequential = have_fetch && preview->pcs[i] == fetch_end;
-                cycles += flash.fetchStallCycles(preview->pcs[i], sequential);
-                fetch_end = preview->pcs[i] + preview->sizes[i];
-                have_fetch = true;
-            }
-            const SimTimeNs now = event_loop_->now();
-            const SimTimeNs elapsed = elapsedForCycles(cycles);
-            auto horizon = deadline;
-            if (const auto event = event_loop_->nextScheduledTime();
-                event && (!horizon || *event < *horizon)) horizon = event;
-            const auto systick = system_->cyclesUntilSysTickInterrupt();
-            if ((horizon && (*horizon <= now || elapsed >= *horizon - now))
-                || (systick && cycles >= *systick)) {
-                jit_limit = 1U;
-            }
-        }
-    }
-    if (allow_jit_block && jit_limit > 1U && !boundaryWorkPending()) {
-        if (auto jit = cpu_->tryStepJitBlock(jit_limit)) {
-            // Fold ART flash stalls per instruction in the block.
-            auto& flash = peripherals_->flash();
-            std::uint32_t extra = 0U;
-            for (std::uint8_t i = 0; i < jit->count; ++i) {
-                const std::uint64_t generation = flash.acrGeneration();
-                if (generation != cached_flash_acr_generation_) {
-                    cached_flash_acr_generation_ = generation;
-                    cached_flash_ws_ = flash.waitStates();
-                    cached_flash_art_hit_capable_ = flash.prefetchEnabled()
-                        || flash.instructionCacheEnabled();
-                    invalidateLoopObservations();
-                }
-                if (cached_flash_ws_ == 0U) {
-                    last_fetch_end_ = jit->pcs[i] + jit->sizes[i];
-                    have_last_fetch_ = true;
-                    continue;
-                }
-                const bool sequential = have_last_fetch_
-                    && jit->pcs[i] == last_fetch_end_;
-                last_fetch_end_ = jit->pcs[i] + jit->sizes[i];
-                have_last_fetch_ = true;
-                if (sequential && cached_flash_art_hit_capable_) continue;
-                extra += flash.fetchStallCycles(jit->pcs[i], sequential);
-            }
-            cpu::FastStepResult result = jit->result;
-            result.cycles = static_cast<std::uint16_t>(result.cycles + extra);
-            return result;
-        }
-    }
-    auto result = allow_jit_block ? cpu_->stepJitFast() : cpu_->stepFast();
+    // Keep the exact single-instruction scheduler path out of the block
+    // preview's large metadata frame.
+    if (max_instructions == 1U) return stepSingleWithFetchTiming(allow_jit_block);
+    return stepBlockWithFetchTiming(
+        allow_jit_block, deadline, max_instructions, block_prevalidated);
+}
+
+cpu::FastStepResult Board::stepSingleWithFetchTiming(const bool allow_jit) {
+    auto result = allow_jit ? cpu_->stepJitFast() : cpu_->stepFast();
     if (result.instructions == 0U || result.instruction_size == 0U) return result;
     const auto& flash = peripherals_->flash();
     const std::uint64_t generation = flash.acrGeneration();
@@ -238,12 +217,104 @@ cpu::FastStepResult Board::stepWithFetchTiming(
     last_fetch_end_ = result.instruction_address + result.instruction_size;
     have_last_fetch_ = true;
     if (sequential && cached_flash_art_hit_capable_) return result;
-    // Range check covers flash bank + boot alias; SRAM/ROM fetches skip.
     const std::uint32_t stall = flash.fetchStallCycles(
-        result.instruction_address, sequential
-    );
+        result.instruction_address, sequential);
     result.cycles = static_cast<std::uint16_t>(result.cycles + stall);
     return result;
+}
+
+cpu::FastStepResult Board::stepBlockWithFetchTiming(
+    const bool allow_jit_block, const std::optional<SimTimeNs> deadline,
+    const std::size_t max_instructions, const bool block_prevalidated) {
+    std::size_t jit_limit = max_instructions;
+    if (allow_jit_block && jit_limit > 1U && !block_prevalidated && !blockBoundaryPending()) {
+        // Do not execute memory/MMIO ahead of board time. Only a pure integer
+        // block with a conservative completion before every boundary may batch.
+        cpu::CortexM4::JitBlockPreview preview{};
+        const bool have_preview = cpu_->prepareAndPeekJitBlock(jit_limit, preview);
+        if (!have_preview) {
+            jit_limit = 1U;
+        } else {
+            jit_limit = std::min(jit_limit, static_cast<std::size_t>(preview.count));
+            const auto& flash = peripherals_->flash();
+            std::uint64_t cycles = preview.max_cycles;
+            // Zero wait states add no fetch stalls for any address; a single
+            // register load replaces one fetchStallCycles call per preview op.
+            if (flash.waitStates() != 0U) {
+                bool have_fetch = have_last_fetch_;
+                std::uint32_t fetch_end = last_fetch_end_;
+                for (std::uint8_t i = 0U; i < preview.count; ++i) {
+                    const bool sequential = have_fetch && preview.pcs[i] == fetch_end;
+                    cycles += flash.fetchStallCycles(preview.pcs[i], sequential);
+                    fetch_end = preview.pcs[i] + preview.sizes[i];
+                    have_fetch = true;
+                }
+            }
+            const SimTimeNs now = event_loop_->now();
+            const SimTimeNs elapsed = elapsedForCycles(cycles);
+            auto horizon = deadline;
+            if (const auto event = event_loop_->nextScheduledTime();
+                event && (!horizon || *event < *horizon)) horizon = event;
+            const auto systick = system_->cyclesUntilSysTickInterrupt();
+            if ((horizon && (*horizon <= now || elapsed >= *horizon - now))
+                || (systick && cycles >= *systick)) {
+                jit_limit = 1U;
+            }
+        }
+    }
+    if (allow_jit_block && jit_limit > 1U && !blockBoundaryPending()) {
+        // The preview above prepared this entry; skip re-probing it.
+        if (auto jit = cpu_->tryStepPreparedJitBlock(jit_limit)) {
+            // Fold ART flash stalls per instruction in the block.
+            auto& flash = peripherals_->flash();
+            std::uint32_t extra = 0U;
+            // Memory-free blocks cannot change flash config mid-block: check
+            // the ACR generation once and skip the loop when no wait states.
+            const bool hoist_flash = jit->memory_free;
+            if (hoist_flash) {
+                const std::uint64_t generation = flash.acrGeneration();
+                if (generation != cached_flash_acr_generation_) {
+                    cached_flash_acr_generation_ = generation;
+                    cached_flash_ws_ = flash.waitStates();
+                    cached_flash_art_hit_capable_ = flash.prefetchEnabled()
+                        || flash.instructionCacheEnabled();
+                    invalidateLoopObservations();
+                }
+            }
+            if (hoist_flash && cached_flash_ws_ == 0U) {
+                const auto last = static_cast<std::uint8_t>(jit->count - 1U);
+                last_fetch_end_ = jit->pcs[last] + jit->sizes[last];
+                have_last_fetch_ = true;
+            } else {
+            for (std::uint8_t i = 0; i < jit->count; ++i) {
+                const std::uint64_t generation = hoist_flash
+                    ? cached_flash_acr_generation_ : flash.acrGeneration();
+                if (generation != cached_flash_acr_generation_) {
+                    cached_flash_acr_generation_ = generation;
+                    cached_flash_ws_ = flash.waitStates();
+                    cached_flash_art_hit_capable_ = flash.prefetchEnabled()
+                        || flash.instructionCacheEnabled();
+                    invalidateLoopObservations();
+                }
+                if (cached_flash_ws_ == 0U) {
+                    last_fetch_end_ = jit->pcs[i] + jit->sizes[i];
+                    have_last_fetch_ = true;
+                    continue;
+                }
+                const bool sequential = have_last_fetch_
+                    && jit->pcs[i] == last_fetch_end_;
+                last_fetch_end_ = jit->pcs[i] + jit->sizes[i];
+                have_last_fetch_ = true;
+                if (sequential && cached_flash_art_hit_capable_) continue;
+                extra += flash.fetchStallCycles(jit->pcs[i], sequential);
+            }
+            }
+            cpu::FastStepResult result = jit->result;
+            result.cycles = static_cast<std::uint16_t>(result.cycles + extra);
+            return result;
+        }
+    }
+    return stepSingleWithFetchTiming(allow_jit_block);
 }
 
 std::optional<Board::PredictedCost> Board::peekPredictedCost() const noexcept {
@@ -262,36 +333,459 @@ std::optional<Board::PredictedCost> Board::peekPredictedCost() const noexcept {
     return cost;
 }
 
-std::optional<Board::PredictedBlockCost> Board::peekPredictedBlockCost(
+Board::PredictedBlockCosts Board::peekPredictedBlockCosts(
     const std::size_t max_instructions, const std::optional<SimTimeNs> deadline) {
-    if (max_instructions < 2U || boundaryWorkPending()) return std::nullopt;
-    if (!cpu_->prepareJitBlock()) return std::nullopt;
-    const auto preview = cpu_->peekJitBlock(max_instructions);
-    if (!preview || !preview->cycles_exact || preview->count < 2U) return std::nullopt;
+    PredictedBlockCosts costs{};
+    if (max_instructions == 0U || blockBoundaryPending()) return costs;
+    const auto append_exact_single = [&] {
+        const auto predicted = peekPredictedCost();
+        if (!predicted || predicted->frequency == 0U) return;
+        const auto systick = system_->cyclesUntilSysTickInterrupt();
+        if (systick && predicted->cycles >= *systick) return;
+        auto horizon = deadline;
+        if (const auto event = event_loop_->nextScheduledTime();
+            event && (!horizon || *event < *horizon)) horizon = event;
+        const SimTimeNs now = event_loop_->now();
+        if (horizon && (*horizon <= now
+            || elapsedForCycles(predicted->cycles) >= *horizon - now)) return;
+        costs.prefixes[0] = PredictedBlockCost{*predicted, 1U};
+        costs.count = 1U;
+    };
+    // A ready block can be inspected without preparing/copying the exact
+    // preview. If it has no exact pure prefix, skip that more expensive path
+    // and retain the same exact single-instruction fallback below. Cold blocks
+    // still pass through preparation so ordinary JIT warmup is preserved.
+    if (cpu_->jitBlockReady()) {
+        const auto ready_preview = cpu_->peekJitBlock(max_instructions);
+        if (ready_preview && ready_preview->exact_cycle_prefix_count == 0U) {
+            append_exact_single();
+            return costs;
+        }
+    }
+    cpu::CortexM4::JitBlockPreview preview_fill{};
+    if (!cpu_->prepareAndPeekExactJitBlock(max_instructions, preview_fill)
+        || preview_fill.exact_cycle_prefix_count == 0U) {
+        append_exact_single();
+        return costs;
+    }
+    const auto preview = std::optional<cpu::CortexM4::JitBlockPreview>{preview_fill};
+
     const auto& flash = peripherals_->flash();
-    PredictedBlockCost predicted;
-    predicted.instructions = preview->count;
-    predicted.cost.cycles = preview->max_cycles;
-    predicted.cost.frequency = peripherals_->rcc().systemClockHz();
-    predicted.cost.fraction = time_fraction_;
+    const std::uint64_t frequency = peripherals_->rcc().systemClockHz();
+    if (frequency == 0U) return costs;
     bool have_fetch = have_last_fetch_;
     std::uint32_t fetch_end = last_fetch_end_;
-    for (std::uint8_t i = 0U; i < preview->count; ++i) {
-        predicted.cost.cycles += flash.fetchStallCycles(
-            preview->pcs[i], have_fetch && preview->pcs[i] == fetch_end);
-        fetch_end = preview->pcs[i] + preview->sizes[i];
-        have_fetch = true;
-    }
-    if (predicted.cost.frequency == 0U) return std::nullopt;
-    const auto systick = system_->cyclesUntilSysTickInterrupt();
-    if (systick && predicted.cost.cycles >= *systick) return std::nullopt;
+    std::uint64_t cycles = 0U;
     auto horizon = deadline;
     if (const auto event = event_loop_->nextScheduledTime();
         event && (!horizon || *event < *horizon)) horizon = event;
+    const SimTimeNs now = event_loop_->now();
+    if (horizon && *horizon <= now) return costs;
+    const auto systick = system_->cyclesUntilSysTickInterrupt();
+    for (std::uint8_t i = 0U; i < preview->exact_cycle_prefix_count; ++i) {
+        cycles += preview->instruction_cycles[i];
+        cycles += flash.fetchStallCycles(
+            preview->pcs[i], have_fetch && preview->pcs[i] == fetch_end);
+        fetch_end = preview->pcs[i] + preview->sizes[i];
+        have_fetch = true;
+        if (systick && cycles >= *systick) break;
+
+        PredictedBlockCost& prefix = costs.prefixes[costs.count++];
+        prefix.instructions = static_cast<std::uint8_t>(i + 1U);
+        prefix.cost = PredictedCost{cycles, frequency, time_fraction_};
+    }
+    // Prefix completion times are monotone. When a time horizon is present,
+    // validate from the longest candidate backward instead of dividing once
+    // for every prefix on the common no-boundary path.
+    if (horizon) {
+        const SimTimeNs available_ns = *horizon - now;
+        while (costs.count != 0U
+            && elapsedForCycles(costs.prefixes[costs.count - 1U].cost.cycles)
+                >= available_ns) {
+            --costs.count;
+        }
+    }
+    if (costs.count == 0U) append_exact_single();
+    return costs;
+}
+
+std::optional<Board::DeferredPurePrefix> Board::prepareDeferredPurePrefix(
+    const std::size_t max_instructions, const std::optional<SimTimeNs> deadline) {
+    if (max_instructions < 2U || blockBoundaryPending()) return std::nullopt;
+    cpu::CortexM4::JitBlockPreview preview{};
+    if (!cpu_->prepareAndPeekExactJitBlock(
+            std::min(max_instructions, cpu::CortexM4::JitStepOutcome::max_block), preview)
+        || preview.exact_cycle_prefix_count < 2U) return std::nullopt;
+
+    const std::uint64_t frequency = peripherals_->rcc().systemClockHz();
+    if (frequency == 0U) return std::nullopt;
+    auto horizon = deadline;
+    if (const auto event = event_loop_->nextScheduledTime();
+        event && (!horizon || *event < *horizon)) horizon = *event;
+    const SimTimeNs now = event_loop_->now();
+    if (horizon && *horizon <= now) return std::nullopt;
+    const auto systick = system_->cyclesUntilSysTickInterrupt();
+    const auto& flash = peripherals_->flash();
+    DeferredPurePrefix prefix{};
+    prefix.start_time_ns = now;
+    prefix.entry_pc = cpu_->state().r[15];
+    prefix.flash_generation = flash.acrGeneration();
+    prefix.execution_generation = memory_.executionGeneration();
+    prefix.clock_hz = frequency;
+    prefix.time_fraction = time_fraction_;
+    bool have_fetch = have_last_fetch_;
+    std::uint32_t fetch_end = last_fetch_end_;
+    std::uint64_t cycles = 0U;
+    for (std::uint8_t i = 0U; i < preview.exact_cycle_prefix_count; ++i) {
+        const std::uint64_t step_cycles = preview.instruction_cycles[i]
+            + flash.fetchStallCycles(preview.pcs[i], have_fetch && preview.pcs[i] == fetch_end);
+        cycles += step_cycles;
+        if (systick && cycles >= *systick) break;
+        const std::uint64_t numerator = cycles * nanoseconds_per_second + time_fraction_;
+        const SimTimeNs elapsed = numerator / frequency;
+        if (horizon && elapsed >= *horizon - now) break;
+        const SimTimeNs completion = saturatingAdd(now, elapsed);
+        // Deferred phase advancement must make strict temporal progress even
+        // for the first instruction (e.g. clocks above 1 GHz).
+        if (completion <= now
+            || (prefix.count != 0U && completion <= prefix.completion_times_ns[prefix.count - 1U])) break;
+        prefix.cumulative_cycles[prefix.count] = cycles;
+        prefix.completion_times_ns[prefix.count] = completion;
+        ++prefix.count;
+        fetch_end = preview.pcs[i] + preview.sizes[i];
+        have_fetch = true;
+    }
+    if (prefix.count < 2U) return std::nullopt;
+    return prefix;
+}
+
+Board::ConcurrentStepResult Board::materializeDeferredPurePrefix(
+    const DeferredPurePrefix& prefix, const std::size_t count) {
+    ConcurrentStepResult rejected{};
+    rejected.cpu_result.reason = cpu::StopReason::synchronization_required;
+    if (count == 0U || count > prefix.count || count > cpu::CortexM4::JitStepOutcome::max_block
+        || cpu_->state().r[15] != prefix.entry_pc
+        || peripherals_->rcc().systemClockHz() != prefix.clock_hz
+        || peripherals_->flash().acrGeneration() != prefix.flash_generation
+        || memory_.executionGeneration() != prefix.execution_generation
+        || time_fraction_ != prefix.time_fraction || blockBoundaryPending()) return rejected;
+
+    auto jit = cpu_->tryStepPreparedJitBlock(count);
+    if (!jit || jit->count != count
+        || !jit->memory_free
+        || peripherals_->flash().acrGeneration() != prefix.flash_generation) return rejected;
+
+    auto& flash = peripherals_->flash();
+    std::uint64_t cycles = jit->result.cycles;
+    bool have_fetch = have_last_fetch_;
+    std::uint32_t fetch_end = last_fetch_end_;
+    for (std::uint8_t i = 0U; i < jit->count; ++i) {
+        const bool sequential = have_fetch && jit->pcs[i] == fetch_end;
+        cycles += flash.fetchStallCycles(jit->pcs[i], sequential);
+        fetch_end = jit->pcs[i] + jit->sizes[i];
+        have_fetch = true;
+    }
+    if (cycles != prefix.cumulative_cycles[count - 1U]
+        || prefix.completion_times_ns[count - 1U] < prefix.start_time_ns) {
+        rejected.cpu_result = jit->result;
+        rejected.cpu_result.reason = cpu::StopReason::synchronization_required;
+        return rejected;
+    }
+    last_fetch_end_ = fetch_end;
+    have_last_fetch_ = have_fetch;
+    cpu::FastStepResult result = jit->result;
+    result.cycles = static_cast<std::uint16_t>(cycles);
+    return ConcurrentStepResult{result, accountCycles(cycles)};
+}
+
+std::optional<Board::ReversibleRamPrefix> Board::prepareReversibleRamPrefix(
+    const std::size_t max_instructions, const std::optional<SimTimeNs> deadline) {
+    ReversibleRamPrefix prefix{};
+    if (!prepareReversibleRamPrefix(prefix, max_instructions, deadline)) return std::nullopt;
+    return prefix;
+}
+
+bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
+    const std::size_t max_instructions, const std::optional<SimTimeNs> deadline,
+    const bool allow_single_prefix) {
+    const std::size_t limit = std::min(max_instructions, ReversibleRamPrefix::max_instructions);
+    if (limit < 2U || blockBoundaryPending()) return false;
+    const auto frequency = peripherals_->rcc().systemClockHz();
+    if (frequency == 0U || time_fraction_ >= frequency) return false;
     const auto now = event_loop_->now();
-    if (horizon && (*horizon <= now
-        || elapsedForCycles(predicted.cost.cycles) >= *horizon - now)) return std::nullopt;
-    return predicted;
+    auto horizon = deadline;
+    if (const auto event = event_loop_->nextScheduledTime();
+        event && (!horizon || *event < *horizon)) horizon = *event;
+    if (horizon && *horizon <= now) return false;
+    const auto systick = system_->cyclesUntilSysTickInterrupt();
+    if (systick && *systick == 0U) return false;
+    auto cycle_credit = systick ? *systick - 1U : std::numeric_limits<std::uint64_t>::max();
+    if (horizon) {
+        const auto available_ns = *horizon - now;
+        if (available_ns <= std::numeric_limits<std::uint64_t>::max() / frequency) {
+            const auto numerator = available_ns * frequency - 1U;
+            const auto time_credit = numerator >= time_fraction_
+                ? (numerator - time_fraction_) / nanoseconds_per_second : 0U;
+            cycle_credit = std::min(cycle_credit, time_credit);
+        }
+    }
+    if (cycle_credit == 0U) return false;
+
+    prefix.count = 0U;
+    prefix.start_time_ns = now;
+    prefix.entry_pc = cpu_->state().r[15];
+    prefix.entry_state.capture(cpu_->state());
+    prefix.clock_hz = frequency;
+    prefix.time_fraction = time_fraction_;
+    prefix.flash_generation = peripherals_->flash().acrGeneration();
+    prefix.execution_generation = memory_.executionGeneration();
+    prefix.memory_checkpoint = memory_.sideEffectCheckpoint();
+    prefix.entry_read_footprint = memory_.readFootprint();
+    prefix.entry_have_fetch = have_last_fetch_;
+    prefix.entry_fetch_end = last_fetch_end_;
+    const auto restore_entry = [&] {
+        const auto current = memory_.sideEffectCheckpoint();
+        if (current.mutation_sequence != prefix.memory_checkpoint.mutation_sequence
+            && !memory_.restoreSideEffects(prefix.memory_checkpoint)) {
+            throw std::logic_error("reversible RAM admission cannot restore its writes");
+        }
+        if (!memory_.mmioUnchangedSince(prefix.memory_checkpoint)) {
+            throw std::logic_error("reversible RAM execution dispatched MMIO");
+        }
+        prefix.entry_state.restore(cpu_->state());
+        memory_.restoreReadFootprint(prefix.entry_read_footprint);
+    };
+    const auto append_chunk = [](ReversibleRamPrefix::ReversibleExecution& aggregate,
+                                 const cpu::CortexM4::TimedJitStepOutcome& chunk) {
+        const auto n = chunk.execution.count;
+        if (n == 0U || n > cpu::CortexM4::JitStepOutcome::max_block
+            || static_cast<std::size_t>(aggregate.count) + n
+                > ReversibleRamPrefix::max_instructions) return false;
+        if (aggregate.count == 0U) aggregate.result = chunk.execution.result;
+        else {
+            aggregate.result.instruction_address = chunk.execution.result.instruction_address;
+            aggregate.result.raw = chunk.execution.result.raw;
+            aggregate.result.instruction_size = chunk.execution.result.instruction_size;
+            aggregate.result.suppress_loop_observation = chunk.execution.result.suppress_loop_observation;
+        }
+        for (std::uint8_t i = 0U; i < n; ++i) {
+            const std::size_t dst = aggregate.count++;
+            aggregate.pcs[dst] = chunk.execution.pcs[i];
+            aggregate.sizes[dst] = chunk.execution.sizes[i];
+            aggregate.instruction_cycles[dst] = chunk.instruction_cycles[i];
+        }
+        aggregate.result.instructions = aggregate.count;
+        aggregate.result.reason = cpu::StopReason::step_complete;
+        return true;
+    };
+
+    // MMIO is trapped and every admitted store is non-executable RAM, so
+    // clock/flash timing inputs cannot change during this speculative span.
+    if (cycle_table_hz_ != frequency) rebuildCycleTable(frequency);
+    const auto& flash = peripherals_->flash();
+    struct FetchTiming {
+        const stm32g4::FlashPeripheral* flash;
+        std::uint16_t wait;
+        bool art_hit;
+    };
+    const FetchTiming fetch_timing{&flash, static_cast<std::uint16_t>(flash.waitStates()),
+        flash.prefetchEnabled() || flash.instructionCacheEnabled()};
+    cpu::CortexM4::ReversibleCycleBudget budget;
+    budget.remaining_cycles = cycle_credit;
+    budget.context = &fetch_timing;
+    budget.have_fetch = prefix.entry_have_fetch;
+    budget.fetch_end = prefix.entry_fetch_end;
+    budget.fetch_stall = +[](const void* context, const std::uint32_t pc, const bool sequential) {
+        const auto& timing = *static_cast<const FetchTiming*>(context);
+        if (timing.wait == 0U || (sequential && timing.art_hit)) return std::uint16_t{0U};
+        return timing.flash->isFlashAddress(pc) ? timing.wait : std::uint16_t{0U};
+    };
+    const auto elapsed_for_span = [&](const std::uint64_t total_cycles) {
+        if (total_cycles < cycle_table_size) {
+            const auto& entry = cycle_table_[static_cast<std::size_t>(total_cycles)];
+            return entry.quotient + static_cast<SimTimeNs>(
+                entry.remainder + prefix.time_fraction >= frequency);
+        }
+        return (total_cycles * nanoseconds_per_second + prefix.time_fraction) / frequency;
+    };
+    ReversibleRamPrefix::ReversibleExecution speculative{};
+    bool stop = false;
+    bool boundary_cut = false;
+    std::uint64_t cycles = 0U;
+    {
+        ReversibleMemoryGuard guard(memory_);
+        while (speculative.count < limit && !stop) {
+            const std::size_t request = std::min<std::size_t>(
+                limit - speculative.count, cpu::CortexM4::JitStepOutcome::max_block);
+            auto chunk = cpu_->tryStepBudgetedReversibleJitBlock(request, budget);
+            if (!chunk || chunk->execution.count == 0U) break;
+            const std::uint8_t chunk_count = chunk->execution.count;
+            if (!append_chunk(speculative, *chunk)) break;
+            for (std::uint8_t i = 0U; i < chunk_count; ++i) {
+                cycles += budget.total_instruction_cycles[i];
+                if ((systick && cycles >= *systick)) {
+                    boundary_cut = true;
+                    stop = true;
+                    break;
+                }
+                const SimTimeNs elapsed = elapsed_for_span(cycles);
+                if (horizon && elapsed >= *horizon - now) {
+                    boundary_cut = true;
+                    stop = true;
+                    break;
+                }
+                const SimTimeNs completion = saturatingAdd(now, elapsed);
+                if (completion <= now || (prefix.count != 0U
+                    && completion <= prefix.completion_times_ns[prefix.count - 1U])) {
+                    boundary_cut = true;
+                    stop = true;
+                    break;
+                }
+                prefix.cumulative_cycles[prefix.count] = cycles;
+                prefix.completion_times_ns[prefix.count++] = completion;
+
+            }
+            if (chunk->execution.result.reason != cpu::StopReason::step_complete) stop = true;
+        }
+    }
+    const auto after = memory_.sideEffectCheckpoint();
+    constexpr std::size_t max_writes_per_instruction = 4U;
+    if (after.mutation_sequence - prefix.memory_checkpoint.mutation_sequence
+            > max_writes_per_instruction * mem::MemoryBus::max_reversible_ram_mutations
+        || !memory_.canRestoreSideEffects(prefix.memory_checkpoint)) {
+        throw std::logic_error("reversible RAM prefix exceeded its journal bound");
+    }
+    if (prefix.count < (allow_single_prefix ? 1U : 2U)) {
+        restore_entry();
+        return false;
+    }
+
+    // A chunk can execute past the first event/deadline/SysTick cut. Undo that
+    // speculative suffix and regenerate exactly the certified instruction count.
+    // The same path also makes every chained block cut replayable.
+    if (speculative.count != prefix.count || boundary_cut) {
+        restore_entry();
+        ReversibleRamPrefix::ReversibleExecution replayed{};
+        ReversibleMemoryGuard guard(memory_);
+        while (replayed.count < prefix.count) {
+            const std::size_t request = std::min<std::size_t>(
+                static_cast<std::size_t>(prefix.count - replayed.count),
+                cpu::CortexM4::JitStepOutcome::max_block);
+            auto chunk = cpu_->tryStepReversibleJitBlock(request);
+            if (!chunk || chunk->execution.count == 0U || !append_chunk(replayed, *chunk)) {
+                throw std::logic_error("reversible RAM admission replay made no progress");
+            }
+            if (chunk->execution.result.reason != cpu::StopReason::step_complete
+                && replayed.count < prefix.count) {
+                throw std::logic_error("reversible RAM admission replay stopped early");
+            }
+        }
+        if (replayed.count != prefix.count) {
+            throw std::logic_error("reversible RAM admission replay count differs");
+        }
+        prefix.evaluated = std::move(replayed);
+    } else {
+        prefix.evaluated = std::move(speculative);
+    }
+    prefix.evaluated_checkpoint = memory_.sideEffectCheckpoint();
+    return true;
+}
+
+Board::ConcurrentStepResult Board::materializeReversibleRamPrefix(
+    const ReversibleRamPrefix& prefix, const std::size_t count) {
+    const auto current = memory_.sideEffectCheckpoint();
+    if (count == 0U || count > prefix.count
+        || current.mutation_sequence != prefix.evaluated_checkpoint.mutation_sequence
+        || current.mmio_generation != prefix.evaluated_checkpoint.mmio_generation
+        || peripherals_->rcc().systemClockHz() != prefix.clock_hz
+        || peripherals_->flash().acrGeneration() != prefix.flash_generation
+        || memory_.executionGeneration() != prefix.execution_generation
+        || time_fraction_ != prefix.time_fraction) {
+        throw std::logic_error("stale reversible RAM prefix");
+    }
+    if (count == prefix.count) {
+        // Admission already measured every executed instruction and its flash
+        // cost. Stable guards above make an uncut commit O(1), not another
+        // metadata copy and per-instruction timing walk.
+        const auto last = count - 1U;
+        last_fetch_end_ = prefix.evaluated.pcs[last] + prefix.evaluated.sizes[last];
+        have_last_fetch_ = true;
+        auto result = prefix.evaluated.result;
+        const auto cycles = prefix.cumulative_cycles[last];
+        result.cycles = static_cast<std::uint16_t>(cycles);
+        return ConcurrentStepResult{result, accountCycles(cycles)};
+    }
+
+    if (current.mutation_sequence != prefix.memory_checkpoint.mutation_sequence
+        && !memory_.restoreSideEffects(prefix.memory_checkpoint)) {
+        throw std::logic_error("reversible RAM interruption cannot restore writes");
+    }
+    prefix.entry_state.restore(cpu_->state());
+    memory_.restoreReadFootprint(prefix.entry_read_footprint);
+    ReversibleRamPrefix::ReversibleExecution replayed{};
+    const auto append_chunk = [](ReversibleRamPrefix::ReversibleExecution& aggregate,
+                                 const cpu::CortexM4::TimedJitStepOutcome& chunk) {
+        const auto n = chunk.execution.count;
+        if (n == 0U || n > cpu::CortexM4::JitStepOutcome::max_block
+            || static_cast<std::size_t>(aggregate.count) + n
+                > ReversibleRamPrefix::max_instructions) return false;
+        if (aggregate.count == 0U) aggregate.result = chunk.execution.result;
+        else {
+            aggregate.result.instruction_address = chunk.execution.result.instruction_address;
+            aggregate.result.raw = chunk.execution.result.raw;
+            aggregate.result.instruction_size = chunk.execution.result.instruction_size;
+            aggregate.result.suppress_loop_observation = chunk.execution.result.suppress_loop_observation;
+        }
+        for (std::uint8_t i = 0U; i < n; ++i) {
+            const std::size_t dst = aggregate.count++;
+            aggregate.pcs[dst] = chunk.execution.pcs[i];
+            aggregate.sizes[dst] = chunk.execution.sizes[i];
+            aggregate.instruction_cycles[dst] = chunk.instruction_cycles[i];
+        }
+        aggregate.result.instructions = aggregate.count;
+        aggregate.result.reason = cpu::StopReason::step_complete;
+        return true;
+    };
+    {
+        ReversibleMemoryGuard guard(memory_);
+        while (replayed.count < count) {
+            const std::size_t request = std::min<std::size_t>(
+                count - replayed.count, cpu::CortexM4::JitStepOutcome::max_block);
+            auto chunk = cpu_->tryStepReversibleJitBlock(request);
+            if (!chunk || !append_chunk(replayed, *chunk)) {
+                throw std::logic_error("reversible RAM interrupted replay differs");
+            }
+            if (chunk->execution.result.reason != cpu::StopReason::step_complete
+                && replayed.count < count) {
+                throw std::logic_error("reversible RAM interrupted replay stopped early");
+            }
+        }
+    }
+    if (replayed.count != count) throw std::logic_error("reversible RAM replay count differs");
+
+    bool have_fetch = prefix.entry_have_fetch;
+    auto fetch_end = prefix.entry_fetch_end;
+    std::uint64_t cycles = 0U;
+    for (std::size_t i = 0U; i < count; ++i) {
+        if (replayed.pcs[i] != prefix.evaluated.pcs[i]
+            || replayed.sizes[i] != prefix.evaluated.sizes[i]
+            || replayed.instruction_cycles[i] != prefix.evaluated.instruction_cycles[i]) {
+            throw std::logic_error("reversible RAM replay metadata differs");
+        }
+        cycles += replayed.instruction_cycles[i];
+        cycles += peripherals_->flash().fetchStallCycles(replayed.pcs[i],
+            have_fetch && replayed.pcs[i] == fetch_end);
+        fetch_end = replayed.pcs[i] + replayed.sizes[i];
+        have_fetch = true;
+    }
+    if (cycles != prefix.cumulative_cycles[count - 1U]) {
+        throw std::logic_error("reversible RAM materialization timing differs");
+    }
+    last_fetch_end_ = fetch_end;
+    have_last_fetch_ = have_fetch;
+    auto result = replayed.result;
+    result.cycles = static_cast<std::uint16_t>(cycles);
+    return ConcurrentStepResult{result, accountCycles(cycles)};
 }
 
 SimTimeNs Board::advanceTime(const std::uint64_t cycles) {
@@ -304,12 +798,13 @@ SimTimeNs Board::advanceTime(const std::uint64_t cycles) {
 }
 
 Board::ConcurrentStepResult Board::beginConcurrentStep(
-    const bool trace_instructions, const bool allow_jit, const std::size_t max_instructions) {
+    const bool trace_instructions, const bool allow_jit, const std::size_t max_instructions,
+    const bool block_prevalidated) {
     // General concurrent dispatch stays single-step: another lane can add a
     // new event while it is in flight. Only the synchronized world burst can
     // supply a larger, prevalidated pure fixed-cost block limit.
     auto result = stepWithFetchTiming(!trace_instructions && allow_jit,
-        std::nullopt, max_instructions, max_instructions > 1U);
+        std::nullopt, max_instructions, block_prevalidated && max_instructions > 1U);
     if (trace_instructions) {
         trace_->record(
             event_loop_->now(), config_.name, "instr",
@@ -323,9 +818,21 @@ Board::ConcurrentStepResult Board::beginConcurrentStep(
 }
 
 bool Board::boundaryWorkPending() const noexcept {
-    return cpu_->state().pending_exc_return || cpu_->state().pending_exception
-        || system_->hasEnabledPending() || system_->resetRequested()
-        || peripherals_->resetRequested();
+    const auto& state = cpu_->state();
+    if (state.pending_exc_return || state.pending_exception
+        || system_->resetRequested() || peripherals_->resetRequested()) return true;
+    return system_->hasTakablePending(state.primask, state.basepri, state.faultmask);
+}
+
+bool Board::blockBoundaryPending() const noexcept {
+    const auto& state = cpu_->state();
+    if (state.pending_exc_return || state.pending_exception) return true;
+    if (system_->resetRequested() || peripherals_->resetRequested()) return true;
+    // Cheap short-circuit first: the full takability scan runs only when
+    // something is actually pending.
+    return system_->hasEnabledPending()
+        && system_->nextPending(state.primask, state.basepri, state.faultmask)
+            .has_value();
 }
 
 std::optional<Board::BoundaryStop> Board::settleInstructionBoundary() {
@@ -476,12 +983,28 @@ bool Board::loopHasNoMmioSince(const ProvenLoop& loop) const noexcept {
 
 SimTimeNs Board::elapsedForCycles(const std::uint64_t cycles) const noexcept {
     const std::uint64_t frequency = peripherals_->rcc().systemClockHz();
-    if (frequency == 0U || cycles >
-            (std::numeric_limits<std::uint64_t>::max() - time_fraction_)
+    if (frequency == 0U) return 0U;
+    if (cycle_table_hz_ != frequency) rebuildCycleTable(frequency);
+    if (cycles < cycle_table_size) {
+        const auto& entry = cycle_table_[static_cast<std::size_t>(cycles)];
+        const std::uint64_t carried = entry.remainder + time_fraction_;
+        return entry.quotient + (carried >= frequency ? 1U : 0U);
+    }
+    if (cycles > (std::numeric_limits<std::uint64_t>::max() - time_fraction_)
                 / nanoseconds_per_second) {
         return std::numeric_limits<SimTimeNs>::max();
     }
     return (cycles * nanoseconds_per_second + time_fraction_) / frequency;
+}
+
+void Board::rebuildCycleTable(const std::uint64_t frequency) const {
+    for (std::size_t c = 0U; c < cycle_table_size; ++c) {
+        const std::uint64_t product = static_cast<std::uint64_t>(c)
+            * nanoseconds_per_second;
+        cycle_table_[c].quotient = frequency == 0U ? 0U : product / frequency;
+        cycle_table_[c].remainder = frequency == 0U ? 0U : product % frequency;
+    }
+    cycle_table_hz_ = frequency;
 }
 
 std::optional<SimTimeNs> Board::nextObservableTime(const SimTimeNs boundary_time) const {

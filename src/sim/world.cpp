@@ -7,7 +7,9 @@
 #include "fil/sim/worker_pool.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <limits>
+#include <stdexcept>
 #include <utility>
 
 namespace fil::sim {
@@ -57,8 +59,7 @@ void stopBoard(
 
 void accumulate(
     WorldBoardRunResult& aggregate,
-    const BoardRunResult& slice,
-    WorldRunResult& world
+    const BoardRunResult& slice
 ) {
     aggregate.result.reason = slice.reason;
     aggregate.result.instructions = saturatingAdd(
@@ -68,8 +69,6 @@ void accumulate(
     aggregate.result.time_ns = slice.time_ns;
     aggregate.result.diagnostic = slice.diagnostic;
     aggregate.result.message = slice.message;
-    world.instructions = saturatingAdd(world.instructions, slice.instructions);
-    world.cycles = saturatingAdd(world.cycles, slice.cycles);
 }
 
 } // namespace
@@ -244,7 +243,10 @@ Result<void> World::initialize(const bool strict_mmio) {
     return {};
 }
 
-Result<WorldRunResult> World::run(const WorldRunOptions& options) {
+Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
+    // Run configuration is immutable for this invocation, including across
+    // peripheral callbacks. Keep a non-aliased snapshot for the hot scheduler.
+    const WorldRunOptions options = requested_options;
     if (options.instruction_quantum == 0U) {
         return argumentError("world instruction quantum must be nonzero");
     }
@@ -252,30 +254,61 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
         return argumentError("world spin threshold must be nonzero when spin detection is enabled");
     }
 
+    if (options.enable_ram_capsules
+        && (options.enable_deferred_prefixes || options.enable_loop_batching)) {
+        return argumentError("RAM capsules require no loop batching and no deferred-pure option");
+    }
+    if ((options.enable_deferred_prefixes || options.enable_ram_capsules)
+        && (!options.enable_jit || options.trace_instructions || options.detect_spin
+            || options.enable_transactional_slices)) {
+        return argumentError("deferred prefixes require JIT without instruction tracing, spin detection, or transactional slices");
+    }
+    const bool deferred_enabled = options.enable_deferred_prefixes || options.enable_ram_capsules;
+
     WorldRunResult output;
     output.start_time_ns = event_loop_.now();
     output.end_time_ns = output.start_time_ns;
     output.boards.resize(boards_.size());
 
+    const bool exact_single_fast_path = boards_.size() <= 64U && !options.enable_loop_batching
+        && !options.detect_spin && !options.trace_instructions
+        && !options.enable_transactional_slices && !deferred_enabled;
     struct SchedulerState {
         bool runnable{true};
         bool in_flight{false};
         bool loop_skip_in_flight{false};
         SimTimeNs ready_time_ns{0};
         std::optional<Board::ConcurrentStepResult> step;
+        std::optional<Board::DeferredPurePrefix> deferred;
+        std::optional<Board::ReversibleRamPrefix> ram;
+        bool ram_active{false};
         std::optional<Board::ProvenLoop> proven_loop;
         bool inside_proven_loop{false};
         Board::LoopSkip loop_skip;
         std::uint64_t proven_loop_instructions{0};
         std::uint64_t same_time_dispatches{0};
     };
-    std::vector<SchedulerState> states(boards_.size());
+    std::vector<SchedulerState> states;
+    if (!exact_single_fast_path) states.resize(boards_.size());
     std::vector<Board*> lane_boards;
     lane_boards.reserve(boards_.size());
     for (const auto& entry : boards_) lane_boards.push_back(entry->board.get());
-    std::vector<std::uint64_t> planned_iterations(boards_.size(), 0U);
-    std::vector<Board::ConcurrentStepResult> burst_steps(boards_.size());
-    std::vector<std::size_t> burst_block_limits(boards_.size(), 1U);
+    std::vector<std::uint64_t> planned_iterations;
+    std::vector<Board::ConcurrentStepResult> burst_steps;
+    std::vector<std::size_t> burst_block_limits;
+    std::vector<std::size_t> candidate_block_limits;
+    std::vector<std::size_t> best_block_limits;
+    std::vector<Board::PredictedBlockCosts> burst_block_costs;
+    std::vector<std::uint8_t> burst_prefix_indices;
+    if (!exact_single_fast_path) {
+        planned_iterations.assign(boards_.size(), 0U);
+        burst_steps.resize(boards_.size());
+        burst_block_limits.assign(boards_.size(), 1U);
+        candidate_block_limits.assign(boards_.size(), 1U);
+        best_block_limits.assign(boards_.size(), 1U);
+        burst_block_costs.resize(boards_.size());
+        burst_prefix_indices.assign(boards_.size(), 0U);
+    }
     std::unique_ptr<LaneWorkerPool> worker_pool;
     ConcurrentEventGuard concurrent_guard;
     if (options.enable_transactional_slices && boards_.size() > 1U
@@ -286,10 +319,12 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
     }
     for (std::size_t index = 0; index < boards_.size(); ++index) {
         initializeSnapshot(output.boards[index], *boards_[index]->board, output.start_time_ns);
+        boards_[index]->board->cpu().setNativeSingleInstructionJitEnabled(
+            options.enable_native_single_jit);
         boards_[index]->board->peripherals().setAdcDecimation(options.adc_decimation);
-        states[index].ready_time_ns = output.start_time_ns;
+        if (!exact_single_fast_path) states[index].ready_time_ns = output.start_time_ns;
         if (options.max_instructions_per_board == 0U) {
-            states[index].runnable = false;
+            if (!exact_single_fast_path) states[index].runnable = false;
             stopBoard(
                 output.boards[index], *boards_[index]->board,
                 BoardStopReason::instruction_budget, "instruction budget exhausted",
@@ -300,6 +335,117 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
 
     const SimTimeNs deadline = options.duration_ns == 0U
         ? 0U : saturatingAdd(output.start_time_ns, options.duration_ns);
+    std::size_t current_dispatch_index = states.size();
+    std::uint64_t active_capsule_mask = 0U;
+    struct DispatchScope {
+        std::size_t& current;
+        std::size_t previous;
+        DispatchScope(std::size_t& context, const std::size_t index)
+            : current(context), previous(context) { current = index; }
+        ~DispatchScope() { current = previous; }
+    };
+    // Deferred instructions have not executed yet. An observation barrier
+    // evaluates only instructions that exact dispatch would already have
+    // started, including the active instruction when the observation falls
+    // strictly between two completion timestamps. No future suffix is run.
+    const auto materialize_deferred = [&](const SimTimeNs at, const bool all,
+                                          const std::size_t dispatch_index) {
+        const bool use_mask = states.size() <= 64U;
+        auto pending = active_capsule_mask;
+        std::size_t fallback_index = 0U;
+        for (;;) {
+            std::size_t index;
+            if (use_mask) {
+                if (pending == 0U) break;
+                index = static_cast<std::size_t>(std::countr_zero(pending));
+                pending &= pending - 1U;
+            } else {
+                if (fallback_index == states.size()) break;
+                index = fallback_index++;
+            }
+            auto& state = states[index];
+            if ((!use_mask && !state.deferred && !state.ram_active)
+                || (!all && state.ready_time_ns > at)) continue;
+            const auto& prefix = state.ram_active
+                ? static_cast<const Board::DeferredPurePrefix&>(*state.ram) : *state.deferred;
+            std::size_t count = 1U;
+            while (count < prefix.count && prefix.completion_times_ns[count - 1U] < at) ++count;
+            const SimTimeNs completion = prefix.completion_times_ns[count - 1U];
+            if (count < prefix.count) ++output.deferred_truncations;
+            auto owner = event_loop_.useOwner(static_cast<EventOwner>(index));
+            state.step = state.ram_active
+                ? lane_boards[index]->materializeReversibleRamPrefix(*state.ram, count)
+                : lane_boards[index]->materializeDeferredPurePrefix(prefix, count);
+            state.ready_time_ns = completion;
+            output.deferred_instructions = saturatingAdd(output.deferred_instructions, count);
+            output.exact_dispatches = saturatingAdd(output.exact_dispatches, count);
+            state.deferred.reset();
+            state.ram_active = false;
+            if (use_mask) active_capsule_mask &= ~(std::uint64_t{1U} << index);
+            // At a dispatch observation, completions at this timestamp were
+            // already settled before any lane started work. Preserve that
+            // phase ordering for an elided internal prefix boundary, too.
+            if (dispatch_index < states.size() && completion == at) {
+                const auto result = state.step->cpu_result;
+                if (result.reason != cpu::StopReason::step_complete) {
+                    throw std::logic_error("deferred pure-prefix materialization failed");
+                }
+                auto& board_output = output.boards[index];
+                board_output.result.reason = BoardStopReason::instruction_budget;
+                board_output.result.instructions = saturatingAdd(
+                    board_output.result.instructions, result.instructions);
+                board_output.result.cycles = saturatingAdd(board_output.result.cycles, result.cycles);
+                board_output.result.time_ns = at;
+                board_output.result.diagnostic.instruction_address = result.instruction_address;
+                board_output.result.diagnostic.raw = result.raw;
+                board_output.result.diagnostic.instruction_size = result.instruction_size;
+                state.step.reset();
+                state.in_flight = false;
+                if (lane_boards[index]->settleInstructionBoundary()) {
+                    throw std::logic_error("unexpected boundary in certified pure prefix");
+                }
+                if (board_output.result.instructions >= options.max_instructions_per_board) {
+                    state.runnable = false;
+                    stopBoard(board_output, *lane_boards[index], BoardStopReason::instruction_budget,
+                              "instruction budget exhausted", at);
+                } else if (index < dispatch_index) {
+                    // This earlier lane's next start precedes the observing
+                    // lane in deterministic board order. The certified suffix
+                    // is private and side-effect-free outside its own RAM.
+                    state.step = lane_boards[index]->beginConcurrentStep(false, true);
+                    state.ready_time_ns = saturatingAdd(at, state.step->elapsed_ns);
+                    state.in_flight = true;
+                    ++state.same_time_dispatches;
+                    ++output.dispatches;
+                    ++output.exact_dispatches;
+                }
+            }
+        }
+    };
+    struct DeliveryBarrierGuard {
+        devices::VirtualCanBus* bus;
+        devices::VirtualCanBus::DeliveryBarrier previous;
+        ~DeliveryBarrierGuard() {
+            static_cast<void>(bus->exchangeDeliveryBarrier(std::move(previous)));
+        }
+    };
+    std::vector<std::unique_ptr<DeliveryBarrierGuard>> delivery_guards;
+    if (deferred_enabled) {
+        for (auto& entry : buses_) {
+            auto previous = entry->bus->exchangeDeliveryBarrier({});
+            auto guard = std::make_unique<DeliveryBarrierGuard>();
+            guard->bus = entry->bus.get();
+            guard->previous = previous;
+            static_cast<void>(entry->bus->exchangeDeliveryBarrier(
+                [&, previous = std::move(previous)](const std::uint64_t at) {
+                    // FDCAN switches event ownership to shared before bus
+                    // delivery; ownership is not the CPU dispatch phase.
+                    materialize_deferred(at, true, current_dispatch_index);
+                    if (previous) previous(at);
+                }));
+            delivery_guards.push_back(std::move(guard));
+        }
+    }
     static_cast<void>(trace_.record(
         output.start_time_ns,
         config_.name,
@@ -323,7 +469,187 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
     SimTimeNs dispatch_time = output.start_time_ns;
     std::uint64_t transaction_backoff = 0U;
 
-    for (;;) {
+    if (exact_single_fast_path) {
+        // This scheduler never consumes loop proofs or reversible epochs.
+        // Avoid their RAM bookkeeping, not the modeled loads/stores. Scopes
+        // restore the caller's tracking settings even if a callback throws.
+        std::vector<std::unique_ptr<mem::MemoryBus::TrackingScope>> tracking_scopes;
+        tracking_scopes.reserve(lane_boards.size());
+        for (auto* board : lane_boards) {
+            tracking_scopes.push_back(std::make_unique<mem::MemoryBus::TrackingScope>(
+                board->memory(), false, false));
+        }
+        struct ExactLane {
+            cpu::FastStepResult step{};
+            cpu::FastStepResult retired{};
+            SimTimeNs retired_time_ns{0};
+            SimTimeNs dispatch_time_ns{0};
+            std::uint64_t instructions{0};
+            std::uint64_t cycles{0};
+            std::uint64_t same_time_dispatches{0};
+        };
+        std::vector<ExactLane> lanes(boards_.size());
+        // Frontier selection reads only contiguous timestamps, not the
+        // larger lane/counter records. Inactive lanes use the maximum time.
+        std::vector<SimTimeNs> completion_times(lanes.size(), std::numeric_limits<SimTimeNs>::max());
+        const std::uint64_t all_lanes = lanes.size() == 64U
+            ? std::numeric_limits<std::uint64_t>::max()
+            : (std::uint64_t{1U} << lanes.size()) - 1U;
+        std::uint64_t runnable = options.max_instructions_per_board == 0U ? 0U : all_lanes;
+        std::uint64_t ready = runnable;
+        std::uint64_t in_flight = 0U;
+        std::uint64_t completing = 0U;
+        SimTimeNs now = output.start_time_ns;
+        for (auto& lane : lanes) lane.retired_time_ns = now;
+        // Keep counters and the last retired instruction in the compact lane
+        // array. Public result/diagnostic storage is only published at a stop
+        // or on return; it is not an observation API while a run is active.
+        const auto publish = [&](const std::size_t index) {
+            const auto& lane = lanes[index];
+            auto& result = output.boards[index].result;
+            result.instructions = lane.instructions;
+            result.cycles = lane.cycles;
+            result.time_ns = lane.retired_time_ns;
+            if (lane.instructions != 0U) {
+                result.diagnostic.instruction_address = lane.retired.instruction_address;
+                result.diagnostic.raw = lane.retired.raw;
+                result.diagnostic.instruction_size = lane.retired.instruction_size;
+            }
+        };
+        for (;;) {
+            // Events precede completions, and every completion precedes every
+            // start at the same timestamp. Low-bit traversal retains board order.
+            auto pending = completing;
+            while (pending != 0U) {
+                const auto index = static_cast<std::size_t>(std::countr_zero(pending));
+                const auto bit = std::uint64_t{1U} << index;
+                pending &= pending - 1U;
+                ExactLane& lane = lanes[index];
+                Board& board = *lane_boards[index];
+                auto& board_output = output.boards[index];
+                in_flight &= ~bit;
+                completion_times[index] = std::numeric_limits<SimTimeNs>::max();
+                if (lane.step.reason != cpu::StopReason::step_complete) [[unlikely]] {
+                    publish(index);
+                    BoardRunResult failure = board.cpuFailure(lane.step);
+                    failure.time_ns = now;
+                    accumulate(board_output, failure);
+                    runnable &= ~bit;
+                    board_output.terminal = true;
+                    if (!failure.succeeded()) {
+                        board_failed = true;
+                        stop_requested = stop_requested || options.stop_on_board_failure;
+                    }
+                    continue;
+                }
+                lane.instructions = saturatingAdd(lane.instructions, lane.step.instructions);
+                lane.cycles = saturatingAdd(lane.cycles, lane.step.cycles);
+                lane.retired_time_ns = now;
+                lane.retired = lane.step;
+                if (auto boundary = board.settleInstructionBoundary()) {
+                    publish(index);
+                    runnable &= ~bit;
+                    stopBoard(board_output, board, boundary->reason,
+                              std::move(boundary->message), now);
+                    board_failed = true;
+                    stop_requested = stop_requested || options.stop_on_board_failure;
+                    continue;
+                }
+                if (deadline != 0U && now >= deadline) {
+                    publish(index);
+                    runnable &= ~bit;
+                    stopBoard(board_output, board, BoardStopReason::time_budget,
+                              "simulated-time budget exhausted", now);
+                    time_exhausted = true;
+                } else if (lane.instructions >= options.max_instructions_per_board) {
+                    publish(index);
+                    runnable &= ~bit;
+                    stopBoard(board_output, board, BoardStopReason::instruction_budget,
+                              "instruction budget exhausted", now);
+                } else {
+                    ready |= bit;
+                }
+            }
+
+            if (deadline != 0U && now >= deadline) {
+                time_exhausted = true;
+                pending = ready;
+                while (pending != 0U) {
+                    const auto index = static_cast<std::size_t>(std::countr_zero(pending));
+                    const auto bit = std::uint64_t{1U} << index;
+                    pending &= pending - 1U;
+                    publish(index);
+                    runnable &= ~bit;
+                    stopBoard(output.boards[index], *lane_boards[index],
+                              BoardStopReason::time_budget,
+                              "simulated-time budget exhausted", now);
+                }
+                ready = 0U;
+            }
+
+            bool dispatched = false;
+            if (!stop_requested && !time_exhausted) {
+                pending = ready;
+                while (pending != 0U) {
+                    const auto index = static_cast<std::size_t>(std::countr_zero(pending));
+                    const auto bit = std::uint64_t{1U} << index;
+                    pending &= pending - 1U;
+                    ExactLane& lane = lanes[index];
+                    if (lane.dispatch_time_ns != now) {
+                        lane.dispatch_time_ns = now;
+                        lane.same_time_dispatches = 0U;
+                    }
+                    if (lane.same_time_dispatches >= options.instruction_quantum) continue;
+                    auto owner_scope = event_loop_.useOwner(static_cast<EventOwner>(index));
+                    const auto step = lane_boards[index]->beginConcurrentStep(false, options.enable_jit);
+                    lane.step = step.cpu_result;
+                    completion_times[index] = saturatingAdd(now, step.elapsed_ns);
+                    ready &= ~bit;
+                    in_flight |= bit;
+                    ++lane.same_time_dispatches;
+                    ++output.dispatches;
+                    ++output.exact_dispatches;
+                    dispatched = true;
+                }
+                if (dispatched) ++output.rounds;
+            }
+
+            if (in_flight == 0U) {
+                if (runnable == 0U || stop_requested || time_exhausted) break;
+                for (auto& lane : lanes) lane.same_time_dispatches = 0U;
+                completing = 0U;
+                continue;
+            }
+            SimTimeNs next_completion = std::numeric_limits<SimTimeNs>::max();
+            completing = 0U;
+            for (std::size_t index = 0U; index < completion_times.size(); ++index) {
+                const auto at = completion_times[index];
+                if (at <= next_completion) {
+                    if (at < next_completion) completing = 0U;
+                    next_completion = at;
+                    completing |= std::uint64_t{1U} << index;
+                }
+            }
+            completing &= in_flight;
+            if (const auto next_event = event_loop_.nextScheduledTime();
+                next_event && *next_event < next_completion) {
+                next_completion = *next_event;
+                completing = 0U;
+            }
+            const auto events = event_loop_.runDueEvents(next_completion);
+            now = events.stopped_at;
+            if (now != next_completion) completing = 0U;
+            output.event_callbacks = saturatingAdd(output.event_callbacks, events.events_executed);
+            if (events.same_time_limit_hit) {
+                trace_.record(now, config_.name, "event_livelock");
+            }
+        }
+        // Stopped lanes already have their full stop diagnostic, which must
+        // not be overwritten by the last successfully retired instruction.
+        for (std::size_t index = 0U; index < lanes.size(); ++index) {
+            if ((runnable & (std::uint64_t{1U} << index)) != 0U) publish(index);
+        }
+    } else for (;;) {
         const SimTimeNs now = event_loop_.now();
         if (now != dispatch_time) {
             dispatch_time = now;
@@ -394,7 +720,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
             if (completed.cpu_result.reason != cpu::StopReason::step_complete) [[unlikely]] {
                 BoardRunResult slice = board.cpuFailure(completed.cpu_result);
                 slice.time_ns = now;
-                accumulate(board_output, slice, output);
+                accumulate(board_output, slice);
                 state.runnable = false;
                 board_output.terminal = true;
                 state.proven_loop.reset();
@@ -402,6 +728,9 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                 if (!slice.succeeded()) {
                     board_failed = true;
                     stop_requested = stop_requested || options.stop_on_board_failure;
+                    if (deferred_enabled && stop_requested) {
+                        materialize_deferred(now, true, states.size());
+                    }
                 }
                 continue;
             }
@@ -419,10 +748,6 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
             board_output.result.diagnostic.raw = completed.cpu_result.raw;
             board_output.result.diagnostic.instruction_size =
                 completed.cpu_result.instruction_size;
-            output.instructions = saturatingAdd(
-                output.instructions, completed.cpu_result.instructions
-            );
-            output.cycles = saturatingAdd(output.cycles, completed.cpu_result.cycles);
 
             const std::uint32_t pc_before_settle = board.cpu().state().r[15];
             const std::uint16_t ipsr_before_settle = board.cpu().state().ipsr();
@@ -435,6 +760,9 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                 state.proven_loop.reset();
                 state.inside_proven_loop = false;
                 stop_requested = stop_requested || options.stop_on_board_failure;
+                if (deferred_enabled && stop_requested) {
+                    materialize_deferred(now, true, states.size());
+                }
                 continue;
             }
             if (board.cpu().state().r[15] != pc_before_settle
@@ -454,7 +782,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
             // Proof work is skipped when neither batching nor spin
             // detection can consume it (also keeps no-batch lockstep
             // bursts firing instead of latching lanes "proven").
-            if ((options.enable_loop_batching || options.detect_spin)
+            if (((!deferred_enabled && options.enable_loop_batching) || options.detect_spin)
                 && !completed.cpu_result.suppress_loop_observation
                 && board.cpu().state().r[15]
                     <= completed.cpu_result.instruction_address) {
@@ -526,7 +854,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
             }
         }
 
-        bool burst_eligible = !options.enable_transactional_slices
+        bool burst_eligible = !deferred_enabled && !options.enable_transactional_slices
             && !options.trace_instructions && !options.detect_spin
             && !stop_requested && !time_exhausted && !states.empty();
         bool all_lanes_proven = !states.empty();
@@ -551,71 +879,136 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                 if (options.enable_jit) {
                     const auto block_deadline = deadline == 0U
                         ? std::nullopt : std::optional<SimTimeNs>{deadline};
-                    const auto remaining = options.max_instructions_per_board
-                        - output.boards.front().result.instructions;
-                    const auto first_block = lane_boards.front()->peekPredictedBlockCost(
-                        static_cast<std::size_t>(std::min<std::uint64_t>(remaining,
-                            cpu::CortexM4::JitStepOutcome::max_block)), block_deadline);
-                    if (first_block) {
-                        const auto& first = first_block->cost;
-                        const std::uint64_t numerator = first.cycles
-                            * 1'000'000'000ULL + first.fraction;
-                        synchronized_blocks = true;
-                        burst_block_limits[0] = first_block->instructions;
-                        for (std::size_t index = 1U; index < boards_.size(); ++index) {
-                            const auto lane_remaining = options.max_instructions_per_board
-                                - output.boards[index].result.instructions;
-                            const auto other = lane_boards[index]->peekPredictedBlockCost(
-                                static_cast<std::size_t>(std::min<std::uint64_t>(lane_remaining,
-                                    cpu::CortexM4::JitStepOutcome::max_block)), block_deadline);
-                            if (!other || other->cost.frequency != first.frequency
-                                || other->cost.cycles * 1'000'000'000ULL + other->cost.fraction
-                                    != numerator) {
-                                synchronized_blocks = false;
-                                break;
+                    for (std::size_t index = 0U; index < boards_.size(); ++index) {
+                        const auto lane_remaining = options.max_instructions_per_board
+                            - output.boards[index].result.instructions;
+                        const auto limit = static_cast<std::size_t>(std::min<std::uint64_t>(
+                            lane_remaining, cpu::CortexM4::JitStepOutcome::max_block));
+                        burst_block_costs[index] = lane_boards[index]->peekPredictedBlockCosts(
+                            limit, block_deadline);
+                    }
+                    std::uint64_t best_instruction_score = 0U;
+                    SimTimeNs best_elapsed = 0U;
+                    // Prefix numerators are strictly increasing. Intersect the
+                    // per-lane frontiers with a multiway merge rather than
+                    // rescanning every lane for every first-lane candidate.
+                    const std::uint64_t common_frequency =
+                        burst_block_costs.front().count == 0U ? 0U
+                        : burst_block_costs.front().prefixes[0].cost.frequency;
+                    bool all_lanes_have_costs = common_frequency != 0U;
+                    for (const auto& lane_costs : burst_block_costs) {
+                        all_lanes_have_costs = all_lanes_have_costs
+                            && lane_costs.count != 0U
+                            && lane_costs.prefixes[0].cost.frequency == common_frequency;
+                    }
+                    if (all_lanes_have_costs && !synchronized_blocks) {
+                        std::fill(burst_prefix_indices.begin(),
+                            burst_prefix_indices.end(), 0U);
+                        while (true) {
+                            std::uint64_t target_numerator = 0U;
+                            for (std::size_t index = 0U; index < boards_.size(); ++index) {
+                                const auto& prefix = burst_block_costs[index].prefixes[
+                                    burst_prefix_indices[index]];
+                                const std::uint64_t numerator = prefix.cost.cycles
+                                    * 1'000'000'000ULL + prefix.cost.fraction;
+                                target_numerator = std::max(target_numerator, numerator);
                             }
-                            burst_block_limits[index] = other->instructions;
+                            bool exhausted = false;
+                            for (std::size_t index = 0U; index < boards_.size(); ++index) {
+                                const auto& lane_costs = burst_block_costs[index];
+                                auto& prefix_index = burst_prefix_indices[index];
+                                while (prefix_index < lane_costs.count) {
+                                    const auto& prefix = lane_costs.prefixes[prefix_index];
+                                    const std::uint64_t numerator = prefix.cost.cycles
+                                        * 1'000'000'000ULL + prefix.cost.fraction;
+                                    if (numerator >= target_numerator) break;
+                                    ++prefix_index;
+                                }
+                                if (prefix_index == lane_costs.count) {
+                                    exhausted = true;
+                                    break;
+                                }
+                            }
+                            if (exhausted) break;
+
+                            bool shared = true;
+                            bool all_prefixes_pure = true;
+                            std::uint64_t instruction_score = 0U;
+                            bool has_multi_instruction_lane = false;
+                            for (std::size_t index = 0U; index < boards_.size(); ++index) {
+                                const auto& prefix = burst_block_costs[index].prefixes[
+                                    burst_prefix_indices[index]];
+                                const std::uint64_t numerator = prefix.cost.cycles
+                                    * 1'000'000'000ULL + prefix.cost.fraction;
+                                if (numerator != target_numerator) {
+                                    shared = false;
+                                    break;
+                                }
+                                candidate_block_limits[index] = prefix.instructions;
+                                instruction_score += prefix.instructions;
+                                has_multi_instruction_lane = has_multi_instruction_lane
+                                    || prefix.instructions > 1U;
+                                // A single-instruction prediction may be a
+                                // memory/MMIO access. It can schedule an event
+                                // after the shared horizon was inspected, so
+                                // it must not share a frontier with a peer
+                                // block that would advance past that event.
+                                const auto pure_preview = lane_boards[index]->cpu()
+                                    .peekJitBlock(prefix.instructions);
+                                all_prefixes_pure = all_prefixes_pure && pure_preview
+                                    && prefix.instructions
+                                        <= pure_preview->exact_cycle_prefix_count;
+                            }
+                            if (shared && all_prefixes_pure && has_multi_instruction_lane) {
+                                const SimTimeNs candidate_elapsed =
+                                    target_numerator / common_frequency;
+                                if (candidate_elapsed != 0U
+                                    && (deadline == 0U
+                                        || candidate_elapsed <= deadline - round_start)
+                                    && (instruction_score > best_instruction_score
+                                        || (instruction_score == best_instruction_score
+                                            && candidate_elapsed > best_elapsed))) {
+                                    best_instruction_score = instruction_score;
+                                    best_elapsed = candidate_elapsed;
+                                    std::copy(candidate_block_limits.begin(),
+                                        candidate_block_limits.end(), best_block_limits.begin());
+                                }
+                            }
+                            if (shared) {
+                                bool exhausted = false;
+                                for (std::size_t index = 0U; index < boards_.size(); ++index) {
+                                    auto& prefix_index = burst_prefix_indices[index];
+                                    ++prefix_index;
+                                    exhausted = exhausted
+                                        || prefix_index == burst_block_costs[index].count;
+                                }
+                                if (exhausted) break;
+                            }
                         }
-                        if (synchronized_blocks) elapsed = numerator / first.frequency;
+                    }
+                    if (best_instruction_score != 0U) {
+                        synchronized_blocks = true;
+                        elapsed = best_elapsed;
+                        std::copy(best_block_limits.begin(), best_block_limits.end(),
+                            burst_block_limits.begin());
                     }
                 }
-                if (!synchronized_blocks) {
-                    std::fill(burst_block_limits.begin(), burst_block_limits.end(), 1U);
-                    // Variable-CPI prediction: every lane forecasts its exact
-                    // next-instruction cost (pipeline class + ART flash stall).
-                    // Any unpredictable lane or divergent cost falls back to
-                    // the exact general scheduler. Lanes are compared on clock
-                    // frequency and time numerators so the gate performs one ns
-                    // division per round instead of one per lane; mixed-clock
-                    // lanes use the general scheduler. Predictions are exact,
-                    // so no post-step rollback is needed.
-                    const auto first_cost = lane_boards.front()->peekPredictedCost();
-                    if (!first_cost || first_cost->frequency == 0U) break;
-                    const std::uint64_t numerator = first_cost->cycles
-                            * 1'000'000'000ULL + first_cost->fraction;
-                    bool same_elapsed = true;
-                    for (std::size_t index = 1; index < boards_.size(); ++index) {
-                        const auto other = lane_boards[index]->peekPredictedCost();
-                        same_elapsed = same_elapsed && other
-                            && other->frequency == first_cost->frequency
-                            && other->cycles * 1'000'000'000ULL + other->fraction
-                                == numerator;
-                    }
-                    if (!same_elapsed) break;
-                    elapsed = numerator / first_cost->frequency;
-                    if (elapsed == 0U
-                        || (deadline != 0U && elapsed > deadline - round_start)) break;
-                }
+                // A next-instruction forecast is not enough for lockstep:
+                // executing that instruction may change RCC/flash timing or
+                // schedule shared work. Fall back to the exact async scheduler
+                // unless a common pure fixed-cost block was fully proven.
+                if (!synchronized_blocks) break;
 
                 for (std::size_t index = 0; index < boards_.size(); ++index) {
                     auto owner_scope = event_loop_.useOwner(static_cast<EventOwner>(index));
                     burst_steps[index] = lane_boards[index]->beginConcurrentStep(
-                        false, options.enable_jit, burst_block_limits[index]);
+                        false, options.enable_jit, burst_block_limits[index], true);
                     ++output.dispatches;
                     ++output.exact_dispatches;
                 }
-                // Larger blocks are admitted only when every lane has a pure,
-                // fixed-cost prefix with the same exact completion time and no
+                // Multi-instruction blocks are admitted only when every lane has a pure,
+                // fixed-cost prefix (which may be a single instruction on some lanes)
+                // with the same exact completion time and no
                 // intervening event/interrupt/deadline. No lane can create a
                 // new MMIO event or start its next dispatch inside another's block.
                 const SimTimeNs completion = saturatingAdd(round_start, elapsed);
@@ -643,7 +1036,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                     if (step.reason != cpu::StopReason::step_complete) [[unlikely]] {
                         BoardRunResult slice = board.cpuFailure(step);
                         slice.time_ns = completion;
-                        accumulate(board_output, slice, output);
+                        accumulate(board_output, slice);
                         states[index].runnable = false;
                         board_output.terminal = true;
                         if (!slice.succeeded()) {
@@ -667,8 +1060,6 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                         step.instruction_address;
                     board_output.result.diagnostic.raw = step.raw;
                     board_output.result.diagnostic.instruction_size = step.instruction_size;
-                    output.instructions = saturatingAdd(output.instructions, step.instructions);
-                    output.cycles = saturatingAdd(output.cycles, step.cycles);
                     states[index].ready_time_ns = completion;
 
                     const std::uint32_t pc_before_settle = board.cpu().state().r[15];
@@ -799,7 +1190,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                         output.event_callbacks, events.events_executed
                     );
                     for (std::size_t index = 0; index < boards_.size(); ++index) {
-                        accumulate(output.boards[index], slices[index], output);
+                        accumulate(output.boards[index], slices[index]);
                         states[index].ready_time_ns = committed_time;
                         states[index].proven_loop.reset();
                         states[index].inside_proven_loop = false;
@@ -838,7 +1229,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
             // monopolize a timestamp. The user quantum caps each same-time burst;
             // ordinary positive-duration instructions naturally yield every step.
             std::fill(planned_iterations.begin(), planned_iterations.end(), 0U);
-            bool can_batch_all_lanes = options.enable_loop_batching
+            bool can_batch_all_lanes = !deferred_enabled && options.enable_loop_batching
                 && !options.trace_instructions && !options.detect_spin;
             bool has_runnable_lane = false;
             std::optional<SimTimeNs> batch_horizon;
@@ -920,10 +1311,6 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                         board_output.result.cycles = saturatingAdd(
                             board_output.result.cycles, state.loop_skip.cycles
                         );
-                        output.instructions = saturatingAdd(
-                            output.instructions, state.loop_skip.instructions
-                        );
-                        output.cycles = saturatingAdd(output.cycles, state.loop_skip.cycles);
                         state.ready_time_ns = saturatingAdd(now, state.loop_skip.elapsed_ns);
                         state.loop_skip_in_flight = true;
                         state.in_flight = true;
@@ -938,6 +1325,55 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
                 }
 
                 auto owner_scope = event_loop_.useOwner(static_cast<EventOwner>(index));
+                if (deferred_enabled) {
+                    const auto remaining = options.max_instructions_per_board
+                        - output.boards[index].result.instructions;
+                    const auto maximum = options.enable_ram_capsules
+                        ? Board::ReversibleRamPrefix::max_instructions
+                        : cpu::CortexM4::JitStepOutcome::max_block;
+                    const auto limit = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, maximum));
+                    const auto lane_deadline = deadline == 0U
+                        ? std::nullopt : std::optional<SimTimeNs>{deadline};
+                    if (options.enable_ram_capsules) {
+                        if (!state.ram) state.ram.emplace();
+                        state.ram_active = board.prepareReversibleRamPrefix(*state.ram, limit, lane_deadline, true);
+                    } else {
+                        state.deferred = board.prepareDeferredPurePrefix(limit, lane_deadline);
+                    }
+                    if (state.ram_active && state.ram->count == 1U) {
+                        // Keep an already evaluated singleton instead of undoing
+                        // it and executing the same instruction a second time.
+                        // It is an ordinary eager step, not a hidden future span.
+                        state.step = board.materializeReversibleRamPrefix(*state.ram, 1U);
+                        state.ready_time_ns = state.ram->completion_times_ns[0U];
+                        state.ram_active = false;
+                        state.in_flight = true;
+                        ++output.dispatches;
+                        ++output.exact_dispatches;
+                        dispatched = true;
+                        continue;
+                    }
+                    if (state.ram_active || state.deferred) {
+                        const auto& prefix = state.ram_active
+                            ? static_cast<const Board::DeferredPurePrefix&>(*state.ram) : *state.deferred;
+                        state.ready_time_ns = prefix.completion_times_ns[prefix.count - 1U];
+                        state.in_flight = true;
+                        ++state.same_time_dispatches;
+                        ++output.dispatches;
+                        ++output.deferred_prefixes;
+                        if (index < 64U) active_capsule_mask |= std::uint64_t{1U} << index;
+                        dispatched = true;
+                        continue;
+                    }
+                    // Board-local MMIO cannot observe peer CPU state. The
+                    // CAN delivery hook below materializes peers before the
+                    // only wired synchronous cross-board peripheral effect.
+                }
+                // A different lane may schedule a shared event while this
+                // instruction is in flight. Keep general concurrent dispatch
+                // atomic; only the lockstep path may admit pure multi-op
+                // prefixes after proving every lane's common frontier.
+                DispatchScope dispatch_scope(current_dispatch_index, index);
                 state.step = board.beginConcurrentStep(
                     options.trace_instructions, options.enable_jit);
                 state.ready_time_ns = saturatingAdd(now, state.step->elapsed_ns);
@@ -974,6 +1410,15 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
         for (const SchedulerState& state : states) {
             if (state.in_flight) next_completion = std::min(next_completion, state.ready_time_ns);
         }
+        if (deferred_enabled) {
+            const auto next_event = event_loop_.nextScheduledTime();
+            if (next_event && *next_event <= next_completion) {
+                next_completion = *next_event;
+                materialize_deferred(next_completion, true, states.size());
+            } else {
+                materialize_deferred(next_completion, false, states.size());
+            }
+        }
         const auto events = event_loop_.runDueEvents(next_completion);
         output.event_callbacks = saturatingAdd(output.event_callbacks, events.events_executed);
         if (events.same_time_limit_hit) {
@@ -1002,6 +1447,13 @@ Result<WorldRunResult> World::run(const WorldRunOptions& options) {
         }
     }
 
+    // Only per-lane totals affect scheduling. Summing once at the end is
+    // equivalent to saturating after each nonnegative increment, including
+    // loops and failure slices, and removes two hot-path updates per step.
+    for (const auto& lane : output.boards) {
+        output.instructions = saturatingAdd(output.instructions, lane.result.instructions);
+        output.cycles = saturatingAdd(output.cycles, lane.result.cycles);
+    }
     output.end_time_ns = event_loop_.now();
     if (board_failed) {
         output.reason = WorldStopReason::board_failure;

@@ -388,7 +388,15 @@ void printNativeJitStats(std::ostream& out, const cpu::CortexM4& cpu, const std:
         << " executions=" << stats.native_executions
         << " instructions=" << stats.native_instructions
         << " failures=" << stats.native_compilation_failures
-        << " evictions=" << stats.native_evictions << '\n';
+        << " evictions=" << stats.native_evictions
+        << " block_executions=" << stats.block_executions
+        << " block_instructions=" << stats.block_instructions
+        << " block_compilations=" << stats.compilations
+        << " block_fallbacks=" << stats.fallbacks
+        << " single_fast=" << stats.single_fast
+        << " single_generic=" << stats.single_generic
+        << " block_generic=" << stats.block_generic
+        << " single_decline=" << stats.single_decline << '\n';
     if (!cpu.nativeJitError().empty()) out << "native_jit_error: " << cpu.nativeJitError() << '\n';
 }
 
@@ -846,6 +854,8 @@ ExitCode runNetworkCommand(
     bool enable_loop_batching = true;
     bool enable_jit = false;
     bool enable_transactional_slices = false;
+    bool enable_deferred_prefixes = false;
+    bool enable_ram_capsules = false;
     bool allow_breakpoint = false;
     unsigned int adc_decimation = 1U;
     std::vector<PendingCanInjection> injections;
@@ -901,6 +911,8 @@ ExitCode runNetworkCommand(
         else if (option == "--loop-batching") enable_loop_batching = true;
         else if (option == "--no-loop-batching") enable_loop_batching = false;
         else if (option == "--jit") enable_jit = true;
+        else if (option == "--deferred-prefixes") enable_deferred_prefixes = true;
+        else if (option == "--ram-capsules") enable_ram_capsules = true;
         else if (option == "--transactional-slices") enable_transactional_slices = true;
         else if (option == "--no-transactional-slices") enable_transactional_slices = false;
         else if (option == "--allow-breakpoint") allow_breakpoint = true;
@@ -973,6 +985,8 @@ ExitCode runNetworkCommand(
     options.enable_loop_batching = enable_loop_batching;
     options.enable_jit = enable_jit;
     options.enable_transactional_slices = enable_transactional_slices;
+    options.enable_deferred_prefixes = enable_deferred_prefixes;
+    options.enable_ram_capsules = enable_ram_capsules;
     options.adc_decimation = adc_decimation;
     auto result = world.value()->run(options);
     if (!result) {
@@ -1001,6 +1015,11 @@ ExitCode runNetworkCommand(
         << "transactional_instructions: "
         << result.value().transactional_instructions << '\n'
         << "lockstep_bursts: " << result.value().lockstep_bursts << '\n';
+    if (enable_deferred_prefixes || enable_ram_capsules) {
+        out << "deferred_prefixes: " << result.value().deferred_prefixes << '\n'
+            << "deferred_instructions: " << result.value().deferred_instructions << '\n'
+            << "deferred_truncations: " << result.value().deferred_truncations << '\n';
+    }
     const bool unmet_expectation = expectation_evaluator.hasFailures();
     for (std::size_t index = 0; index < expectations.size(); ++index) {
         const auto& check = expectations[index];
@@ -1388,6 +1407,8 @@ void printHelp(std::ostream& out) {
         << "  --strict-mmio --trace-instr --detect-spin --no-loop-batching --jit --allow-breakpoint\n"
         << "  --adc-decimation N (keep 1 of N continuous ADC scans)\n"
         << "  --transactional-slices (experimental parallel lane epochs)\n"
+        << "  --deferred-prefixes (experimental interruptible pure JIT prefixes)\n"
+        << "  --ram-capsules (experimental reversible RAM prefixes; --no-loop-batching)\n"
         << "  --inject-can BUS[@TIME_MS]:ID:HEXDATA\n\n"
         << "Watch-network options:\n"
         << "  --duration-ms N --refresh-ms N --max-instructions N --quantum N\n"

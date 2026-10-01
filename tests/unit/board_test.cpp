@@ -47,6 +47,16 @@ TEST(BoardTest, WorkerSliceMatchesStandaloneExecution) {
         << "owner-local slice preserves standalone architectural results";
 }
 
+TEST(BoardTest, WorkerBoundaryStillHonorsResetRequestsWithoutTakableIrqs) {
+    auto board = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(board);
+    ASSERT_TRUE(board.value()->memory().write32(0xe000ed0cU, 0x05fa0004U));
+
+    const auto result = board.value()->runWorkerSlice(0U, 10U, 1'000U);
+    EXPECT_EQ(result.reason, fil::sim::BoardStopReason::reset_requested);
+    EXPECT_EQ(result.instructions, 0U);
+}
+
 TEST(BoardTest, RestoresTransactionalBoardState) {
     auto board = fil::sim::Board::load(fixtureBoard());
     EXPECT_TRUE(board.hasValue()) << "loads board for transaction rollback";
@@ -96,6 +106,252 @@ bool installAndWarmJitLoop(fil::sim::Board& board, const bool mmio = false) {
     board.cpu().state() = initial;
     board.cpu().state().r[1] = 0xe0001004U;
     return board.cpu().jitBlockReady();
+}
+
+bool installBranchingReversibleProgram(fil::sim::Board& board) {
+    const std::uint32_t start = board.cpu().state().r[15];
+    std::vector<std::uint8_t> code;
+    for (unsigned int i = 0U; i < 80U; ++i) {
+        code.push_back(0x01U); code.push_back(0x30U); // adds r0, #1
+        if (i == 5U) {
+            code.push_back(0x00U); code.push_back(0xd1U); // bne +0: skip next halfword
+            code.push_back(0x01U); code.push_back(0x30U);
+        } else if (i == 12U) {
+            code.push_back(0x00U); code.push_back(0xe0U); // b +0: skip next halfword
+            code.push_back(0x01U); code.push_back(0x30U);
+        }
+    }
+    if (!board.memory().loadBytes(start, code)) return false;
+    const auto initial = board.cpu().state();
+    // Warm entry points reached after conditional/unconditional branches and
+    // the 16-op CPU block cap; the Board chain itself must never execute cold.
+    for (const unsigned int instruction : {0U, 8U, 17U, 33U, 49U, 65U, 81U}) {
+        for (unsigned int attempt = 0U; attempt < 64U; ++attempt) {
+            board.cpu().state().r[15] = start + instruction * 2U;
+            static_cast<void>(board.cpu().prepareJitBlock());
+        }
+    }
+    board.cpu().state() = initial;
+    board.cpu().state().r[0] = 0U;
+    board.cpu().setNativeSingleInstructionJitEnabled(false);
+    return true;
+}
+
+TEST(BoardTest, ReversibleRamPrefixChainsBranchesAndReplaysLongCuts) {
+    auto exact = fil::sim::Board::load(fixtureBoard());
+    auto speculative = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(exact && speculative);
+    ASSERT_TRUE(installBranchingReversibleProgram(*exact.value()));
+    ASSERT_TRUE(installBranchingReversibleProgram(*speculative.value()));
+
+    const auto prefix = speculative.value()->prepareReversibleRamPrefix(64U);
+    ASSERT_TRUE(prefix);
+    EXPECT_EQ(prefix->count, 64U);
+    EXPECT_EQ(prefix->evaluated.count, prefix->count);
+    bool crossed_branch = false;
+    for (std::size_t i = 1U; i < prefix->count; ++i) {
+        crossed_branch |= prefix->evaluated.pcs[i]
+            != prefix->evaluated.pcs[i - 1U] + prefix->evaluated.sizes[i - 1U];
+    }
+    EXPECT_TRUE(crossed_branch) << "the chained metadata follows taken conditional/unconditional branches";
+
+    constexpr std::size_t cut = 23U;
+    const auto committed = speculative.value()->materializeReversibleRamPrefix(*prefix, cut);
+    fil::sim::BoardRunOptions options;
+    options.max_instructions = cut;
+    options.duration_ns = 0U;
+    options.enable_loop_batching = false;
+    const auto reference = exact.value()->run(options);
+    EXPECT_EQ(reference.instructions, cut);
+    EXPECT_EQ(committed.cpu_result.instructions, cut);
+    EXPECT_EQ(committed.cpu_result.instruction_address, prefix->evaluated.pcs[cut - 1U]);
+    EXPECT_EQ(committed.cpu_result.cycles, reference.cycles);
+    EXPECT_EQ(committed.elapsed_ns, reference.time_ns);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(speculative.value()->cpu().state(), exact.value()->cpu().state()));
+
+    auto full_exact = fil::sim::Board::load(fixtureBoard());
+    auto full_speculative = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(full_exact && full_speculative);
+    ASSERT_TRUE(installBranchingReversibleProgram(*full_exact.value()));
+    ASSERT_TRUE(installBranchingReversibleProgram(*full_speculative.value()));
+    const auto full_prefix = full_speculative.value()->prepareReversibleRamPrefix(64U);
+    ASSERT_TRUE(full_prefix);
+    ASSERT_EQ(full_prefix->count, 64U);
+    const auto full_commit = full_speculative.value()->materializeReversibleRamPrefix(
+        *full_prefix, full_prefix->count);
+    options.max_instructions = 64U;
+    const auto full_reference = full_exact.value()->run(options);
+    EXPECT_EQ(full_commit.cpu_result.instructions, 64U);
+    EXPECT_EQ(full_commit.cpu_result.cycles, full_reference.cycles);
+    EXPECT_EQ(full_commit.elapsed_ns, full_reference.time_ns);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(full_speculative.value()->cpu().state(),
+                                       full_exact.value()->cpu().state()));
+}
+
+TEST(BoardTest, ReversibleRamPrefixRespectsInstructionAndTimeBoundaries) {
+    auto budget_board = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(budget_board);
+    ASSERT_TRUE(installBranchingReversibleProgram(*budget_board.value()));
+    const auto budget = budget_board.value()->prepareReversibleRamPrefix(17U);
+    ASSERT_TRUE(budget);
+    EXPECT_EQ(budget->count, 17U);
+
+    auto event_board = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(event_board);
+    ASSERT_TRUE(installBranchingReversibleProgram(*event_board.value()));
+    const auto baseline = event_board.value()->prepareReversibleRamPrefix(40U);
+    ASSERT_TRUE(baseline);
+    ASSERT_GE(baseline->count, 2U);
+    const auto event_time = baseline->completion_times_ns[1U];
+    ASSERT_TRUE(event_board.value()->eventLoop().scheduleAt(event_time, [] {}));
+    EXPECT_FALSE(event_board.value()->prepareReversibleRamPrefix(40U));
+
+    auto deadline_board = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(deadline_board);
+    ASSERT_TRUE(installBranchingReversibleProgram(*deadline_board.value()));
+    const auto deadline_baseline = deadline_board.value()->prepareReversibleRamPrefix(40U);
+    ASSERT_TRUE(deadline_baseline);
+    EXPECT_FALSE(deadline_board.value()->prepareReversibleRamPrefix(
+        40U, deadline_baseline->completion_times_ns[1U]));
+
+    auto tick_board = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(tick_board);
+    ASSERT_TRUE(installBranchingReversibleProgram(*tick_board.value()));
+    const auto tick_baseline = tick_board.value()->prepareReversibleRamPrefix(40U);
+    ASSERT_TRUE(tick_baseline);
+    ASSERT_GE(tick_baseline->count, 2U);
+    const auto tick_cycles = tick_baseline->cumulative_cycles[1U];
+    ASSERT_GT(tick_cycles, 0U);
+    ASSERT_TRUE(tick_board.value()->memory().write32(
+        0xe000e014U, static_cast<std::uint32_t>(tick_cycles - 1U)));
+    ASSERT_TRUE(tick_board.value()->memory().write32(0xe000e010U, 3U));
+    EXPECT_FALSE(tick_board.value()->prepareReversibleRamPrefix(40U));
+}
+
+TEST(BoardTest, DeferredPurePrefixAdmissionDoesNotExecuteAndCanMaterializeOne) {
+    auto board = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(board);
+    ASSERT_TRUE(installAndWarmJitLoop(*board.value()));
+    const auto initial = board.value()->cpu().state();
+    const auto admitted_time = board.value()->eventLoop().now();
+    EXPECT_FALSE(board.value()->prepareDeferredPurePrefix(1U));
+    EXPECT_FALSE(board.value()->prepareDeferredPurePrefix(8U, admitted_time + 1U));
+    const auto prefix = board.value()->prepareDeferredPurePrefix(8U);
+    ASSERT_TRUE(prefix);
+    EXPECT_GE(prefix->count, 2U);
+    EXPECT_EQ(prefix->entry_pc, initial.r[15]);
+    EXPECT_EQ(board.value()->eventLoop().now(), admitted_time);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(board.value()->cpu().state(), initial));
+
+    const auto result = board.value()->materializeDeferredPurePrefix(*prefix, 1U);
+    EXPECT_EQ(result.cpu_result.instructions, 1U);
+    EXPECT_EQ(board.value()->cpu().state().r[15], initial.r[15] + 2U);
+    EXPECT_GT(result.cpu_result.cycles, 0U);
+    EXPECT_GT(result.elapsed_ns, 0U);
+}
+
+TEST(BoardTest, DeferredPurePrefixWithFractionAndFlashWaitsMatchesExactExecution) {
+    auto exact = fil::sim::Board::load(fixtureBoard());
+    auto deferred = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(exact && deferred);
+    ASSERT_TRUE(exact.value()->memory().write32(0x40022000U, 2U));
+    ASSERT_TRUE(deferred.value()->memory().write32(0x40022000U, 2U));
+    ASSERT_TRUE(installAndWarmJitLoop(*exact.value()));
+    ASSERT_TRUE(installAndWarmJitLoop(*deferred.value()));
+
+    // Advance both boards by one instruction to leave a fractional-ns phase.
+    fil::sim::BoardRunOptions one;
+    one.max_instructions = 1U;
+    one.duration_ns = 0U;
+    one.enable_loop_batching = false;
+    const auto exact_first = exact.value()->run(one);
+    const auto deferred_first = deferred.value()->run(one);
+    ASSERT_EQ(exact_first.instructions, 1U);
+    ASSERT_EQ(deferred_first.instructions, 1U);
+    ASSERT_TRUE(installAndWarmJitLoop(*exact.value()));
+    ASSERT_TRUE(installAndWarmJitLoop(*deferred.value()));
+
+    const auto prefix = deferred.value()->prepareDeferredPurePrefix(8U);
+    ASSERT_TRUE(prefix);
+    EXPECT_NE(prefix->time_fraction, 0U);
+    ASSERT_GE(prefix->count, 2U);
+    const std::size_t count = 2U;
+    one.max_instructions = count;
+    const auto reference = exact.value()->run(one);
+    ASSERT_EQ(reference.instructions, count);
+    const auto materialized = deferred.value()->materializeDeferredPurePrefix(*prefix, count);
+    EXPECT_EQ(materialized.cpu_result.instructions, count);
+    EXPECT_EQ(materialized.cpu_result.cycles, reference.cycles);
+    EXPECT_EQ(materialized.elapsed_ns, reference.time_ns - exact_first.time_ns);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(deferred.value()->cpu().state(), exact.value()->cpu().state()));
+}
+
+TEST(BoardTest, DeferredPurePrefixRejectsExecutableCodeInvalidation) {
+    auto board = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(board);
+    ASSERT_TRUE(installAndWarmJitLoop(*board.value()));
+    const auto prefix = board.value()->prepareDeferredPurePrefix(8U);
+    ASSERT_TRUE(prefix);
+    const auto before = board.value()->cpu().state();
+    const std::uint32_t pc = before.r[15];
+    const std::vector<std::uint8_t> replacement{0x02U, 0x30U};
+    ASSERT_TRUE(board.value()->memory().loadBytes(pc, replacement));
+    const auto result = board.value()->materializeDeferredPurePrefix(*prefix, 1U);
+    EXPECT_EQ(result.cpu_result.instructions, 0U);
+    EXPECT_EQ(result.elapsed_ns, 0U);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(board.value()->cpu().state(), before));
+}
+
+TEST(BoardTest, DeferredPurePrefixStopsStrictlyBeforeEventAndSysTick) {
+    auto event_board = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(event_board);
+    ASSERT_TRUE(installAndWarmJitLoop(*event_board.value()));
+    const auto baseline = event_board.value()->prepareDeferredPurePrefix(8U);
+    ASSERT_TRUE(baseline);
+    ASSERT_GE(baseline->count, 2U);
+    ASSERT_TRUE(event_board.value()->eventLoop().scheduleAt(
+        baseline->completion_times_ns[1U], [] {}));
+    EXPECT_FALSE(event_board.value()->prepareDeferredPurePrefix(8U));
+
+    auto tick_board = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(tick_board);
+    ASSERT_TRUE(installAndWarmJitLoop(*tick_board.value()));
+    const auto tick_baseline = tick_board.value()->prepareDeferredPurePrefix(8U);
+    ASSERT_TRUE(tick_baseline);
+    ASSERT_GE(tick_baseline->count, 2U);
+    const auto cycles_to_boundary = tick_baseline->cumulative_cycles[1U];
+    ASSERT_GT(cycles_to_boundary, 0U);
+    ASSERT_TRUE(tick_board.value()->memory().write32(
+        0xe000e014U, static_cast<std::uint32_t>(cycles_to_boundary - 1U)));
+    ASSERT_TRUE(tick_board.value()->memory().write32(0xe000e010U, 3U));
+    EXPECT_FALSE(tick_board.value()->prepareDeferredPurePrefix(8U));
+}
+
+TEST(BoardTest, SingleInstructionDispatchMatchesWithFlashWaits) {
+    auto exact = fil::sim::Board::load(fixtureBoard());
+    auto jit = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(exact && jit);
+    ASSERT_TRUE(exact.value()->memory().write32(0x40022000U, 2U));
+    ASSERT_TRUE(jit.value()->memory().write32(0x40022000U, 2U));
+    ASSERT_TRUE(installAndWarmJitLoop(*exact.value()));
+    ASSERT_TRUE(installAndWarmJitLoop(*jit.value()));
+    const std::uint32_t target = exact.value()->cpu().state().r[15] + 6U;
+
+    fil::sim::BoardRunOptions options;
+    options.max_instructions = 10U;
+    options.duration_ns = 0U;
+    options.enable_loop_batching = false;
+    options.stop_address = target; // Forces exact one-instruction dispatch.
+    options.enable_jit = false;
+    const auto reference = exact.value()->run(options);
+    options.enable_jit = true;
+    const auto accelerated = jit.value()->run(options);
+
+    EXPECT_EQ(accelerated.reason, reference.reason);
+    EXPECT_EQ(accelerated.instructions, reference.instructions);
+    EXPECT_EQ(accelerated.cycles, reference.cycles);
+    EXPECT_EQ(accelerated.time_ns, reference.time_ns);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(jit.value()->cpu().state(), exact.value()->cpu().state()));
 }
 
 TEST(BoardTest, JitPreservesScheduledEventAndDeadlineBoundaries) {

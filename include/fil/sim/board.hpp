@@ -75,6 +75,93 @@ struct BoardRunResult {
 class Board {
 public:
     struct TransactionCheckpoint;
+
+    /**
+     * @brief Admission certificate for deferred execution of a pure CPU prefix.
+     *
+     * Admission prepares and certifies code but does not execute the CPU or
+     * advance board time. Until materialization, the canonical CPU state is
+     * stale relative to the scheduler's deferred logical progress. Callers
+     * must materialize (or discard) before observing CPU state or dispatching
+     * an impure operation/callback. Completion timestamps are absolute and
+     * strictly increasing.
+     */
+    struct DeferredPurePrefix {
+        static constexpr std::size_t max_instructions = 64U;
+        SimTimeNs start_time_ns{0};
+        std::uint8_t count{0};
+        std::array<SimTimeNs, max_instructions> completion_times_ns{};
+        std::uint32_t entry_pc{0};
+        std::uint64_t flash_generation{0};
+        std::uint64_t execution_generation{0};
+        std::uint64_t clock_hz{0};
+        std::uint64_t time_fraction{0};
+        std::array<std::uint64_t, max_instructions> cumulative_cycles{};
+    };
+
+    /**
+     * @brief Reversible private-RAM experiment; speculative CPU/RAM is not observable.
+     *
+     * Only fast integer/backed-memory handlers run, with MMIO trapped and
+     * non-executable RAM-only stores. Every event, shared delivery and public
+     * observation must materialize before inspecting or mutating this board.
+     */
+    struct ReversibleRamPrefix : DeferredPurePrefix {
+        static constexpr std::size_t max_instructions = 64U;
+        struct ReversibleExecution {
+            cpu::FastStepResult result{};
+            std::array<std::uint32_t, max_instructions> pcs{};
+            std::array<std::uint8_t, max_instructions> sizes{};
+            std::array<std::uint16_t, max_instructions> instruction_cycles{};
+            std::uint8_t count{0U};
+        };
+        // FP instructions are excluded from the capsule, so copying the FP
+        // register bank on every admission is unnecessary. Keep every integer
+        // field, including exception requests, for exact interrupted replay.
+        struct IntegerSnapshot {
+            std::array<std::uint32_t, 16> r{};
+            std::uint32_t xpsr{0}, msp{0}, psp{0};
+            std::uint32_t primask{0}, basepri{0}, faultmask{0}, control{0};
+            std::uint32_t instruction_address{0};
+            bool thumb{true}, halted{false};
+            std::uint8_t it_state{0};
+            std::optional<std::uint16_t> pending_exception;
+            std::optional<std::uint32_t> pending_exc_return;
+            void capture(const cpu::CpuState& state) noexcept {
+                r = state.r;
+                xpsr = state.xpsr; msp = state.msp; psp = state.psp;
+                primask = state.primask; basepri = state.basepri;
+                faultmask = state.faultmask; control = state.control;
+                instruction_address = state.instruction_address;
+                thumb = state.thumb; halted = state.halted; it_state = state.it_state;
+                pending_exception = state.pending_exception;
+                pending_exc_return = state.pending_exc_return;
+            }
+            void restore(cpu::CpuState& state) const noexcept {
+                state.r = r;
+                state.xpsr = xpsr; state.msp = msp; state.psp = psp;
+                state.primask = primask; state.basepri = basepri;
+                state.faultmask = faultmask; state.control = control;
+                state.instruction_address = instruction_address;
+                state.thumb = thumb; state.halted = halted; state.it_state = it_state;
+                state.pending_exception = pending_exception;
+                state.pending_exc_return = pending_exc_return;
+            }
+        };
+        IntegerSnapshot entry_state{};
+        mem::MemoryBus::SideEffectCheckpoint memory_checkpoint{};
+        mem::MemoryBus::SideEffectCheckpoint evaluated_checkpoint{};
+        mem::MemoryBus::ReadFootprint entry_read_footprint{};
+        ReversibleExecution evaluated{};
+        bool entry_have_fetch{false};
+        std::uint32_t entry_fetch_end{0};
+    };
+
+    /** Result of executing and charging one (possibly batched) board prefix. */
+    struct ConcurrentStepResult {
+        cpu::FastStepResult cpu_result;
+        SimTimeNs elapsed_ns{0};
+    };
     using TransactionCheckpointPtr = std::shared_ptr<const TransactionCheckpoint>;
 
     /** @brief Loads config references, ELF, MCU map, CPU, and peripherals. */
@@ -94,6 +181,46 @@ public:
 
     /** @brief Runs until a configured boundary or architectural failure. */
     [[nodiscard]] BoardRunResult run(const BoardRunOptions& options);
+
+    /**
+     * @brief Certifies a deferred, memory-free fixed-cycle instruction prefix.
+     *
+     * Returns no certificate unless at least two instructions can complete
+     * strictly before the next scheduled event, SysTick, and optional run
+     * deadline. This only prepares/peeks JIT metadata: CPU registers, cycles,
+     * and simulated time are unchanged.
+     */
+    [[nodiscard]] std::optional<DeferredPurePrefix> prepareDeferredPurePrefix(
+        std::size_t max_instructions, std::optional<SimTimeNs> deadline = std::nullopt);
+
+    /**
+     * @brief Materializes the requested leading instructions of a certificate.
+     *
+     * Execute only after any observation barrier has selected a count no larger
+     * than the certificate. A stale/mismatched certificate returns an empty
+     * result and does not charge board time. CPU observations before this call
+     * see the pre-prefix canonical state, not deferred progress.
+     */
+    [[nodiscard]] ConcurrentStepResult materializeDeferredPurePrefix(
+        const DeferredPurePrefix& prefix, std::size_t count);
+
+    /**
+     * @brief Speculates up to 64 reversible RAM/ALU instructions without advancing timers.
+     *
+     * Chains prepared CPU fast blocks across taken/not-taken integer branches,
+     * stopping at boundaries or when a later block is not reversible/ready.
+     */
+    [[nodiscard]] std::optional<ReversibleRamPrefix> prepareReversibleRamPrefix(
+        std::size_t max_instructions, std::optional<SimTimeNs> deadline = std::nullopt);
+    /** @brief Fills reusable scheduler-owned storage, avoiding certificate copies. */
+    [[nodiscard]] bool prepareReversibleRamPrefix(
+        ReversibleRamPrefix& out, std::size_t max_instructions,
+        std::optional<SimTimeNs> deadline = std::nullopt,
+        bool allow_single_prefix = false);
+
+    /** @brief Commits the started prefix, restoring/replaying an interrupted suffix. */
+    [[nodiscard]] ConcurrentStepResult materializeReversibleRamPrefix(
+        const ReversibleRamPrefix& prefix, std::size_t count);
 
     /** @brief Runs one lane using only owner-local events until shared synchronization. */
     [[nodiscard]] BoardRunResult runWorkerSlice(
@@ -125,11 +252,6 @@ public:
 
 private:
     friend class World;
-
-    struct ConcurrentStepResult {
-        cpu::FastStepResult cpu_result;
-        SimTimeNs elapsed_ns{0};
-    };
 
     struct BoundaryStop {
         BoardStopReason reason{BoardStopReason::host_error};
@@ -198,10 +320,14 @@ private:
         std::optional<SimTimeNs> deadline = std::nullopt,
         std::size_t max_instructions = cpu::CortexM4::JitStepOutcome::max_block,
         bool block_prevalidated = false);
+    [[nodiscard]] cpu::FastStepResult stepSingleWithFetchTiming(bool allow_jit);
+    [[nodiscard]] cpu::FastStepResult stepBlockWithFetchTiming(
+        bool allow_jit_block, std::optional<SimTimeNs> deadline,
+        std::size_t max_instructions, bool block_prevalidated);
     /** Executes one instruction and accrues board-local cycles without moving shared time. */
     [[nodiscard]] ConcurrentStepResult beginConcurrentStep(
         bool trace_instructions, bool allow_jit = false,
-        std::size_t max_instructions = 1U);
+        std::size_t max_instructions = 1U, bool block_prevalidated = true);
     /** @brief Exact next-instruction cost inputs for the burst gate. */
     struct PredictedCost {
         std::uint64_t cycles{0};    ///< Pipeline + ART flash stall cycles.
@@ -227,11 +353,26 @@ private:
         PredictedCost cost;
         std::uint8_t instructions{0U};
     };
-    /** Pure, fixed-cost blocks that finish before every observable boundary. */
-    [[nodiscard]] std::optional<PredictedBlockCost> peekPredictedBlockCost(
+    struct PredictedBlockCosts {
+        std::array<PredictedBlockCost, cpu::CortexM4::JitStepOutcome::max_block> prefixes{};
+        std::uint8_t count{0U};
+    };
+    /** Pure, exact prefixes that finish before every observable boundary. */
+    [[nodiscard]] PredictedBlockCosts peekPredictedBlockCosts(
         std::size_t max_instructions, std::optional<SimTimeNs> deadline);
     /** Applies exception/reset effects due at the just-completed instruction boundary. */
     [[nodiscard]] bool boundaryWorkPending() const noexcept;
+    /**
+     * @brief Whether JIT block batching must defer at this boundary.
+     *
+     * Mirrors settle's own entry predicate: only a takable exception
+     * (per PRIMASK/BASEPRI/FAULTMASK/active priority, as enterPending
+     * evaluates it), a pended return, or a reset request blocks batching.
+     * Merely masked or lower-priority pending interrupts do not: no
+     * admitted block op can change masking (MSR/CPS never compile into
+     * blocks) or take an exception early, so batching past them is exact.
+     */
+    [[nodiscard]] bool blockBoundaryPending() const noexcept;
     [[nodiscard]] std::optional<BoundaryStop> settleInstructionBoundary();
     [[nodiscard]] std::optional<BoundaryStop> settleInstructionBoundarySlow();
     [[nodiscard]] std::optional<ProvenLoop> observeLoopBoundary(
@@ -281,6 +422,14 @@ private:
     // Cached real-timing inputs (clock + flash ACR) with fetch-sequencing
     // for the simplified ART model. Refreshed on change, not per reset.
     std::uint64_t cached_clock_hz_{0};
+    /// Divide-free cycles->ns conversion: (c*1e9)/F split into quotient and
+    /// remainder per cycle count. Remainder plus carry is always < 2*F, so
+    /// the per-step carry resolves with one compare (exact, no division).
+    static constexpr std::size_t cycle_table_size = 128U;
+    struct CycleTableEntry { std::uint64_t quotient{0}; std::uint64_t remainder{0}; };
+    mutable std::array<CycleTableEntry, cycle_table_size> cycle_table_{};
+    mutable std::uint64_t cycle_table_hz_{0};
+    void rebuildCycleTable(std::uint64_t frequency) const;
     std::uint64_t cached_flash_acr_generation_{0};
     std::uint32_t cached_flash_ws_{0};
     bool cached_flash_art_hit_capable_{false};
