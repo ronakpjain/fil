@@ -60,6 +60,212 @@ void configureReceiver(fil::sim::Board& board) {
     ASSERT_TRUE(board.memory().loadBytes(board.image().vectorBase() + 37U * 4U, bytes));
 }
 
+TEST(DeferredPrefixTest, WarmIdleCallPeriodEveryCutMatchesExactCpuMemoryAndTimers) {
+    // A small FreeRTOS-style idle call: the callee saves/restores R3/LR and
+    // polls a private-RAM deletion count, then the caller polls the ready count.
+    const std::vector<std::uint8_t> code{
+        0x08U,0xb5U, 0x00U,0xf0U,0x05U,0xf8U, 0x07U,0x4bU,
+        0x1bU,0x68U, 0x01U,0x2bU, 0xf9U,0xd9U, 0xfeU,0xe7U,
+        0x08U,0xb5U, 0x00U,0xe0U, 0x00U,0xbfU, 0x02U,0x4bU,
+        0x1bU,0x68U, 0x00U,0x2bU, 0xfaU,0xd1U, 0x08U,0xbdU,
+        0x40U,0x00U,0x00U,0x20U, 0x44U,0x00U,0x00U,0x20U};
+    for (std::size_t count = 1U; count <= 36U; ++count) {
+        SCOPED_TRACE(count);
+        auto exact = fil::sim::Board::load(fil::test::fixtureBoardConfig());
+        auto speculative = fil::sim::Board::load(fil::test::fixtureBoardConfig());
+        ASSERT_TRUE(exact && speculative);
+        fil::sim::BoardRunOptions options;
+        options.duration_ns = 0U;
+        options.enable_loop_batching = false;
+        options.enable_jit = true;
+        options.max_instructions = 13U;
+        for (auto* board : {exact.value().get(), speculative.value().get()}) {
+            board->cpu().state().r[3] = 1U;
+            board->cpu().setNativeSingleInstructionJitEnabled(false);
+            ASSERT_TRUE(board->memory().write32(0x20000040U, 0U));
+            ASSERT_TRUE(board->memory().write32(0x20000044U, 1U));
+            ASSERT_TRUE(board->memory().write32(0xe0001000U, 1U));
+            installCode(*board, code);
+            const auto warmed = board->run(options);
+            ASSERT_EQ(warmed.instructions, 13U);
+        }
+        const auto start = exact.value()->eventLoop().now();
+        const auto stack = exact.value()->cpu().state().r[13];
+        const auto entry = speculative.value()->cpu().state();
+        const auto base = entry.r[15] - 2U;
+        for (const auto offset : {2U, 6U, 8U, 10U, 12U, 16U, 18U, 22U, 24U, 26U, 28U, 30U}) {
+            speculative.value()->cpu().state().r[15] = base + offset;
+            for (unsigned i = 0U; i < 64U; ++i) static_cast<void>(speculative.value()->cpu().prepareJitBlock(true));
+        }
+        speculative.value()->cpu().state() = entry;
+        const auto prefix = speculative.value()->prepareReversibleRamPrefix(36U);
+        ASSERT_TRUE(prefix);
+        ASSERT_EQ(prefix->count, 36U);
+        ASSERT_TRUE(prefix->period_certificate);
+        const auto committed = speculative.value()->materializeReversibleRamPrefix(*prefix, count);
+        options.max_instructions = count;
+        const auto reference = exact.value()->run(options);
+        ASSERT_EQ(reference.instructions, count);
+        EXPECT_EQ(committed.cpu_result.instructions, count);
+        EXPECT_EQ(committed.cpu_result.cycles, reference.cycles);
+        EXPECT_EQ(committed.elapsed_ns, reference.time_ns - start);
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(speculative.value()->cpu().state(), exact.value()->cpu().state()));
+        for (const auto address : {0x20000040U, 0x20000044U, stack - 8U, stack - 4U, stack, stack + 4U}) {
+            const auto expected = exact.value()->memory().read32(address);
+            const auto actual = speculative.value()->memory().read32(address);
+            ASSERT_TRUE(expected && actual);
+            EXPECT_EQ(actual.value(), expected.value());
+        }
+        const auto expected_counter = exact.value()->memory().read32(0xe0001004U);
+        const auto actual_counter = speculative.value()->memory().read32(0xe0001004U);
+        ASSERT_TRUE(expected_counter && actual_counter);
+        EXPECT_EQ(actual_counter.value(), expected_counter.value());
+
+        // Now admit from the just-materialized phase through the immutable
+        // certificate, with a varying partial cut at every loop iteration.
+        const auto hit_start = exact.value()->eventLoop().now();
+        const auto hit_prefix = speculative.value()->prepareReversibleRamPrefix(36U);
+        ASSERT_TRUE(hit_prefix);
+        ASSERT_GT(hit_prefix->memoized_count, 0U);
+        const std::size_t hit_cut = 1U + ((count - 1U) % hit_prefix->memoized_count);
+        const auto hit_commit = speculative.value()->materializeReversibleRamPrefix(
+            *hit_prefix, hit_cut);
+        options.max_instructions = hit_cut;
+        const auto hit_reference = exact.value()->run(options);
+        ASSERT_EQ(hit_reference.instructions, hit_cut);
+        EXPECT_EQ(hit_commit.cpu_result.cycles, hit_reference.cycles);
+        EXPECT_EQ(hit_commit.elapsed_ns, hit_reference.time_ns - hit_start);
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(speculative.value()->cpu().state(),
+                                          exact.value()->cpu().state()));
+        EXPECT_EQ(speculative.value()->memory().read32(0x20000040U).value(),
+                  exact.value()->memory().read32(0x20000040U).value());
+        EXPECT_EQ(speculative.value()->memory().read32(0x20000044U).value(),
+                  exact.value()->memory().read32(0x20000044U).value());
+        EXPECT_EQ(speculative.value()->memory().read32(0xe0001004U).value(),
+                  exact.value()->memory().read32(0xe0001004U).value());
+    }
+}
+
+TEST(DeferredPrefixTest, IdempotentPeriodAdmissionReusesRotatedPhasesWithoutExecution) {
+    const std::vector<std::uint8_t> code{
+        0x08U,0xb5U, 0x00U,0xf0U,0x05U,0xf8U, 0x07U,0x4bU,
+        0x1bU,0x68U, 0x01U,0x2bU, 0xf9U,0xd9U, 0xfeU,0xe7U,
+        0x08U,0xb5U, 0x00U,0xe0U, 0x00U,0xbfU, 0x02U,0x4bU,
+        0x1bU,0x68U, 0x00U,0x2bU, 0xfaU,0xd1U, 0x08U,0xbdU,
+        0x40U,0x00U,0x00U,0x20U, 0x44U,0x00U,0x00U,0x20U};
+    auto exact = fil::sim::Board::load(fil::test::fixtureBoardConfig());
+    auto cached = fil::sim::Board::load(fil::test::fixtureBoardConfig());
+    ASSERT_TRUE(exact && cached);
+    fil::sim::BoardRunOptions warm;
+    warm.duration_ns = 0U;
+    warm.enable_loop_batching = false;
+    warm.enable_jit = true;
+    warm.max_instructions = 13U;
+    for (auto* board : {exact.value().get(), cached.value().get()}) {
+        board->cpu().state().r[3] = 1U;
+        board->cpu().setNativeSingleInstructionJitEnabled(false);
+        ASSERT_TRUE(board->memory().write32(0x20000040U, 0U));
+        ASSERT_TRUE(board->memory().write32(0x20000044U, 1U));
+        ASSERT_TRUE(board->memory().write32(0xe0001000U, 1U));
+        installCode(*board, code);
+        ASSERT_EQ(board->run(warm).instructions, 13U);
+    }
+    const auto entry = cached.value()->cpu().state();
+    const auto base = entry.r[15] - 2U;
+    for (const auto offset : {2U, 6U, 8U, 10U, 12U, 16U, 18U, 22U, 24U, 26U, 28U, 30U}) {
+        cached.value()->cpu().state().r[15] = base + offset;
+        for (unsigned i = 0U; i < 64U; ++i) {
+            static_cast<void>(cached.value()->cpu().prepareJitBlock(true));
+        }
+    }
+    cached.value()->cpu().state() = entry;
+    const auto initial = cached.value()->prepareReversibleRamPrefix(36U);
+    ASSERT_TRUE(initial);
+    ASSERT_TRUE(initial->period_certificate);
+    static_cast<void>(cached.value()->materializeReversibleRamPrefix(*initial, 1U));
+    warm.max_instructions = 1U;
+    ASSERT_EQ(exact.value()->run(warm).instructions, 1U);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(cached.value()->cpu().state(), exact.value()->cpu().state()));
+
+    const auto start = exact.value()->eventLoop().now();
+    const auto repeated = cached.value()->prepareReversibleRamPrefix(12U);
+    ASSERT_TRUE(repeated);
+    EXPECT_GT(repeated->memoized_count, 0U);
+    EXPECT_NE(repeated->period_phase, 0U);
+    const std::uint8_t memoized = repeated->memoized_count;
+    const auto result = cached.value()->materializeReversibleRamPrefix(*repeated, memoized);
+    warm.max_instructions = memoized;
+    const auto reference = exact.value()->run(warm);
+    ASSERT_EQ(reference.instructions, memoized);
+    EXPECT_EQ(result.cpu_result.cycles, reference.cycles);
+    EXPECT_EQ(result.elapsed_ns, reference.time_ns - start);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(cached.value()->cpu().state(), exact.value()->cpu().state()));
+    for (const auto address : {0x20000040U, 0x20000044U}) {
+        EXPECT_EQ(cached.value()->memory().read32(address).value(),
+                  exact.value()->memory().read32(address).value());
+    }
+    EXPECT_EQ(cached.value()->memory().read32(0xe0001004U).value(),
+              exact.value()->memory().read32(0xe0001004U).value());
+
+    // A successful admission rebases validation: unrelated external writes
+    // remain compatible, while a write to any period input invalidates reuse.
+    ASSERT_TRUE(cached.value()->memory().write32(0x20000060U, 0x12345678U));
+    const auto unrelated = cached.value()->prepareReversibleRamPrefix(12U);
+    ASSERT_TRUE(unrelated);
+    EXPECT_GT(unrelated->memoized_count, 0U);
+    ASSERT_TRUE(cached.value()->memory().write32(0x20000040U, 1U));
+    const auto changed_input = cached.value()->prepareReversibleRamPrefix(12U);
+    ASSERT_TRUE(changed_input);
+    EXPECT_EQ(changed_input->memoized_count, 0U);
+}
+
+TEST(DeferredPrefixTest, RestorationInvalidatesImmutablePeriodAdmission) {
+    auto board = fil::sim::Board::load(fil::test::fixtureBoardConfig());
+    ASSERT_TRUE(board);
+    const std::vector<std::uint8_t> code{
+        0x08U,0xb5U, 0x00U,0xf0U,0x05U,0xf8U, 0x07U,0x4bU,
+        0x1bU,0x68U, 0x01U,0x2bU, 0xf9U,0xd9U, 0xfeU,0xe7U,
+        0x08U,0xb5U, 0x00U,0xe0U, 0x00U,0xbfU, 0x02U,0x4bU,
+        0x1bU,0x68U, 0x00U,0x2bU, 0xfaU,0xd1U, 0x08U,0xbdU,
+        0x40U,0x00U,0x00U,0x20U, 0x44U,0x00U,0x00U,0x20U};
+    board.value()->cpu().state().r[3] = 1U;
+    board.value()->cpu().setNativeSingleInstructionJitEnabled(false);
+    ASSERT_TRUE(board.value()->memory().write32(0x20000040U, 0U));
+    ASSERT_TRUE(board.value()->memory().write32(0x20000044U, 1U));
+    ASSERT_TRUE(board.value()->memory().write32(0xe0001000U, 1U));
+    installCode(*board.value(), code);
+    fil::sim::BoardRunOptions warm;
+    warm.duration_ns = 0U;
+    warm.enable_loop_batching = false;
+    warm.enable_jit = true;
+    warm.max_instructions = 13U;
+    ASSERT_EQ(board.value()->run(warm).instructions, 13U);
+    const auto entry = board.value()->cpu().state();
+    const auto base = entry.r[15] - 2U;
+    for (const auto offset : {2U, 6U, 8U, 10U, 12U, 16U, 18U, 22U, 24U, 26U, 28U, 30U}) {
+        board.value()->cpu().state().r[15] = base + offset;
+        for (unsigned i = 0U; i < 64U; ++i) {
+            static_cast<void>(board.value()->cpu().prepareJitBlock(true));
+        }
+    }
+    board.value()->cpu().state() = entry;
+    const auto certificate = board.value()->prepareReversibleRamPrefix(36U);
+    ASSERT_TRUE(certificate && certificate->period_certificate);
+    const auto checkpoint = board.value()->memory().sideEffectCheckpoint();
+    ASSERT_TRUE(board.value()->memory().restoreSideEffects(checkpoint));
+    const auto after_rewind = board.value()->prepareReversibleRamPrefix(12U);
+    ASSERT_TRUE(after_rewind);
+    EXPECT_EQ(after_rewind->memoized_count, 0U);
+    const auto transaction = board.value()->captureTransaction(fil::sim::shared_event_owner);
+    ASSERT_TRUE(board.value()->restoreTransaction(transaction));
+    const auto after_transaction_restore = board.value()->prepareReversibleRamPrefix(12U);
+    ASSERT_TRUE(after_transaction_restore);
+    EXPECT_EQ(after_transaction_restore->memoized_count, 0U);
+    ASSERT_TRUE(board.value()->reset());
+    EXPECT_THROW(static_cast<void>(board.value()->materializeReversibleRamPrefix(*certificate, 1U)),
+                 std::logic_error);
+}
+
 TEST(DeferredPrefixTest, ReversibleRamEveryCutMatchesExactCpuMemoryAndTimers) {
     for (std::size_t count = 1U; count <= 6U; ++count) {
         auto exact = fil::sim::Board::load(fil::test::fixtureBoardConfig());
@@ -78,6 +284,7 @@ TEST(DeferredPrefixTest, ReversibleRamEveryCutMatchesExactCpuMemoryAndTimers) {
         const auto prefix = speculative.value()->prepareReversibleRamPrefix(6U);
         ASSERT_TRUE(prefix);
         ASSERT_EQ(prefix->count, 6U);
+        EXPECT_FALSE(prefix->period_certificate) << "non-idempotent RAM writes cannot certify a period";
         EXPECT_EQ(speculative.value()->eventLoop().now(), prefix->start_time_ns);
         EXPECT_FALSE(speculative.value()->memory().mmioTrapping());
         EXPECT_FALSE(speculative.value()->memory().reversibleRamOnly());

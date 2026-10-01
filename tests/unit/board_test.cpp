@@ -1,5 +1,6 @@
 #include "fil/sim/board.hpp"
 #include "../fixture_support.hpp"
+#include "fil/stm32g4/stm32g4.hpp"
 
 #include <gtest/gtest.h>
 
@@ -108,6 +109,46 @@ bool installAndWarmJitLoop(fil::sim::Board& board, const bool mmio = false) {
     return board.cpu().jitBlockReady();
 }
 
+bool warmIdempotentPeriodCache(fil::sim::Board& board) {
+    const std::vector<std::uint8_t> code{
+        0x08U,0xb5U, 0x00U,0xf0U,0x05U,0xf8U, 0x07U,0x4bU,
+        0x1bU,0x68U, 0x01U,0x2bU, 0xf9U,0xd9U, 0xfeU,0xe7U,
+        0x08U,0xb5U, 0x00U,0xe0U, 0x00U,0xbfU, 0x02U,0x4bU,
+        0x1bU,0x68U, 0x00U,0x2bU, 0xfaU,0xd1U, 0x08U,0xbdU,
+        0x40U,0x00U,0x00U,0x20U, 0x44U,0x00U,0x00U,0x20U};
+    board.cpu().state().r[3] = 1U;
+    board.cpu().setNativeSingleInstructionJitEnabled(false);
+    if (!board.memory().write32(0x20000040U, 0U)
+        || !board.memory().write32(0x20000044U, 1U)
+        || !board.memory().write32(0xe0001000U, 1U)
+        || !board.memory().loadBytes(board.cpu().state().r[15], code)) return false;
+    for (unsigned int i = 0U; i < 64U; ++i) {
+        static_cast<void>(board.cpu().prepareJitBlock());
+    }
+    fil::sim::BoardRunOptions warm;
+    warm.duration_ns = 0U;
+    warm.enable_loop_batching = false;
+    warm.enable_jit = true;
+    warm.max_instructions = 13U;
+    if (board.run(warm).instructions != 13U) return false;
+    const auto entry = board.cpu().state();
+    const auto base = entry.r[15] - 2U;
+    for (const auto offset : {2U, 6U, 8U, 10U, 12U, 16U, 18U, 22U, 24U, 26U, 28U, 30U}) {
+        board.cpu().state().r[15] = base + offset;
+        for (unsigned int i = 0U; i < 64U; ++i) {
+            static_cast<void>(board.cpu().prepareJitBlock(true));
+        }
+    }
+    board.cpu().state() = entry;
+    auto built = board.prepareReversibleRamPrefix(36U);
+    if (!built || !built->period_certificate || built->count != 36U) return false;
+    static_cast<void>(board.materializeReversibleRamPrefix(*built, built->count));
+    const auto reused = board.prepareReversibleRamPrefix(12U);
+    if (!reused || reused->memoized_count == 0U) return false;
+    static_cast<void>(board.materializeReversibleRamPrefix(*reused, reused->count));
+    return true;
+}
+
 bool installBranchingReversibleProgram(fil::sim::Board& board) {
     const std::uint32_t start = board.cpu().state().r[15];
     std::vector<std::uint8_t> code;
@@ -186,6 +227,61 @@ TEST(BoardTest, ReversibleRamPrefixChainsBranchesAndReplaysLongCuts) {
     EXPECT_EQ(full_commit.elapsed_ns, full_reference.time_ns);
     EXPECT_TRUE(fil::cpu::bitwiseEqual(full_speculative.value()->cpu().state(),
                                        full_exact.value()->cpu().state()));
+}
+
+TEST(BoardTest, IdempotentPeriodCacheRejectsChangedFlashClockAndCodeGeneration) {
+    {
+        auto board = fil::sim::Board::load(fixtureBoard());
+        ASSERT_TRUE(board);
+        ASSERT_TRUE(warmIdempotentPeriodCache(*board.value()));
+        const auto old_prefix = board.value()->prepareReversibleRamPrefix(8U);
+        ASSERT_TRUE(old_prefix);
+        ASSERT_NE(old_prefix->memoized_count, 0U);
+        static_cast<void>(board.value()->materializeReversibleRamPrefix(
+            *old_prefix, old_prefix->count));
+        const auto old_frequency = board.value()->peripherals().rcc().systemClockHz();
+        ASSERT_TRUE(board.value()->memory().write32(0x40021008U, 0U)); // select MSI
+        ASSERT_NE(board.value()->peripherals().rcc().systemClockHz(), old_frequency);
+        const auto fresh = board.value()->prepareReversibleRamPrefix(8U);
+        ASSERT_TRUE(fresh);
+        EXPECT_EQ(fresh->memoized_count, 0U)
+            << "a clock change must not reuse cached cycle cost";
+    }
+    {
+        auto board = fil::sim::Board::load(fixtureBoard());
+        ASSERT_TRUE(board);
+        ASSERT_TRUE(warmIdempotentPeriodCache(*board.value()));
+        const auto old_prefix = board.value()->prepareReversibleRamPrefix(8U);
+        ASSERT_TRUE(old_prefix);
+        ASSERT_NE(old_prefix->memoized_count, 0U);
+        static_cast<void>(board.value()->materializeReversibleRamPrefix(
+            *old_prefix, old_prefix->count));
+        ASSERT_TRUE(board.value()->memory().write32(0x40022000U, 2U)); // FLASH ACR latency
+        const auto fresh = board.value()->prepareReversibleRamPrefix(8U);
+        ASSERT_TRUE(fresh);
+        EXPECT_EQ(fresh->memoized_count, 0U)
+            << "FLASH ACR changes must not reuse cached fetch costs";
+    }
+    {
+        auto board = fil::sim::Board::load(fixtureBoard());
+        ASSERT_TRUE(board);
+        ASSERT_TRUE(warmIdempotentPeriodCache(*board.value()));
+        const auto old_prefix = board.value()->prepareReversibleRamPrefix(8U);
+        ASSERT_TRUE(old_prefix);
+        ASSERT_NE(old_prefix->memoized_count, 0U);
+        static_cast<void>(board.value()->materializeReversibleRamPrefix(
+            *old_prefix, old_prefix->count));
+        const std::uint32_t pc = board.value()->cpu().state().r[15] & ~1U;
+        const auto first = board.value()->memory().read8(pc);
+        const auto second = board.value()->memory().read8(pc + 1U);
+        ASSERT_TRUE(first && second);
+        const std::vector<std::uint8_t> same_instruction{first.value(), second.value()};
+        ASSERT_TRUE(board.value()->memory().loadBytes(pc, same_instruction));
+        const auto fresh = board.value()->prepareReversibleRamPrefix(8U);
+        ASSERT_TRUE(fresh);
+        EXPECT_EQ(fresh->memoized_count, 0U)
+            << "executable writes must invalidate a cached period certificate";
+    }
 }
 
 TEST(BoardTest, ReversibleRamPrefixRespectsInstructionAndTimeBoundaries) {

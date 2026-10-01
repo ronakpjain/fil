@@ -73,6 +73,7 @@ struct BoardRunResult {
 
 /** @brief Loaded and wired firmware board instance. */
 class Board {
+    struct IdempotentPeriodCertificate;
 public:
     struct TransactionCheckpoint;
 
@@ -137,6 +138,15 @@ public:
                 pending_exception = state.pending_exception;
                 pending_exc_return = state.pending_exc_return;
             }
+            [[nodiscard]] bool matches(const cpu::CpuState& state) const noexcept {
+                return r == state.r && xpsr == state.xpsr && msp == state.msp && psp == state.psp
+                    && primask == state.primask && basepri == state.basepri
+                    && faultmask == state.faultmask && control == state.control
+                    && instruction_address == state.instruction_address
+                    && thumb == state.thumb && halted == state.halted && it_state == state.it_state
+                    && pending_exception == state.pending_exception
+                    && pending_exc_return == state.pending_exc_return;
+            }
             void restore(cpu::CpuState& state) const noexcept {
                 state.r = r;
                 state.xpsr = xpsr; state.msp = msp; state.psp = psp;
@@ -153,8 +163,12 @@ public:
         mem::MemoryBus::SideEffectCheckpoint evaluated_checkpoint{};
         mem::MemoryBus::ReadFootprint entry_read_footprint{};
         ReversibleExecution evaluated{};
+        std::uint8_t folded_instructions{0U};
         bool entry_have_fetch{false};
         std::uint32_t entry_fetch_end{0};
+        std::shared_ptr<const IdempotentPeriodCertificate> period_certificate;
+        std::uint8_t period_phase{0U};
+        std::uint8_t memoized_count{0U};
     };
 
     /** Result of executing and charging one (possibly batched) board prefix. */
@@ -205,7 +219,7 @@ public:
         const DeferredPurePrefix& prefix, std::size_t count);
 
     /**
-     * @brief Speculates up to 64 reversible RAM/ALU instructions without advancing timers.
+     * @brief Speculates up to 192 reversible RAM/ALU instructions without advancing timers.
      *
      * Chains prepared CPU fast blocks across taken/not-taken integer branches,
      * stopping at boundaries or when a later block is not reversible/ready.
@@ -391,6 +405,8 @@ private:
     );
     [[nodiscard]] bool loopProofStillValid(const ProvenLoop& loop) const noexcept;
     [[nodiscard]] bool loopHasNoMmioSince(const ProvenLoop& loop) const noexcept;
+    [[nodiscard]] std::shared_ptr<const IdempotentPeriodCertificate> buildIdempotentPeriodCertificate(
+        std::size_t period, std::uint64_t period_cycles);
     [[nodiscard]] std::optional<SimTimeNs> nextObservableTime(SimTimeNs boundary_time) const;
     [[nodiscard]] SimTimeNs nextInstructionElapsedNs() const noexcept {
         return elapsedForCycles(1U);
@@ -417,6 +433,10 @@ private:
     std::unique_ptr<cortexm::ExceptionController> exceptions_;
     std::uint64_t time_fraction_{0};
     std::array<LoopObservation, 256> loop_observations_{};
+    // Bounded to the most recently certified natural period.
+    std::shared_ptr<const IdempotentPeriodCertificate> idempotent_period_cache_;
+    mem::MemoryBus::SideEffectCheckpoint period_validation_checkpoint_{};
+    std::uint64_t period_validation_restoration_generation_{0U};
     std::uint64_t loop_observation_generation_{1U};
     std::optional<std::uint32_t> read_footprint_boundary_;
     // Cached real-timing inputs (clock + flash ACR) with fetch-sequencing
