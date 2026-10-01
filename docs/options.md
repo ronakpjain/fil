@@ -40,13 +40,14 @@ These are recommendations, not hidden overrides. The actual defaults follow.
 
 ## Execution flags
 
-`run BOARD`, `run-network NETWORK`, and `watch-network NETWORK` accept:
+`run BOARD`, `run-network NETWORK`, `watch-network NETWORK`, and
+`serve-network NETWORK --transport stdio` share these execution options:
 
 | Flag | Actual default / contract |
 | --- | --- |
 | `--duration-ms N` | `run`: board config `default_duration_ms` (schema default 1000); network: 1000; watch: unlimited. Watch `0` explicitly means unlimited. |
 | `--max-instructions N` | `run`: board config `max_instructions` (schema default 50,000,000); network: 50,000,000 per board; watch: 50,000,000 per board **per slice**. |
-| `--trace FILE` | No JSONL file unless requested. See [Tracing](tracing.md). |
+| `--trace FILE` | `run` and `run-network` write JSONL only when requested. `watch-network` and `serve-network` do not accept this option. See [Tracing](tracing.md). |
 | `--trace-instr` | Off; enables instruction events and prevents batched execution. |
 | `--strict-mmio` / `--lenient-mmio` | Lenient; strict faults on unmodeled MMIO. |
 | `--detect-spin` | Off; diagnostic stopping on proven repeated CPU state. Legitimate idle loops can trigger it. |
@@ -67,7 +68,7 @@ are passed to `run`, symbol resolution takes precedence over the address.
 
 | Flag | Actual default / contract |
 | --- | --- |
-| `--quantum N` | 1024; must be nonzero. Scheduling work cap, not permission to cross observable events. Also accepted by watch. |
+| `--quantum N` | 1024; must be nonzero. Scheduling work cap, not permission to cross observable events. Also accepted by watch and serve. |
 | `--inject-can BUS[@TIME_MS]:ID:HEXDATA` | None; repeatable scheduled CAN injection. Omitted time means time zero. |
 | `--transactional-slices` / `--no-transactional-slices` | Off; experimental reversible parallel lane epochs. Worker execution requires multiple boards, no tracing, and no spin detection. |
 | `--deferred-prefixes` | Off; experimental pure deferred prefixes. Requires `--jit`; incompatible with instruction tracing, spin detection, transactional slices, and RAM capsules. |
@@ -77,19 +78,26 @@ Experimental scheduler flags above are **run-network only**. See
 [Performance](performance.md) for observation barriers and ownership restrictions.
 There is no current `--execution-windows` CLI flag.
 
-### Watch only
+### Watch and serve
+
+`watch-network` uses human-readable text on stdio. `serve-network` requires
+`--transport stdio` and uses the binary protocol documented in
+[Binary network service](serve_network.md); it shares watch pacing, filtering,
+and simulation flags but never writes text to stdout.
 
 | Flag | Actual default / contract |
 | --- | --- |
 | `--refresh-ms N` | 1 simulated ms per slice; must be nonzero. |
 | `--live-filter TYPE` / `--trace-type TYPE` | `can_tx`; first explicit filter replaces the default. Repeat for multiple exact types. |
 | `--no-wall-pacing` | Pacing is on; disable to run slices back-to-back while retaining live I/O. |
-| `--control-stdin` | Accepted compatibility marker; stdin is always monitored. |
+| `--control-stdin` | Watch-only accepted compatibility marker; stdio control is always active. Serve rejects it. |
 
-Stdin accepts `BUS:ID:HEXDATA`, `adc BOARD INSTANCE CHANNEL VALUE`,
-`gpio BOARD PORT PIN 0|1|release`, `quit`, and `exit`. With a supplied duration,
-EOF does not stop the simulation; without a duration EOF stops it. See
-[Live monitoring](watch_network.md) for ranges and protocol details.
+`watch-network` stdin accepts `BUS:ID:HEXDATA`, `adc BOARD INSTANCE CHANNEL VALUE`,
+`gpio BOARD PORT PIN 0|1|release`, `quit`, and `exit`. The binary `serve-network`
+request/trace format is specified in [Binary network service](serve_network.md).
+Both commands stop on clean EOF when unlimited; with a finite duration, EOF does
+not stop the simulation. See [Live monitoring](watch_network.md) for the text
+syntax and pacing behavior.
 
 ## Hardware comparison
 

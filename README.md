@@ -32,14 +32,20 @@ and timing effects are modeled. See [Architecture](docs/architecture.md),
 [instruction coverage](docs/thumb_instruction_coverage.md), and
 [peripheral coverage](docs/stm32g4_peripheral_coverage.md) for the support boundary.
 
-`run` executes one board; `run-network` executes a configured network;
-`watch-network` monitors a live network and accepts CAN/ADC/GPIO input on stdin.
-`--trace FILE` writes JSONL events; `--trace-instr` records individual instructions.
-`inspect-config`, `inspect-elf`, and `disasm-window` inspect inputs.
+`run` executes one board; `run-network` executes a configured network as a
+human-readable batch job; `watch-network` is the human-facing live monitor with
+text traces and CAN/ADC/GPIO stdin controls. `serve-network` requires
+`--transport stdio` and is the interprocess counterpart: stdin/stdout carry a
+documented, versioned binary protocol and stdout contains no human-readable output. See
+[Live monitoring](docs/watch_network.md) and [the stdio protocol](docs/serve_network.md).
+`--trace FILE` writes JSONL events for `run` and `run-network`; `--trace-instr`
+records individual instructions. `inspect-config`, `inspect-elf`, and
+`disasm-window` inspect inputs.
 `compare-stlink` requires an attached ST-Link and controls/resets the physical
 target; flashing requires explicit `--flash`. See [Configuration](docs/configuration.md),
-[Live monitoring](docs/watch_network.md), [Tracing](docs/tracing.md), and
-[Hardware comparison](docs/hardware_comparison.md) for contracts and safety.
+[Live monitoring](docs/watch_network.md), [the binary network protocol](docs/serve_network.md),
+[Tracing](docs/tracing.md), and [Hardware comparison](docs/hardware_comparison.md)
+for contracts and safety.
 
 ## Performance
 

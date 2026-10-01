@@ -1,4 +1,5 @@
 #include "fil/cli/cli.hpp"
+#include "fil/cli/network_protocol.hpp"
 
 #include "fil/common/error.hpp"
 #include "fil/config/config.hpp"
@@ -12,7 +13,11 @@
 #include "fil/stm32g4/stm32g4.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
 #include <chrono>
+#include <csignal>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -20,6 +25,7 @@
 #include <limits>
 #include <optional>
 #include <ostream>
+#include <span>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -175,6 +181,231 @@ Result<PendingGpioInjection> parseGpioInjection(const std::string_view text) {
     }
     injection.pin = static_cast<std::uint8_t>(pin.value());
     return injection;
+}
+
+bool validUtf8(const std::string_view text) noexcept {
+    std::size_t index = 0U;
+    while (index < text.size()) {
+        const auto first = static_cast<std::uint8_t>(text[index]);
+        if (first <= 0x7fU) {
+            ++index;
+            continue;
+        }
+        if (first >= 0xc2U && first <= 0xdfU) {
+            if (index + 1U >= text.size()) return false;
+            const auto second = static_cast<std::uint8_t>(text[index + 1U]);
+            if (second < 0x80U || second > 0xbfU) return false;
+            index += 2U;
+            continue;
+        }
+        if (first >= 0xe0U && first <= 0xefU) {
+            if (index + 2U >= text.size()) return false;
+            const auto second = static_cast<std::uint8_t>(text[index + 1U]);
+            const auto third = static_cast<std::uint8_t>(text[index + 2U]);
+            if (third < 0x80U || third > 0xbfU) return false;
+            if ((first == 0xe0U && (second < 0xa0U || second > 0xbfU))
+                || (first == 0xedU && (second < 0x80U || second > 0x9fU))
+                || (first != 0xe0U && first != 0xedU
+                    && (second < 0x80U || second > 0xbfU))) return false;
+            index += 3U;
+            continue;
+        }
+        if (first >= 0xf0U && first <= 0xf4U) {
+            if (index + 3U >= text.size()) return false;
+            const auto second = static_cast<std::uint8_t>(text[index + 1U]);
+            const auto third = static_cast<std::uint8_t>(text[index + 2U]);
+            const auto fourth = static_cast<std::uint8_t>(text[index + 3U]);
+            if (third < 0x80U || third > 0xbfU || fourth < 0x80U || fourth > 0xbfU) return false;
+            if ((first == 0xf0U && (second < 0x90U || second > 0xbfU))
+                || (first == 0xf4U && (second < 0x80U || second > 0x8fU))
+                || (first != 0xf0U && first != 0xf4U
+                    && (second < 0x80U || second > 0xbfU))) return false;
+            index += 4U;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+class BinaryPayloadWriter {
+public:
+    void u8(const std::uint8_t value) { bytes_.push_back(value); }
+
+    void u16(const std::uint16_t value) {
+        u8(static_cast<std::uint8_t>(value & 0xffU));
+        u8(static_cast<std::uint8_t>((value >> 8U) & 0xffU));
+    }
+
+    void u32(const std::uint32_t value) {
+        for (unsigned int index = 0U; index < 4U; ++index) {
+            u8(static_cast<std::uint8_t>((value >> (index * 8U)) & 0xffU));
+        }
+    }
+
+    void u64(const std::uint64_t value) {
+        for (unsigned int index = 0U; index < 8U; ++index) {
+            u8(static_cast<std::uint8_t>((value >> (index * 8U)) & 0xffU));
+        }
+    }
+
+    void string(const std::string_view value) {
+        if (value.size() > std::numeric_limits<std::uint16_t>::max() || !validUtf8(value)) {
+            valid_ = false;
+            return;
+        }
+        u16(static_cast<std::uint16_t>(value.size()));
+        bytes_.insert(bytes_.end(), value.begin(), value.end());
+    }
+
+    void raw(const std::span<const std::uint8_t> value) {
+        bytes_.insert(bytes_.end(), value.begin(), value.end());
+    }
+
+    [[nodiscard]] bool valid() const noexcept {
+        return valid_ && bytes_.size() <= network_protocol::maximum_payload_size;
+    }
+
+    [[nodiscard]] std::vector<std::uint8_t> take() && { return std::move(bytes_); }
+
+private:
+    bool valid_{true};
+    std::vector<std::uint8_t> bytes_;
+};
+
+class BinaryPayloadReader {
+public:
+    explicit BinaryPayloadReader(const std::span<const std::uint8_t> bytes) : bytes_(bytes) {}
+
+    bool u8(std::uint8_t& value) {
+        if (remaining() < 1U) return false;
+        value = bytes_[position_++];
+        return true;
+    }
+
+    bool u16(std::uint16_t& value) {
+        std::uint8_t low = 0U;
+        std::uint8_t high = 0U;
+        if (!u8(low) || !u8(high)) return false;
+        value = static_cast<std::uint16_t>(low)
+            | static_cast<std::uint16_t>(static_cast<std::uint16_t>(high) << 8U);
+        return true;
+    }
+
+    bool u32(std::uint32_t& value) {
+        if (remaining() < 4U) return false;
+        value = 0U;
+        for (unsigned int index = 0U; index < 4U; ++index) {
+            value |= static_cast<std::uint32_t>(bytes_[position_++]) << (index * 8U);
+        }
+        return true;
+    }
+
+    bool u64(std::uint64_t& value) {
+        if (remaining() < 8U) return false;
+        value = 0U;
+        for (unsigned int index = 0U; index < 8U; ++index) {
+            value |= static_cast<std::uint64_t>(bytes_[position_++]) << (index * 8U);
+        }
+        return true;
+    }
+
+    bool string(std::string& value) {
+        std::uint16_t length = 0U;
+        if (!u16(length) || remaining() < length) return false;
+        const auto* const data = reinterpret_cast<const char*>(bytes_.data() + position_);
+        value.assign(data, length);
+        position_ += length;
+        return validUtf8(value);
+    }
+
+    bool raw(const std::size_t length, std::span<const std::uint8_t>& value) {
+        if (remaining() < length) return false;
+        value = bytes_.subspan(position_, length);
+        position_ += length;
+        return true;
+    }
+
+    [[nodiscard]] bool finished() const noexcept { return position_ == bytes_.size(); }
+
+private:
+    [[nodiscard]] std::size_t remaining() const noexcept { return bytes_.size() - position_; }
+
+    std::span<const std::uint8_t> bytes_;
+    std::size_t position_{0U};
+};
+
+enum class ProtocolReplyStatus : std::uint16_t {
+    ok = 0U,
+    invalid_request = 1U,
+    unknown_target = 2U,
+    unsupported_message = 3U,
+};
+
+enum class ProtocolEndReason : std::uint8_t {
+    stop_request = 0U,
+    input_eof = 1U,
+    duration_reached = 2U,
+    all_boards_stopped = 3U,
+    runtime_error = 4U,
+};
+
+bool writeProtocolFrame(
+    std::ostream& out,
+    const network_protocol::MessageKind kind,
+    const std::uint32_t request_id,
+    BinaryPayloadWriter payload
+) {
+    if (!payload.valid()) return false;
+    const network_protocol::Frame frame{kind, request_id, std::move(payload).take()};
+    return network_protocol::writeFrame(out, frame).hasValue();
+}
+
+bool writeProtocolReply(
+    std::ostream& out,
+    const std::uint32_t request_id,
+    const ProtocolReplyStatus status,
+    const std::uint64_t time_ns,
+    const std::string_view message
+) {
+    BinaryPayloadWriter payload;
+    payload.u16(static_cast<std::uint16_t>(status));
+    payload.u64(time_ns);
+    payload.string(message);
+    return writeProtocolFrame(out, network_protocol::MessageKind::reply, request_id,
+                              std::move(payload));
+}
+
+bool writeProtocolTrace(std::ostream& out, const sim::TraceRecord& record) {
+    if (record.fields.size() > std::numeric_limits<std::uint16_t>::max()) return false;
+    BinaryPayloadWriter payload;
+    payload.u64(record.time_ns);
+    payload.u64(record.sequence);
+    payload.string(record.source);
+    payload.string(record.type);
+    payload.u16(static_cast<std::uint16_t>(record.fields.size()));
+    for (const auto& [key, value] : record.fields) {
+        payload.string(key);
+        payload.string(value);
+    }
+    return writeProtocolFrame(out, network_protocol::MessageKind::trace, 0U,
+                              std::move(payload));
+}
+
+bool writeProtocolEnd(
+    std::ostream& out,
+    const std::uint64_t time_ns,
+    const ProtocolEndReason reason,
+    const ExitCode exit_code,
+    const std::string_view message = {}
+) {
+    BinaryPayloadWriter payload;
+    payload.u64(time_ns);
+    payload.u8(static_cast<std::uint8_t>(reason));
+    payload.u8(static_cast<std::uint8_t>(exit_code));
+    payload.string(message);
+    return writeProtocolFrame(out, network_protocol::MessageKind::end, 0U,
+                              std::move(payload));
 }
 
 void printLiveTraceRecord(std::ostream& out, const sim::TraceRecord& record) {
@@ -1083,13 +1314,15 @@ ExitCode runNetworkCommand(
     return ExitCode::success;
 }
 
-ExitCode watchNetworkCommand(
+ExitCode networkMonitorCommand(
     const std::span<const std::string_view> args,
     std::ostream& out,
-    std::ostream& err
+    std::ostream& err,
+    const bool binary_protocol
 ) {
+    const std::string_view command_name = binary_protocol ? "serve-network" : "watch-network";
     if (args.size() < 2U) {
-        err << "fil: watch-network requires a network config path\n";
+        err << "fil: " << command_name << " requires a network config path\n";
         return ExitCode::usage_error;
     }
 
@@ -1172,7 +1405,7 @@ ExitCode watchNetworkCommand(
         else if (option == "--no-loop-batching") enable_loop_batching = false;
         else if (option == "--jit") enable_jit = true;
         else if (option != "--control-stdin") {
-            err << "fil: unknown watch-network option: " << option << '\n';
+            err << "fil: unknown " << command_name << " option: " << option << '\n';
             return ExitCode::usage_error;
         }
     }
@@ -1198,6 +1431,7 @@ ExitCode watchNetworkCommand(
         return ExitCode::config_error;
     }
     world.value()->setDiagnosticsEnabled(true);
+    world.value()->trace().setRetainRecords(!binary_protocol);
     sim::CanExpectationEvaluator expectation_evaluator(world.value()->trace(), expectations);
     ScopedTraceObserverReset observer_reset(world.value()->trace());
     std::vector<std::string> recorded_types = live_filters;
@@ -1211,16 +1445,35 @@ ExitCode watchNetworkCommand(
         recorded_types.emplace_back("expectation_incomplete");
     }
     world.value()->trace().setTypeAllowlist(std::move(recorded_types));
-    world.value()->trace().setObserver([&out, &live_filters, &expectation_evaluator](const sim::TraceRecord& record) {
+    bool protocol_output_failed = false;
+    world.value()->trace().setObserver([&out, &live_filters, &expectation_evaluator,
+                                         binary_protocol, &protocol_output_failed](
+                                            const sim::TraceRecord& record) {
         if (std::find(live_filters.begin(), live_filters.end(), record.type) != live_filters.end()) {
-            printLiveTraceRecord(out, record);
+            if (binary_protocol) protocol_output_failed |= !writeProtocolTrace(out, record);
+            else printLiveTraceRecord(out, record);
         }
         expectation_evaluator.observe(record);
     });
-    if (!expectations.empty()) expectation_evaluator.begin(
-        world.value()->eventLoop().now(), world.value()->eventLoop()
-    );
-    out << "watching network " << network_config.value().name << '\n' << std::flush;
+    if (binary_protocol) {
+        BinaryPayloadWriter hello;
+        hello.string(network_config.value().name);
+        hello.u32(static_cast<std::uint32_t>(world.value()->boardCount()));
+        hello.u32(static_cast<std::uint32_t>(world.value()->canBusCount()));
+        if (!writeProtocolFrame(out, network_protocol::MessageKind::hello, 0U,
+                                std::move(hello))) {
+            err << "fil: serve-network failed to write protocol hello\n";
+            return ExitCode::runtime_error;
+        }
+        if (!expectations.empty()) expectation_evaluator.begin(
+            world.value()->eventLoop().now(), world.value()->eventLoop()
+        );
+    } else {
+        if (!expectations.empty()) expectation_evaluator.begin(
+            world.value()->eventLoop().now(), world.value()->eventLoop()
+        );
+        out << "watching network " << network_config.value().name << '\n' << std::flush;
+    }
 
     const sim::SimTimeNs started_at = world.value()->eventLoop().now();
     const auto wall_start = std::chrono::steady_clock::now();
@@ -1233,6 +1486,191 @@ ExitCode watchNetworkCommand(
         ).count());
     };
     bool duration_reached = false;
+    ProtocolEndReason end_reason = ProtocolEndReason::stop_request;
+    network_protocol::FrameDecoder protocol_decoder;
+    const auto handleProtocolRequest = [&](const network_protocol::Frame& request) -> bool {
+        ProtocolReplyStatus status = ProtocolReplyStatus::ok;
+        std::string message;
+        bool stop_after_reply = false;
+        BinaryPayloadReader payload(request.payload);
+
+        if (request.request_id == 0U) {
+            status = ProtocolReplyStatus::invalid_request;
+            message = "request ID zero is reserved for server messages";
+        } else if (request.kind == network_protocol::MessageKind::can_inject) {
+            std::string bus_name;
+            std::uint32_t id = 0U;
+            std::uint8_t flags = 0U;
+            std::uint8_t data_length = 0U;
+            std::span<const std::uint8_t> data;
+            if (!payload.string(bus_name) || !payload.u32(id) || !payload.u8(flags)
+                || !payload.u8(data_length) || !payload.raw(data_length, data)
+                || !payload.finished() || (flags & 0xf8U) != 0U) {
+                status = ProtocolReplyStatus::invalid_request;
+                message = "malformed CAN_INJECT payload";
+            } else {
+                const auto dlc = devices::lengthToDlc(data_length);
+                if (!dlc || devices::dlcToLength(*dlc) != data_length) {
+                    status = ProtocolReplyStatus::invalid_request;
+                    message = "CAN data length must be 0..8, 12, 16, 20, 24, 32, 48, or 64";
+                } else {
+                    devices::CanFrame frame;
+                    frame.id = id;
+                    frame.extended = (flags & 0x01U) != 0U;
+                    frame.fd = (flags & 0x02U) != 0U;
+                    frame.brs = (flags & 0x04U) != 0U;
+                    frame.dlc = *dlc;
+                    std::copy(data.begin(), data.end(), frame.data.begin());
+                    const auto valid = devices::validate(frame);
+                    if (!valid) {
+                        status = ProtocolReplyStatus::invalid_request;
+                        message = valid.error().message;
+                    } else if (devices::VirtualCanBus* bus = world.value()->canBus(bus_name);
+                               bus == nullptr) {
+                        status = ProtocolReplyStatus::unknown_target;
+                        message = "CAN_INJECT names an undeclared bus";
+                    } else {
+                        const auto injected = bus->inject(frame, world.value()->eventLoop().now());
+                        if (!injected) {
+                            status = ProtocolReplyStatus::invalid_request;
+                            message = injected.error().message;
+                        }
+                    }
+                }
+            }
+        } else if (request.kind == network_protocol::MessageKind::adc_set) {
+            std::string board_name;
+            std::string instance_name;
+            std::uint8_t channel = 0U;
+            std::uint16_t value = 0U;
+            if (!payload.string(board_name) || !payload.string(instance_name)
+                || !payload.u8(channel) || !payload.u16(value) || !payload.finished()
+                || channel > 19U || value > 4095U) {
+                status = ProtocolReplyStatus::invalid_request;
+                message = "malformed ADC_SET payload or value out of range";
+            } else if (sim::Board* board = world.value()->board(board_name); board == nullptr) {
+                status = ProtocolReplyStatus::unknown_target;
+                message = "ADC_SET names an unknown board";
+            } else if (stm32g4::AdcPeripheral* adc = board->peripherals().adc(instance_name);
+                       adc == nullptr) {
+                status = ProtocolReplyStatus::unknown_target;
+                message = "ADC_SET names an unknown ADC instance";
+            } else {
+                adc->setChannelValue(channel, value);
+            }
+        } else if (request.kind == network_protocol::MessageKind::gpio_set) {
+            std::string board_name;
+            std::string port_name;
+            std::uint8_t pin = 0U;
+            std::uint8_t action = 0U;
+            if (!payload.string(board_name) || !payload.string(port_name)
+                || !payload.u8(pin) || !payload.u8(action) || !payload.finished()
+                || pin > 15U || action > 2U) {
+                status = ProtocolReplyStatus::invalid_request;
+                message = "malformed GPIO_SET payload or value out of range";
+            } else if (sim::Board* board = world.value()->board(board_name); board == nullptr) {
+                status = ProtocolReplyStatus::unknown_target;
+                message = "GPIO_SET names an unknown board";
+            } else if (stm32g4::GpioPeripheral* port = board->peripherals().gpio(port_name);
+                       port == nullptr) {
+                status = ProtocolReplyStatus::unknown_target;
+                message = "GPIO_SET names an unknown GPIO port";
+            } else if (action == 2U) {
+                port->releaseInput(pin);
+            } else {
+                port->setInput(pin, action == 1U);
+            }
+        } else if (request.kind == network_protocol::MessageKind::stop) {
+            if (!payload.finished()) {
+                status = ProtocolReplyStatus::invalid_request;
+                message = "STOP payload must be empty";
+            } else {
+                stop_after_reply = true;
+            }
+        } else {
+            status = ProtocolReplyStatus::unsupported_message;
+            message = "unsupported client message kind";
+        }
+
+        if (status != ProtocolReplyStatus::ok) {
+            err << "fil: serve-network request " << request.request_id << ": " << message << '\n';
+        }
+        if (protocol_output_failed || !writeProtocolReply(
+                out, request.request_id, status, world.value()->eventLoop().now(), message)) {
+            return false;
+        }
+        if (stop_after_reply) {
+            stop_requested = true;
+            end_reason = ProtocolEndReason::stop_request;
+        }
+        return true;
+    };
+    const auto finishProtocol = [&](const ProtocolEndReason reason, const ExitCode code,
+                                    const std::string_view message = {}) {
+        if (!binary_protocol) return code;
+        if (!writeProtocolEnd(out, world.value()->eventLoop().now(), reason, code, message)) {
+            err << "fil: serve-network failed to write protocol END\n";
+            return ExitCode::runtime_error;
+        }
+        return code;
+    };
+    const auto closeProtocolInput = [&]() -> bool {
+        const auto complete = protocol_decoder.finish();
+        if (!complete) {
+            err << "fil: " << complete.error().message << '\n';
+            return false;
+        }
+        stdin_eof = true;
+        if (!duration_ns) {
+            end_reason = ProtocolEndReason::input_eof;
+            stop_requested = true;
+        }
+        return true;
+    };
+    const auto readProtocolInput = [&]() -> bool {
+        std::array<std::uint8_t, 4096U> input_bytes{};
+        ssize_t count = -1;
+        do {
+            count = ::read(STDIN_FILENO, input_bytes.data(), input_bytes.size());
+        } while (count < 0 && errno == EINTR);
+        if (count < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+            err << "fil: failed to read serve-network stdio input\n";
+            return false;
+        }
+        if (count == 0) return closeProtocolInput();
+        const auto appended = protocol_decoder.append(std::span<const std::uint8_t>{
+            input_bytes.data(), static_cast<std::size_t>(count)
+        });
+        if (!appended) {
+            err << "fil: " << appended.error().message << '\n';
+            return false;
+        }
+        while (!stop_requested) {
+            auto frame = protocol_decoder.next();
+            if (!frame) {
+                err << "fil: " << frame.error().message << '\n';
+                return false;
+            }
+            if (!frame.value()) break;
+            if (!handleProtocolRequest(*frame.value())) {
+                err << "fil: serve-network failed to write protocol reply\n";
+                return false;
+            }
+        }
+        return true;
+    };
+    if (binary_protocol) {
+        pollfd input{STDIN_FILENO, POLLIN, 0};
+        const int ready = ::poll(&input, 1, 0);
+        if (ready < 0 && errno != EINTR) {
+            err << "fil: failed to poll serve-network stdio input\n";
+            return ExitCode::runtime_error;
+        }
+        if (ready > 0 && (input.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0) {
+            if (!readProtocolInput()) return ExitCode::runtime_error;
+        }
+    }
     while (!stop_requested) {
         const sim::SimTimeNs elapsed = world.value()->eventLoop().now() - started_at;
         if (duration_ns && elapsed >= *duration_ns) {
@@ -1250,14 +1688,24 @@ ExitCode watchNetworkCommand(
         options.trace_instructions = trace_instructions;
         options.detect_spin = detect_spin;
         auto result = world.value()->run(options);
-        if (!result || !result.value().succeeded()) {
+        if (protocol_output_failed) {
             if (!expectations.empty()) expectation_evaluator.finish(world.value()->eventLoop().now());
-            if (!result) err << "fil: " << formatError(result.error()) << '\n';
-            else err << "fil: watch stopped with "
-                     << sim::worldStopReasonName(result.value().reason) << '\n';
+            err << "fil: serve-network failed to write protocol trace\n";
             return ExitCode::runtime_error;
         }
-        if (result.value().reason == sim::WorldStopReason::all_boards_stopped) break;
+        if (!result || !result.value().succeeded()) {
+            if (!expectations.empty()) expectation_evaluator.finish(world.value()->eventLoop().now());
+            const std::string failure = !result
+                ? formatError(result.error())
+                : "network stopped with " + std::string(sim::worldStopReasonName(result.value().reason));
+            err << "fil: " << command_name << " stopped: " << failure << '\n';
+            if (protocol_output_failed) return ExitCode::runtime_error;
+            return finishProtocol(ProtocolEndReason::runtime_error, ExitCode::runtime_error, failure);
+        }
+        if (result.value().reason == sim::WorldStopReason::all_boards_stopped) {
+            end_reason = ProtocolEndReason::all_boards_stopped;
+            break;
+        }
 
         // Pace simulation time to wall-clock time so live consumers observe
         // real rates. Each iteration re-syncs to the absolute sim-vs-wall
@@ -1276,18 +1724,30 @@ ExitCode watchNetworkCommand(
 
         if (stdin_eof) continue;
         pollfd input{STDIN_FILENO, POLLIN, 0};
-        const bool buffered = std::cin.rdbuf()->in_avail() > 0;
+        const bool buffered = !binary_protocol && std::cin.rdbuf()->in_avail() > 0;
         // Wall pacing already waited; a blocking poll here would run the
         // simulation slower than real time by one refresh window per slice.
         const int ready = buffered
             ? 1
             : ::poll(&input, 1, wall_pacing ? 0 : static_cast<int>(refresh_ms));
         if (ready < 0) {
+            if (binary_protocol && errno == EINTR) continue;
             if (!expectations.empty()) expectation_evaluator.finish(world.value()->eventLoop().now());
             err << "fil: failed to poll stdin\n";
             return ExitCode::runtime_error;
         }
         if (ready == 0) continue;
+        if (binary_protocol) {
+            if ((input.revents & (POLLERR | POLLNVAL)) != 0
+                && (input.revents & (POLLIN | POLLHUP)) == 0) {
+                if (!closeProtocolInput()) return ExitCode::runtime_error;
+            } else if ((input.revents & (POLLIN | POLLHUP)) != 0
+                       && !readProtocolInput()) {
+                if (!expectations.empty()) expectation_evaluator.finish(world.value()->eventLoop().now());
+                return ExitCode::runtime_error;
+            }
+            continue;
+        }
         if (!buffered && (input.revents & (POLLERR | POLLNVAL)) != 0) {
             // An unusable control channel behaves like end-of-input.
             stdin_eof = true;
@@ -1368,6 +1828,12 @@ ExitCode watchNetworkCommand(
         }
     }
     if (!expectations.empty()) expectation_evaluator.finish(world.value()->eventLoop().now());
+    if (duration_reached) end_reason = ProtocolEndReason::duration_reached;
+    else if (stdin_eof && !stop_requested) end_reason = ProtocolEndReason::input_eof;
+    if (protocol_output_failed) {
+        err << "fil: serve-network failed to write protocol trace\n";
+        return ExitCode::runtime_error;
+    }
     // Total-duration exactness: the per-slice sleeps keep phase within a
     // fraction of a slice, but the last sleep's wake jitter is never
     // corrected inside the loop. Sync once to the absolute deadline so the
@@ -1376,7 +1842,76 @@ ExitCode watchNetworkCommand(
     if (wall_pacing && duration_reached && !stop_requested) {
         std::this_thread::sleep_until(wall_start + std::chrono::nanoseconds(*duration_ns));
     }
-    return ExitCode::success;
+    return finishProtocol(end_reason, ExitCode::success);
+}
+
+ExitCode watchNetworkCommand(
+    const std::span<const std::string_view> args,
+    std::ostream& out,
+    std::ostream& err
+) {
+    return networkMonitorCommand(args, out, err, false);
+}
+
+class ScopedSigpipeIgnore {
+public:
+    ScopedSigpipeIgnore() : previous_(std::signal(SIGPIPE, SIG_IGN)) {}
+    ~ScopedSigpipeIgnore() {
+        if (previous_ != SIG_ERR) static_cast<void>(std::signal(SIGPIPE, previous_));
+    }
+    ScopedSigpipeIgnore(const ScopedSigpipeIgnore&) = delete;
+    ScopedSigpipeIgnore& operator=(const ScopedSigpipeIgnore&) = delete;
+
+private:
+    using SignalHandler = void (*)(int);
+    SignalHandler previous_{SIG_ERR};
+};
+
+ExitCode serveNetworkCommand(
+    const std::span<const std::string_view> args,
+    std::ostream& out,
+    std::ostream& err
+) {
+    if (args.size() < 2U) {
+        err << "fil: serve-network requires a network config path and --transport stdio\n";
+        return ExitCode::usage_error;
+    }
+
+    bool transport_seen = false;
+    std::vector<std::string_view> monitor_args{"serve-network", args[1]};
+    for (std::size_t index = 2U; index < args.size(); ++index) {
+        const std::string_view option = args[index];
+        if (option != "--transport") {
+            if (option == "--control-stdin") {
+                err << "fil: serve-network uses stdio protocol controls; --control-stdin is not applicable\n";
+                return ExitCode::usage_error;
+            }
+            monitor_args.push_back(option);
+            continue;
+        }
+        if (transport_seen) {
+            err << "fil: serve-network accepts --transport only once\n";
+            return ExitCode::usage_error;
+        }
+        if (index + 1U >= args.size()) {
+            err << "fil: --transport requires a value (supported: stdio)\n";
+            return ExitCode::usage_error;
+        }
+        const std::string_view transport = args[++index];
+        if (transport != "stdio") {
+            err << "fil: unsupported serve-network transport: " << transport
+                << " (supported: stdio)\n";
+            return ExitCode::usage_error;
+        }
+        transport_seen = true;
+    }
+    if (!transport_seen) {
+        err << "fil: serve-network requires --transport stdio\n";
+        return ExitCode::usage_error;
+    }
+
+    ScopedSigpipeIgnore ignore_sigpipe;
+    return networkMonitorCommand(monitor_args, out, err, true);
 }
 
 } // namespace
@@ -1392,7 +1927,9 @@ void printHelp(std::ostream& out) {
         << "  disasm-window <firmware.elf>   Decode a bounded Thumb instruction window\n"
         << "  run <board.json> [options]     Execute one firmware board deterministically\n"
         << "  run-network <network.json>     Execute a deterministic network and its attached stimuli\n"
-        << "  watch-network <network.json>   Run a network and stimuli with stdin/stdout control\n"
+        << "  watch-network <network.json>   Run a human-facing live network monitor\n"
+        << "  serve-network <network.json> --transport stdio\n"
+        << "                                  Serve binary stdio control and traces\n"
         << "  compare-stlink <board.json>    Compare emulator state with STM32G4 hardware\n\n"
         << "Run options:\n"
         << "  --duration-ms N --max-instructions N --trace FILE --trace-instr\n"
@@ -1418,7 +1955,14 @@ void printHelp(std::ostream& out) {
         << "  --no-wall-pacing (watch runs slices back-to-back instead of real time)\n"
         << "  watch also stops early when all boards reach terminal CPU boundaries\n"
         << "  stdin: BUS:ID:HEXDATA, adc BOARD INSTANCE CHANNEL VALUE,\n"
-        << "  gpio BOARD PORT PIN 0|1|release, quit, or exit\n";
+        << "  gpio BOARD PORT PIN 0|1|release, quit, or exit\n"
+        << "\nServe-network options:\n"
+        << "  --transport stdio (required; binary protocol on stdin/stdout)\n"
+        << "  --duration-ms N --refresh-ms N --max-instructions N --quantum N\n"
+        << "  --live-filter TYPE (repeatable), --trace-instr, --no-wall-pacing\n"
+        << "  --adc-decimation N --strict-mmio --lenient-mmio --detect-spin\n"
+        << "  --no-loop-batching --jit\n"
+        << "  See docs/serve_network.md for the versioned binary protocol.\n";
 }
 
 ExitCode run(
@@ -1502,6 +2046,10 @@ ExitCode run(
 
     if (args.front() == "watch-network") {
         return watchNetworkCommand(args, out, err);
+    }
+
+    if (args.front() == "serve-network") {
+        return serveNetworkCommand(args, out, err);
     }
 
     if (args.front() == "compare-stlink") {

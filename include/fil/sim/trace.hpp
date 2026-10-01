@@ -47,6 +47,9 @@ public:
     /** @brief Enables or disables future record collection without clearing existing records. */
     void setEnabled(bool enabled) noexcept { enabled_ = enabled; }
 
+    /** @brief Enables/disables history retention while preserving observers and sequence IDs. */
+    void setRetainRecords(bool retain) noexcept { retain_records_ = retain; }
+
     /** @brief Reports whether future trace records are currently observable. */
     [[nodiscard]] bool enabled() const noexcept { return enabled_; }
 
@@ -109,6 +112,7 @@ public:
 
 private:
     bool enabled_{true};
+    bool retain_records_{true};
     std::uint64_t next_sequence_{0};
     std::vector<TraceRecord> records_;
     std::vector<std::string> allowlist_;

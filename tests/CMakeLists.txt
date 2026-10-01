@@ -21,6 +21,7 @@ add_executable(fil_tests
     unit/jit_test.cpp
     unit/llvm_jit_test.cpp
     unit/memory_bus_test.cpp
+    unit/network_protocol_test.cpp
     unit/peripheral_test.cpp
     unit/scheduler_tick_test.cpp
     unit/smoke_test.cpp

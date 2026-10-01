@@ -1,5 +1,6 @@
 #include "fil/devices/can_bus.hpp"
 #include "fil/cli/cli.hpp"
+#include "fil/cli/network_protocol.hpp"
 #include "fil/sim/world.hpp"
 #include "fil/stm32g4/stm32g4.hpp"
 #include "../fixture_support.hpp"
@@ -12,6 +13,7 @@
 #include <iostream>
 #include <iterator>
 #include <sstream>
+#include <unistd.h>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -99,6 +101,44 @@ public:
 
 private:
     fil::test::TemporaryDirectory directory_{"fil-world-tests"};
+};
+
+class ScopedStdinPipe {
+public:
+    ~ScopedStdinPipe() {
+        if (original_ >= 0) {
+            static_cast<void>(::dup2(original_, STDIN_FILENO));
+            static_cast<void>(::close(original_));
+        }
+    }
+
+    [[nodiscard]] bool redirect(const std::vector<std::uint8_t>& input) {
+        original_ = ::dup(STDIN_FILENO);
+        if (original_ < 0) return false;
+        int descriptors[2]{};
+        if (::pipe(descriptors) != 0) return false;
+        if (::dup2(descriptors[0], STDIN_FILENO) < 0) {
+            static_cast<void>(::close(descriptors[0]));
+            static_cast<void>(::close(descriptors[1]));
+            return false;
+        }
+        static_cast<void>(::close(descriptors[0]));
+        std::size_t written = 0U;
+        while (written < input.size()) {
+            const ssize_t result = ::write(descriptors[1], input.data() + written,
+                                          input.size() - written);
+            if (result <= 0) {
+                static_cast<void>(::close(descriptors[1]));
+                return false;
+            }
+            written += static_cast<std::size_t>(result);
+        }
+        static_cast<void>(::close(descriptors[1]));
+        return true;
+    }
+
+private:
+    int original_{-1};
 };
 
 TEST(WorldTest, LoadsSharedCanFabric) {
@@ -332,6 +372,163 @@ TEST(WorldTest, StopsWatchNetworkFromStdin) {
     EXPECT_EQ(result, fil::cli::ExitCode::success);
     EXPECT_EQ(out.str().find("expectation_"), std::string::npos);
     EXPECT_TRUE(err.str().empty());
+}
+
+TEST(WorldTest, ServeNetworkRequiresAnExplicitSupportedTransport) {
+    const std::string_view missing_transport[]{"serve-network", "network.json"};
+    std::ostringstream missing_out;
+    std::ostringstream missing_err;
+    EXPECT_EQ(fil::cli::run(missing_transport, missing_out, missing_err),
+              fil::cli::ExitCode::usage_error);
+    EXPECT_TRUE(missing_out.str().empty());
+    EXPECT_NE(missing_err.str().find("--transport stdio"), std::string::npos);
+
+    const std::string_view unsupported_transport[]{
+        "serve-network", "network.json", "--transport", "tcp"
+    };
+    std::ostringstream unsupported_out;
+    std::ostringstream unsupported_err;
+    EXPECT_EQ(fil::cli::run(unsupported_transport, unsupported_out, unsupported_err),
+              fil::cli::ExitCode::usage_error);
+    EXPECT_TRUE(unsupported_out.str().empty());
+    EXPECT_NE(unsupported_err.str().find("supported: stdio"), std::string::npos);
+}
+
+TEST(WorldTest, ServeNetworkUsesBinaryStdioFramesForControlsAndTraces) {
+    TempWorldConfigs files;
+    const auto network_path = files.writeNetwork({files.writeBoard("serve.json", "serve")});
+    const std::string path = network_path.string();
+
+    std::vector<std::uint8_t> request_bytes;
+    const auto appendString = [](std::vector<std::uint8_t>& payload, const std::string_view value) {
+        payload.push_back(static_cast<std::uint8_t>(value.size() & 0xffU));
+        payload.push_back(static_cast<std::uint8_t>((value.size() >> 8U) & 0xffU));
+        for (const char byte : value) {
+            payload.push_back(static_cast<std::uint8_t>(static_cast<unsigned char>(byte)));
+        }
+    };
+    const auto appendU32 = [](std::vector<std::uint8_t>& payload, const std::uint32_t value) {
+        for (unsigned int index = 0U; index < 4U; ++index) {
+            payload.push_back(static_cast<std::uint8_t>((value >> (index * 8U)) & 0xffU));
+        }
+    };
+    const auto appendFrame = [&](const fil::cli::network_protocol::Frame& frame) {
+        std::ostringstream encoded(std::ios::out | std::ios::binary);
+        EXPECT_TRUE(fil::cli::network_protocol::writeFrame(encoded, frame));
+        for (const char byte : encoded.str()) {
+            request_bytes.push_back(static_cast<std::uint8_t>(static_cast<unsigned char>(byte)));
+        }
+    };
+
+    std::vector<std::uint8_t> can_payload;
+    appendString(can_payload, "vehicle");
+    appendU32(can_payload, 0x123U);
+    can_payload.insert(can_payload.end(), {0U, 1U, 0x5aU});
+    appendFrame({fil::cli::network_protocol::MessageKind::can_inject, 1U,
+                 std::move(can_payload)});
+
+    std::vector<std::uint8_t> adc_payload;
+    appendString(adc_payload, "serve");
+    appendString(adc_payload, "ADC1");
+    adc_payload.insert(adc_payload.end(), {5U, 0U, 8U}); // channel 5, value 2048.
+    appendFrame({fil::cli::network_protocol::MessageKind::adc_set, 2U,
+                 std::move(adc_payload)});
+
+    std::vector<std::uint8_t> gpio_payload;
+    appendString(gpio_payload, "serve");
+    appendString(gpio_payload, "GPIOA");
+    gpio_payload.insert(gpio_payload.end(), {5U, 1U}); // pin 5 driven high.
+    appendFrame({fil::cli::network_protocol::MessageKind::gpio_set, 3U,
+                 std::move(gpio_payload)});
+
+    std::vector<std::uint8_t> missing_bus_payload;
+    appendString(missing_bus_payload, "missing-bus");
+    appendU32(missing_bus_payload, 0x123U);
+    missing_bus_payload.insert(missing_bus_payload.end(), {0U, 0U});
+    appendFrame({fil::cli::network_protocol::MessageKind::can_inject, 4U,
+                 std::move(missing_bus_payload)});
+    appendFrame({fil::cli::network_protocol::MessageKind::stop, 5U, {}});
+
+    ScopedStdinPipe stdin_pipe;
+    ASSERT_TRUE(stdin_pipe.redirect(request_bytes)) << "redirects test protocol requests to stdin";
+    const std::string_view args[]{"serve-network", path, "--transport", "stdio",
+                                  "--no-wall-pacing", "--live-filter", "can_rx"};
+    std::ostringstream out(std::ios::out | std::ios::binary);
+    std::ostringstream err;
+    const auto result = fil::cli::run(args, out, err);
+
+    EXPECT_EQ(result, fil::cli::ExitCode::success);
+    EXPECT_NE(err.str().find("request 4"), std::string::npos);
+    const std::string output_bytes = out.str();
+    std::vector<std::uint8_t> output;
+    output.reserve(output_bytes.size());
+    for (const char byte : output_bytes) {
+        output.push_back(static_cast<std::uint8_t>(static_cast<unsigned char>(byte)));
+    }
+
+    fil::cli::network_protocol::FrameDecoder decoder;
+    ASSERT_TRUE(decoder.append(output));
+    std::vector<fil::cli::network_protocol::Frame> frames;
+    while (true) {
+        auto next = decoder.next();
+        ASSERT_TRUE(next) << (next ? "" : next.error().message);
+        if (!next.value()) break;
+        frames.push_back(std::move(*next.value()));
+    }
+    ASSERT_TRUE(decoder.finish());
+    ASSERT_EQ(frames.size(), 8U);
+    EXPECT_EQ(frames[0].kind, fil::cli::network_protocol::MessageKind::hello);
+    EXPECT_EQ(frames[1].kind, fil::cli::network_protocol::MessageKind::trace);
+    EXPECT_EQ(frames[1].request_id, 0U);
+    for (std::size_t index = 0U; index < 5U; ++index) {
+        EXPECT_EQ(frames[index + 2U].kind, fil::cli::network_protocol::MessageKind::reply);
+        EXPECT_EQ(frames[index + 2U].request_id, index + 1U);
+    }
+    const auto replyStatus = [](const fil::cli::network_protocol::Frame& frame) {
+        return static_cast<std::uint16_t>(frame.payload[0U])
+            | static_cast<std::uint16_t>(static_cast<std::uint16_t>(frame.payload[1U]) << 8U);
+    };
+    EXPECT_EQ(replyStatus(frames[2]), 0U);
+    EXPECT_EQ(replyStatus(frames[3]), 0U);
+    EXPECT_EQ(replyStatus(frames[4]), 0U);
+    EXPECT_EQ(replyStatus(frames[5]), 2U);
+    EXPECT_EQ(replyStatus(frames[6]), 0U);
+    EXPECT_EQ(frames[7].kind, fil::cli::network_protocol::MessageKind::end);
+}
+
+TEST(WorldTest, ServeNetworkStopsOnCleanUnlimitedStdioEof) {
+    TempWorldConfigs files;
+    const auto network_path = files.writeNetwork({files.writeBoard("serve-eof.json", "serve-eof")});
+    const std::string path = network_path.string();
+    const std::vector<std::uint8_t> no_input;
+    ScopedStdinPipe stdin_pipe;
+    ASSERT_TRUE(stdin_pipe.redirect(no_input));
+
+    const std::string_view args[]{"serve-network", path, "--transport", "stdio"};
+    std::ostringstream out(std::ios::out | std::ios::binary);
+    std::ostringstream err;
+    EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::success);
+    EXPECT_TRUE(err.str().empty());
+
+    const std::string encoded = out.str();
+    std::vector<std::uint8_t> bytes;
+    for (const char byte : encoded) {
+        bytes.push_back(static_cast<std::uint8_t>(static_cast<unsigned char>(byte)));
+    }
+    fil::cli::network_protocol::FrameDecoder decoder;
+    ASSERT_TRUE(decoder.append(bytes));
+    auto hello = decoder.next();
+    ASSERT_TRUE(hello && hello.value().has_value());
+    EXPECT_EQ(hello.value()->kind, fil::cli::network_protocol::MessageKind::hello);
+    auto end = decoder.next();
+    ASSERT_TRUE(end && end.value().has_value());
+    EXPECT_EQ(end.value()->kind, fil::cli::network_protocol::MessageKind::end);
+    ASSERT_GE(end.value()->payload.size(), 10U);
+    EXPECT_EQ(end.value()->payload[8U], 1U); // clean EOF
+    auto trailing = decoder.next();
+    ASSERT_TRUE(trailing);
+    EXPECT_FALSE(trailing.value().has_value());
+    EXPECT_TRUE(decoder.finish());
 }
 
 TEST(WorldTest, NestedBusInjectionDoesNotSatisfyParentBusExpectation) {

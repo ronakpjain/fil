@@ -5,6 +5,23 @@
 namespace {
 
 /** @brief Observer input remains valid when its callback recursively appends records. */
+TEST(TraceRecorderTest, ObserverCanStreamWithoutRetainingHistory) {
+    fil::sim::TraceRecorder trace;
+    trace.setRetainRecords(false);
+    trace.setTypeAllowlist({"can_tx"});
+    std::vector<std::uint64_t> observed_sequences;
+    trace.setObserver([&](const fil::sim::TraceRecord& record) {
+        observed_sequences.push_back(record.sequence);
+    });
+
+    EXPECT_EQ(trace.record(1U, "bus", "can_tx"), 0U);
+    EXPECT_EQ(trace.record(2U, "cpu", "instr"), 1U);
+    EXPECT_EQ(trace.record(3U, "bus", "can_tx"), 2U);
+
+    EXPECT_EQ(observed_sequences, (std::vector<std::uint64_t>{0U, 2U}));
+    EXPECT_TRUE(trace.records().empty());
+}
+
 TEST(TraceRecorderTest, ObserverRecordSurvivesRecursiveAppend) {
     fil::sim::TraceRecorder trace;
     bool expanding = false;

@@ -1,7 +1,6 @@
 #include "fil/sim/trace.hpp"
 
 #include <algorithm>
-#include <iomanip>
 #include <ostream>
 #include <sstream>
 #include <utility>
@@ -52,11 +51,18 @@ std::uint64_t TraceRecorder::record(
     if (!enabled_) return next_sequence_;
     if (!passesFilter(type)) return next_sequence_++;
     const std::uint64_t sequence = next_sequence_++;
-    records_.push_back(TraceRecord{
-        time_ns, sequence, std::move(source), std::move(type), std::move(fields),
-    });
-    if (observer_) {
-        const TraceRecord observed = records_.back();
+    if (retain_records_) {
+        records_.push_back(TraceRecord{
+            time_ns, sequence, std::move(source), std::move(type), std::move(fields),
+        });
+        if (observer_) {
+            const TraceRecord observed = records_.back();
+            observer_(observed);
+        }
+    } else if (observer_) {
+        const TraceRecord observed{
+            time_ns, sequence, std::move(source), std::move(type), std::move(fields),
+        };
         observer_(observed);
     }
     return sequence;
