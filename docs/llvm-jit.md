@@ -1,6 +1,6 @@
 # Native LLVM JIT
 
-`--jit` enables an experimental LLVM ORC backend when the executable was built with LLVM support. Unlike the cached-handler implementation, it emits LLVM IR, optimizes it with the O2 module pipeline, and materializes **host machine code** through ORC LLJIT. Generated kernels do not call the interpreter.
+`--jit` enables an experimental LLVM ORC backend when the executable was built with LLVM support. Unlike the cached-handler implementation, it emits LLVM IR, runs the O0 module pipeline, and materializes **host machine code** through ORC LLJIT. Generated kernels do not call the interpreter.
 
 The interpreter remains the default and correctness reference. Unsupported, cold, or unsafe execution uses the existing interpreter/cached handlers. A native backend is not automatically a speedup: compilation and function-call costs remain, and the network scheduler still preserves each observable instruction boundary.
 
@@ -42,6 +42,17 @@ ORC engines are initialized lazily. Cached block preparation retains its 50-prob
 A CPU retains at most 32 native kernels in a dynamically updated LRU cache. Both native single-instruction and block executions refresh recency. At capacity, a hot candidate may replace the least recently used resident only after that resident has been idle for at least 16,384 eligible JIT dispatches. Otherwise the candidate stays cached and must rewarm before retrying. This admission hysteresis avoids replacing an actively used working set merely because a new candidate appears.
 
 Eviction clears matching raw entry points in both CPU caches before releasing the kernel's ORC resources. Evicted sites can compile again after rewarming. Kernel slots remain stable until replacement, and kernels keep their runtime alive. Executable-write invalidation still clears decoded/block references by generation; unreferenced resident resources can be reclaimed through subsequent LRU replacement. Capacity bounds retained kernels, not lifetime compilation count. This is not a bound on total compile time, and workloads with a changing working set can still incur compilation overhead.
+
+## Compilation pipeline
+
+Native compilation currently uses LLVM's **O0 module pipeline**, not O1 or O2.
+This limits optimization-pass work for the small supported integer kernels;
+it does not disable native code generation or change the guest timing model.
+IR verification runs before and after the pipeline. Less IR optimization can
+trade lower compilation overhead for slower generated code, so compare total
+real-firmware wall time, including compilation, before treating it as a win.
+There is no CLI switch for the native module optimization level. The host
+executable's Release/IPO/PGO build settings are separate from this JIT pipeline.
 
 ## Validation and performance
 

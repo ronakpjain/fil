@@ -339,9 +339,9 @@ std::shared_ptr<const NativeJitKernel> LlvmJit::compile(
     pass_builder.registerLoopAnalyses(loop_analyses);
     pass_builder.crossRegisterProxies(loop_analyses, function_analyses,
                                       cgscc_analyses, module_analyses);
-    // Straight-line integer kernels gain nothing from vectorization or
-    // aggressive inlining; O1 keeps ISel/regalloc quality while cutting
-    // pass-manager time, the dominant cost for few-instruction functions.
+    // Use the O0 module pipeline to limit IR optimization-pass overhead for
+    // small integer kernels. This is separate from host build optimization
+    // and may trade generated-code quality for lower compilation latency.
     auto optimization_pipeline = pass_builder.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O0);
     optimization_pipeline.run(*module, module_analyses);
     if (!verifyModule(*module, verifier)) {

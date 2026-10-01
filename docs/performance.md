@@ -24,6 +24,8 @@ all runtime/build flags, actual defaults, and recommended command presets.
 | --- | --- |
 | Decode and memory caches | Direct-mapped decoded instructions and cached backed-memory access reduce decoding/mapping work while retaining permission checks and executable-write generation invalidation. Cache index folding reduces collisions between distant firmware addresses. |
 | CPU hot paths | Specialized integer handlers, prepared block metadata, and guarded backed-memory multi-word paths avoid repeated generic dispatch. Unsupported, faulting, or MMIO work retains ordinary execution. |
+| Pending-exception selection cache | Reuses exact exception selection for unchanged CPU masks and system-control generation. Selection-affecting mutations invalidate the cache; the cached takable-pending check avoids rescanning priorities without suppressing eligible exceptions. |
+| Native compilation pipeline | Uses LLVM's O0 module pipeline to limit optimization-pass overhead for small integer kernels. This is a compile-time/runtime tradeoff, not evidence of an end-to-end firmware speedup. |
 | Event-aware scheduling | Bounds execution by events, interrupts, instruction budgets, and simulated-time deadlines. |
 | Loop batching | Batches proven repeated loops; unproven paths execute normally. Disable with `--no-loop-batching`. `--detect-spin` requests loop detection; `--trace-instr` retains instruction-level execution. |
 | Cached JIT handlers | `--jit` opts into specialized handlers and prepared blocks, with fallback for unsupported or unsafe operations. |
