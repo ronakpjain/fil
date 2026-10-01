@@ -182,6 +182,19 @@ public:
         bool previous_read_footprints_;
         bool previous_write_journal_;
     };
+    /** @brief Temporarily includes CPU stores in the read footprint while compiling a certificate. */
+    class StoreFootprintScope {
+    public:
+        explicit StoreFootprintScope(MemoryBus& bus) noexcept;
+        ~StoreFootprintScope();
+        StoreFootprintScope(const StoreFootprintScope&) = delete;
+        StoreFootprintScope& operator=(const StoreFootprintScope&) = delete;
+        StoreFootprintScope(StoreFootprintScope&&) = delete;
+        StoreFootprintScope& operator=(StoreFootprintScope&&) = delete;
+    private:
+        MemoryBus& bus_;
+        bool previous_;
+    };
     /** @brief Constructs an empty address map. */
     MemoryBus();
 
@@ -407,11 +420,28 @@ public:
         SideEffectCheckpoint checkpoint, const ReadFootprint& footprint
     ) const;
 
+    /**
+     * @brief Checks RAM inputs with journal/read-footprint rules but ignores MMIO epoch changes.
+     *
+     * Use ONLY for previously certified MMIO-free idempotent spans. This is
+     * not a transaction-validity or rollback predicate. The caller MUST capture
+     * restorationGeneration() with the checkpoint and require it to match before
+     * reuse: journal sequence numbers can repeat after a transactional rewind.
+     */
+    [[nodiscard]] bool ramInputsCompatibleSince(
+        SideEffectCheckpoint checkpoint, const ReadFootprint& footprint
+    ) const;
+
     /** @brief Whether backed-memory state can be transactionally restored. */
     [[nodiscard]] bool canRestoreSideEffects(SideEffectCheckpoint checkpoint) const noexcept;
 
     /** @brief Reverses backed-memory writes when no MMIO occurred since a checkpoint. */
     [[nodiscard]] bool restoreSideEffects(SideEffectCheckpoint checkpoint);
+
+    /** @brief Monotonic invalidation token advanced after every successful restore. */
+    [[nodiscard]] std::uint64_t restorationGeneration() const noexcept {
+        return restoration_generation_;
+    }
 
     /** @brief True when no MMIO read or write occurred since the checkpoint. */
     [[nodiscard]] bool mmioUnchangedSince(SideEffectCheckpoint checkpoint) const noexcept {
@@ -428,6 +458,9 @@ private:
     };
 
     static void addReadFootprint(ReadFootprint& footprint, std::uint32_t address) noexcept;
+    void addAccessFootprint(std::uint32_t address, std::uint32_t width) const noexcept;
+    void addStoreFootprint(std::uint32_t address, std::uint32_t width,
+                           const AccessContext& context) noexcept;
     [[nodiscard]] static bool footprintContains(
         const ReadFootprint& footprint, std::uint32_t address
     ) noexcept;
@@ -457,11 +490,13 @@ private:
     mutable std::uint64_t mmio_generation_{1};
     std::uint64_t mutation_sequence_{0};
     std::uint64_t journal_generation_{1};
+    std::uint64_t restoration_generation_{0};
     bool write_journal_tracking_{true};
     static constexpr std::size_t mutation_journal_capacity = 8192U;
     std::array<BackedMutation, mutation_journal_capacity> mutation_journal_{};
     mutable ReadFootprint read_footprint_{};
     bool read_footprint_tracking_{true};
+    bool store_footprint_tracking_{false};
     bool trap_shared_mmio_{false};
     bool trap_all_mmio_{false};
     bool reversible_ram_only_{false};

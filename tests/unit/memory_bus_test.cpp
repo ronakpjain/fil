@@ -460,6 +460,194 @@ TEST(MemoryBusTest, UnjournaledWordStoresMatchBytewiseArchitecturalEffects) {
     EXPECT_EQ(unjournaled.read32(0x20000004U).value(), original_word);
 }
 
+TEST(MemoryBusTest, StoreFootprintScopeTracksIdempotentAndAllStorePaths) {
+    using fil::mem::AccessContext;
+    using fil::mem::AccessType;
+    using fil::mem::MemoryBus;
+
+    MemoryBus bus;
+    ASSERT_TRUE(bus.mapRam(0x20000000U, 64U, "ram").hasValue());
+    ASSERT_TRUE(bus.mapAlias(0x00000000U, 0x20000000U, 64U, "alias").hasValue());
+    const AccessContext cpu_store{AccessType::data_write, 0x08000100U};
+    EXPECT_EQ(bus.takeReadFootprint().words, MemoryBus::ReadFootprint{}.words);
+    {
+        MemoryBus::StoreFootprintScope tracking(bus);
+        ASSERT_TRUE(bus.write8(0x20000000U, 0U, cpu_store)); // idempotent
+        auto footprint = bus.takeReadFootprint();
+        EXPECT_NE(footprint.words, MemoryBus::ReadFootprint{}.words);
+
+        ASSERT_TRUE(bus.write32(0x20000001U, 0x11223344U, cpu_store));
+        footprint = bus.takeReadFootprint();
+        EXPECT_NE(footprint.words, MemoryBus::ReadFootprint{}.words);
+
+        const std::uint32_t words[] = {0x01020304U, 0x05060708U};
+        ASSERT_TRUE(bus.tryFastWriteWords(0x20000008U, 2U, words, cpu_store));
+        footprint = bus.takeReadFootprint();
+        EXPECT_NE(footprint.words, MemoryBus::ReadFootprint{}.words);
+
+        ASSERT_TRUE(bus.write32(0x0000000cU, 0xaabbccddU, cpu_store));
+        footprint = bus.takeReadFootprint();
+        EXPECT_NE(footprint.words, MemoryBus::ReadFootprint{}.words)
+            << "alias stores track canonical backing words";
+
+        ASSERT_TRUE(bus.write32(0x20000010U, 0U, {AccessType::data_write, 0U}));
+        EXPECT_EQ(bus.takeReadFootprint().words, MemoryBus::ReadFootprint{}.words)
+            << "PC-zero stores retain existing non-CPU origin convention";
+    }
+    ASSERT_TRUE(bus.write8(0x20000014U, 0U, cpu_store));
+    EXPECT_EQ(bus.takeReadFootprint().words, MemoryBus::ReadFootprint{}.words)
+        << "store tracking is restored after scope exit";
+}
+
+TEST(MemoryBusTest, StoreCertificatesRejectChangesToEveryTouchedCanonicalWord) {
+    using fil::mem::AccessContext;
+    using fil::mem::AccessType;
+    using fil::mem::MemoryBus;
+    constexpr std::uint32_t base = 0x20000000U;
+    const AccessContext cpu_store{AccessType::data_write, 0x08000100U};
+    for (unsigned path = 0U; path < 7U; ++path) {
+        SCOPED_TRACE(path);
+        MemoryBus bus;
+        ASSERT_TRUE(bus.mapRam(base, 64U, "ram"));
+        ASSERT_TRUE(bus.mapAlias(0U, base, 64U, "alias"));
+        std::uint32_t first = 0U;
+        std::uint32_t last = 0U;
+        {
+            MemoryBus::StoreFootprintScope outer(bus);
+            {
+                MemoryBus::StoreFootprintScope inner(bus);
+                const std::uint32_t words[] = {0U, 0U, 0U};
+                switch (path) {
+                case 0U: ASSERT_TRUE(bus.write8(base, 0U, cpu_store)); break;
+                case 1U:
+                    ASSERT_TRUE(bus.tryFastWrite(base + 3U, fil::mem::AccessSize::halfword, 0U, cpu_store));
+                    last = 4U; break;
+                case 2U: ASSERT_TRUE(bus.write32(base + 1U, 0U, cpu_store)); last = 4U; break;
+                case 3U: ASSERT_TRUE(bus.write64(base + 2U, 0U, cpu_store)); last = 8U; break;
+                case 4U:
+                    ASSERT_TRUE(bus.tryFastWriteWords(base + 8U, 3U, words, cpu_store));
+                    first = 8U; last = 16U; break;
+                case 5U:
+                    ASSERT_TRUE(bus.write64(11U, 0U, cpu_store));
+                    first = 8U; last = 16U; break;
+                case 6U:
+                    bus.setWriteJournalTracking(false);
+                    ASSERT_TRUE(bus.tryFastWrite32(base, 0U, cpu_store));
+                    bus.setWriteJournalTracking(true); break;
+                }
+            }
+            // Nested scope exit must preserve the outer setting.
+            ASSERT_TRUE(bus.write8(base + first, 0U, cpu_store));
+        }
+        const auto footprint = bus.takeReadFootprint();
+        for (auto word = first; word <= last; word += 4U) {
+            const auto checkpoint = bus.sideEffectCheckpoint();
+            ASSERT_TRUE(bus.write8(base + word, 1U, {AccessType::data_write, 0U}));
+            EXPECT_FALSE(bus.ramInputsCompatibleSince(checkpoint, footprint));
+        }
+        ASSERT_TRUE(bus.write8(base + 32U, 0U, cpu_store));
+        EXPECT_EQ(bus.takeReadFootprint().words, MemoryBus::ReadFootprint{}.words);
+    }
+    MemoryBus disabled;
+    ASSERT_TRUE(disabled.mapRam(base, 8U, "ram"));
+    disabled.setReadFootprintTracking(false);
+    const auto checkpoint = disabled.sideEffectCheckpoint();
+    {
+        MemoryBus::StoreFootprintScope scope(disabled);
+        ASSERT_TRUE(disabled.write8(base, 0U, cpu_store));
+    }
+    EXPECT_FALSE(disabled.ramInputsCompatibleSince(checkpoint, disabled.takeReadFootprint()));
+}
+
+TEST(MemoryBusTest, RestorationTokenRejectsJournalSequenceAba) {
+    fil::mem::MemoryBus bus;
+    ASSERT_TRUE(bus.mapRam(0x20000000U, 8U, "ram"));
+    ASSERT_TRUE(bus.read8(0x20000000U, {fil::mem::AccessType::data_read, 0x08000100U}));
+    const auto footprint = bus.takeReadFootprint();
+    const auto initial = bus.sideEffectCheckpoint();
+    ASSERT_TRUE(bus.write8(0x20000000U, 1U));
+    const auto admission = bus.sideEffectCheckpoint();
+    const auto token = bus.restorationGeneration();
+    ASSERT_TRUE(bus.restoreSideEffects(initial));
+    ASSERT_TRUE(bus.write8(0x20000000U, 2U));
+    EXPECT_EQ(bus.sideEffectCheckpoint().mutation_sequence, admission.mutation_sequence);
+    EXPECT_TRUE(bus.ramInputsCompatibleSince(admission, footprint))
+        << "sequence compatibility alone cannot detect a different transaction branch";
+    EXPECT_NE(bus.restorationGeneration(), token)
+        << "certificate reuse must also validate the monotonic restoration token";
+}
+
+TEST(MemoryBusTest, RamInputCompatibilityIsScopedAndDoesNotRelaxTransactionChecks) {
+    using fil::mem::AccessContext;
+    using fil::mem::AccessType;
+    using fil::mem::MemoryBus;
+
+    MemoryBus bus;
+    RecordingMmio device;
+    ASSERT_TRUE(bus.mapRam(0x20000000U, 32U, "ram").hasValue());
+    ASSERT_TRUE(bus.mapMmio(0x40000000U, 16U, device, "mmio").hasValue());
+    static_cast<void>(bus.read32(0x20000000U,
+        {AccessType::data_read, 0x08000100U}));
+    const auto footprint = bus.takeReadFootprint();
+
+    auto checkpoint = bus.sideEffectCheckpoint();
+    ASSERT_TRUE(bus.write8(0x20000008U, 1U, {AccessType::data_write, 0U}));
+    EXPECT_TRUE(bus.ramInputsCompatibleSince(checkpoint, footprint));
+    checkpoint = bus.sideEffectCheckpoint();
+    ASSERT_TRUE(bus.write8(0x20000000U, 1U, {AccessType::data_write, 0U}));
+    EXPECT_FALSE(bus.ramInputsCompatibleSince(checkpoint, footprint));
+
+    checkpoint = bus.sideEffectCheckpoint();
+    ASSERT_TRUE(bus.write8(0x20000000U, 2U, {AccessType::data_write, 0U}));
+    ASSERT_TRUE(bus.restoreSideEffects(checkpoint));
+    const auto fresh_admission = bus.sideEffectCheckpoint();
+    EXPECT_TRUE(bus.ramInputsCompatibleSince(fresh_admission, footprint))
+        << "overlap restored before fresh admission is compatible";
+
+    const auto mmio_checkpoint = bus.sideEffectCheckpoint();
+    static_cast<void>(bus.read32(0x40000000U));
+    EXPECT_TRUE(bus.ramInputsCompatibleSince(mmio_checkpoint, footprint));
+    EXPECT_FALSE(bus.sideEffectsCompatibleSince(mmio_checkpoint, footprint));
+    EXPECT_FALSE(bus.sideEffectsRestoredSince(mmio_checkpoint));
+    EXPECT_FALSE(bus.canRestoreSideEffects(mmio_checkpoint));
+}
+
+TEST(MemoryBusTest, RestoreAdvancesMonotonicGeneration) {
+    fil::mem::MemoryBus bus;
+    ASSERT_TRUE(bus.mapRam(0x20000000U, 16U, "ram").hasValue());
+    const auto initial = bus.restorationGeneration();
+    const auto checkpoint = bus.sideEffectCheckpoint();
+    ASSERT_TRUE(bus.write8(0x20000000U, 0x5aU));
+    ASSERT_TRUE(bus.restoreSideEffects(checkpoint));
+    EXPECT_EQ(bus.restorationGeneration(), initial + 1U);
+    const auto no_op_checkpoint = bus.sideEffectCheckpoint();
+    ASSERT_TRUE(bus.restoreSideEffects(no_op_checkpoint));
+    EXPECT_EQ(bus.restorationGeneration(), initial + 2U);
+}
+
+TEST(MemoryBusTest, CpuReadFootprintsCoverEveryTouchedWord) {
+    using fil::mem::AccessContext;
+    using fil::mem::AccessType;
+    fil::mem::MemoryBus bus;
+    ASSERT_TRUE(bus.mapRam(0x20000000U, 32U, "ram").hasValue());
+    const AccessContext cpu_read{AccessType::data_read, 0x08000100U};
+
+    ASSERT_TRUE(bus.read32(0x20000003U, cpu_read)); // crosses word boundary
+    const auto unaligned = bus.takeReadFootprint();
+    const auto first_word = bus.sideEffectCheckpoint();
+    ASSERT_TRUE(bus.write8(0x20000000U, 1U, {AccessType::data_write, 0U}));
+    EXPECT_FALSE(bus.ramInputsCompatibleSince(first_word, unaligned));
+    const auto second_word = bus.sideEffectCheckpoint();
+    ASSERT_TRUE(bus.write8(0x20000004U, 1U, {AccessType::data_write, 0U}));
+    EXPECT_FALSE(bus.ramInputsCompatibleSince(second_word, unaligned));
+
+    ASSERT_TRUE(bus.read64(0x20000008U, cpu_read));
+    const auto wide = bus.takeReadFootprint();
+    const auto wide_checkpoint = bus.sideEffectCheckpoint();
+    ASSERT_TRUE(bus.write8(0x2000000cU, 1U, {AccessType::data_write, 0U}));
+    EXPECT_FALSE(bus.ramInputsCompatibleSince(wide_checkpoint, wide));
+}
+
 TEST(MemoryBusTest, TrackingScopeRestoresSettingsOnExit) {
     fil::mem::MemoryBus bus;
     bus.setReadFootprintTracking(false);

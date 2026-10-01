@@ -78,6 +78,15 @@ MemoryBus::TrackingScope::~TrackingScope() {
     bus_.setReadFootprintTracking(previous_read_footprints_);
 }
 
+MemoryBus::StoreFootprintScope::StoreFootprintScope(MemoryBus& bus) noexcept
+    : bus_(bus), previous_(bus.store_footprint_tracking_) {
+    bus_.store_footprint_tracking_ = true;
+}
+
+MemoryBus::StoreFootprintScope::~StoreFootprintScope() {
+    bus_.store_footprint_tracking_ = previous_;
+}
+
 void MemoryBus::setReadFootprintTracking(const bool enabled) noexcept {
     if (read_footprint_tracking_ == enabled) return;
     read_footprint_tracking_ = enabled;
@@ -373,9 +382,8 @@ MemoryResult<std::uint64_t> MemoryBus::read(
         return result;
     }
 
-    if (read_footprint_tracking_
-        && context.type == AccessType::data_read && context.pc != 0U) {
-        addReadFootprint(read_footprint_, address);
+    if (context.type == AccessType::data_read && context.pc != 0U) {
+        addAccessFootprint(address, width);
     }
     const std::size_t offset = address - region->info.base;
     std::uint64_t value = 0;
@@ -452,6 +460,7 @@ MemoryResult<std::uint64_t> MemoryBus::write(
         return result;
     }
 
+    addStoreFootprint(address, width, context);
     const std::size_t offset = address - region->info.base;
     for (std::uint32_t index = 0; index < width; ++index) {
         const auto byte = static_cast<std::uint8_t>(value >> (index * 8U));
@@ -563,9 +572,8 @@ bool MemoryBus::tryFastRead32(
         || (context.type == AccessType::instruction_fetch && !region->info.executable)) {
         return false;
     }
-    if (read_footprint_tracking_
-        && context.type == AccessType::data_read && context.pc != 0U) {
-        addReadFootprint(read_footprint_, address);
+    if (context.type == AccessType::data_read && context.pc != 0U) {
+        addAccessFootprint(address, sizeof(std::uint32_t));
     }
     std::uint32_t value = 0U;
     const std::size_t offset = address - region->info.base;
@@ -595,6 +603,7 @@ bool MemoryBus::tryFastWrite32(
             && (region->info.kind != RegionKind::ram || region->info.executable))) {
         return false;
     }
+    addStoreFootprint(address, sizeof(value), context);
     const std::size_t offset = address - region->info.base;
     if (storeUnjournaledWord(*region, offset, value)) {
         if (region->info.executable) ++execution_generation_;
@@ -647,9 +656,8 @@ bool MemoryBus::tryFastRead(
         || (context.type == AccessType::instruction_fetch && !region->info.executable)) {
         return false;
     }
-    if (read_footprint_tracking_
-        && context.type == AccessType::data_read && context.pc != 0U) {
-        addReadFootprint(read_footprint_, address);
+    if (context.type == AccessType::data_read && context.pc != 0U) {
+        addAccessFootprint(address, width);
     }
     const std::size_t offset = address - region->info.base;
     std::uint64_t value = 0U;
@@ -682,6 +690,7 @@ bool MemoryBus::tryFastWrite(
             && (region->info.kind != RegionKind::ram || region->info.executable))) {
         return false;
     }
+    addStoreFootprint(address, width, context);
     const std::size_t offset = address - region->info.base;
     if (width == sizeof(std::uint32_t)
         && storeUnjournaledWord(*region, offset, static_cast<std::uint32_t>(value))) {
@@ -721,7 +730,7 @@ bool MemoryBus::tryFastReadWords(
         && context.type == AccessType::data_read && context.pc != 0U;
     const std::size_t base = address - region->info.base;
     for (std::uint32_t w = 0U; w < count; ++w) {
-        if (footprint) addReadFootprint(read_footprint_, address + w * 4U);
+        if (footprint) addAccessFootprint(address + w * 4U, 4U);
         std::uint32_t value = 0U;
         std::memcpy(&value, region->bytes.data() + base + w * 4U, sizeof(value));
         if constexpr (std::endian::native == std::endian::big) {
@@ -755,6 +764,7 @@ bool MemoryBus::tryFastWriteWords(
             && (region->info.kind != RegionKind::ram || region->info.executable))) {
         return false;
     }
+    addStoreFootprint(address, static_cast<std::uint32_t>(span), context);
     const std::size_t base = address - region->info.base;
     for (std::uint32_t w = 0U; w < count; ++w) {
         const std::uint32_t value = values[w];
@@ -805,6 +815,29 @@ void MemoryBus::addReadFootprint(
     for (const std::uint32_t mixed : {first, second}) {
         const std::size_t bit = mixed & (bit_count - 1U);
         footprint.words[bit >> 6U] |= std::uint64_t{1U} << (bit & 63U);
+    }
+}
+
+void MemoryBus::addAccessFootprint(
+    const std::uint32_t address, const std::uint32_t width
+) const noexcept {
+    if (!read_footprint_tracking_ || width == 0U) return;
+    const std::uint32_t first_word = address & ~std::uint32_t{3U};
+    const std::uint64_t end = static_cast<std::uint64_t>(address) + width;
+    for (std::uint64_t word = first_word; word < end; word += 4U) {
+        addReadFootprint(read_footprint_, static_cast<std::uint32_t>(word));
+    }
+}
+
+void MemoryBus::addStoreFootprint(
+    const std::uint32_t address, const std::uint32_t width,
+    const AccessContext& context
+) noexcept {
+    if (!store_footprint_tracking_ || context.pc == 0U || width == 0U) return;
+    const std::uint32_t first_word = address & ~std::uint32_t{3U};
+    const std::uint64_t end = static_cast<std::uint64_t>(address) + width;
+    for (std::uint64_t word = first_word; word < end; word += 4U) {
+        addReadFootprint(read_footprint_, static_cast<std::uint32_t>(word));
     }
 }
 
@@ -916,6 +949,16 @@ bool MemoryBus::sideEffectsCompatibleSince(
     return true;
 }
 
+bool MemoryBus::ramInputsCompatibleSince(
+    SideEffectCheckpoint checkpoint, const ReadFootprint& footprint
+) const {
+    // This deliberately ignores MMIO changes only; callers must restrict it
+    // to previously certified MMIO-free idempotent spans, never transactions.
+    if (!footprint.complete || !read_footprint_tracking_ || !write_journal_tracking_) return false;
+    checkpoint.mmio_generation = mmio_generation_;
+    return sideEffectsCompatibleSince(checkpoint, footprint);
+}
+
 bool MemoryBus::canRestoreSideEffects(
     const SideEffectCheckpoint checkpoint
 ) const noexcept {
@@ -949,6 +992,7 @@ bool MemoryBus::restoreSideEffects(const SideEffectCheckpoint checkpoint) {
     mutation_sequence_ = checkpoint.mutation_sequence;
     ++side_effect_generation_;
     if (executable_changed) ++execution_generation_;
+    ++restoration_generation_;
     return true;
 }
 
