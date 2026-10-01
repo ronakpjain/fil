@@ -521,6 +521,39 @@ TEST(WorldTimeTest, CompactFrontierMatchesGeneralSchedulerAcrossPaddingBoundary)
     }
 }
 
+TEST(WorldTimeTest, CompactQuantumMatchesGeneralAtSaturatedClock) {
+    TempWorldTimeConfigs files;
+    const auto config = files.network({
+        files.writeBoard("saturated-alpha.json", "saturated-alpha"),
+        files.writeBoard("saturated-beta.json", "saturated-beta")});
+    auto compact = fil::sim::World::load(config);
+    auto general = fil::sim::World::load(config);
+    ASSERT_TRUE(compact && general);
+    for (auto* world : {compact.value().get(), general.value().get()}) {
+        ASSERT_TRUE(installIdleLoop(*world, "saturated-alpha", 1U));
+        ASSERT_TRUE(installIdleLoop(*world, "saturated-beta", 3U));
+        static_cast<void>(world->eventLoop().runDueEvents(
+            std::numeric_limits<fil::sim::SimTimeNs>::max()));
+    }
+    auto options = runOptions(0U);
+    options.max_instructions_per_board = 11U;
+    options.instruction_quantum = 1U;
+    options.enable_loop_batching = false;
+    const auto result = compact.value()->run(options);
+    options.enable_loop_batching = true;
+    const auto reference = general.value()->run(options);
+    ASSERT_TRUE(result && reference);
+    EXPECT_EQ(result.value().reason, reference.value().reason);
+    EXPECT_EQ(result.value().instructions, reference.value().instructions);
+    EXPECT_EQ(result.value().cycles, reference.value().cycles);
+    EXPECT_EQ(result.value().end_time_ns, reference.value().end_time_ns);
+    EXPECT_EQ(result.value().dispatches, result.value().instructions);
+    for (const auto name : {"saturated-alpha", "saturated-beta"}) {
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(compact.value()->board(name)->cpu().state(),
+            general.value()->board(name)->cpu().state()));
+    }
+}
+
 TEST(WorldTimeTest, SynchronizedPureJitBlocksMatchInterpreter) {
     TempWorldTimeConfigs files;
     const auto config = files.network({

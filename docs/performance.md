@@ -123,6 +123,6 @@ make BUILD_DIR=build-release BUILD_TYPE=Release test
 make BUILD_DIR=build-release BUILD_TYPE=Release benchmark BENCH_REPS=3
 ```
 
-Differential tests cover cached execution, MMIO restart, code invalidation, execution caps, timing, events, and scheduling. Native-specific tests cover emitted arithmetic/flags, branches, prefix limits, preserved state, fetch faults, and invalidation.
+Differential tests cover cached execution, MMIO restart, code invalidation, execution caps, timing, events, and scheduling, including quantum handling when completion timestamps saturate. Native-specific tests cover emitted arithmetic/flags, branches, prefix limits, preserved state, fetch faults, and invalidation.
 
 Tests provide regression evidence, not proof for every firmware. Synthetic smoke benchmarks do not establish six-board network throughput; wall-time measurements are not correctness tests.
