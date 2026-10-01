@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -43,6 +44,17 @@ void prepare(fil::cpu::CortexM4& cpu, const std::uint32_t pc = flash_base) {
     cpu.state().r[13] = cpu.state().msp;
 }
 
+struct FakeFetchStalls {
+    std::uint16_t nonsequential{0U};
+    std::uint16_t sequential{0U};
+};
+
+std::uint16_t fakeFetchStall(
+    const void* context, const std::uint32_t, const bool sequential) {
+    const auto& stalls = *static_cast<const FakeFetchStalls*>(context);
+    return sequential ? stalls.sequential : stalls.nonsequential;
+}
+
 class SharedMmio final : public fil::mem::MmioDevice {
 public:
     fil::mem::MemoryResult<std::uint64_t> read(
@@ -63,6 +75,311 @@ public:
 
     int reads{0};
 };
+
+TEST(JitTest, ReversibleTimedBlockCommitsFastPrefixWithExactCosts) {
+    auto bus = basicBus();
+    // ADDS r0,#1; BEQ (not taken); UDIV r2,r5,r6; STR r0,[r1];
+    // MOV pc,r0 is admitted as the final generic terminator but must not run.
+    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({
+        0x3001U, 0xD000U, 0xFBB5U, 0xF2F6U, 0x6008U, 0x4687U
+    })).hasValue());
+    fil::cpu::CortexM4 cpu(bus);
+    fil::cpu::CortexM4 reference(bus);
+    bus.setReversibleRamOnly(true);
+    bus.setAllMmioTrapping(true);
+    prepare(cpu);
+    prepare(reference);
+    cpu.state().r[0] = reference.state().r[0] = 4U;
+    cpu.state().r[1] = reference.state().r[1] = ram_base;
+    cpu.state().r[5] = reference.state().r[5] = 101U;
+    cpu.state().r[6] = reference.state().r[6] = 10U;
+    for (unsigned int i = 0U; i < 70U; ++i) {
+        static_cast<void>(cpu.prepareJitBlock());
+    }
+    ASSERT_TRUE(cpu.jitBlockReady());
+
+    const auto timed = cpu.tryStepReversibleJitBlock();
+    ASSERT_TRUE(timed);
+    ASSERT_EQ(timed->execution.count, 4U) << "pc=0x" << std::hex
+        << cpu.state().r[15] << " reason="
+        << fil::cpu::stopReasonName(timed->execution.result.reason);
+    EXPECT_EQ(timed->execution.result.instructions, 4U);
+    EXPECT_EQ(cpu.state().r[15], flash_base + 10U)
+        << "generic MOV-to-PC was not executed";
+    EXPECT_EQ(cpu.state().r[0], 5U);
+    EXPECT_EQ(cpu.state().r[2], 10U);
+    const auto stored = bus.read32(ram_base);
+    ASSERT_TRUE(stored);
+    EXPECT_EQ(stored.value(), 5U);
+
+    std::uint32_t sum = 0U;
+    for (std::uint8_t i = 0U; i < timed->execution.count; ++i) {
+        const auto expected = reference.stepFast();
+        ASSERT_EQ(expected.reason, fil::cpu::StopReason::step_complete);
+        EXPECT_EQ(timed->execution.pcs[i], expected.instruction_address);
+        EXPECT_EQ(timed->instruction_cycles[i], expected.cycles);
+        sum += timed->instruction_cycles[i];
+    }
+    EXPECT_EQ(timed->execution.result.cycles, sum);
+    EXPECT_EQ(timed->instruction_cycles[1], 1U)
+        << "failed conditional branch retires for one cycle";
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()));
+}
+
+TEST(JitTest, ReversibleTimedBlockTimesSignedDivideExactly) {
+    auto bus = basicBus();
+    ASSERT_TRUE(bus.loadBytes(flash_base,
+        halfwords({0xFB93U, 0xF1F2U, 0xBF00U})).hasValue()); // SDIV r1,r3,r2; NOP
+    fil::cpu::CortexM4 cpu(bus);
+    fil::cpu::CortexM4 reference(bus);
+    prepare(cpu);
+    prepare(reference);
+    cpu.state().r[3] = reference.state().r[3]
+        = std::bit_cast<std::uint32_t>(-10);
+    cpu.state().r[2] = reference.state().r[2] = 3U;
+    for (unsigned int i = 0U; i < 70U; ++i) static_cast<void>(cpu.prepareJitBlock());
+    const auto timed = cpu.tryStepReversibleJitBlock();
+    ASSERT_TRUE(timed);
+    ASSERT_EQ(timed->execution.count, 2U);
+    const auto divided = reference.stepFast();
+    ASSERT_EQ(divided.reason, fil::cpu::StopReason::step_complete);
+    EXPECT_EQ(timed->instruction_cycles[0], divided.cycles);
+    EXPECT_EQ(cpu.state().r[1], std::bit_cast<std::uint32_t>(-3));
+    EXPECT_EQ(timed->instruction_cycles[1], reference.stepFast().cycles);
+    EXPECT_EQ(timed->execution.result.cycles,
+        static_cast<std::uint16_t>(timed->instruction_cycles[0]
+            + timed->instruction_cycles[1]));
+}
+
+TEST(JitTest, ReversibleTimedBlockStopsAtBranchWithRefillCost) {
+    auto bus = basicBus();
+    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0xBF00U, 0xE000U, 0x2009U})).hasValue());
+    bus.setReversibleRamOnly(true);
+    bus.setAllMmioTrapping(true);
+    fil::cpu::CortexM4 cpu(bus);
+    fil::cpu::CortexM4 reference(bus);
+    prepare(cpu);
+    prepare(reference);
+    for (unsigned int i = 0U; i < 70U; ++i) static_cast<void>(cpu.prepareJitBlock());
+    const auto timed = cpu.tryStepReversibleJitBlock();
+    ASSERT_TRUE(timed);
+    ASSERT_EQ(timed->execution.count, 2U);
+    std::uint32_t sum = 0U;
+    for (std::uint8_t i = 0U; i < timed->execution.count; ++i) {
+        const auto expected = reference.stepFast();
+        ASSERT_EQ(expected.reason, fil::cpu::StopReason::step_complete);
+        EXPECT_EQ(timed->execution.pcs[i], expected.instruction_address);
+        EXPECT_EQ(timed->instruction_cycles[i], expected.cycles);
+        sum += timed->instruction_cycles[i];
+    }
+    EXPECT_EQ(timed->execution.result.cycles, sum);
+    EXPECT_EQ(timed->execution.result.cycles, 5U);
+    EXPECT_EQ(cpu.state().r[15], flash_base + 6U);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()));
+}
+
+TEST(JitTest, ReversibleTimedBlockReturnsCommittedPrefixOnDecline) {
+    constexpr std::uint32_t mmio_base = 0x40000000U;
+    auto bus = basicBus();
+    SharedMmio device;
+    ASSERT_TRUE(bus.mapMmio(mmio_base, 16U, device, "capsule-mmio").hasValue());
+    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0x2001U, 0x6008U, 0xBF00U})).hasValue());
+    bus.setSharedMmioTrapping(true);
+    bus.setAllMmioTrapping(true);
+    bus.setReversibleRamOnly(true);
+    fil::cpu::CortexM4 cpu(bus);
+    prepare(cpu);
+    cpu.state().r[1] = mmio_base;
+    for (unsigned int i = 0U; i < 70U; ++i) static_cast<void>(cpu.prepareJitBlock());
+    const auto timed = cpu.tryStepReversibleJitBlock();
+    ASSERT_TRUE(timed);
+    ASSERT_EQ(timed->execution.count, 1U);
+    EXPECT_TRUE(timed->execution.memory_free)
+        << "declined MMIO instruction is not part of the committed prefix";
+    EXPECT_EQ(timed->instruction_cycles[0], 1U);
+    EXPECT_EQ(timed->execution.result.cycles, 1U);
+    EXPECT_EQ(cpu.state().r[15], flash_base + 2U)
+        << "declined MMIO store remains the next instruction";
+    EXPECT_EQ(device.reads, 0);
+
+    // If the first instruction declines, no empty-prefix outcome is returned
+    // and no guest state is changed.
+    auto fault_bus = basicBus();
+    ASSERT_TRUE(fault_bus.loadBytes(flash_base, halfwords({0x6808U, 0xBF00U})).hasValue());
+    fil::cpu::CortexM4 fault_cpu(fault_bus);
+    prepare(fault_cpu);
+    fault_cpu.state().r[1] = 0x50000000U;
+    for (unsigned int i = 0U; i < 70U; ++i) static_cast<void>(fault_cpu.prepareJitBlock());
+    const auto fault_before = fault_cpu.state();
+    EXPECT_FALSE(fault_cpu.tryStepReversibleJitBlock().has_value());
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(fault_cpu.state(), fault_before));
+
+    auto executable_bus = basicBus();
+    ASSERT_TRUE(executable_bus.mapRam(
+        ram_base + 0x1000U, 0x100U, "capsule-executable-ram", true).hasValue());
+    ASSERT_TRUE(executable_bus.loadBytes(
+        flash_base, halfwords({0x6008U, 0xBF00U})).hasValue());
+    executable_bus.setAllMmioTrapping(true);
+    executable_bus.setReversibleRamOnly(true);
+    fil::cpu::CortexM4 executable_cpu(executable_bus);
+    prepare(executable_cpu);
+    executable_cpu.state().r[0] = 0x2001U;
+    executable_cpu.state().r[1] = ram_base + 0x1000U;
+    for (unsigned int i = 0U; i < 70U; ++i) {
+        static_cast<void>(executable_cpu.prepareJitBlock());
+    }
+    const auto executable_before = executable_cpu.state();
+    EXPECT_FALSE(executable_cpu.tryStepReversibleJitBlock().has_value());
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(executable_cpu.state(), executable_before));
+    const auto unchanged = executable_bus.read32(ram_base + 0x1000U);
+    ASSERT_TRUE(unchanged);
+    EXPECT_EQ(unchanged.value(), 0U)
+        << "reversible store restriction refuses executable RAM writes";
+}
+
+TEST(JitTest, BudgetedReversiblePrefixDebitsExactCommittedCosts) {
+    auto bus = basicBus();
+    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({
+        0x3001U, 0xD000U, 0xFBB5U, 0xF2F6U, 0x6008U, 0x4687U
+    })).hasValue());
+    bus.setReversibleRamOnly(true);
+    bus.setAllMmioTrapping(true);
+    fil::cpu::CortexM4 cpu(bus);
+    fil::cpu::CortexM4 reference(bus);
+    prepare(cpu);
+    prepare(reference);
+    cpu.state().r[1] = reference.state().r[1] = ram_base;
+    cpu.state().r[5] = reference.state().r[5] = 101U;
+    cpu.state().r[6] = reference.state().r[6] = 10U;
+    for (unsigned int i = 0U; i < 70U; ++i) static_cast<void>(cpu.prepareJitBlock());
+
+    FakeFetchStalls stalls{3U, 1U};
+    fil::cpu::CortexM4::ReversibleCycleBudget budget{};
+    budget.fetch_stall = fakeFetchStall;
+    budget.context = &stalls;
+    const auto initial = cpu.state();
+    for (const std::uint64_t credit : {0U, 1U, 3U}) {
+        budget.remaining_cycles = credit;
+        EXPECT_FALSE(cpu.tryStepBudgetedReversibleJitBlock(16U, budget));
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), initial));
+        EXPECT_EQ(budget.remaining_cycles, credit);
+        EXPECT_FALSE(budget.have_fetch);
+    }
+
+    budget.remaining_cycles = 4U;
+    auto first = cpu.tryStepBudgetedReversibleJitBlock(16U, budget);
+    ASSERT_TRUE(first);
+    ASSERT_EQ(first->execution.count, 1U);
+    EXPECT_EQ(first->instruction_cycles[0], 1U);
+    EXPECT_EQ(budget.total_instruction_cycles[0], 4U);
+    EXPECT_EQ(budget.remaining_cycles, 0U);
+    EXPECT_TRUE(budget.have_fetch);
+    EXPECT_EQ(budget.fetch_end, flash_base + 2U);
+
+    // Prepare the next entry PC after the first committed capsule.
+    for (unsigned int i = 0U; i < 70U; ++i) static_cast<void>(cpu.prepareJitBlock());
+    // Failed BEQ (ADDS cleared Z), UDIV, and STR each include the exact
+    // sequential-fetch surcharge; the final generic MOV-to-PC is not run.
+    budget.remaining_cycles = 10U;
+    auto suffix = cpu.tryStepBudgetedReversibleJitBlock(16U, budget);
+    ASSERT_TRUE(suffix);
+    ASSERT_EQ(suffix->execution.count, 3U);
+    EXPECT_EQ(suffix->instruction_cycles[0], 1U); // failed conditional branch
+    EXPECT_EQ(suffix->instruction_cycles[1], 4U); // UDIV r5/r6 = 10, divisor 10
+    EXPECT_EQ(budget.total_instruction_cycles[0], 2U);
+    EXPECT_EQ(budget.total_instruction_cycles[1], 5U);
+    EXPECT_EQ(budget.total_instruction_cycles[2], 3U);
+    EXPECT_EQ(budget.remaining_cycles, 0U);
+    EXPECT_EQ(budget.fetch_end, flash_base + 10U);
+    EXPECT_EQ(cpu.state().r[15], flash_base + 10U);
+
+    std::uint32_t reference_cycles = 0U;
+    for (unsigned int i = 0U; i < 4U; ++i) {
+        const auto step = reference.stepFast();
+        ASSERT_EQ(step.reason, fil::cpu::StopReason::step_complete);
+        reference_cycles += step.cycles;
+    }
+    EXPECT_EQ(first->execution.result.cycles + suffix->execution.result.cycles,
+        reference_cycles);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()));
+    const auto stored = bus.read32(ram_base);
+    ASSERT_TRUE(stored);
+    EXPECT_EQ(stored.value(), cpu.state().r[0]);
+}
+
+TEST(JitTest, BudgetedReversibleBlockRejectsBeforeTakenBranchSideEffects) {
+    auto bus = basicBus();
+    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0xBF00U, 0xE7FFU})).hasValue());
+    bus.setReversibleRamOnly(true);
+    bus.setAllMmioTrapping(true);
+    fil::cpu::CortexM4 cpu(bus);
+    prepare(cpu);
+    for (unsigned int i = 0U; i < 70U; ++i) static_cast<void>(cpu.prepareJitBlock());
+
+    fil::cpu::CortexM4::ReversibleCycleBudget budget{};
+    budget.remaining_cycles = 2U;
+    const auto prefix = cpu.tryStepBudgetedReversibleJitBlock(16U, budget);
+    ASSERT_TRUE(prefix);
+    ASSERT_EQ(prefix->execution.count, 1U);
+    EXPECT_EQ(cpu.state().r[15], flash_base + 2U);
+    EXPECT_EQ(prefix->execution.result.cycles, 1U);
+    EXPECT_EQ(budget.total_instruction_cycles[0], 1U);
+    EXPECT_EQ(budget.remaining_cycles, 1U)
+        << "branch's conservative refill bound rejected it before execution";
+}
+
+TEST(JitTest, BudgetedReversibleDeclineDoesNotSpendCreditOnDeclinedMemory) {
+    constexpr std::uint32_t mmio_base = 0x40000000U;
+    auto bus = basicBus();
+    SharedMmio device;
+    ASSERT_TRUE(bus.mapMmio(mmio_base, 16U, device, "budget-mmio").hasValue());
+    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0x2001U, 0x6008U, 0xBF00U})).hasValue());
+    bus.setAllMmioTrapping(true);
+    bus.setReversibleRamOnly(true);
+    fil::cpu::CortexM4 cpu(bus);
+    prepare(cpu);
+    cpu.state().r[1] = mmio_base;
+    for (unsigned int i = 0U; i < 70U; ++i) static_cast<void>(cpu.prepareJitBlock());
+    FakeFetchStalls stalls{2U, 1U};
+    fil::cpu::CortexM4::ReversibleCycleBudget budget{};
+    budget.remaining_cycles = 3U;
+    budget.fetch_stall = fakeFetchStall;
+    budget.context = &stalls;
+    const auto prefix = cpu.tryStepBudgetedReversibleJitBlock(16U, budget);
+    ASSERT_TRUE(prefix);
+    ASSERT_EQ(prefix->execution.count, 1U);
+    EXPECT_EQ(budget.total_instruction_cycles[0], 3U);
+    EXPECT_EQ(budget.remaining_cycles, 0U);
+    EXPECT_EQ(budget.fetch_end, flash_base + 2U);
+    EXPECT_EQ(cpu.state().r[15], flash_base + 2U)
+        << "declined MMIO store is not speculatively consumed";
+    EXPECT_EQ(device.reads, 0);
+
+    auto executable_bus = basicBus();
+    ASSERT_TRUE(executable_bus.mapRam(
+        ram_base + 0x1000U, 0x100U, "budget-executable-ram", true).hasValue());
+    ASSERT_TRUE(executable_bus.loadBytes(
+        flash_base, halfwords({0x6008U, 0xBF00U})).hasValue());
+    executable_bus.setAllMmioTrapping(true);
+    executable_bus.setReversibleRamOnly(true);
+    fil::cpu::CortexM4 executable_cpu(executable_bus);
+    prepare(executable_cpu);
+    executable_cpu.state().r[0] = 0x2001U;
+    executable_cpu.state().r[1] = ram_base + 0x1000U;
+    for (unsigned int i = 0U; i < 70U; ++i) {
+        static_cast<void>(executable_cpu.prepareJitBlock());
+    }
+    fil::cpu::CortexM4::ReversibleCycleBudget exec_budget{};
+    exec_budget.remaining_cycles = 20U;
+    const auto executable_before = executable_cpu.state();
+    EXPECT_FALSE(executable_cpu.tryStepBudgetedReversibleJitBlock(16U, exec_budget));
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(executable_cpu.state(), executable_before));
+    EXPECT_EQ(exec_budget.remaining_cycles, 20U);
+    EXPECT_FALSE(exec_budget.have_fetch);
+    const auto unchanged = executable_bus.read32(ram_base + 0x1000U);
+    ASSERT_TRUE(unchanged);
+    EXPECT_EQ(unchanged.value(), 0U);
+}
 
 TEST(JitTest, ClassifiesBoundaries) {
     using fil::cpu::InstrKind;
@@ -190,11 +507,11 @@ TEST(JitTest, WarmBlockCommitsPrefixAndRestartsMmioInstructionExactlyOnce) {
     prepare(cpu);
     cpu.state().r[2] = mmio_base;
     ASSERT_TRUE(cpu.jitBlockReady());
-    EXPECT_FALSE(cpu.peekJitBlock().has_value())
-        << "preview refuses a prefix containing an MMIO load";
-    const auto pure_prefix = cpu.peekJitBlock(1U);
+    const auto pure_prefix = cpu.peekJitBlock();
     ASSERT_TRUE(pure_prefix.has_value());
-    EXPECT_EQ(pure_prefix->count, 1U);
+    EXPECT_EQ(pure_prefix->count, 1U)
+        << "exact preview stops before the MMIO load";
+    EXPECT_EQ(pure_prefix->pcs[0], flash_base);
 
     const auto trapped = cpu.tryStepJitBlock();
     ASSERT_TRUE(trapped.has_value());
@@ -266,6 +583,17 @@ TEST(JitTest, JitExecutionCapAndPurePreviewAreBounded) {
     EXPECT_EQ(preview->count, 2U);
     EXPECT_EQ(preview->pcs[0], flash_base);
     EXPECT_EQ(preview->pcs[1], flash_base + 2U);
+    fil::cpu::CortexM4::JitBlockPreview fused_preview{};
+    ASSERT_TRUE(cpu.prepareAndPeekJitBlock(2U, fused_preview));
+    EXPECT_EQ(fused_preview.count, preview->count);
+    EXPECT_EQ(fused_preview.max_cycles, preview->max_cycles);
+    EXPECT_EQ(fused_preview.exact_cycle_prefix_count,
+        preview->exact_cycle_prefix_count);
+    for (std::size_t i = 0; i < preview->count; ++i) {
+        EXPECT_EQ(fused_preview.pcs[i], preview->pcs[i]);
+        EXPECT_EQ(fused_preview.sizes[i], preview->sizes[i]);
+        EXPECT_EQ(fused_preview.instruction_cycles[i], preview->instruction_cycles[i]);
+    }
     const auto execution = cpu.tryStepJitBlock(2U);
     ASSERT_TRUE(execution.has_value());
     EXPECT_EQ(execution->count, 2U);
@@ -330,6 +658,7 @@ TEST(JitTest, SingleInstructionJitMatchesInterpreterAndFallbackCases) {
         ASSERT_TRUE(ref_bus.loadBytes(flash_base, code).hasValue());
         fil::cpu::CortexM4 jit(jit_bus);
         fil::cpu::CortexM4 reference(ref_bus);
+        jit.setNativeSingleInstructionJitEnabled(false);
         prepare(jit);
         prepare(reference);
         configure(jit.state());
@@ -370,6 +699,78 @@ TEST(JitTest, SingleInstructionJitMatchesInterpreterAndFallbackCases) {
     }, true);
 }
 
+TEST(JitTest, WarmSingleCacheRespectsCodeAndArchitecturalStateChanges) {
+    auto jit_bus = basicBus();
+    auto ref_bus = basicBus();
+    for (auto* bus : {&jit_bus, &ref_bus}) {
+        ASSERT_TRUE(bus->loadBytes(flash_base, halfwords({0x2001U})).hasValue());
+    }
+    fil::cpu::CortexM4 jit(jit_bus);
+    fil::cpu::CortexM4 reference(ref_bus);
+    jit.setNativeSingleInstructionJitEnabled(false);
+    prepare(jit);
+    ASSERT_EQ(jit.stepJitFast().reason, fil::cpu::StopReason::step_complete);
+    for (auto* bus : {&jit_bus, &ref_bus}) {
+        ASSERT_TRUE(bus->loadBytes(flash_base, halfwords({0x2009U})).hasValue());
+    }
+    for (const unsigned int scenario : {0U, 1U, 2U, 3U, 4U}) {
+        prepare(jit);
+        if (scenario == 1U) jit.state().setItState(0x08U); // Failed EQ must not write r0.
+        if (scenario == 2U) jit.state().halted = true;
+        if (scenario == 3U) jit.state().thumb = false;
+        if (scenario == 4U) jit.state().xpsr &= ~fil::cpu::xpsr_t;
+        reference.state() = jit.state();
+        const auto actual = jit.stepJitFast();
+        const auto expected = reference.stepFast();
+        EXPECT_EQ(actual.reason, expected.reason);
+        EXPECT_EQ(actual.raw, expected.raw);
+        EXPECT_EQ(actual.instructions, expected.instructions);
+        EXPECT_EQ(actual.cycles, expected.cycles);
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(jit.state(), reference.state()));
+        if (scenario == 0U) EXPECT_EQ(jit.state().r[0], 9U);
+        if (actual.reason != fil::cpu::StopReason::step_complete) {
+            EXPECT_EQ(jit.lastDiagnostic().message, reference.lastDiagnostic().message);
+        }
+    }
+}
+
+TEST(JitTest, CachedUnconditionalFastPathMatchesInterpreter) {
+    for (const auto& code : {
+            halfwords({0x3001U}), // ADDS r0,#1
+            halfwords({0x6808U}), // LDR r0,[r1]
+            halfwords({0xE000U}), // B to the instruction after fallthrough
+        }) {
+        auto jit_bus = basicBus();
+        auto ref_bus = basicBus();
+        ASSERT_TRUE(jit_bus.loadBytes(flash_base, code).hasValue());
+        ASSERT_TRUE(ref_bus.loadBytes(flash_base, code).hasValue());
+        fil::cpu::CortexM4 jit(jit_bus);
+        fil::cpu::CortexM4 reference(ref_bus);
+        jit.setNativeSingleInstructionJitEnabled(false);
+        prepare(jit);
+        prepare(reference);
+        jit.state().r[0] = reference.state().r[0] = 0xffffffffU;
+        jit.state().r[1] = reference.state().r[1] = ram_base;
+        ASSERT_TRUE(jit_bus.write32(ram_base, 0x12345678U).hasValue());
+        ASSERT_TRUE(ref_bus.write32(ram_base, 0x12345678U).hasValue());
+        for (unsigned int i = 0U; i < 4U; ++i) {
+            const auto actual = jit.stepJitFast();
+            const auto expected = reference.stepFast();
+            EXPECT_EQ(actual.reason, expected.reason);
+            EXPECT_EQ(actual.raw, expected.raw);
+            EXPECT_EQ(actual.instruction_size, expected.instruction_size);
+            EXPECT_EQ(actual.instructions, expected.instructions);
+            EXPECT_EQ(actual.cycles, expected.cycles);
+            EXPECT_EQ(actual.suppress_loop_observation,
+                expected.suppress_loop_observation);
+            EXPECT_TRUE(fil::cpu::bitwiseEqual(jit.state(), reference.state()));
+            if (actual.reason != fil::cpu::StopReason::step_complete) break;
+            jit.state().r[15] = flash_base;
+            reference.state().r[15] = flash_base;
+        }
+    }
+}
+
 TEST(JitTest, SingleInstructionJitFallsBackForMmioAndFaults) {
     auto compare_fallback = [](const bool mapped_mmio, const bool trap) {
         constexpr std::uint32_t mmio_base = 0x40000000U;
@@ -387,6 +788,7 @@ TEST(JitTest, SingleInstructionJitFallsBackForMmioAndFaults) {
         ref_bus.setSharedMmioTrapping(trap);
         fil::cpu::CortexM4 jit(jit_bus);
         fil::cpu::CortexM4 reference(ref_bus);
+        jit.setNativeSingleInstructionJitEnabled(false);
         prepare(jit);
         prepare(reference);
         jit.state().r[2] = mapped_mmio ? mmio_base : 0x50000000U;
@@ -443,6 +845,34 @@ TEST(JitTest, RegisterAluSpecializationsMatchInterpreterAcrossSeeds) {
         {halfwords({0xEB51U, 0x0082U}), fil::cpu::InstrKind::adc}, // ADCS.W r0,r1,r2,LSL #2
         {halfwords({0xEB71U, 0x0082U}), fil::cpu::InstrKind::sbc}, // SBCS.W r0,r1,r2,LSL #2
         {halfwords({0xEB0DU, 0x0001U}), fil::cpu::InstrKind::add}, // ADD.W r0,sp,r1
+        {halfwords({0x4248U}), fil::cpu::InstrKind::rsb}, // RSBS r0,r1,#0
+        {halfwords({0x421AU}), fil::cpu::InstrKind::tst}, // TST r2,r3
+        {halfwords({0xFB01U, 0x3002U}), fil::cpu::InstrKind::mla}, // MLA r0,r1,r2,r3
+        {halfwords({0xFBA2U, 0x0103U}), fil::cpu::InstrKind::umull}, // UMULL r0,r1,r2,r3
+        {halfwords({0xFAB1U, 0xF081U}), fil::cpu::InstrKind::clz}, // CLZ r0,r1
+        {halfwords({0xBA08U}), fil::cpu::InstrKind::rev}, // REV r0,r1
+        {halfwords({0xBA48U}), fil::cpu::InstrKind::rev16}, // REV16 r0,r1
+        {halfwords({0xBAC8U}), fil::cpu::InstrKind::revsh}, // REVSH r0,r1
+        {halfwords({0xF36FU, 0x0007U}), fil::cpu::InstrKind::bfc}, // BFC r0,#0,#8
+        {halfwords({0xF3C1U, 0x2007U}), fil::cpu::InstrKind::ubfx}, // UBFX r0,r1,#8,#8
+        {halfwords({0xB248U}), fil::cpu::InstrKind::sxtb}, // SXTB r0,r1
+        {halfwords({0xB2C8U}), fil::cpu::InstrKind::uxtb}, // UXTB r0,r1
+        {halfwords({0xB208U}), fil::cpu::InstrKind::sxth}, // SXTH r0,r1
+        {halfwords({0xB288U}), fil::cpu::InstrKind::uxth}, // UXTH r0,r1
+        {halfwords({0xFA81U, 0xF042U}), fil::cpu::InstrKind::uadd8}, // UADD8 r0,r1,r2
+        {halfwords({0xFAA1U, 0xF082U}), fil::cpu::InstrKind::sel}, // SEL r0,r1,r2
+        {halfwords({0xD0FDU}), fil::cpu::InstrKind::b}, // BEQ.N (conditional branch)
+        {halfwords({0xF47FU, 0xAFFCU}), fil::cpu::InstrKind::b}, // BNE.W (conditional branch)
+        {halfwords({0x4708U}), fil::cpu::InstrKind::bx}, // BX r1 (declines unless Thumb target)
+        {halfwords({0x6808U}), fil::cpu::InstrKind::ldr}, // LDR r0,[r1] (RAM/decline)
+        {halfwords({0x6048U}), fil::cpu::InstrKind::str}, // STR r0,[r1,#4]
+        {halfwords({0x7848U}), fil::cpu::InstrKind::ldrb}, // LDRB r0,[r1,#1]
+        {halfwords({0x8048U}), fil::cpu::InstrKind::strh}, // STRH r0,[r1,#2]
+        {halfwords({0xE891U, 0x0005U}), fil::cpu::InstrKind::ldm}, // LDMIA.W r1,{r0,r2}
+        {halfwords({0xE881U, 0x0005U}), fil::cpu::InstrKind::stm}, // STMIA.W r1,{r0,r2}
+        {halfwords({0xB4F0U}), fil::cpu::InstrKind::push}, // PUSH {r4-r7}
+        {halfwords({0xBCF0U}), fil::cpu::InstrKind::pop}, // POP {r4-r7}
+        {halfwords({0xBDF0U}), fil::cpu::InstrKind::pop}, // POP {r4-r7,pc} (return)
     };
     for (const auto& encoding : encodings) {
         std::optional<fil::cpu::DecodedInstruction> decoded;
@@ -470,6 +900,7 @@ TEST(JitTest, RegisterAluSpecializationsMatchInterpreterAcrossSeeds) {
             ASSERT_TRUE(ref_bus.loadBytes(flash_base, encoding.bytes).hasValue());
             fil::cpu::CortexM4 jit(jit_bus);
             fil::cpu::CortexM4 reference(ref_bus);
+            jit.setNativeSingleInstructionJitEnabled(false);
             prepare(jit);
             prepare(reference);
             std::uint32_t random = 0xA511E9B3U
@@ -500,6 +931,138 @@ TEST(JitTest, RegisterAluSpecializationsMatchInterpreterAcrossSeeds) {
             EXPECT_EQ(actual.cycles, expected.cycles);
             EXPECT_TRUE(fil::cpu::bitwiseEqual(jit.state(), reference.state()))
                 << "kind=" << static_cast<int>(encoding.kind) << " trial=" << trial;
+        }
+    }
+}
+
+TEST(JitTest, CachedArithmeticPreservesNzcvAtCarryAndOverflowEdges) {
+    for (const auto opcode : {0x1840U, 0x1a40U, 0x4148U, 0x4188U, 0x4288U, 0x4248U}) {
+        auto jit_bus = basicBus();
+        auto ref_bus = basicBus();
+        for (auto* bus : {&jit_bus, &ref_bus}) {
+            ASSERT_TRUE(bus->loadBytes(flash_base,
+                halfwords({static_cast<std::uint16_t>(opcode)})).hasValue());
+        }
+        fil::cpu::CortexM4 jit(jit_bus);
+        fil::cpu::CortexM4 reference(ref_bus);
+        jit.setNativeSingleInstructionJitEnabled(false);
+        prepare(jit);
+        static_cast<void>(jit.stepFast()); // Warm the cache, then vary its live operands.
+        for (const auto left : {0U, 1U, 0x7fffffffU, 0x80000000U, 0xffffffffU}) {
+            for (const auto right : {0U, 1U, 0x7fffffffU, 0x80000000U, 0xffffffffU}) {
+                for (const bool carry : {false, true}) {
+                    prepare(jit);
+                    jit.state().r[0] = left;
+                    jit.state().r[1] = right;
+                    jit.state().xpsr |= fil::cpu::xpsr_q | fil::cpu::xpsr_ge_mask
+                        | fil::cpu::xpsr_n | fil::cpu::xpsr_z | fil::cpu::xpsr_v;
+                    if (carry) jit.state().xpsr |= fil::cpu::xpsr_c;
+                    reference.state() = jit.state();
+                    const auto actual = jit.stepJitFast();
+                    const auto expected = reference.stepFast();
+                    EXPECT_EQ(actual.reason, expected.reason);
+                    EXPECT_EQ(actual.cycles, expected.cycles);
+                    EXPECT_TRUE(fil::cpu::bitwiseEqual(jit.state(), reference.state()))
+                        << "opcode=" << std::hex << opcode << " left=" << left
+                        << " right=" << right << " carry=" << carry;
+                }
+            }
+        }
+    }
+}
+
+TEST(JitTest, MemoryHandlersMatchInterpreterAcrossSeeds) {
+    struct Encoding {
+        std::vector<std::uint8_t> bytes;
+        fil::cpu::InstrKind kind;
+    };
+    const std::vector<Encoding> encodings{
+        {halfwords({0x6808U}), fil::cpu::InstrKind::ldr}, // LDR r0,[r1]
+        {halfwords({0x6048U}), fil::cpu::InstrKind::str}, // STR r0,[r1,#4]
+        {halfwords({0x7848U}), fil::cpu::InstrKind::ldrb}, // LDRB r0,[r1,#1]
+        {halfwords({0x8048U}), fil::cpu::InstrKind::strh}, // STRH r0,[r1,#2]
+        {halfwords({0xE891U, 0x0005U}), fil::cpu::InstrKind::ldm}, // LDMIA.W r1,{r0,r2}
+        {halfwords({0xE881U, 0x0005U}), fil::cpu::InstrKind::stm}, // STMIA.W r1,{r0,r2}
+        {halfwords({0xB4F0U}), fil::cpu::InstrKind::push}, // PUSH {r4-r7}
+        {halfwords({0xBCF0U}), fil::cpu::InstrKind::pop}, // POP {r4-r7}
+        {halfwords({0xBDF0U}), fil::cpu::InstrKind::pop}, // POP {r4-r7,pc}
+        {halfwords({0x4708U}), fil::cpu::InstrKind::bx}, // BX r1
+    };
+    for (const auto& encoding : encodings) {
+        for (unsigned int trial = 0U; trial < 25U; ++trial) {
+            auto jit_bus = basicBus();
+            auto ref_bus = basicBus();
+            ASSERT_TRUE(jit_bus.loadBytes(flash_base, encoding.bytes).hasValue());
+            ASSERT_TRUE(ref_bus.loadBytes(flash_base, encoding.bytes).hasValue());
+            // Seed RAM identically so success paths compare data, not just state.
+            std::uint32_t seed = 0x12345678U ^ (static_cast<std::uint32_t>(trial) * 0x9E3779B1U);
+            for (std::uint32_t addr = ram_base; addr < ram_base + 256U; addr += 4U) {
+                seed = seed * 1664525U + 1013904223U;
+                const std::uint32_t word = seed ^ (seed >> 13U);
+                const std::vector<std::uint8_t> word_bytes{
+                    static_cast<std::uint8_t>(word), static_cast<std::uint8_t>(word >> 8U),
+                    static_cast<std::uint8_t>(word >> 16U),
+                    static_cast<std::uint8_t>(word >> 24U)};
+                ASSERT_TRUE(jit_bus.loadBytes(addr, word_bytes).hasValue());
+                ASSERT_TRUE(ref_bus.loadBytes(addr, word_bytes).hasValue());
+            }
+            fil::cpu::CortexM4 jit(jit_bus);
+            fil::cpu::CortexM4 reference(ref_bus);
+            jit.setNativeSingleInstructionJitEnabled(false);
+            prepare(jit);
+            prepare(reference);
+            // AimMemOps at RAM (success), alternating SP-relative and r1-based.
+            std::uint32_t s = 0xABCDEF01U ^ (static_cast<std::uint32_t>(trial) * 0x85EBCA6BU);
+            for (std::size_t r = 0; r < 13U; ++r) {
+                s = s * 1664525U + 1013904223U;
+                jit.state().r[r] = ram_base + (s % 240U);
+                reference.state().r[r] = jit.state().r[r];
+            }
+            jit.state().r[13] = ram_base + 0xC0U;
+            reference.state().r[13] = ram_base + 0xC0U;
+            // BX targets: alternate valid Thumb RAM/flash targets and faults.
+            if (encoding.kind == fil::cpu::InstrKind::bx) {
+                jit.state().r[1] = (trial % 2U == 0U)
+                    ? (flash_base + 1U) : (ram_base + 0x33U);
+                reference.state().r[1] = jit.state().r[1];
+            }
+            // POP {r4-r7,pc}: plant the PC word (5th transfer word) covering
+            // valid Thumb targets, exception-return tokens, and faults.
+            if (encoding.bytes.size() == 2U && encoding.bytes[1] == 0xBDU) {
+                const std::uint32_t target = (trial % 3U == 0U)
+                    ? (flash_base + 1U)
+                    : (trial % 3U == 1U ? 0xFFFFFFFDU : (ram_base + 2U));
+                auto poke_pc = [&](fil::mem::MemoryBus& bus) {
+                    const std::vector<std::uint8_t> target_bytes{
+                        static_cast<std::uint8_t>(target),
+                        static_cast<std::uint8_t>(target >> 8U),
+                        static_cast<std::uint8_t>(target >> 16U),
+                        static_cast<std::uint8_t>(target >> 24U)};
+                    EXPECT_TRUE(bus.loadBytes(ram_base + 0xC0U + 16U, target_bytes)
+                        .hasValue());
+                };
+                poke_pc(jit_bus);
+                poke_pc(ref_bus);
+            }
+            const auto initial = jit.state();
+            static_cast<void>(jit.stepFast()); // Populate decode metadata.
+            jit.state() = initial;
+            const auto actual = jit.stepJitFast();
+            const auto expected = reference.stepFast();
+            EXPECT_EQ(actual.reason, expected.reason);
+            EXPECT_EQ(actual.instructions, expected.instructions);
+            EXPECT_EQ(actual.cycles, expected.cycles);
+            EXPECT_EQ(actual.suppress_loop_observation, expected.suppress_loop_observation);
+            EXPECT_TRUE(fil::cpu::bitwiseEqual(jit.state(), reference.state()))
+                << "kind=" << static_cast<int>(encoding.kind) << " trial=" << trial;
+            // Compare full RAM contents for data-path equivalence.
+            for (std::uint32_t addr = ram_base; addr < ram_base + 256U; addr += 4U) {
+                const auto jaw = jit_bus.read32(addr, {});
+                const auto raw = ref_bus.read32(addr, {});
+                ASSERT_TRUE(jaw.hasValue() && raw.hasValue());
+                EXPECT_EQ(jaw.value(), raw.value())
+                    << "RAM mismatch at 0x" << std::hex << addr;
+            }
         }
     }
 }
@@ -596,6 +1159,18 @@ TEST(JitTest, ExactPreviewAgreesWithExecutionIncludingBranchFallthrough) {
             const auto preview = cpu.peekJitBlock(limit);
             ASSERT_TRUE(preview);
             ASSERT_TRUE(preview->cycles_exact);
+            fil::cpu::CortexM4::JitBlockPreview fused_preview{};
+            ASSERT_TRUE(cpu.prepareAndPeekExactJitBlock(limit, fused_preview));
+            EXPECT_EQ(fused_preview.count, preview->count);
+            EXPECT_EQ(fused_preview.max_cycles, preview->max_cycles);
+            EXPECT_EQ(fused_preview.exact_cycle_prefix_count,
+                preview->exact_cycle_prefix_count);
+            for (std::size_t i = 0; i < preview->count; ++i) {
+                EXPECT_EQ(fused_preview.pcs[i], preview->pcs[i]);
+                EXPECT_EQ(fused_preview.sizes[i], preview->sizes[i]);
+                EXPECT_EQ(fused_preview.instruction_cycles[i],
+                    preview->instruction_cycles[i]);
+            }
             const auto result = cpu.tryStepJitBlock(limit);
             ASSERT_TRUE(result);
             EXPECT_EQ(result->result.reason, fil::cpu::StopReason::step_complete);

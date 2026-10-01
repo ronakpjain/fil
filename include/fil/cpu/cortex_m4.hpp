@@ -155,21 +155,24 @@ struct RunResult {
 
 /** @brief Allocation-free result for the successful per-instruction hot path. */
 struct FastStepResult {
+    // Keep the successful hot result within the host's two-register return
+    // ABI (16 bytes) instead of requiring an out-pointer and stack copies.
     StopReason reason{StopReason::step_complete};
-    std::uint32_t instruction_address{0};
-    std::uint32_t raw{0};
+    bool suppress_loop_observation{false};
     std::uint8_t instruction_size{0};
     std::uint8_t instructions{0};
+    std::uint32_t instruction_address{0};
+    std::uint32_t raw{0};
     // Widened from 8 to 16 bits: realistic pipeline + flash-stall totals
     // reach ~21 cycles (e.g. 16-register LDM to PC with wait states).
     std::uint16_t cycles{0};
-    bool suppress_loop_observation{false};
 };
+static_assert(sizeof(FastStepResult) <= 16U);
 
 /** @brief Minimal deterministic Cortex-M4 Thumb interpreter. */
 class CortexM4 {
 public:
-    explicit CortexM4(mem::MemoryBus& memory) noexcept;
+    explicit CortexM4(mem::MemoryBus& memory);
     ~CortexM4();
     CortexM4(const CortexM4&) = delete;
     CortexM4& operator=(const CortexM4&) = delete;
@@ -198,6 +201,17 @@ public:
 
     /** @brief Executes one cached, specialized instruction or interprets exactly one step. */
     [[nodiscard]] FastStepResult stepJitFast();
+
+    /**
+     * @brief Enables LLVM-compiled one-instruction kernels for direct CPU stepping.
+     *
+     * Multi-instruction native blocks remain independently available. The
+     * multi-board runner disables single kernels by default because measured
+     * real-firmware runs did not recover their dispatch/codegen overhead.
+     */
+    void setNativeSingleInstructionJitEnabled(bool enabled) noexcept {
+        native_single_instruction_jit_enabled_ = enabled;
+    }
 
     /** @brief Gets the diagnostic captured by the most recent failed fast step. */
     [[nodiscard]] const DiagnosticSnapshot& lastDiagnostic() const noexcept {
@@ -230,16 +244,45 @@ public:
         std::array<std::uint32_t, max_block> pcs{};
         std::array<std::uint8_t, max_block> sizes{};
         std::uint8_t count{0};
+        /// True when no executed op touched memory (ACR stable mid-block).
+        bool memory_free{true};
     };
 
     /** @brief Read-only metadata and conservative CPU-cycle bound for a JIT prefix. */
     struct JitBlockPreview {
         std::array<std::uint32_t, JitStepOutcome::max_block> pcs{};
         std::array<std::uint8_t, JitStepOutcome::max_block> sizes{};
+        std::array<std::uint16_t, JitStepOutcome::max_block> instruction_cycles{};
         std::uint8_t count{0};
+        std::uint8_t exact_cycle_prefix_count{0};
         std::uint64_t max_cycles{0};
         /** True only for a memory-free, non-faulting prefix with fixed cycle cost. */
         bool cycles_exact{true};
+    };
+
+    /** @brief Fast-handler-only execution with exact per-committed-op pipeline costs. */
+    struct TimedJitStepOutcome {
+        JitStepOutcome execution{};
+        std::array<std::uint16_t, JitStepOutcome::max_block> instruction_cycles{};
+    };
+
+    /**
+     * @brief Caller-owned conservative cycle credit and fetch-stall state.
+     *
+     * The optional callback is called before each candidate instruction and
+     * must be pure/stable for the duration of the attempt. A null callback
+     * means zero additional fetch cycles.
+     */
+    struct ReversibleCycleBudget {
+        using FetchStallCallback = std::uint16_t (*)(
+            const void* context, std::uint32_t pc, bool sequential);
+        std::uint64_t remaining_cycles{0U};
+        FetchStallCallback fetch_stall{nullptr};
+        const void* context{nullptr};
+        bool have_fetch{false};
+        std::uint32_t fetch_end{0U};
+        std::array<std::uint16_t, JitStepOutcome::max_block>
+            total_instruction_cycles{};
     };
 
     /**
@@ -255,14 +298,61 @@ public:
         std::size_t max_instructions = JitStepOutcome::max_block);
 
     /**
+     * @brief Executes a block prepared by prepareAndPeekJitBlock().
+     *
+     * Same as tryStepJitBlock() but skips hotness/validity probing: the
+     * caller prepared the entry moments ago on this thread with no
+     * intervening CPU/memory change (board-side flash/event queries only).
+     * A defensive slot recheck still guards against misuse.
+     */
+    [[nodiscard]] std::optional<JitStepOutcome> tryStepPreparedJitBlock(
+        std::size_t max_instructions = JitStepOutcome::max_block);
+
+    /**
+     * @brief Prepares and executes only cached fast handlers, with exact costs.
+     *
+     * Stops before generic operations and at fast-handler declines, returning
+     * only the committed prefix. Intended for a caller that provides rollback
+     * for CPU and RAM state and enforces its MMIO/store restrictions externally.
+     * No peripheral timing is included; returned costs are CPU pipeline cycles.
+     */
+    [[nodiscard]] std::optional<TimedJitStepOutcome> tryStepReversibleJitBlock(
+        std::size_t max_instructions = JitStepOutcome::max_block);
+
+    /** @brief Executes a guarded reversible prefix without exceeding cycle credit. */
+    [[nodiscard]] std::optional<TimedJitStepOutcome> tryStepBudgetedReversibleJitBlock(
+        std::size_t max_instructions, ReversibleCycleBudget& budget);
+
+    /**
      * @brief Previews a ready block prefix without executing it.
      *
-     * Returns nullopt for unavailable blocks, zero-length requests, or any
-     * selected prefix containing a memory instruction. max_cycles includes
-     * maximum modeled divide latency and the possible control-flow refill.
+     * Returns nullopt for unavailable blocks, zero-length requests, or when
+     * the first selected instruction is not block-admitted (system/FP forms
+     * or memory without a fast handler). Otherwise previews the maximal
+     * admittable prefix; non-handler memory and control flow terminate it.
+     * max_cycles includes maximum modeled divide latency and the possible
+     * control-flow refill.
      */
     [[nodiscard]] std::optional<JitBlockPreview> peekJitBlock(
         std::size_t max_instructions = JitStepOutcome::max_block) const noexcept;
+
+    /**
+     * @brief Prepares a block and fills its preview in a single slot lookup.
+     *
+     * Hot-path fusion of prepareJitBlock() + peekJitBlock(): advances
+     * hotness/compilation once, then fills the caller-owned preview from
+     * compile-time data without big-struct returns. Returns false (preview
+     * untouched) when no block is ready or the admitted prefix is empty.
+     *
+     * The optimistic variant admits handler-covered transfers for the
+     * board horizon gate (backed RAM executes inline; MMIO/faults stop
+     * the block precisely). The exact variant stops before any memory op
+     * for synchronized-burst prediction.
+     */
+    [[nodiscard]] bool prepareAndPeekJitBlock(
+        std::size_t max_instructions, JitBlockPreview& preview_out);
+    [[nodiscard]] bool prepareAndPeekExactJitBlock(
+        std::size_t max_instructions, JitBlockPreview& preview_out);
 
     /**
      * @brief Whether a compiled JIT block covers the current PC.
@@ -281,6 +371,11 @@ public:
         std::uint64_t block_instructions{0};
         std::uint64_t fallbacks{0};
         std::uint64_t compilations{0};
+        std::uint64_t single_fast{0};
+        std::uint64_t single_generic{0};
+        std::uint64_t block_generic{0};
+        /// Fast-handler declines on the single-step path (MMIO/faults).
+        std::uint64_t single_decline{0};
         std::uint64_t native_compilations{0};
         std::uint64_t native_executions{0};
         std::uint64_t native_instructions{0};
@@ -311,13 +406,27 @@ private:
         std::uint16_t base_cycles{1};
         bool divide_form{false};
         std::uint8_t jit_fast{0};
+        std::uint16_t branch_penalty{0};
+        bool fast_unconditional{false};
+        bool suppress_loop_observation{false};
+        /// True when execution may report synchronization_required (memory).
+        /// Lets the stepper skip its restart copy for pure ALU/branch ops.
+        bool may_trap{false};
+        bool native_supported{false};
         NativeFunction native_function{nullptr};
         std::uint8_t native_slot{0U};
         std::uint16_t native_hits{0U};
         bool native_attempted{false};
     };
 
-    static constexpr std::size_t instruction_cache_entries = 16384U;
+    static constexpr std::size_t instruction_cache_entries = 65536U;
+
+    /// Direct-mapped decode-cache index with high-bit folding so firmware
+    /// spread across flash does not alias every 32 KiB of code.
+    [[nodiscard]] static constexpr std::size_t instructionCacheIndex(
+        const std::uint32_t pc) noexcept {
+        return ((pc >> 1U) ^ (pc >> 17U)) & (instruction_cache_entries - 1U);
+    }
 
     [[nodiscard]] StopReason execute(
         const DecodedInstruction& instruction,
@@ -328,7 +437,9 @@ private:
     mem::MemoryBus& memory_;
     const cortexm::SystemControl* system_{nullptr};
     CpuState state_{};
-    std::array<InstructionCacheEntry, instruction_cache_entries> instruction_cache_{};
+    // Heap-boxed: ~8 MiB combined at current capacities; inline members
+    // would overflow caller stacks (unit tests construct CPUs as locals).
+    std::unique_ptr<std::array<InstructionCacheEntry, instruction_cache_entries>> instruction_cache_;
     DiagnosticSnapshot last_diagnostic_{};
 
     // Hot-path JIT: direct-mapped block cache keyed by entry PC.
@@ -354,7 +465,24 @@ private:
         cmp_reg,
         logic_reg,
         mul_reg,
+        mla_mls,
+        long_mul,
+        alu_single,
+        alu_rsb_tst,
+        dsp_extend,
         shift,
+        bx_blx,
+        divide,
+        pop_pc,
+        ldr_imm,
+        str_imm,
+        ldr_sub,
+        str_sub,
+        ldrd_strd,
+        push_pop,
+        ldm_stm,
+        ldr_word_gpr,
+        str_word_gpr,
     };
     struct JitBlockEntry {
         std::uint64_t generation{0};
@@ -377,9 +505,39 @@ private:
         std::array<bool, JitStepOutcome::max_block> is_memory{};
         std::array<bool, JitStepOutcome::max_block> is_terminator{};
         std::array<std::uint16_t, JitStepOutcome::max_block> branch_penalty{};
+        // Precomputed fast-block metadata: when every op is a JitFast integer
+        // op and nothing touches memory, block execution skips per-op
+        // generation/PC/IT/pending checks and cycle branches.
+        bool all_fast{false};
+        bool has_memory{false};
+        bool has_store{false};
+        std::uint16_t fast_base_cycles{0};
+        bool fast_last_suppress{false};
+        // Precomputed preview: pure function of slot contents, so peek and
+        // board-side budget checks reuse it instead of recomputing per step.
+        std::array<std::uint16_t, JitStepOutcome::max_block> preview_cycles{};
+        std::array<std::uint32_t, JitStepOutcome::max_block + 1U> preview_prefix_cycles{};
+        std::array<std::uint32_t, JitStepOutcome::max_block + 1U> base_prefix_cycles{};
+        std::array<bool, JitStepOutcome::max_block> suppress_obs{};
+        std::uint8_t preview_count{0}; ///< Memory-free prefix length.
+        /// Optimistic prefix incl. handler-covered transfers (horizon gate).
+        std::uint8_t preview_extended_count{0};
+        /// Consecutive entry-declines (MMIO/fault polls); the gate singles
+        /// these directly instead of re-wasting prepare/preview/execute.
+        /// Clears on any commit or slot rebuild; false positives only cost
+        /// batching, never correctness (single-step is always exact).
+        std::uint8_t decline_streak{0};
+        std::uint8_t preview_exact_prefix{0}; ///< Leading exact-cycle ops.
     };
-    static constexpr std::size_t jit_block_entries = 1024U;
-    std::array<JitBlockEntry, jit_block_entries> jit_blocks_{};
+    static constexpr std::size_t jit_block_entries = 4096U;
+
+    /// Direct-mapped block-cache index with high-bit folding matching the
+    /// decode cache strategy.
+    [[nodiscard]] static constexpr std::size_t jitBlockIndex(
+        const std::uint32_t pc) noexcept {
+        return ((pc >> 1U) ^ (pc >> 13U)) & (jit_block_entries - 1U);
+    }
+    std::unique_ptr<std::array<JitBlockEntry, jit_block_entries>> jit_blocks_;
     std::array<std::uint16_t, jit_block_entries> jit_hot_{};
     JitStats jit_stats_{};
     static constexpr std::uint16_t jit_compile_threshold = 50U;
@@ -388,7 +546,8 @@ private:
     static constexpr std::size_t max_native_kernels = 32U;
     struct NativeState;
     std::unique_ptr<NativeState> native_state_;
-    std::uint64_t native_clock_{0}; ///< Eligible JIT dispatches, not simulated time.
+    std::uint64_t native_clock_{0}; ///< Native candidates/block execution, not simulated time.
+    bool native_single_instruction_jit_enabled_{true};
     std::string native_jit_error_;
     [[nodiscard]] bool ensureNativeCompiler();
     [[nodiscard]] std::uint8_t retainNativeKernel(std::shared_ptr<const NativeJitKernel> kernel);
@@ -396,7 +555,13 @@ private:
     [[nodiscard]] bool executeNativeInstruction(InstructionCacheEntry& entry);
     void prepareNativeBlock(JitBlockEntry& entry);
 
-    [[nodiscard]] FastStepResult stepFastImpl(bool use_jit);
+    [[nodiscard]] FastStepResult stepFastImpl(bool use_jit, bool fast_handler_declined = false);
+    /// Shared block-execution body; prepared skips hotness/validity probing.
+    [[nodiscard]] std::optional<JitStepOutcome> tryStepJitBlockImpl(
+        std::size_t max_instructions, bool prepared, bool fast_only = false,
+        std::array<std::uint16_t, JitStepOutcome::max_block>* instruction_cycles = nullptr);
+    [[nodiscard]] std::optional<TimedJitStepOutcome> executeTrustedReversibleJitBlock(
+        std::size_t max_instructions, ReversibleCycleBudget* budget = nullptr);
     [[nodiscard]] bool executeJitFast(const DecodedInstruction& op, JitFast fast,
                                       std::uint32_t pc) noexcept;
     [[nodiscard]] std::optional<DecodedInstruction> fetchDecode(
