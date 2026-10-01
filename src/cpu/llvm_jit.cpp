@@ -339,7 +339,10 @@ std::shared_ptr<const NativeJitKernel> LlvmJit::compile(
     pass_builder.registerLoopAnalyses(loop_analyses);
     pass_builder.crossRegisterProxies(loop_analyses, function_analyses,
                                       cgscc_analyses, module_analyses);
-    auto optimization_pipeline = pass_builder.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
+    // Straight-line integer kernels gain nothing from vectorization or
+    // aggressive inlining; O1 keeps ISel/regalloc quality while cutting
+    // pass-manager time, the dominant cost for few-instruction functions.
+    auto optimization_pipeline = pass_builder.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O0);
     optimization_pipeline.run(*module, module_analyses);
     if (!verifyModule(*module, verifier)) {
         error = "LLVM module verification failed after optimization: " + verifier;
