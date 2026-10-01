@@ -72,6 +72,49 @@ TEST(CortexMTest, ResetClearsInterruptLevelsAndPendingSummary) {
     EXPECT_FALSE(system.hasEnabledPending());
 }
 
+TEST(CortexMTest, TakablePendingCacheTracksMasksPrioritiesAndLifecycle) {
+    fil::cortexm::SystemControl system;
+    constexpr auto word = fil::mem::AccessSize::word;
+
+    ASSERT_TRUE(system.write(0xe100U, word, 0x3U, {})); // IRQ0 and IRQ1 enabled.
+    ASSERT_TRUE(system.write(0xe400U, word, 0x4020U, {})); // IRQ0=0x20, IRQ1=0x40.
+    system.pend(16U);
+    system.pend(17U);
+    EXPECT_TRUE(system.hasTakablePending(0U, 0U, 0U));
+    EXPECT_FALSE(system.hasTakablePending(1U, 0U, 0U));
+    EXPECT_FALSE(system.hasTakablePending(0U, 0x20U, 0U));
+    EXPECT_FALSE(system.hasTakablePending(0U, 0U, 1U));
+    EXPECT_FALSE(system.hasTakablePending(0U, 0U, 1U)); // Cache the masked null result.
+    EXPECT_TRUE(system.hasTakablePending(0U, 0U, 0U)); // Unmask without a generation change.
+
+    ASSERT_TRUE(system.write(0xe401U, fil::mem::AccessSize::byte, 0x10U, {}));
+    system.clearPending(16U);
+    EXPECT_TRUE(system.hasTakablePending(0U, 0U, 0U)); // IRQ1 now outranks IRQ0.
+
+    // A pending peripheral line is visible after its NVIC enable is written.
+    system.reset(0x08000000U);
+    system.setInterruptLine(5U, true);
+    EXPECT_FALSE(system.hasTakablePending(0U, 0U, 0U));
+    ASSERT_TRUE(system.write(0xe100U, word, 1U << 5U, {}));
+    EXPECT_TRUE(system.hasTakablePending(0U, 0U, 0U));
+
+    // Active exception changes affect nesting; a lower-urgency pending IRQ
+    // cannot preempt until the current exception returns.
+    ASSERT_TRUE(system.write(0xe405U, fil::mem::AccessSize::byte, 0x40U, {}));
+    ASSERT_TRUE(system.write(0xe406U, fil::mem::AccessSize::byte, 0x60U, {}));
+    system.enter(21U);
+    ASSERT_TRUE(system.write(0xe100U, word, 1U << 6U, {})); // Enable the nested IRQ too.
+    system.pend(22U);
+    EXPECT_FALSE(system.hasTakablePending(0U, 0U, 0U));
+    ASSERT_TRUE(system.write(0xe406U, fil::mem::AccessSize::byte, 0x10U, {}));
+    EXPECT_TRUE(system.hasTakablePending(0U, 0U, 0U));
+    system.leave(21U);
+    EXPECT_TRUE(system.hasTakablePending(0U, 0U, 0U));
+
+    system.reset(0x08000000U);
+    EXPECT_FALSE(system.hasTakablePending(0U, 0U, 0U));
+}
+
 TEST(CortexMTest, BasepriArbitrationUsesOnlyImplementedPriorityBits) {
     fil::cortexm::SystemControl system;
     ASSERT_TRUE(system.write(0xe100U, fil::mem::AccessSize::word, 1U, {}));

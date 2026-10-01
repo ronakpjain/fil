@@ -120,6 +120,19 @@ public:
         return pendsv_pending_ || systick_pending_ || external_pending_enabled_;
     }
 
+    /** @brief Exact cached test for an enabled exception that can preempt now. */
+    [[nodiscard]] bool hasTakablePending(
+        std::uint32_t primask, std::uint32_t basepri, std::uint32_t faultmask
+    ) const {
+        const PendingSelection& cached = selection_cache_;
+        if (cached.valid && cached.primask == primask && cached.basepri == basepri
+            && cached.faultmask == faultmask
+            && cached.generation == selection_generation_) {
+            return cached.has_value;
+        }
+        return nextPending(primask, basepri, faultmask).has_value();
+    }
+
     [[nodiscard]] mem::MemoryResult<std::uint64_t> read(
         std::uint32_t offset,
         mem::AccessSize size,
@@ -193,10 +206,9 @@ private:
     bool systick_pending_{false};
     bool external_pending_enabled_{false};
     bool reset_requested_{false};
-    // Memoized nextPending() selection. The settle path queries selection
-    // with identical masks for long stretches between pend/enter/leave and
-    // priority/enable writes; the key pins every input so a hit returns the
-    // exact value a full scan would produce.
+    // Memoized nextPending() selection. Selection mutations invalidate this
+    // entry through noteSelectionChanged(); mask registers remain explicit
+    // key inputs because they are owned by CPU state, not SystemControl.
     std::uint64_t selection_generation_{0};
     struct PendingSelection {
         bool valid{false};
@@ -205,10 +217,6 @@ private:
         std::uint32_t primask{0};
         std::uint32_t basepri{0};
         std::uint32_t faultmask{0};
-        std::uint16_t active_exception{0};
-        bool pendsv{false};
-        bool systick{false};
-        bool external{false};
         std::uint64_t generation{0};
     };
     mutable PendingSelection selection_cache_{};

@@ -202,9 +202,6 @@ std::optional<std::uint16_t> SystemControl::nextPending(
     const PendingSelection& cached = selection_cache_;
     if (cached.valid && cached.primask == primask && cached.basepri == basepri
         && cached.faultmask == faultmask
-        && cached.active_exception == active_exception_
-        && cached.pendsv == pendsv_pending_ && cached.systick == systick_pending_
-        && cached.external == external_pending_enabled_
         && cached.generation == selection_generation_) {
         if (!cached.has_value) return std::nullopt;
         return cached.value;
@@ -217,10 +214,6 @@ std::optional<std::uint16_t> SystemControl::nextPending(
     fresh.primask = primask;
     fresh.basepri = basepri;
     fresh.faultmask = faultmask;
-    fresh.active_exception = active_exception_;
-    fresh.pendsv = pendsv_pending_;
-    fresh.systick = systick_pending_;
-    fresh.external = external_pending_enabled_;
     fresh.generation = selection_generation_;
     selection_cache_ = fresh;
     return selected;
