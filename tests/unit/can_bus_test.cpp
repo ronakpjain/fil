@@ -32,6 +32,33 @@ TEST(CanBusTest, BroadcastsDeterministically) {
     EXPECT_TRUE(deliveries == std::vector<int>({1, 2})) << "delivers injection in attachment order";
 }
 
+TEST(CanBusTest, DeliveryBarrierPrecedesObserversAndCanBeRestored) {
+    fil::devices::VirtualCanBus bus("vehicle");
+    std::vector<int> order;
+    const auto sender = bus.attach("sender", false, [](const auto&, std::uint64_t) {});
+    const auto receiver = bus.attach("receiver", false,
+        [&](const auto&, std::uint64_t) { order.push_back(3); });
+    ASSERT_TRUE(sender);
+    ASSERT_TRUE(receiver);
+    bus.setTraceCallback([&](const auto&) { order.push_back(2); });
+    auto original = bus.exchangeDeliveryBarrier([&](const auto time) {
+        EXPECT_EQ(time, 100U);
+        order.push_back(1);
+    });
+    EXPECT_FALSE(original);
+    fil::devices::CanFrame frame;
+    frame.id = 0x123U;
+    EXPECT_FALSE(bus.send(999U, frame, 100U));
+    EXPECT_TRUE(order.empty());
+    ASSERT_TRUE(bus.send(sender.value(), frame, 100U));
+    EXPECT_EQ(order, (std::vector<int>{1, 2, 2, 3}));
+    auto barrier = bus.exchangeDeliveryBarrier(std::move(original));
+    EXPECT_TRUE(barrier);
+    order.clear();
+    ASSERT_TRUE(bus.inject(frame, 200U));
+    EXPECT_EQ(order, (std::vector<int>{2, 2, 2, 3}));
+}
+
 TEST(CanBusTest, ValidatesFramesAndAttachments) {
     fil::devices::VirtualCanBus bus("vehicle");
     const auto node = bus.attach("node", false, [](const auto&, std::uint64_t) {});

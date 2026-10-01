@@ -119,6 +119,7 @@ Result<void> VirtualCanBus::send(
         return Error{ErrorCategory::invalid_argument, "CAN sender is not attached", std::nullopt};
     }
     const std::string sender_name = node->name;
+    if (delivery_barrier_) delivery_barrier_(time_ns);
     trace(CanTraceRecord::Direction::transmit, time_ns, sender_name, frame);
     deliver(frame, time_ns, sender);
     return {};
@@ -127,6 +128,7 @@ Result<void> VirtualCanBus::send(
 Result<void> VirtualCanBus::inject(const CanFrame& frame, const std::uint64_t time_ns) {
     auto valid = validate(frame);
     if (!valid) return valid.error();
+    if (delivery_barrier_) delivery_barrier_(time_ns);
     trace(CanTraceRecord::Direction::transmit, time_ns, "external", frame);
     deliver(frame, time_ns, std::nullopt);
     return {};

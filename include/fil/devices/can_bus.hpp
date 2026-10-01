@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <utility>
 
 namespace fil::devices {
 
@@ -57,6 +58,7 @@ public:
     using NodeId = std::uint64_t; ///< Opaque attachment identifier.
     using ReceiveCallback = std::function<void(const CanFrame&, std::uint64_t)>;
     using TraceCallback = std::function<void(const CanTraceRecord&)>;
+    using DeliveryBarrier = std::function<void(std::uint64_t)>;
 
     /** @brief Creates a named bus with an informational nominal bit rate. */
     explicit VirtualCanBus(std::string name, std::uint32_t bitrate = 500000U);
@@ -80,6 +82,11 @@ public:
     /** @brief Sets an optional synchronous trace sink. */
     void setTraceCallback(TraceCallback callback) { trace_callback_ = std::move(callback); }
 
+    /** @brief Exchanges a pre-transmission observation barrier, before trace/receive callbacks. */
+    [[nodiscard]] DeliveryBarrier exchangeDeliveryBarrier(DeliveryBarrier barrier) noexcept {
+        return std::exchange(delivery_barrier_, std::move(barrier));
+    }
+
     [[nodiscard]] std::string_view name() const noexcept { return name_; }
     [[nodiscard]] std::uint32_t bitrate() const noexcept { return bitrate_; }
     [[nodiscard]] std::size_t nodeCount() const noexcept { return nodes_.size(); }
@@ -102,6 +109,7 @@ private:
     std::uint64_t next_sequence_{0};
     std::vector<Node> nodes_;
     TraceCallback trace_callback_;
+    DeliveryBarrier delivery_barrier_;
 };
 
 } // namespace fil::devices
