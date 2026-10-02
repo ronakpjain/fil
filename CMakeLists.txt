@@ -284,13 +284,14 @@ if(FIL_BUILD_TESTS)
 
         list(LENGTH FIL_PER_AUDIT_ELFS FIL_PER_AUDIT_ELF_COUNT)
         if(FIL_PER_AUDIT_ELF_COUNT EQUAL 7)
-            find_package(Python3 3.9 QUIET COMPONENTS Interpreter)
+            find_program(FIL_BASH_EXECUTABLE NAMES bash)
+            find_program(FIL_JQ_EXECUTABLE NAMES jq)
             find_program(FIL_ARM_NONE_EABI_OBJDUMP NAMES arm-none-eabi-objdump)
-            if(Python3_Interpreter_FOUND AND FIL_ARM_NONE_EABI_OBJDUMP)
+            if(FIL_BASH_EXECUTABLE AND FIL_JQ_EXECUTABLE AND FIL_ARM_NONE_EABI_OBJDUMP)
                 add_test(
                     NAME fil.per.audit_instructions
-                    COMMAND "${Python3_EXECUTABLE}"
-                        "${PROJECT_SOURCE_DIR}/tools/audit_per_instructions.py"
+                    COMMAND "${FIL_BASH_EXECUTABLE}"
+                        "${PROJECT_SOURCE_DIR}/tools/audit_per_instructions.sh"
                         --fil "$<TARGET_FILE:fil>"
                         --objdump "${FIL_ARM_NONE_EABI_OBJDUMP}"
                         --report "${CMAKE_CURRENT_BINARY_DIR}/per-instruction-audit.json"
@@ -302,7 +303,7 @@ if(FIL_BUILD_TESTS)
                 )
             else()
                 message(STATUS
-                    "Python 3.9+ or arm-none-eabi-objdump unavailable; "
+                    "Bash, jq, or arm-none-eabi-objdump unavailable; "
                     "the opt-in PER instruction audit test will not be added"
                 )
             endif()

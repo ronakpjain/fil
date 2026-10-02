@@ -50,8 +50,9 @@ The core implements architectural PC reads, Thumb-target validation, APSR N/Z/C/
 
 At board level, SVC enters exception 11, pending SysTick/PendSV/NVIC exceptions vector through VTOR, and `BX`, `POP`, or `LDM` with a recognized EXC_RETURN restores a frame. Basic integer frames and extended frames containing S0-S15 plus FPSCR are unit covered. `CONTROL.FPCA` is claimed automatically on FP register-file access when `FPCCR.ASPEN` is set (reset leaves `FPCCR` clear, matching silicon; firmware opts in explicitly). With `FPCCR.LSPEN`, entry reserves the FP area and defers pushing until handler code first touches the FP file (`VMRS` excluded), and returns skip the unread area; a nested entry while one reservation is pending stacks eagerly. Lazy multi-level nesting beyond that, `FPCCR.LSPACT` reads, and FPU gating via `CPACR` are not modeled. FreeRTOS-style manual S16-S31 transfers are covered separately by VSTM/VLDM.
 
-The optional PER audit runs `tools/audit_per_instructions.py` over all configured
-external ELFs. It uses `arm-none-eabi-objdump -d` as the code/data boundary and
+The optional PER audit runs `tools/audit_per_instructions.sh` over all configured
+external ELFs when Bash, `jq`, and `arm-none-eabi-objdump` are available. It uses
+`arm-none-eabi-objdump -d` as the code/data boundary and
 checks that `fil disasm-window` agrees on instruction address, raw halfwords, width,
 and supported status. The JSON report records per-ELF counts, input hashes, and tool
 versions; it does not treat instructions absent from those binaries as covered.

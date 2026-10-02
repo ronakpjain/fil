@@ -155,7 +155,7 @@ See [Hardware comparison](hardware_comparison.md) before connecting a target.
   `TESTS=ON`, `DOCS=ON`, `IPO=ON`, `ASAN=OFF`, `UBSAN=OFF`,
   `PGO_GENERATE=OFF`, empty `FIL_PGO_PROFILE` and `PER_FIRMWARE_DIR`.
   `GENERATOR`, `CMAKE_ARGS`, `BUILD_ARGS`, `CTEST_ARGS` pass extra settings.
-  Tools are overridable with `CMAKE`, `CTEST`, `PYTHON`.
+  Tools are overridable with `CMAKE` and `CTEST`.
 - Directory presets: `DEBUG_BUILD_DIR=build-debug`,
   `RELEASE_BUILD_DIR=build-release`, `SANITIZE_BUILD_DIR=build-sanitize`,
   `PGO_GENERATE_BUILD_DIR=build-pgo-generate`, `PGO_BUILD_DIR=build-pgo`.

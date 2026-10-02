@@ -6,7 +6,6 @@ root_path = $(if $(filter /%,$(1)),$(abspath $(1)),$(abspath $(ROOT_DIR)/$(1)))
 
 CMAKE ?= cmake
 CTEST ?= ctest
-PYTHON ?= python3
 BUILD_DIR ?= build
 BUILD_PATH = $(call root_path,$(BUILD_DIR))
 BUILD_TYPE ?= Release
@@ -204,7 +203,7 @@ test-sanitize:
 	$(MAKE) BUILD_DIR="$(SANITIZE_BUILD_DIR)" BUILD_TYPE=Debug IPO=OFF ASAN=ON UBSAN=ON test
 
 benchmark: build
-	$(PYTHON) "$(ROOT_DIR)/tools/bench_real_timing.py" "$(FIL_PATH)" --reps "$(BENCH_REPS)" $(BENCH_ARGS)
+	"$(ROOT_DIR)/tools/bench_real_timing.sh" "$(FIL_PATH)" --reps "$(BENCH_REPS)" $(BENCH_ARGS)
 
 docs: configure
 	$(CMAKE) --build "$(BUILD_PATH)" --target docs --config "$(BUILD_TYPE)"

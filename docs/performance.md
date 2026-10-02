@@ -132,7 +132,7 @@ checks all six boards reach the deadline, and exits unsuccessfully when median
 throughput is not above realtime:
 
 ```bash
-python3 tools/bench_full_network.py --binary build-pgo/fil --reps 3 --check-trace
+tools/bench_full_network.sh --binary build-pgo/fil --reps 3 --check-trace
 ```
 
 To benchmark the interpreter reference, explicitly use
