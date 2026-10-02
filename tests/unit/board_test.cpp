@@ -447,6 +447,35 @@ TEST(BoardTest, DeferredPurePrefixStopsStrictlyBeforeEventAndSysTick) {
     EXPECT_FALSE(tick_board.value()->prepareDeferredPurePrefix(8U));
 }
 
+TEST(BoardTest, PureJitBlocksMatchExactAcrossFlashTimingChanges) {
+    auto exact = fil::sim::Board::load(fixtureBoard());
+    auto jit = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(exact && jit);
+    ASSERT_TRUE(installAndWarmJitLoop(*exact.value()));
+    ASSERT_TRUE(installAndWarmJitLoop(*jit.value()));
+
+    fil::sim::BoardRunOptions options;
+    options.max_instructions = 37U; // Includes branches and a partial final block.
+    options.duration_ns = 0U;
+    options.enable_loop_batching = false;
+    // Rewrite ACR between spans to exercise generation invalidation, ART on
+    // sequential fetches, taken branches, and the zero-latency fast path.
+    for (const std::uint32_t acr : {4U, 4U | (1U << 8U), 2U | (1U << 9U), 0U, 3U}) {
+        SCOPED_TRACE(acr);
+        ASSERT_TRUE(exact.value()->memory().write32(0x40022000U, acr));
+        ASSERT_TRUE(jit.value()->memory().write32(0x40022000U, acr));
+        options.enable_jit = false;
+        const auto reference = exact.value()->run(options);
+        options.enable_jit = true;
+        const auto accelerated = jit.value()->run(options);
+        EXPECT_EQ(accelerated.reason, reference.reason);
+        EXPECT_EQ(accelerated.instructions, reference.instructions);
+        EXPECT_EQ(accelerated.cycles, reference.cycles);
+        EXPECT_EQ(accelerated.time_ns, reference.time_ns);
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(jit.value()->cpu().state(), exact.value()->cpu().state()));
+    }
+}
+
 TEST(BoardTest, SingleInstructionDispatchMatchesWithFlashWaits) {
     auto exact = fil::sim::Board::load(fixtureBoard());
     auto jit = fil::sim::Board::load(fixtureBoard());

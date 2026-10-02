@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <limits>
 #include <string_view>
 #include <vector>
 
@@ -428,6 +429,249 @@ TEST(JitTest, BudgetedReversibleDeclineDoesNotSpendCreditOnDeclinedMemory) {
     const auto unchanged = executable_bus.read32(ram_base + 0x1000U);
     ASSERT_TRUE(unchanged);
     EXPECT_EQ(unchanged.value(), 0U);
+}
+
+TEST(JitTest, ReversibleScalarFallbackPreservesEveryItMaskAndPredicate) {
+    for (std::uint16_t mask = 1U; mask < 16U; ++mask) {
+        for (const bool zero : {false, true}) {
+            auto bus = basicBus();
+            ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({
+                static_cast<std::uint16_t>(0xBF10U | mask), // IT NE, mask
+                0x2001U, // MOVS r0,#1 (implicit flags suppressed in IT)
+                0xBF00U
+            })).hasValue());
+            bus.setReversibleRamOnly(true);
+            bus.setAllMmioTrapping(true);
+            fil::cpu::CortexM4 cpu(bus);
+            fil::cpu::CortexM4 reference(bus);
+            prepare(cpu);
+            prepare(reference);
+            cpu.state().xpsr = reference.state().xpsr = fil::cpu::xpsr_t
+                | (zero ? fil::cpu::xpsr_z : 0U);
+            ASSERT_EQ(cpu.stepFast().reason, fil::cpu::StopReason::step_complete);
+            ASSERT_EQ(reference.stepFast().reason, fil::cpu::StopReason::step_complete);
+            const auto expected = reference.stepFast();
+            ASSERT_EQ(expected.reason, fil::cpu::StopReason::step_complete);
+            fil::cpu::CortexM4::ReversibleCycleBudget budget{};
+            budget.remaining_cycles = 100U;
+            const auto actual = cpu.tryStepBudgetedReversibleJitBlock(1U, budget);
+            ASSERT_TRUE(actual) << "mask=" << mask << " zero=" << zero;
+            ASSERT_EQ(actual->execution.count, 1U);
+            EXPECT_EQ(actual->execution.result.cycles, expected.cycles);
+            EXPECT_EQ(actual->execution.pcs[0], expected.instruction_address);
+            EXPECT_EQ(budget.total_instruction_cycles[0], expected.cycles);
+            EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()))
+                << "mask=" << mask << " zero=" << zero;
+        }
+    }
+}
+
+TEST(JitTest, CompleteItBlocksMatchStepFastAcrossMasksConditionsAndFlags) {
+    constexpr std::array<std::uint32_t, 4> flags{
+        fil::cpu::xpsr_n, fil::cpu::xpsr_z, fil::cpu::xpsr_c, fil::cpu::xpsr_v};
+    for (std::uint16_t mask = 1U; mask < 16U; ++mask) {
+        for (std::uint16_t condition = 0U; condition < 14U; ++condition) {
+            auto bus = basicBus();
+            ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({
+                static_cast<std::uint16_t>(0xBF00U
+                    | (static_cast<std::uint32_t>(condition) << 4U) | mask),
+                0x2001U, 0x2002U, 0x2003U, 0x2004U
+            })).hasValue());
+            bus.setReversibleRamOnly(true);
+            bus.setAllMmioTrapping(true);
+            fil::cpu::CortexM4 cpu(bus);
+            fil::cpu::CortexM4 reference(bus);
+            for (std::uint32_t combination = 0U; combination < 16U; ++combination) {
+                prepare(cpu);
+                prepare(reference);
+                std::uint32_t apsr = 0U;
+                for (std::uint32_t bit = 0U; bit < flags.size(); ++bit) {
+                    if ((combination & (1U << bit)) != 0U) apsr |= flags[bit];
+                }
+                cpu.state().xpsr = reference.state().xpsr = fil::cpu::xpsr_t | apsr;
+                ASSERT_EQ(reference.stepFast().reason, fil::cpu::StopReason::step_complete);
+                ASSERT_EQ(cpu.stepFast().reason, fil::cpu::StopReason::step_complete);
+                ASSERT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()));
+                while (fil::cpu::inItBlock(reference.state().it_state)) {
+                    const auto expected = reference.stepFast();
+                    ASSERT_EQ(expected.reason, fil::cpu::StopReason::step_complete);
+                    const auto actual = cpu.tryStepReversibleJitBlock(1U);
+                    ASSERT_TRUE(actual) << "mask=" << mask << " cond=" << condition
+                                        << " flags=" << combination;
+                    ASSERT_EQ(actual->execution.count, 1U);
+                    EXPECT_EQ(actual->execution.pcs[0], expected.instruction_address);
+                    EXPECT_EQ(actual->instruction_cycles[0], expected.cycles);
+                    EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()))
+                        << "mask=" << mask << " cond=" << condition
+                        << " flags=" << combination;
+                }
+            }
+        }
+    }
+}
+
+TEST(JitTest, ItFallbackBudgetRequiresConservativeCreditAndFetchStalls) {
+    auto bus = basicBus();
+    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0xBF1CU, 0x2001U, 0x2002U})).hasValue());
+    bus.setReversibleRamOnly(true);
+    bus.setAllMmioTrapping(true);
+    fil::cpu::CortexM4 cpu(bus);
+    fil::cpu::CortexM4 reference(bus);
+    prepare(cpu);
+    prepare(reference);
+    ASSERT_EQ(cpu.stepFast().reason, fil::cpu::StopReason::step_complete);
+    ASSERT_EQ(reference.stepFast().reason, fil::cpu::StopReason::step_complete);
+    const auto before = cpu.state();
+
+    FakeFetchStalls stalls{3U, 2U};
+    fil::cpu::CortexM4::ReversibleCycleBudget budget{};
+    budget.context = &stalls;
+    budget.fetch_stall = fakeFetchStall;
+    const auto expected_first = reference.stepFast();
+    budget.remaining_cycles = expected_first.cycles + stalls.nonsequential - 1U;
+    EXPECT_FALSE(cpu.tryStepBudgetedReversibleJitBlock(1U, budget));
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), before));
+    EXPECT_EQ(budget.remaining_cycles, expected_first.cycles + stalls.nonsequential - 1U);
+    EXPECT_FALSE(budget.have_fetch);
+
+    budget.remaining_cycles = expected_first.cycles + stalls.nonsequential;
+    const auto first = cpu.tryStepBudgetedReversibleJitBlock(1U, budget);
+    ASSERT_TRUE(first);
+    EXPECT_EQ(budget.total_instruction_cycles[0],
+        expected_first.cycles + stalls.nonsequential);
+    EXPECT_EQ(budget.remaining_cycles, 0U);
+    EXPECT_EQ(budget.fetch_end, flash_base + 4U);
+
+    const auto expected_second = reference.stepFast();
+    budget.remaining_cycles = expected_second.cycles + stalls.sequential;
+    const auto second = cpu.tryStepBudgetedReversibleJitBlock(1U, budget);
+    ASSERT_TRUE(second);
+    EXPECT_EQ(budget.total_instruction_cycles[0], expected_second.cycles + stalls.sequential);
+    EXPECT_EQ(budget.remaining_cycles, 0U);
+    EXPECT_EQ(budget.fetch_end, flash_base + 6U);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()));
+
+    auto max_bus = basicBus();
+    ASSERT_TRUE(max_bus.loadBytes(flash_base, halfwords({0xBF18U, 0x2001U})).hasValue());
+    max_bus.setReversibleRamOnly(true);
+    max_bus.setAllMmioTrapping(true);
+    fil::cpu::CortexM4 max_cpu(max_bus);
+    prepare(max_cpu);
+    ASSERT_EQ(max_cpu.stepFast().reason, fil::cpu::StopReason::step_complete);
+    const auto max_before = max_cpu.state();
+    FakeFetchStalls maximal{std::numeric_limits<std::uint16_t>::max(), 0U};
+    fil::cpu::CortexM4::ReversibleCycleBudget max_budget{};
+    max_budget.remaining_cycles = std::numeric_limits<std::uint16_t>::max();
+    max_budget.context = &maximal;
+    max_budget.fetch_stall = fakeFetchStall;
+    EXPECT_FALSE(max_cpu.tryStepBudgetedReversibleJitBlock(1U, max_budget));
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(max_cpu.state(), max_before));
+    EXPECT_EQ(max_budget.remaining_cycles, std::numeric_limits<std::uint16_t>::max());
+    EXPECT_FALSE(max_budget.have_fetch);
+}
+
+TEST(JitTest, UntimedReversibleFallbackExecutesItAndThenItsScalarOp) {
+    auto bus = basicBus();
+    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0xBF18U, 0x3001U})).hasValue());
+    bus.setReversibleRamOnly(true);
+    bus.setAllMmioTrapping(true);
+    fil::cpu::CortexM4 cpu(bus);
+    fil::cpu::CortexM4 reference(bus);
+    prepare(cpu);
+    prepare(reference);
+
+    const auto it = cpu.tryStepReversibleJitBlock(1U);
+    ASSERT_TRUE(it);
+    ASSERT_EQ(it->execution.count, 1U);
+    EXPECT_EQ(it->execution.pcs[0], flash_base);
+    ASSERT_EQ(reference.stepFast().reason, fil::cpu::StopReason::step_complete);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()));
+
+    const auto expected = reference.stepFast();
+    const auto scalar = cpu.tryStepReversibleJitBlock(1U);
+    ASSERT_TRUE(scalar);
+    ASSERT_EQ(scalar->execution.count, 1U);
+    EXPECT_EQ(scalar->instruction_cycles[0], expected.cycles);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()));
+}
+
+TEST(JitTest, ReversibleItFallbackRejectsUnsafeOpsAndBudgetShortfallIsInert) {
+    const std::array<std::vector<std::uint16_t>, 10> unsafe_ops{{
+        {0x6008U},                 // store
+        {0xEE30U, 0x0A00U},       // VFP
+        {0xDF00U},                 // SVC
+        {0xBE00U},                 // BKPT
+        {0xBF08U},                 // nested IT
+        {0x4678U},                 // MOV r0,PC
+        {0x4348U},                 // MUL
+        {0xFB93U, 0xF1F2U},       // SDIV
+        {0xFBB5U, 0xF2F6U},       // UDIV
+        {0x4687U}                  // MOV PC,r0
+    }};
+    for (const auto& op : unsafe_ops) {
+        auto bus = basicBus();
+        std::vector<std::uint16_t> words{0xBF18U};
+        words.insert(words.end(), op.begin(), op.end());
+        std::vector<std::uint8_t> code;
+        for (const auto word : words) {
+            code.push_back(static_cast<std::uint8_t>(word));
+            code.push_back(static_cast<std::uint8_t>(word >> 8U));
+        }
+        ASSERT_TRUE(bus.loadBytes(flash_base, code).hasValue());
+        bus.setReversibleRamOnly(true);
+        bus.setAllMmioTrapping(true);
+        fil::cpu::CortexM4 cpu(bus);
+        prepare(cpu);
+        ASSERT_EQ(cpu.stepFast().reason, fil::cpu::StopReason::step_complete);
+        const auto before = cpu.state();
+        fil::cpu::CortexM4::ReversibleCycleBudget budget{};
+        budget.remaining_cycles = 100U;
+        EXPECT_FALSE(cpu.tryStepBudgetedReversibleJitBlock(1U, budget));
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), before));
+        EXPECT_EQ(budget.remaining_cycles, 100U);
+        EXPECT_FALSE(budget.have_fetch);
+    }
+
+    auto bus = basicBus();
+    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0xBF18U, 0x2001U})).hasValue());
+    bus.setReversibleRamOnly(true);
+    bus.setAllMmioTrapping(true);
+    fil::cpu::CortexM4 cpu(bus);
+    prepare(cpu);
+    ASSERT_EQ(cpu.stepFast().reason, fil::cpu::StopReason::step_complete);
+    const auto before = cpu.state();
+    fil::cpu::CortexM4::ReversibleCycleBudget budget{};
+    budget.remaining_cycles = 0U;
+    EXPECT_FALSE(cpu.tryStepBudgetedReversibleJitBlock(1U, budget));
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), before));
+    EXPECT_EQ(budget.remaining_cycles, 0U);
+    EXPECT_FALSE(budget.have_fetch);
+}
+
+TEST(JitTest, ItFallbackRejectsHaltedAndPendingEntriesAndColdNonItAlu) {
+    for (const unsigned scenario : {0U, 1U, 2U}) {
+        auto bus = basicBus();
+        ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0xBF18U, 0x2001U})).hasValue());
+        bus.setReversibleRamOnly(true);
+        bus.setAllMmioTrapping(true);
+        fil::cpu::CortexM4 cpu(bus);
+        prepare(cpu);
+        ASSERT_EQ(cpu.stepFast().reason, fil::cpu::StopReason::step_complete);
+        if (scenario == 0U) cpu.state().halted = true;
+        if (scenario == 1U) cpu.state().pending_exception = 16U;
+        if (scenario == 2U) cpu.state().pending_exc_return = 0xFFFFFFFDU;
+        const auto before = cpu.state();
+        EXPECT_FALSE(cpu.tryStepReversibleJitBlock(1U));
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), before));
+    }
+
+    auto bus = basicBus();
+    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0x3001U})).hasValue());
+    fil::cpu::CortexM4 cpu(bus);
+    prepare(cpu);
+    const auto before = cpu.state();
+    EXPECT_FALSE(cpu.tryStepReversibleJitBlock(1U));
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), before));
 }
 
 TEST(JitTest, ClassifiesBoundaries) {

@@ -563,6 +563,8 @@ private:
         std::array<std::uint16_t, JitStepOutcome::max_block>* instruction_cycles = nullptr);
     [[nodiscard]] std::optional<TimedJitStepOutcome> executeTrustedReversibleJitBlock(
         std::size_t max_instructions, ReversibleCycleBudget* budget = nullptr);
+    [[nodiscard]] std::optional<TimedJitStepOutcome> tryStepItScalarFallback(
+        ReversibleCycleBudget* budget);
     [[nodiscard]] bool executeJitFast(const DecodedInstruction& op, JitFast fast,
                                       std::uint32_t pc) noexcept;
     [[nodiscard]] std::optional<DecodedInstruction> fetchDecode(
