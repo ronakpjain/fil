@@ -17,6 +17,7 @@ Options:
   --reference-binary PATH   matched baseline executable; runs alternate order
   --duration-ms N           simulated duration per measurement (default: 5000)
   --reps N                  repetitions per executable (default: 3)
+  --min-throughput X        required realtime ratio (default: above 1.0)
   --check-trace             compare 1,000 ms interpreter/JIT traces first
   --no-loop-batching        disable loop batching
   --deferred-prefixes       enable experimental interruptible JIT prefixes
@@ -35,10 +36,23 @@ positive_integer() {
     [[ $1 =~ ^[0-9]+$ ]] && ((10#$1 > 0))
 }
 
+validate_duration() {
+    local value=$1
+    [[ $value =~ ^[0-9]+$ ]] || fail '--duration-ms must be a positive integer'
+    # Bound the scaled budget before evaluating potentially overflowing arithmetic.
+    value=${value#"${value%%[!0]*}"}
+    [[ -n $value ]] || fail '--duration-ms must be a positive integer'
+    if ((${#value} > 13)) || { ((${#value} == 13)) && [[ $value > 9223372036854 ]]; }; then
+        fail '--duration-ms exceeds the supported instruction-budget range'
+    fi
+}
+
 binary="$ROOT_DIR/build-pgo/fil"
 reference_binary=
 duration_ms=5000
 reps=3
+min_throughput=
+threshold_requested=0
 check_trace=0
 no_loop_batching=0
 deferred_prefixes=0
@@ -47,7 +61,7 @@ no_ram_capsules=0
 
 while (($#)); do
     case $1 in
-        --binary|--reference-binary|--duration-ms|--reps)
+        --binary|--reference-binary|--duration-ms|--reps|--min-throughput)
             (($# >= 2)) || fail "$1 requires a value"
             option=$1
             value=$2
@@ -56,9 +70,10 @@ while (($#)); do
                 --binary) binary=$value ;;
                 --reference-binary) reference_binary=$value ;;
                 --duration-ms)
-                    positive_integer "$value" || fail '--duration-ms must be a positive integer'
+                    validate_duration "$value"
                     duration_ms=$((10#$value))
                     ;;
+                --min-throughput) min_throughput=$value; threshold_requested=1 ;;
                 --reps)
                     positive_integer "$value" || fail '--reps must be a positive integer'
                     reps=$((10#$value))
@@ -69,7 +84,7 @@ while (($#)); do
         --reference-binary=*) reference_binary=${1#*=}; shift ;;
         --duration-ms=*)
             value=${1#*=}
-            positive_integer "$value" || fail '--duration-ms must be a positive integer'
+            validate_duration "$value"
             duration_ms=$((10#$value))
             shift
             ;;
@@ -79,6 +94,7 @@ while (($#)); do
             reps=$((10#$value))
             shift
             ;;
+        --min-throughput=*) min_throughput=${1#*=}; threshold_requested=1; shift ;;
         --check-trace) check_trace=1; shift ;;
         --no-loop-batching) no_loop_batching=1; shift ;;
         --deferred-prefixes) deferred_prefixes=1; shift ;;
@@ -88,6 +104,12 @@ while (($#)); do
         *) fail "unrecognized argument: $1" ;;
     esac
 done
+
+if ((threshold_requested)); then
+    [[ $min_throughput =~ ^[0-9]+([.][0-9]+)?$ ]] || fail '--min-throughput must be a positive number'
+    awk -v value="$min_throughput" 'BEGIN { exit value > 0 ? 0 : 1 }' \
+        || fail '--min-throughput must be a positive number'
+fi
 
 absolute_path() {
     case $1 in
@@ -124,7 +146,7 @@ run_network() {
     validation_file="$work_dir/run-$run_number.validation"
     command=("$executable" run-network "$NETWORK"
         --duration-ms "$duration"
-        --max-instructions 1000000000 --quantum 1024
+        --max-instructions "$((duration * 1000000))" --quantum 1024
         --strict-mmio --adc-decimation 1)
     ((jit)) || command+=(--no-jit)
     ((no_batch)) && command+=(--no-loop-batching)
@@ -339,5 +361,9 @@ if [[ -n $reference_binary ]]; then
 fi
 printf 'ADC decimation: 1; all six boards reached the time budget\n'
 printf 'Median: %.3fs; throughput: %sx realtime\n' "$candidate_median" "$throughput"
-awk -v median="$candidate_median" -v duration="$duration_ms" \
-    'BEGIN { exit (median < duration / 1000) ? 0 : 1 }'
+# Test the unrounded ratio: the displayed three decimals are not acceptance evidence.
+awk -v median="$candidate_median" -v duration="$duration_ms" -v minimum="$min_throughput" \
+    'BEGIN {
+        ratio = (duration / 1000) / median
+        exit (minimum == "" ? ratio > 1 : ratio >= minimum) ? 0 : 1
+    }'

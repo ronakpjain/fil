@@ -161,6 +161,10 @@ with the scheduler being measured. Clean-rebuild profile-use objects when
 replacing a profile in place; mixed old/new profile summaries can break ThinLTO.
 
 For longer matched comparisons, use the same helper with an explicit duration.
+The instruction budget scales with duration; every board must still reach the
+deadline. Add `--min-throughput 1.2` to require at least 1.2 simulated seconds per
+host wall second, including initialization. The threshold uses the unrounded
+median ratio rather than the displayed value.
 The optional trace check compares against exact single-instruction execution
 with the same firmware and ADC decimation 1. Retrain PGO with the scheduling
 options being measured; an old profile is not a matched baseline. To test the
