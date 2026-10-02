@@ -17,7 +17,7 @@ This roadmap lists deliberate gaps; it is not a release schedule.
 4. **Measure scheduler changes.** Keep transactional worker epochs opt-in until they
    show a repeatable benefit across representative workloads and preserve exact
    traces.
-5. **Automate compatibility evidence.** Run the external PER decoder audit and smoke
+5. **Automate compatibility evidence.** Run the external firmware decoder audit and smoke
    matrix in an environment where the firmware artifacts and ARM tools are
    available.
 

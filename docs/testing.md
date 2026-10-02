@@ -1,7 +1,7 @@
 # Testing
 
 The required suite is hermetic: it uses committed synthetic Cortex-M4F fixtures and
-does not require the external PER repository or an ARM toolchain. It uses the
+does not require external firmware or an ARM toolchain. It uses the
 installed GoogleTest CMake package; CTest discovers each test case independently.
 
 ## Required suite
@@ -80,22 +80,22 @@ controls the attached target and can optionally rewrite flash. The explicit
 `--flash` is never passed unless explicitly included in `COMPARE_ARGS`. See
 [Hardware comparison](hardware_comparison.md) for the probe fixture and command.
 
-## External PER acceptance
+## External firmware acceptance
 
 External firmware checks are opt-in. Point the Makefile at the directory containing
-the seven board output directories (and use a separate build directory):
+the expected board output directories (and use a separate build directory):
 
 ```bash
 make test-per BUILD_DIR=build-per \
-  PER_FIRMWARE_DIR=/absolute/path/to/PER/Projects/firmware/output
+  PER_FIRMWARE_DIR=/absolute/path/to/firmware/output
 ```
 
 This configures/builds first, then runs CTest's `per` label. CMake registers tests
-only for firmware files that exist; the full six-board network test requires all
-six non-test board images. `CTEST_ARGS='-LE long'` skips the longer integration case.
+only for firmware files that exist; the full network test requires all
+configured non-test board images. `CTEST_ARGS='-LE long'` skips the longer integration case.
 
-CMake adds ELF inspection, strict-MMIO board smoke runs, a one-second `g4_testing`
-run, and the six-board CAN network test when the required files exist. Stimulus `expect` entries can assert firmware-originated CAN output within inclusive simulated-time windows. The network
+CMake adds ELF inspection, strict-MMIO board smoke runs, a one-second MCU-test
+image run, and the CAN network test when the required files exist. Stimulus `expect` entries can assert firmware-originated CAN output within inclusive simulated-time windows. The network
 test verifies firmware-originated transmit and receive records in a generated JSONL
 trace. Use `-L per -LE long` for the short subset.
 

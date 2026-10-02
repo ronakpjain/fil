@@ -8,6 +8,12 @@ Keep firmware, build, PGO profile, host power mode, tracing, ADC decimation, std
 
 The timing model includes instruction costs, branch penalties, and flash fetch stalls; it is not cycle-accurate silicon timing.
 
+Profile the real network before changing execution paths. On macOS, run the
+network unpaced with tracing off and collect `sample PID 5 1 -file profile.txt`
+while it is running; on Linux, use an available sampling profiler such as
+`perf`. Sampling identifies hot paths but perturbs wall time, so collect
+throughput measurements separately with the benchmark helper.
+
 ## Recommended defaults
 
 Use Release with supported IPO, the default JIT, guarded network RAM capsules,
@@ -59,7 +65,7 @@ make BUILD_DIR=build-release BUILD_TYPE=Release IPO=ON test
 make pgo
 ```
 
-The target cleans old PGO outputs, builds, trains, merges profiles, rebuilds with the profile, and tests. Default training uses the six-board PER configuration with JIT enabled and ADC decimation 1 for 1,000 ms with a 50 million instruction limit.
+The target cleans old PGO outputs, builds, trains, merges profiles, rebuilds with the profile, and tests. Default training uses the checked-in network configuration with JIT enabled and ADC decimation 1 for 1,000 ms with a 50 million instruction limit.
 
 - Override training with `PGO_TRAIN_ARGS='run-network ...'`.
 - Use matching `PGO_CXX` and `LLVM_PROFDATA` versions.
@@ -71,7 +77,14 @@ The target cleans old PGO outputs, builds, trains, merges profiles, rebuilds wit
 
 ## Network comparison
 
-The configuration requires firmware from the sibling PER checkout.
+Build the target firmware before measuring its configured network. Firmware
+compiler optimization is a workload change, not an emulator-only speedup;
+compare FIL binaries on identical ELFs and clock settings.
+
+ADC common `CCR.CKMODE` selects each group's synchronous clock division.
+Correct clock modeling is distinct from ADC decimation: every conversion,
+DMA transfer, and interrupt at the configured rate is retained. Results from
+different firmware clocks or older ADC clock models are not matched baselines.
 
 ```bash
 /usr/bin/time -p ./build-release/fil run-network configs/networks/per_vehicle.json \

@@ -16,9 +16,9 @@ make test
 ./build/fil run-network configs/networks/per_vehicle.json --duration-ms 1000 --quantum 1024 --strict-mmio
 ```
 
-The checked-in board/network configurations reference firmware in a sibling PER
-checkout. `make benchmark` instead generates synthetic fixtures and requires no
-PER firmware. Run `make help` for build, sanitizer, PGO, and CLI shortcuts.
+The checked-in board/network configurations reference external firmware images.
+`make benchmark` instead generates synthetic fixtures and requires no external
+firmware. Run `make help` for build, sanitizer, PGO, and CLI shortcuts.
 See [Options and recommended defaults](docs/options.md) for the complete command
 and build reference, including experimental modes and Make-wrapper differences.
 

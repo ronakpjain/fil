@@ -141,7 +141,7 @@ See [Hardware comparison](hardware_comparison.md) before connecting a target.
 | `FIL_LLVM_COMPONENT_LINKING` | OFF; prefer monolithic LLVM when available. |
 | `FIL_PGO_GENERATE` | OFF; Clang profile instrumentation. |
 | `FIL_PGO_PROFILE` | Empty; path to an existing Clang `.profdata`. Mutually exclusive with generation; neither PGO mode supports configured sanitizers. |
-| `FIL_PER_FIRMWARE_DIR` | Empty; opt-in external PER compatibility tests. |
+| `FIL_PER_FIRMWARE_DIR` | Empty; opt-in external firmware compatibility tests. |
 | `LLVM_DIR` | Optional LLVM CMake installation override. |
 
 ## Make shortcuts and overrides
@@ -180,7 +180,7 @@ See [Hardware comparison](hardware_comparison.md) before connecting a target.
   (PATH, then `xcrun` on macOS). Profile defaults:
   `PGO_PROFILE=build-pgo-generate/fil.profdata`,
   `PGO_PROFILE_PATTERN=build-pgo-generate/fil-%p.profraw`.
-  `PGO_TRAIN_ARGS` defaults to the six-board PER network, 1000 ms,
+  `PGO_TRAIN_ARGS` defaults to the checked-in network, 1000 ms,
   50,000,000 instructions, quantum 1024, strict MMIO, JIT, ADC decimation 1.
   **Override it to match the scheduler you deploy**; the default training
   command is not a guarantee of matching your runtime workload.
