@@ -1,6 +1,7 @@
 #include "fil/stm32g4/peripheral.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -41,6 +42,45 @@ AdcPeripheral::AdcPeripheral(
 }
 
 AdcPeripheral::~AdcPeripheral() = default;
+
+AdcCommonPeripheral::AdcCommonPeripheral(
+    std::string name, std::vector<AdcPeripheral*> members,
+    sim::EventLoop* const event_loop, sim::TraceRecorder* const trace
+) : RegisterPeripheral(std::move(name), 0x100, event_loop, trace), members_(std::move(members)) {
+    reset();
+}
+
+void AdcCommonPeripheral::setSystemClockHz(const std::uint64_t frequency_hz) {
+    system_clock_hz_ = std::max<std::uint64_t>(frequency_hz, 1U);
+    updateMemberClocks();
+}
+
+void AdcCommonPeripheral::storeRegister(
+    const std::uint32_t word_offset, const std::uint32_t previous,
+    const std::uint32_t value, const std::uint32_t write_mask,
+    const mem::AccessContext& context
+) {
+    static_cast<void>(previous);
+    static_cast<void>(value);
+    static_cast<void>(write_mask);
+    static_cast<void>(context);
+    if (word_offset == 0x08U) updateMemberClocks(); // ADC_CCR.CKMODE
+}
+
+void AdcCommonPeripheral::onReset() { updateMemberClocks(); }
+
+void AdcCommonPeripheral::updateMemberClocks() {
+    const unsigned int mode = (registerValue(0x08U) >> 16U) & 0x3U;
+    // CKMODE 00 selects the asynchronous ADC kernel clock. RCC ADC12SEL /
+    // ADC345SEL and PLLP/HSI source rates are not yet modeled; use SYSCLK as
+    // the explicit deterministic fallback. Synchronous modes are modeled as
+    // HCLK / {1,2,4}; RCC.HPRE is not modeled, so HCLK currently equals SYSCLK.
+    const std::uint64_t divisor = mode == 2U ? 2U : mode == 3U ? 4U : 1U;
+    const std::uint64_t clock = system_clock_hz_ / divisor;
+    for (AdcPeripheral* member : members_) {
+        if (member != nullptr) member->setInputClockHz(clock);
+    }
+}
 
 mem::MemoryResult<std::uint64_t> AdcPeripheral::read(
     const std::uint32_t offset,
@@ -119,8 +159,42 @@ void AdcPeripheral::setInterruptCallback(InterruptCallback callback) {
 }
 
 void AdcPeripheral::setInputClockHz(const std::uint64_t frequency_hz) {
+    const std::uint64_t next_hz = std::max<std::uint64_t>(frequency_hz, 1U);
+    if (next_hz == input_clock_hz_) return;
+
     synchronizeLazyConversions();
-    input_clock_hz_ = std::max<std::uint64_t>(frequency_hz, 1U);
+    const std::uint64_t previous_hz = input_clock_hz_;
+    const sim::SimTimeNs now = currentTime();
+    const bool event_pending = conversion_event_.pending();
+    std::optional<sim::SimTimeNs> rescheduled_time;
+    if (next_conversion_ns_ && conversion_delay_override_ns_ == 0U) {
+        const sim::SimTimeNs remaining_ns = *next_conversion_ns_ > now
+            ? *next_conversion_ns_ - now : 0U;
+        // Integer checked arithmetic avoids an out-of-range float-to-time cast.
+        // Overflow is a deterministic configuration/runtime error; no event or
+        // clock state is mutated until the replacement deadline is representable.
+        if (remaining_ns > std::numeric_limits<sim::SimTimeNs>::max() / previous_hz) {
+            throw std::overflow_error("ADC clock reschedule multiplication overflow");
+        }
+        const std::uint64_t cycle_time_product = remaining_ns * previous_hz;
+        sim::SimTimeNs delay = cycle_time_product / next_hz;
+        if (cycle_time_product % next_hz != 0U) {
+            if (delay == std::numeric_limits<sim::SimTimeNs>::max()) {
+                throw std::overflow_error("ADC clock reschedule rounding overflow");
+            }
+            ++delay;
+        }
+        delay = std::max<sim::SimTimeNs>(delay, 1U);
+        if (delay > std::numeric_limits<sim::SimTimeNs>::max() - now) {
+            throw std::overflow_error("ADC conversion time overflow during clock change");
+        }
+        rescheduled_time = now + delay;
+    }
+
+    if (event_pending) conversion_event_.cancel();
+    input_clock_hz_ = next_hz;
+    if (rescheduled_time) next_conversion_ns_ = *rescheduled_time;
+    if (event_pending) refreshConversionScheduling();
 }
 
 void AdcPeripheral::setSampleHistoryEnabled(const bool enabled) {
@@ -311,6 +385,8 @@ void AdcPeripheral::completeConversion() {
 }
 
 void AdcPeripheral::completeSkippedScans(const unsigned int skipped) {
+    skipped_scan_event_ = false;
+    skipped_scan_count_ = 0U;
     sequence_rank_ = 0U;
     scan_index_ += skipped;
     beginNextScan();
@@ -364,14 +440,9 @@ void AdcPeripheral::armSkippedScans(const unsigned int count) {
         return;
     }
     next_conversion_ns_ = now + count * period;
-    if (lazyConversionEligible()) {
-        conversion_event_.cancel();
-        return;
-    }
-    static_cast<void>(conversion_event_.scheduleOwnerLocalAt(next_conversion_ns_.value(), [this, count]() {
-        next_conversion_ns_.reset();
-        completeSkippedScans(count);
-    }, [this]() { return ownerLocalTrusted(); }));
+    skipped_scan_event_ = true;
+    skipped_scan_count_ = count;
+    refreshConversionScheduling();
 }
 
 void AdcPeripheral::materializeConversion(
@@ -408,6 +479,12 @@ void AdcPeripheral::synchronizeLazyConversions() {
     if (conversion_event_.pending() || !next_conversion_ns_) return;
     const sim::SimTimeNs now = currentTime();
     if (now < *next_conversion_ns_) return;
+    if (skipped_scan_event_) {
+        const unsigned int skipped = skipped_scan_count_;
+        next_conversion_ns_.reset();
+        completeSkippedScans(skipped);
+        return;
+    }
 
     const sim::SimTimeNs delay = conversionDelayForRank(0U);
     if (delay == 0U) return;
@@ -439,6 +516,14 @@ void AdcPeripheral::armNextConversion(const sim::SimTimeNs completion_time) {
 
 void AdcPeripheral::scheduleConversionEvent() {
     if (eventLoop() == nullptr || !next_conversion_ns_) return;
+    if (skipped_scan_event_) {
+        const unsigned int skipped = skipped_scan_count_;
+        static_cast<void>(conversion_event_.scheduleOwnerLocalAt(*next_conversion_ns_, [this, skipped]() {
+            next_conversion_ns_.reset();
+            completeSkippedScans(skipped);
+        }, [this]() { return ownerLocalTrusted(); }));
+        return;
+    }
     static_cast<void>(conversion_event_.scheduleOwnerLocalAt(*next_conversion_ns_, [this]() {
         next_conversion_ns_.reset();
         completeConversion();
@@ -448,6 +533,8 @@ void AdcPeripheral::scheduleConversionEvent() {
 void AdcPeripheral::cancelConversion() noexcept {
     conversion_event_.cancel();
     next_conversion_ns_.reset();
+    skipped_scan_event_ = false;
+    skipped_scan_count_ = 0U;
 }
 
 } // namespace fil::stm32g4

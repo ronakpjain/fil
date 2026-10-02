@@ -137,6 +137,7 @@ private:
     std::vector<std::unique_ptr<UsartPeripheral>> usart_;
     std::vector<std::unique_ptr<TimerPeripheral>> timers_;
     std::vector<std::unique_ptr<AdcPeripheral>> adc_;
+    std::vector<std::unique_ptr<AdcCommonPeripheral>> adc_common_;
     std::vector<std::unique_ptr<SpiPeripheral>> spi_;
     std::vector<std::unique_ptr<FdcanPeripheral>> fdcan_;
     std::vector<std::unique_ptr<std::ofstream>> usart_tx_files_;

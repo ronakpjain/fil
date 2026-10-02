@@ -10,6 +10,172 @@
 
 namespace {
 
+TEST(Stm32G4Test, AdcCommonCkmodeClocksSeparateGroupsAndHonorsPartialCcrWrites) {
+    fil::sim::EventLoop events;
+    fil::sim::TraceRecorder trace;
+    fil::stm32g4::AdcPeripheral adc1("ADC1", &events, &trace);
+    fil::stm32g4::AdcPeripheral adc2("ADC2", &events, &trace);
+    fil::stm32g4::AdcPeripheral adc3("ADC3", &events, &trace);
+    fil::stm32g4::AdcPeripheral adc4("ADC4", &events, &trace);
+    fil::stm32g4::AdcPeripheral adc5("ADC5", &events, &trace);
+    adc1.setSampleHistoryEnabled(true);
+    adc2.setSampleHistoryEnabled(true);
+    adc3.setSampleHistoryEnabled(true);
+    adc4.setSampleHistoryEnabled(true);
+    adc5.setSampleHistoryEnabled(true);
+    fil::stm32g4::AdcCommonPeripheral adc12("ADC12_COMMON", {&adc1, &adc2}, &events, &trace);
+    fil::stm32g4::AdcCommonPeripheral adc345("ADC345_COMMON", {&adc3, &adc4, &adc5}, &events, &trace);
+    adc12.setSystemClockHz(170'000'000U);
+    adc345.setSystemClockHz(170'000'000U);
+    constexpr auto word = fil::mem::AccessSize::word;
+    constexpr auto half = fil::mem::AccessSize::halfword;
+    // A halfword write to CCR[31:16] exercises merge/write-mask behavior.
+    ASSERT_TRUE(adc12.write(0x0aU, half, 3U, {})); // CKMODE=11: HCLK/4
+    ASSERT_TRUE(adc345.write(0x0aU, half, 1U, {})); // CKMODE=01: HCLK
+    ASSERT_TRUE(adc1.write(0x08U, word, 1U, {}));
+    ASSERT_TRUE(adc2.write(0x08U, word, 1U, {}));
+    ASSERT_TRUE(adc3.write(0x08U, word, 1U, {}));
+    ASSERT_TRUE(adc4.write(0x08U, word, 1U, {}));
+    ASSERT_TRUE(adc5.write(0x08U, word, 1U, {}));
+    for (auto* adc : {&adc1, &adc2, &adc3, &adc4, &adc5}) {
+        ASSERT_TRUE(adc->write(0x08U, word, 1U | (1U << 2U), {}));
+    }
+    EXPECT_EQ(events.nextScheduledTime(), 89U)
+        << "ADC3/4 use 170 MHz HCLK (15 conversion cycles, rounded up)";
+    ASSERT_EQ(events.runDueEvents(1000U).events_executed, 5U);
+    EXPECT_EQ(adc1.samples().size(), 1U);
+    EXPECT_EQ(adc2.samples().size(), 1U);
+    EXPECT_EQ(adc3.samples().size(), 1U);
+    EXPECT_EQ(adc4.samples().size(), 1U);
+    EXPECT_EQ(adc5.samples().size(), 1U);
+    EXPECT_EQ(adc1.samples().front().time_ns, 353U)
+        << "ADC1/2 use 42.5 MHz HCLK/4 without suppressing conversions";
+    EXPECT_EQ(adc2.samples().front().time_ns, 353U);
+    EXPECT_EQ(adc3.samples().front().time_ns, 89U);
+    EXPECT_EQ(adc4.samples().front().time_ns, 89U);
+    EXPECT_EQ(adc5.samples().front().time_ns, 89U);
+
+    // A mid-conversion CCR change carries forward elapsed clock cycles rather
+    // than leaving the already-armed event at its old timestamp.
+    fil::sim::EventLoop switched_events;
+    fil::stm32g4::AdcPeripheral switched_adc("ADC1", &switched_events, &trace);
+    fil::stm32g4::AdcCommonPeripheral switched_common(
+        "ADC12_COMMON", {&switched_adc}, &switched_events, &trace);
+    switched_common.setSystemClockHz(170'000'000U);
+    ASSERT_TRUE(switched_common.write(0x0aU, half, 3U, {}));
+    ASSERT_TRUE(switched_adc.write(0x08U, word, 1U, {}));
+    ASSERT_TRUE(switched_adc.write(0x08U, word, 1U | (1U << 2U), {}));
+    ASSERT_EQ(switched_events.advanceBy(100U).events_executed, 0U);
+    ASSERT_TRUE(switched_common.write(0x0aU, half, 1U, {}));
+    EXPECT_EQ(switched_events.nextScheduledTime(), 164U);
+    ASSERT_EQ(switched_events.runDueEvents(164U).events_executed, 1U);
+    EXPECT_EQ(switched_events.now(), 164U);
+
+    // Lazy conversions have a logical deadline despite having no queued event.
+    fil::sim::EventLoop lazy_events;
+    fil::stm32g4::AdcPeripheral lazy_adc("ADC1", &lazy_events, &trace);
+    fil::stm32g4::AdcCommonPeripheral lazy_common(
+        "ADC12_COMMON", {&lazy_adc}, &lazy_events, &trace);
+    lazy_common.setSystemClockHz(170'000'000U);
+    ASSERT_TRUE(lazy_common.write(0x0aU, half, 1U, {}));
+    lazy_adc.setSampleHistoryEnabled(false);
+    ASSERT_TRUE(lazy_adc.write(0x0cU, word, 1U << 13U, {}));
+    ASSERT_TRUE(lazy_adc.write(0x08U, word, 1U, {}));
+    ASSERT_TRUE(lazy_adc.write(0x08U, word, 1U | (1U << 2U), {}));
+    ASSERT_EQ(lazy_events.advanceBy(40U).events_executed, 0U);
+    ASSERT_TRUE(lazy_common.write(0x0aU, half, 2U, {})); // HCLK/2, retaining lazy deadline.
+    lazy_adc.setSampleHistoryEnabled(true);
+    EXPECT_EQ(lazy_events.nextScheduledTime(), 138U);
+    ASSERT_EQ(lazy_events.runDueEvents(138U).events_executed, 1U);
+    EXPECT_EQ(lazy_adc.samples().front().time_ns, 138U);
+
+    // A decimation gap uses a specialized skipped-scan event. Clock changes
+    // must retain its scan count rather than turn the landing into a sample.
+    fil::sim::EventLoop gap_events;
+    fil::stm32g4::AdcPeripheral gap_adc("ADC1", &gap_events, &trace);
+    fil::stm32g4::AdcCommonPeripheral gap_common(
+        "ADC12_COMMON", {&gap_adc}, &gap_events, &trace);
+    gap_common.setSystemClockHz(170'000'000U);
+    gap_adc.setSampleHistoryEnabled(true);
+    gap_adc.setDecimation(2U);
+    ASSERT_TRUE(gap_common.write(0x0aU, half, 1U, {}));
+    ASSERT_TRUE(gap_adc.write(0x0cU, word, 1U << 13U, {}));
+    ASSERT_TRUE(gap_adc.write(0x08U, word, 1U, {}));
+    ASSERT_TRUE(gap_adc.write(0x08U, word, 1U | (1U << 2U), {}));
+    ASSERT_EQ(gap_events.runDueEvents(89U).events_executed, 1U);
+    ASSERT_TRUE(gap_events.advanceBy(11U).events_executed == 0U);
+    ASSERT_TRUE(gap_common.write(0x0aU, half, 2U, {}));
+    EXPECT_EQ(gap_events.nextScheduledTime(), 256U);
+    ASSERT_EQ(gap_events.runDueEvents(256U).events_executed, 1U);
+    EXPECT_EQ(gap_adc.samples().size(), 1U) << "the gap landing remains suppressed";
+    ASSERT_EQ(gap_events.runDueEvents(433U).events_executed, 1U);
+    ASSERT_EQ(gap_adc.samples().size(), 2U);
+    EXPECT_EQ(gap_adc.samples().back().time_ns, 433U);
+}
+
+TEST(Stm32G4Test, AdcCommonClockTracksRccPllChanges) {
+    fil::sim::EventLoop events;
+    fil::sim::TraceRecorder trace;
+    fil::cortexm::SystemControl system;
+    auto mcu = fil::stm32g4::Stm32G4::create(events, trace, system, true, 16'000'000U);
+    ASSERT_TRUE(mcu);
+    constexpr auto word = fil::mem::AccessSize::word;
+    constexpr auto half = fil::mem::AccessSize::halfword;
+    // PLL source HSE=16 MHz, M=1, N=85, R=8 => SYSCLK/HCLK=170 MHz.
+    ASSERT_TRUE(mcu.value()->router().write(0x2100cU, word,
+        3U | (85U << 8U) | (3U << 25U), {}));
+    ASSERT_TRUE(mcu.value()->router().write(0x21000U, word,
+        (1U << 16U) | (1U << 24U), {}));
+    ASSERT_TRUE(mcu.value()->router().write(0x21008U, word, 3U, {}));
+    ASSERT_EQ(mcu.value()->rcc().systemClockHz(), 170'000'000U);
+    auto* adc = mcu.value()->adc("ADC1");
+    ASSERT_NE(adc, nullptr);
+    ASSERT_TRUE(mcu.value()->router().write(0x1000030aU, half, 3U, {}));
+    ASSERT_TRUE(adc->write(0x08U, word, 1U, {}));
+    ASSERT_TRUE(adc->write(0x08U, word, 1U | (1U << 2U), {}));
+    ASSERT_EQ(events.runDueEvents(400U).events_executed, 1U);
+    ASSERT_EQ(adc->samples().size(), 1U);
+    EXPECT_EQ(adc->samples().front().time_ns, 353U)
+        << "RCC SYSCLK updates the ADC12 group, whose CKMODE=11 divides HCLK by four";
+}
+
+TEST(Stm32G4Test, Adc5RoutesItsDmaRequestAndDedicatedInterrupt) {
+    fil::sim::EventLoop events;
+    fil::sim::TraceRecorder trace;
+    trace.setEnabled(false);
+    fil::cortexm::SystemControl system;
+    auto mcu = fil::stm32g4::Stm32G4::create(events, trace, system, true);
+    ASSERT_TRUE(mcu);
+    fil::mem::MemoryBus memory;
+    ASSERT_TRUE(memory.mapRam(0x20000000U, 0x1000U, "ram"));
+    ASSERT_TRUE(memory.mapMmio(0x40000000U, 0x20000000U,
+                               mcu.value()->router(), "peripherals"));
+    mcu.value()->attachMemory(memory);
+    auto& router = mcu.value()->router();
+    constexpr auto word = fil::mem::AccessSize::word;
+    ASSERT_TRUE(router.write(0x20800U, word, 39U, {})); // DMAMUX request ADC5.
+    ASSERT_TRUE(router.write(0x2000cU, word, 1U, {}));
+    ASSERT_TRUE(router.write(0x20010U, word, 0x50000640U, {}));
+    ASSERT_TRUE(router.write(0x20014U, word, 0x20000000U, {}));
+    ASSERT_TRUE(router.write(0x20008U, word, 1U | (1U << 8U) | (1U << 10U), {}));
+    ASSERT_TRUE(system.write(0xe104U, word, 1U << 30U, {})); // IRQ62 = ADC5.
+    auto* adc5 = mcu.value()->adc("ADC5");
+    ASSERT_NE(adc5, nullptr);
+    adc5->setChannelValue(0U, 0x5a5U);
+    ASSERT_TRUE(adc5->write(0x04U, word, 1U << 2U, {})); // EOC interrupt.
+    ASSERT_TRUE(adc5->write(0x08U, word, 1U, {}));
+    ASSERT_TRUE(adc5->write(0x08U, word, 1U | (1U << 2U), {}));
+    ASSERT_EQ(events.runDueEvents(5000U).events_executed, 1U);
+    const auto transferred = memory.read16(0x20000000U);
+    ASSERT_TRUE(transferred);
+    EXPECT_EQ(transferred.value(), 0x5a5U);
+    const auto remaining = router.read(0x2000cU, word, {});
+    ASSERT_TRUE(remaining);
+    EXPECT_EQ(remaining.value(), 0U);
+    EXPECT_EQ(system.nextPending(0U, 0U, 0U), 78U)
+        << "ADC5 asserts external IRQ62 (exception number 78), not ADC3's IRQ47";
+}
+
 TEST(Stm32G4Test, CertifiesOnlyTrustedAdcEventsAndRechecksPendingHooks) {
     fil::sim::EventLoop events;
     fil::sim::TraceRecorder trace;

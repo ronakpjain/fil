@@ -64,8 +64,12 @@ Stm32G4::Stm32G4(
     };
     for (const auto name : timer_names) timers_.push_back(std::make_unique<TimerPeripheral>(std::string(name), 16000000U, &event_loop, &trace));
 
-    constexpr std::array<std::string_view, 4> adc_names{"ADC1", "ADC2", "ADC3", "ADC4"};
+    constexpr std::array<std::string_view, 5> adc_names{"ADC1", "ADC2", "ADC3", "ADC4", "ADC5"};
     for (const auto name : adc_names) adc_.push_back(std::make_unique<AdcPeripheral>(std::string(name), &event_loop, &trace));
+    adc_common_.push_back(std::make_unique<AdcCommonPeripheral>(
+        "ADC12_COMMON", std::vector<AdcPeripheral*>{adc_[0].get(), adc_[1].get()}, &event_loop, &trace));
+    adc_common_.push_back(std::make_unique<AdcCommonPeripheral>(
+        "ADC345_COMMON", std::vector<AdcPeripheral*>{adc_[2].get(), adc_[3].get(), adc_[4].get()}, &event_loop, &trace));
 
     constexpr std::array<std::string_view, 3> spi_names{"SPI1", "SPI2", "SPI3"};
     for (const auto name : spi_names) spi_.push_back(std::make_unique<SpiPeripheral>(std::string(name), &event_loop, &trace));
@@ -74,8 +78,6 @@ Stm32G4::Stm32G4(
         fdcan_.push_back(std::make_unique<FdcanPeripheral>(instance, fdcan_message_ram_, &event_loop, &trace));
     }
 
-    stubs_.push_back(std::make_unique<UnknownMmioDevice>("ADC12_COMMON", 0x50000300U, false, 0, &event_loop, &trace));
-    stubs_.push_back(std::make_unique<UnknownMmioDevice>("ADC345_COMMON", 0x50000700U, false, 0, &event_loop, &trace));
     exti_.setSyscfg(&syscfg_);
 }
 
@@ -140,7 +142,7 @@ Result<void> Stm32G4::mapDevices() {
         auto result = checked(timer_bases[index], *timers_[index]);
         if (!result) return result.error();
     }
-    constexpr std::array<std::uint32_t, 4> adc_bases{0x50000000U, 0x50000100U, 0x50000400U, 0x50000500U};
+    constexpr std::array<std::uint32_t, 5> adc_bases{0x50000000U, 0x50000100U, 0x50000400U, 0x50000500U, 0x50000600U};
     for (std::size_t index = 0; index < adc_.size(); ++index) {
         auto result = checked(adc_bases[index], *adc_[index]);
         if (!result) return result.error();
@@ -163,14 +165,9 @@ Result<void> Stm32G4::mapDevices() {
         );
         if (!result) return result.error();
     }
-    constexpr std::array<std::pair<std::uint32_t, std::uint32_t>, 2> stub_ranges{
-        std::pair{0x50000300U, 0x100U}, {0x50000700U, 0x100U},
-    };
-    for (std::size_t index = 0; index < stubs_.size(); ++index) {
-        auto result = router_.map(
-            stub_ranges[index].first - peripheral_base, stub_ranges[index].second,
-            *stubs_[index], std::string(stubs_[index]->name())
-        );
+    constexpr std::array<std::uint32_t, 2> adc_common_bases{0x50000300U, 0x50000700U};
+    for (std::size_t index = 0; index < adc_common_.size(); ++index) {
+        auto result = checked(adc_common_bases[index], *adc_common_[index]);
         if (!result) return result.error();
     }
     mapped_ = true;
@@ -204,9 +201,10 @@ void Stm32G4::wireInterrupts() {
     for (std::size_t index = 0; index < timers_.size(); ++index) {
         connect(*timers_[index], std::array{timer_irqs[index]});
     }
-    constexpr std::array<std::uint8_t, 4> adc_dma_requests{5U, 36U, 37U, 38U};
+    constexpr std::array<std::uint8_t, 5> adc_dma_requests{5U, 36U, 37U, 38U, 39U};
+    constexpr std::array<std::uint16_t, 5> adc_irqs{18U, 18U, 47U, 61U, 62U};
     for (std::size_t index = 0; index < adc_.size(); ++index) {
-        connect(*adc_[index], std::array<std::uint16_t, 1>{18U});
+        connect(*adc_[index], std::array<std::uint16_t, 1>{adc_irqs[index]});
         adc_[index]->setCertifiedSampleCallback(
             [this, request = adc_dma_requests[index]](const AdcSample&) {
                 serviceDmaRequest(request);
@@ -257,7 +255,7 @@ void Stm32G4::wireInterrupts() {
     dma2_.setEnableCallback(dma_enable_trigger);
     rcc_.setClockChangedCallback([this](const std::uint64_t frequency) {
         for (auto& timer : timers_) timer->setInputClockHz(frequency);
-        for (auto& adc : adc_) adc->setInputClockHz(frequency);
+        for (auto& common : adc_common_) common->setSystemClockHz(frequency);
     });
     iwdg_.setResetCallback([this] { reset_requested_ = true; });
     wwdg_.setResetCallback([this] { reset_requested_ = true; });
@@ -268,11 +266,12 @@ void Stm32G4::serviceDmaRequest(const std::uint8_t request) {
 }
 
 bool Stm32G4::adcOwnerLocalSafe(const std::size_t adc_index) const {
-    if (adc_index >= adc_.size() || memory_ == nullptr) return false;
-    constexpr std::array<std::uint8_t, 4> requests{5U, 36U, 37U, 38U};
-    constexpr std::array<std::uint32_t, 4> data_registers{
-        0x50000040U, 0x50000140U, 0x50000440U, 0x50000540U,
+    constexpr std::array<std::uint8_t, 5> requests{5U, 36U, 37U, 38U, 39U};
+    constexpr std::array<std::uint32_t, 5> data_registers{
+        0x50000040U, 0x50000140U, 0x50000440U, 0x50000540U, 0x50000640U,
     };
+    if (adc_index >= requests.size() || adc_index >= data_registers.size()
+        || adc_index >= adc_.size() || memory_ == nullptr) return false;
     const std::uint8_t request = requests[adc_index];
     const std::uint32_t source = data_registers[adc_index];
     if (source < 0x40000000U
@@ -517,6 +516,7 @@ void Stm32G4::setTraceSourcePrefix(const std::string_view prefix) {
     qualify(usart_);
     qualify(timers_);
     qualify(adc_);
+    qualify(adc_common_);
     qualify(spi_);
     qualify(fdcan_);
     qualify(stubs_);
@@ -549,6 +549,7 @@ void Stm32G4::reset() {
     for (auto& device : usart_) device->reset();
     for (auto& device : timers_) device->reset();
     for (auto& device : adc_) device->reset();
+    for (auto& device : adc_common_) device->reset();
     for (auto& device : spi_) device->reset();
     fdcan_message_ram_.reset();
     for (auto& device : fdcan_) device->reset();

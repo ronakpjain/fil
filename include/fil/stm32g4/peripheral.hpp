@@ -580,6 +580,28 @@ private:
     std::vector<TimerUpdate> updates_;
 };
 
+class AdcPeripheral;
+
+/** @brief Shared ADC12/ADC345 common control and clock group. */
+class AdcCommonPeripheral final : public RegisterPeripheral {
+public:
+    explicit AdcCommonPeripheral(std::string name, std::vector<AdcPeripheral*> members,
+                                 sim::EventLoop* event_loop = nullptr,
+                                 sim::TraceRecorder* trace = nullptr);
+    void setSystemClockHz(std::uint64_t frequency_hz);
+
+protected:
+    void storeRegister(std::uint32_t word_offset, std::uint32_t previous,
+                       std::uint32_t value, std::uint32_t write_mask,
+                       const mem::AccessContext& context) override;
+    void onReset() override;
+
+private:
+    void updateMemberClocks();
+    std::vector<AdcPeripheral*> members_;
+    std::uint64_t system_clock_hz_{16000000U};
+};
+
 /** @brief ADC conversion result with selected channel metadata. */
 struct AdcSample {
     sim::SimTimeNs time_ns{0};
@@ -709,6 +731,8 @@ private:
     bool skip_scan_{false};
     sim::ScheduledEvent conversion_event_;
     std::optional<sim::SimTimeNs> next_conversion_ns_;
+    bool skipped_scan_event_{false};
+    unsigned int skipped_scan_count_{0U};
     bool sample_history_enabled_{true};
     std::vector<AdcSample> samples_;
 };
