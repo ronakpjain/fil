@@ -23,7 +23,7 @@ std::uint32_t referenceCrc32Mpeg2(std::span<const std::uint8_t> bytes) {
     std::uint32_t crc = 0xffffffffU;
     for (const std::uint8_t byte : bytes) {
         crc ^= static_cast<std::uint32_t>(byte) << 24U;
-        for (unsigned int bit = 0U; bit < 8U; ++bit) {
+        for (std::uint32_t bit = 0U; bit < 8U; ++bit) {
             crc = (crc & 0x80000000U) != 0U
                 ? (crc << 1U) ^ 0x04c11db7U
                 : (crc << 1U);
@@ -41,7 +41,7 @@ std::uint32_t referenceCrc32Mpeg2(
     std::uint32_t crc = initial;
     for (const std::uint8_t byte : bytes) {
         crc ^= static_cast<std::uint32_t>(byte) << 24U;
-        for (unsigned int bit = 0U; bit < 8U; ++bit) {
+        for (std::uint32_t bit = 0U; bit < 8U; ++bit) {
             crc = (crc & 0x80000000U) != 0U
                 ? (crc << 1U) ^ polynomial
                 : (crc << 1U);

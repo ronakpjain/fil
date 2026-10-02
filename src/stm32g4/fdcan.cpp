@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <stdexcept>
 #include <utility>
 
@@ -59,14 +60,14 @@ constexpr std::array<std::uint32_t, 7> interrupt_groups{
     0xfc0000U, // warning, bus-off, watchdog, protocol/access errors
 };
 
-unsigned int checkedControllerIndex(const unsigned int instance_number) {
+std::uint32_t checkedControllerIndex(const std::uint32_t instance_number) {
     if (instance_number == 0U || instance_number > FdcanMessageRam::controllerCount) {
         throw std::invalid_argument("FDCAN instance number must be in the range 1..3");
     }
     return instance_number - 1U;
 }
 
-std::string defaultControllerName(const unsigned int instance_number) {
+std::string defaultControllerName(const std::uint32_t instance_number) {
     return "FDCAN" + std::to_string(instance_number);
 }
 
@@ -153,7 +154,7 @@ mem::MemoryResult<std::uint64_t> FdcanMessageRam::write(const std::uint32_t offs
 
 void FdcanMessageRam::reset() noexcept { bytes_.fill(0); }
 
-std::optional<std::uint32_t> FdcanMessageRam::absoluteOffset(const unsigned int controller_index,
+std::optional<std::uint32_t> FdcanMessageRam::absoluteOffset(const std::uint32_t controller_index,
                                                              const std::uint32_t controller_offset,
                                                              const std::uint32_t width) noexcept {
     if (controller_index >= controllerCount || width == 0U ||
@@ -163,7 +164,7 @@ std::optional<std::uint32_t> FdcanMessageRam::absoluteOffset(const unsigned int 
     return static_cast<std::uint32_t>(controller_index) * controllerStride + controller_offset;
 }
 
-std::uint32_t FdcanMessageRam::loadWord(const unsigned int controller_index,
+std::uint32_t FdcanMessageRam::loadWord(const std::uint32_t controller_index,
                                         const std::uint32_t controller_offset) const noexcept {
     const auto absolute = absoluteOffset(controller_index, controller_offset, 4U);
     if (!absolute.has_value()) {
@@ -176,7 +177,7 @@ std::uint32_t FdcanMessageRam::loadWord(const unsigned int controller_index,
            (static_cast<std::uint32_t>(bytes_[offset + 3U]) << 24U);
 }
 
-void FdcanMessageRam::storeWord(const unsigned int controller_index,
+void FdcanMessageRam::storeWord(const std::uint32_t controller_index,
                                 const std::uint32_t controller_offset,
                                 const std::uint32_t value) noexcept {
     const auto absolute = absoluteOffset(controller_index, controller_offset, 4U);
@@ -190,7 +191,7 @@ void FdcanMessageRam::storeWord(const unsigned int controller_index,
     bytes_[offset + 3U] = static_cast<std::uint8_t>((value >> 24U) & 0xffU);
 }
 
-void FdcanMessageRam::clearRange(const unsigned int controller_index, const std::uint32_t offset,
+void FdcanMessageRam::clearRange(const std::uint32_t controller_index, const std::uint32_t offset,
                                  const std::uint32_t size) noexcept {
     const auto absolute = absoluteOffset(controller_index, offset, size);
     if (!absolute.has_value()) {
@@ -202,14 +203,14 @@ void FdcanMessageRam::clearRange(const unsigned int controller_index, const std:
 
 FdcanPeripheral::FdcanPeripheral(const Instance instance, FdcanMessageRam& message_ram,
                                  sim::EventLoop* const event_loop, sim::TraceRecorder* const trace)
-    : FdcanPeripheral(static_cast<unsigned int>(instance), message_ram, event_loop, trace) {}
+    : FdcanPeripheral(static_cast<std::uint32_t>(instance), message_ram, event_loop, trace) {}
 
-FdcanPeripheral::FdcanPeripheral(const unsigned int instance_number, FdcanMessageRam& message_ram,
+FdcanPeripheral::FdcanPeripheral(const std::uint32_t instance_number, FdcanMessageRam& message_ram,
                                  sim::EventLoop* const event_loop, sim::TraceRecorder* const trace)
     : FdcanPeripheral(defaultControllerName(instance_number), instance_number, message_ram,
                       event_loop, trace) {}
 
-FdcanPeripheral::FdcanPeripheral(std::string name, const unsigned int instance_number,
+FdcanPeripheral::FdcanPeripheral(std::string name, const std::uint32_t instance_number,
                                  FdcanMessageRam& message_ram, sim::EventLoop* const event_loop,
                                  sim::TraceRecorder* const trace)
     : RegisterPeripheral(std::move(name), registerBlockSize, event_loop, trace),
@@ -257,7 +258,7 @@ void FdcanPeripheral::setInterruptCallback(InterruptCallback callback) {
     updateInterruptLines();
 }
 
-void FdcanPeripheral::setInterruptLineCallback(const unsigned int line,
+void FdcanPeripheral::setInterruptLineCallback(const std::uint32_t line,
                                                LineInterruptCallback callback) {
     if (line >= line_interrupt_callbacks_.size()) {
         return;
@@ -345,7 +346,7 @@ bool FdcanPeripheral::receiveFrame(const devices::CanFrame& frame, const std::ui
             setInterruptFlags(interruptRxFifo0Full | interruptRxFifo0Lost);
             return false;
         }
-        rx_get_index_ = static_cast<std::uint8_t>((static_cast<unsigned int>(rx_get_index_) + 1U) %
+        rx_get_index_ = static_cast<std::uint8_t>((static_cast<std::uint32_t>(rx_get_index_) + 1U) %
                                                   FdcanMessageRam::rxFifoElementCount);
         --rx_fill_level_;
         overwritten = true;
@@ -377,7 +378,7 @@ bool FdcanPeripheral::receiveFrame(const devices::CanFrame& frame, const std::ui
         message_ram_.storeWord(instance_index_, element_offset + 8U + byte_offset, data_word);
     }
 
-    rx_put_index_ = static_cast<std::uint8_t>((static_cast<unsigned int>(rx_put_index_) + 1U) %
+    rx_put_index_ = static_cast<std::uint8_t>((static_cast<std::uint32_t>(rx_put_index_) + 1U) %
                                               FdcanMessageRam::rxFifoElementCount);
     ++rx_fill_level_;
     updateRxFifo0Status();
@@ -398,7 +399,7 @@ bool FdcanPeripheral::receiveFrame(const devices::CanFrame& frame, const std::ui
     return true;
 }
 
-bool FdcanPeripheral::transmitBuffer(const unsigned int buffer_index) {
+bool FdcanPeripheral::transmitBuffer(const std::uint32_t buffer_index) {
     if (buffer_index >= FdcanMessageRam::txFifoElementCount) {
         return false;
     }
@@ -460,12 +461,12 @@ bool FdcanPeripheral::transmitBuffer(const unsigned int buffer_index) {
     return true;
 }
 
-void FdcanPeripheral::acknowledgeRxFifo0(const unsigned int acknowledged_index) {
+void FdcanPeripheral::acknowledgeRxFifo0(const std::uint32_t acknowledged_index) {
     if (rx_fill_level_ == 0U || acknowledged_index >= FdcanMessageRam::rxFifoElementCount) {
         return;
     }
-    const unsigned int distance = (acknowledged_index + FdcanMessageRam::rxFifoElementCount -
-                                   static_cast<unsigned int>(rx_get_index_)) %
+    const std::uint32_t distance = (acknowledged_index + FdcanMessageRam::rxFifoElementCount -
+                                   static_cast<std::uint32_t>(rx_get_index_)) %
                                       FdcanMessageRam::rxFifoElementCount +
                                   1U;
     if (distance > rx_fill_level_) {
@@ -508,20 +509,20 @@ void FdcanPeripheral::setInterruptFlags(const std::uint32_t flags) {
         if ((enabled & interrupt_groups[group]) == 0U) {
             continue;
         }
-        const unsigned int line = (selections & (1U << group)) == 0U ? 0U : 1U;
+        const std::uint32_t line = (selections & (1U << group)) == 0U ? 0U : 1U;
         interrupt_line_asserted_[line] = false;
     }
     updateInterruptLines();
 }
 
-bool FdcanPeripheral::interruptLinePending(const unsigned int line) const noexcept {
+bool FdcanPeripheral::interruptLinePending(const std::uint32_t line) const noexcept {
     if (line > 1U || (registerValue(ile) & (1U << line)) == 0U) {
         return false;
     }
     const std::uint32_t pending = registerValue(ir) & registerValue(ie) & interrupt_mask;
     const std::uint32_t selections = registerValue(ils);
     for (std::size_t group = 0; group < interrupt_groups.size(); ++group) {
-        const unsigned int selected_line = (selections & (1U << group)) == 0U ? 0U : 1U;
+        const std::uint32_t selected_line = (selections & (1U << group)) == 0U ? 0U : 1U;
         if (selected_line == line && (pending & interrupt_groups[group]) != 0U) {
             return true;
         }
@@ -530,7 +531,7 @@ bool FdcanPeripheral::interruptLinePending(const unsigned int line) const noexce
 }
 
 void FdcanPeripheral::updateInterruptLines() {
-    for (unsigned int line = 0; line < interrupt_line_asserted_.size(); ++line) {
+    for (std::uint32_t line = 0; line < interrupt_line_asserted_.size(); ++line) {
         const bool pending = interruptLinePending(line);
         setInterruptLevel(line, pending);
         if (!pending) {
@@ -605,7 +606,7 @@ void FdcanPeripheral::storeRegister(const std::uint32_t word_offset, const std::
         if (!operational()) {
             return;
         }
-        for (unsigned int buffer = 0; buffer < FdcanMessageRam::txFifoElementCount; ++buffer) {
+        for (std::uint32_t buffer = 0; buffer < FdcanMessageRam::txFifoElementCount; ++buffer) {
             const std::uint32_t buffer_bit = 1U << buffer;
             if ((requests & buffer_bit) == 0U) {
                 continue;

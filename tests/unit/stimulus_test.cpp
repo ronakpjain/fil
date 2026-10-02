@@ -7,6 +7,7 @@
 #include "fil/stm32g4/stm32g4.hpp"
 #include "../fixture_support.hpp"
 
+#include <cstdint>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -302,7 +303,7 @@ TEST(StimulusTest, SchedulesCanGpioAdcAndUsartInputs) {
     ASSERT_NE(gpio, nullptr);
     ASSERT_NE(adc, nullptr);
     ASSERT_NE(usart, nullptr);
-    adc->setChannelProvider([](const unsigned int, const fil::sim::SimTimeNs) {
+    adc->setChannelProvider([](const std::uint32_t, const fil::sim::SimTimeNs) {
         return std::uint16_t{123U};
     });
     adc->setConversionDelay(5'000U);

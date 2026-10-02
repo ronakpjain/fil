@@ -10,6 +10,7 @@
 #include "../config/json_internal.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <memory>

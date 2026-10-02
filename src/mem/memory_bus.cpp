@@ -4,13 +4,14 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 
 namespace fil::mem {
 namespace {
 
-constexpr unsigned int maximum_alias_depth = 8;
+constexpr std::uint32_t maximum_alias_depth = 8;
 
 /** @brief Checks a nonempty target range without 32-bit wraparound. */
 bool validRange(const std::uint32_t base, const std::uint32_t size) {
@@ -119,7 +120,7 @@ bool MemoryBus::storeUnjournaledWord(
         std::memcpy(&old_value, region.bytes.data() + offset, sizeof(old_value));
         std::uint32_t difference = old_value ^ value;
         std::uint64_t changed_bytes = 0U;
-        for (unsigned int byte = 0U; byte < sizeof(value); ++byte) {
+        for (std::uint32_t byte = 0U; byte < sizeof(value); ++byte) {
             changed_bytes += (difference & 0xffU) != 0U;
             difference >>= 8U;
         }
@@ -319,7 +320,7 @@ MemoryResult<std::uint64_t> MemoryBus::read(
     const std::uint32_t address,
     const AccessSize size,
     const AccessContext& context,
-    const unsigned int alias_depth
+    const std::uint32_t alias_depth
 ) const {
     const std::uint32_t width = byteCount(size);
     if (!validRange(address, width)) {
@@ -398,7 +399,7 @@ MemoryResult<std::uint64_t> MemoryBus::write(
     const AccessSize size,
     const std::uint64_t value,
     const AccessContext& context,
-    const unsigned int alias_depth
+    const std::uint32_t alias_depth
 ) {
     const std::uint32_t width = byteCount(size);
     if (!validRange(address, width)) {

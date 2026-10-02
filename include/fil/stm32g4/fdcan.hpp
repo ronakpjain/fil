@@ -32,7 +32,7 @@ class FdcanPeripheral;
 class FdcanMessageRam final : public mem::MmioDevice {
 public:
     static constexpr std::uint32_t baseAddress = 0x4000a400U;
-    static constexpr unsigned int controllerCount = 3U;
+    static constexpr std::uint32_t controllerCount = 3U;
     static constexpr std::uint32_t controllerStride = 0x350U;
     static constexpr std::uint32_t sizeBytes = controllerCount * controllerStride;
 
@@ -68,11 +68,11 @@ public:
     void reset() noexcept;
 
     /** @brief Reads one little-endian word from a zero-based controller slice. */
-    [[nodiscard]] std::uint32_t loadWord(unsigned int controller_index,
+    [[nodiscard]] std::uint32_t loadWord(std::uint32_t controller_index,
                                          std::uint32_t controller_offset) const noexcept;
 
     /** @brief Writes one little-endian word in a zero-based controller slice. */
-    void storeWord(unsigned int controller_index, std::uint32_t controller_offset,
+    void storeWord(std::uint32_t controller_index, std::uint32_t controller_offset,
                    std::uint32_t value) noexcept;
 
 private:
@@ -81,9 +81,9 @@ private:
     [[nodiscard]] mem::BusFault fault(std::uint32_t offset, mem::AccessSize size,
                                       const mem::AccessContext& context, std::string message) const;
     [[nodiscard]] static std::optional<std::uint32_t>
-    absoluteOffset(unsigned int controller_index, std::uint32_t controller_offset,
+    absoluteOffset(std::uint32_t controller_index, std::uint32_t controller_offset,
                    std::uint32_t width) noexcept;
-    void clearRange(unsigned int controller_index, std::uint32_t offset,
+    void clearRange(std::uint32_t controller_index, std::uint32_t offset,
                     std::uint32_t size) noexcept;
 
     std::string name_;
@@ -126,13 +126,13 @@ public:
         return mem::MmioDomain::shared;
     }
 
-    enum class Instance : unsigned int {
+    enum class Instance : std::uint32_t {
         fdcan1 = 1U,
         fdcan2 = 2U,
         fdcan3 = 3U,
     };
 
-    using InterruptCallback = std::function<void(unsigned int line)>;
+    using InterruptCallback = std::function<void(std::uint32_t line)>;
     using LineInterruptCallback = std::function<void()>;
 
     static constexpr std::uint32_t registerBlockSize = 0x100U;
@@ -168,11 +168,11 @@ public:
                              sim::EventLoop* event_loop = nullptr,
                              sim::TraceRecorder* trace = nullptr);
 
-    explicit FdcanPeripheral(unsigned int instance_number, FdcanMessageRam& message_ram,
+    explicit FdcanPeripheral(std::uint32_t instance_number, FdcanMessageRam& message_ram,
                              sim::EventLoop* event_loop = nullptr,
                              sim::TraceRecorder* trace = nullptr);
 
-    FdcanPeripheral(std::string name, unsigned int instance_number, FdcanMessageRam& message_ram,
+    FdcanPeripheral(std::string name, std::uint32_t instance_number, FdcanMessageRam& message_ram,
                     sim::EventLoop* event_loop = nullptr, sim::TraceRecorder* trace = nullptr);
 
     ~FdcanPeripheral() override;
@@ -185,15 +185,15 @@ public:
     void detachBus() noexcept;
 
     [[nodiscard]] bool busAttached() const noexcept { return bus_ != nullptr; }
-    [[nodiscard]] unsigned int instanceNumber() const noexcept { return instance_index_ + 1U; }
-    [[nodiscard]] unsigned int controllerIndex() const noexcept { return instance_index_; }
+    [[nodiscard]] std::uint32_t instanceNumber() const noexcept { return instance_index_ + 1U; }
+    [[nodiscard]] std::uint32_t controllerIndex() const noexcept { return instance_index_; }
 
     /** @brief Installs one callback carrying the asserted FDCAN interrupt line (0
      * or 1). */
     void setInterruptCallback(InterruptCallback callback);
 
     /** @brief Installs a callback for one individual FDCAN interrupt line. */
-    void setInterruptLineCallback(unsigned int line, LineInterruptCallback callback);
+    void setInterruptLineCallback(std::uint32_t line, LineInterruptCallback callback);
 
     /** @brief Injects a bus frame through this core's filters and RX FIFO 0. */
     [[nodiscard]] bool receiveFrame(const devices::CanFrame& frame, std::uint64_t time_ns);
@@ -218,16 +218,16 @@ private:
     };
 
     [[nodiscard]] FilterDecision filter(const devices::CanFrame& frame) const noexcept;
-    [[nodiscard]] bool transmitBuffer(unsigned int buffer_index);
-    void acknowledgeRxFifo0(unsigned int acknowledged_index);
+    [[nodiscard]] bool transmitBuffer(std::uint32_t buffer_index);
+    void acknowledgeRxFifo0(std::uint32_t acknowledged_index);
     void updateRxFifo0Status() noexcept;
     void updateTxFifoStatus() noexcept;
     void setInterruptFlags(std::uint32_t flags);
     void updateInterruptLines();
-    [[nodiscard]] bool interruptLinePending(unsigned int line) const noexcept;
+    [[nodiscard]] bool interruptLinePending(std::uint32_t line) const noexcept;
 
     FdcanMessageRam& message_ram_;
-    unsigned int instance_index_{0};
+    std::uint32_t instance_index_{0};
     devices::VirtualCanBus* bus_{nullptr};
     devices::VirtualCanBus::NodeId bus_node_id_{0};
     std::uint8_t rx_fill_level_{0};

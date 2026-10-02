@@ -1,6 +1,7 @@
 #include "fil/sim/event_loop.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 #include <mutex>
 #include <queue>

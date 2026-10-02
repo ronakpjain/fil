@@ -19,7 +19,7 @@ namespace {
 
 TEST(EventLoopTest, OrdersEventsDeterministically) {
     fil::sim::EventLoop loop;
-    std::vector<int> order;
+    std::vector<std::int32_t> order;
     static_cast<void>(loop.scheduleAt(20, [&]() { order.push_back(3); }));
     static_cast<void>(loop.scheduleAt(10, [&]() {
         order.push_back(1);
@@ -29,7 +29,7 @@ TEST(EventLoopTest, OrdersEventsDeterministically) {
 
     const auto first = loop.runDueEvents(10);
     EXPECT_TRUE(first.events_executed == 3) << "event loop runs nested same-time events";
-    EXPECT_TRUE(order == std::vector<int>({1, 2, 4}))
+    EXPECT_TRUE(order == std::vector<std::int32_t>({1, 2, 4}))
         << "event loop orders by time then insertion sequence";
     EXPECT_TRUE(loop.now() == 10 && loop.pending() == 1) << "event loop retains future events";
 
@@ -81,7 +81,7 @@ TEST(EventLoopTest, ObservationBarrierReportsDefaultGlobalEventsAndNestedOrder) 
     static_cast<void>(loop.exchangeObservationBarrier([&](const auto time, const auto owner, const auto kind) {
         observed.emplace_back(time, owner, kind);
     }));
-    std::vector<int> callbacks;
+    std::vector<std::int32_t> callbacks;
     {
         auto scope = loop.useOwner(7U);
         static_cast<void>(loop.scheduleAt(4U, [&] {
@@ -91,7 +91,7 @@ TEST(EventLoopTest, ObservationBarrierReportsDefaultGlobalEventsAndNestedOrder) 
         static_cast<void>(loop.scheduleAt(4U, [&] { callbacks.push_back(2); }));
     }
     EXPECT_EQ(loop.runDueEvents(4U).events_executed, 3U);
-    EXPECT_EQ(callbacks, (std::vector<int>{1, 2, 3}));
+    EXPECT_EQ(callbacks, (std::vector<std::int32_t>{1, 2, 3}));
     EXPECT_EQ(observed.size(), 3U);
     EXPECT_EQ(observed[0], (std::tuple{4U, 7U, Observation::global}));
     EXPECT_EQ(observed[1], (std::tuple{4U, 7U, Observation::global}));
@@ -100,8 +100,8 @@ TEST(EventLoopTest, ObservationBarrierReportsDefaultGlobalEventsAndNestedOrder) 
 
 TEST(EventLoopTest, SelfClearingObserverSnapshotSurvivesNestedEventScheduling) {
     fil::sim::EventLoop loop;
-    unsigned observations = 0U;
-    std::vector<int> callbacks;
+    std::uint32_t observations = 0U;
+    std::vector<std::int32_t> callbacks;
     static_cast<void>(loop.exchangeObservationBarrier([&](auto, auto, auto) {
         ++observations;
         const auto previous = loop.exchangeObservationBarrier({});
@@ -112,7 +112,7 @@ TEST(EventLoopTest, SelfClearingObserverSnapshotSurvivesNestedEventScheduling) {
 
     EXPECT_EQ(loop.runDueEvents(1U).events_executed, 2U);
     EXPECT_EQ(observations, 1U);
-    EXPECT_EQ(callbacks, (std::vector<int>{1, 2}));
+    EXPECT_EQ(callbacks, (std::vector<std::int32_t>{1, 2}));
 }
 
 TEST(EventLoopTest, ObservationBarrierExceptionRestoresInvocationOwner) {
@@ -130,7 +130,7 @@ TEST(EventLoopTest, ObservationBarrierExceptionRestoresInvocationOwner) {
 
 TEST(EventLoopTest, OwnedInvocationObservesTimestampAndOwnerBeforeCallback) {
     fil::sim::EventLoop loop;
-    std::vector<int> sequence;
+    std::vector<std::int32_t> sequence;
     static_cast<void>(loop.exchangeObservationBarrier([&](const auto time, const auto owner, const auto kind) {
         EXPECT_EQ(time, 6U);
         EXPECT_EQ(owner, 5U);
@@ -145,7 +145,7 @@ TEST(EventLoopTest, OwnedInvocationObservesTimestampAndOwnerBeforeCallback) {
         }));
     }
     EXPECT_EQ(loop.runOwnedEvents(5U, 6U).events_executed, 1U);
-    EXPECT_EQ(sequence, (std::vector<int>{1, 2}));
+    EXPECT_EQ(sequence, (std::vector<std::int32_t>{1, 2}));
     EXPECT_EQ(loop.activeOwner(), fil::sim::shared_event_owner);
 }
 
@@ -169,9 +169,9 @@ TEST(EventLoopTest, InsertionPrunesGloballyRetiredOwnerCallbacks) {
     for (const fil::sim::EventOwner owner : {0U, 63U, 64U, 1000U}) {
         SCOPED_TRACE(owner);
         fil::sim::EventLoop loop;
-        std::vector<int> order;
-        auto payload = std::make_shared<int>(1);
-        const std::weak_ptr<int> lifetime = payload;
+        std::vector<std::int32_t> order;
+        auto payload = std::make_shared<std::int32_t>(1);
+        const std::weak_ptr<std::int32_t> lifetime = payload;
         {
             auto scope = loop.useOwner(owner);
             static_cast<void>(loop.scheduleAt(5U, [payload, &order] {
@@ -189,7 +189,7 @@ TEST(EventLoopTest, InsertionPrunesGloballyRetiredOwnerCallbacks) {
         EXPECT_EQ(loop.pending(), 2U);
         EXPECT_EQ(loop.nextScheduledTime(owner), 10U);
         EXPECT_EQ(loop.runOwnedEvents(owner, 10U).events_executed, 2U);
-        EXPECT_EQ(order, (std::vector<int>{1, 2, 3}));
+        EXPECT_EQ(order, (std::vector<std::int32_t>{1, 2, 3}));
         EXPECT_EQ(loop.runDueEvents(10U).events_executed, 0U);
     }
 }
@@ -202,7 +202,7 @@ TEST(EventLoopTest, AdvancesOneOwnerIndependently) {
         << "untouched owner queues permit transactional clock rewind";
 
     fil::sim::EventLoop loop;
-    std::vector<unsigned int> calls;
+    std::vector<std::uint32_t> calls;
     {
         auto owner = loop.useOwner(1U);
         static_cast<void>(loop.scheduleAt(7U, [&]() { calls.push_back(1U); }));
@@ -215,7 +215,7 @@ TEST(EventLoopTest, AdvancesOneOwnerIndependently) {
 
     const auto event_checkpoint = loop.ownerCheckpoint(1U);
     const auto local = loop.runOwnedEvents(1U, 7U);
-    EXPECT_TRUE(local.events_executed == 1U && calls == std::vector<unsigned int>{1U})
+    EXPECT_TRUE(local.events_executed == 1U && calls == std::vector<std::uint32_t>{1U})
         << "owner-local execution drains only the selected lane";
     EXPECT_TRUE(loop.now() == 0U && loop.now(1U) == 7U && loop.pending() == 2U)
         << "owner-local execution leaves the shared clock and other lanes untouched";
@@ -224,7 +224,7 @@ TEST(EventLoopTest, AdvancesOneOwnerIndependently) {
 
     const auto remaining = loop.runDueEvents(7U);
     EXPECT_TRUE((remaining.events_executed == 2U &&
-                 calls == std::vector<unsigned int>{1U, 2U, 3U} && loop.pending() == 0U))
+                 calls == std::vector<std::uint32_t>{1U, 2U, 3U} && loop.pending() == 0U))
         << "global execution skips an owner event already committed locally";
 }
 
@@ -249,7 +249,7 @@ TEST(EventLoopTest, DenseAndSparseOwnerClocksPreserveRewindAndSharedClamp) {
 TEST(EventLoopTest, DenseAndSparseQueuesPreserveCancellationAndClear) {
     for (const fil::sim::EventOwner owner : {0U, 63U, 64U, 1000U}) {
         fil::sim::EventLoop loop;
-        unsigned calls = 0U;
+        std::uint32_t calls = 0U;
         {
             auto scope = loop.useOwner(owner);
             const auto canceled = loop.scheduleAt(5U, [&] { ++calls; });
@@ -266,7 +266,7 @@ TEST(EventLoopTest, DenseAndSparseQueuesPreserveCancellationAndClear) {
 
 TEST(EventLoopTest, ReusesPersistentLaneWorkers) {
     fil::sim::LaneWorkerPool workers(4U);
-    std::array<std::atomic<unsigned int>, 4> calls{};
+    std::array<std::atomic<std::uint32_t>, 4> calls{};
     const auto task = [&](const std::size_t lane) {
         calls[lane].fetch_add(1U, std::memory_order_relaxed);
     };
@@ -305,7 +305,7 @@ TEST(EventLoopTest, ValidatesWorkerPoolFailuresAndRecovery) {
     } catch (const std::runtime_error&) {
         propagated = true;
     }
-    std::atomic<unsigned int> recovered{0U};
+    std::atomic<std::uint32_t> recovered{0U};
     workers.run([&](std::size_t) {
         recovered.fetch_add(1U, std::memory_order_relaxed);
     });
@@ -316,10 +316,10 @@ TEST(EventLoopTest, ValidatesWorkerPoolFailuresAndRecovery) {
 TEST(EventLoopTest, SupportsConcurrentOwnerLanes) {
     fil::sim::EventLoop loop;
     loop.setConcurrentAccess(true);
-    std::atomic<unsigned int> calls{0U};
+    std::atomic<std::uint32_t> calls{0U};
     const auto worker = [&](const fil::sim::EventOwner owner) {
         auto scope = loop.useOwner(owner);
-        for (unsigned int index = 0U; index < 100U; ++index) {
+        for (std::uint32_t index = 0U; index < 100U; ++index) {
             static_cast<void>(loop.scheduleAt(0U, [&]() {
                 calls.fetch_add(1U, std::memory_order_relaxed);
             }));
@@ -339,7 +339,7 @@ TEST(EventLoopTest, SupportsConcurrentOwnerLanes) {
 
 TEST(EventLoopTest, CancelsAndRejectsInvalidTime) {
     fil::sim::EventLoop loop;
-    int calls = 0;
+    std::int32_t calls = 0;
     const fil::sim::EventId event = loop.scheduleAfter(5, [&]() { ++calls; });
     EXPECT_TRUE(loop.cancel(event)) << "event cancellation succeeds once";
     EXPECT_TRUE(!loop.cancel(event)) << "event cancellation is idempotent";
@@ -360,7 +360,7 @@ TEST(EventLoopTest, CancelsAndRejectsInvalidTime) {
 
 TEST(EventLoopTest, ManagesReplaceableScheduledEvents) {
     fil::sim::EventLoop loop;
-    int calls = 0;
+    std::int32_t calls = 0;
     {
         fil::sim::ScheduledEvent event(&loop);
         const auto first = event.scheduleAt(5U, [&]() { calls += 10; });
@@ -382,7 +382,7 @@ TEST(EventLoopTest, ManagesReplaceableScheduledEvents) {
 
 TEST(EventLoopTest, DetectsZeroDelayLivelock) {
     fil::sim::EventLoop loop(3);
-    int calls = 0;
+    std::int32_t calls = 0;
     std::function<void()> reschedule;
     reschedule = [&]() {
         ++calls;

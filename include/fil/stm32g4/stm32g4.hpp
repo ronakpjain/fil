@@ -69,7 +69,7 @@ public:
      * N-1 of N scans (see AdcPeripheral::setDecimation). Persists across
      * peripheral resets like other host-side attachments.
      */
-    void setAdcDecimation(unsigned int factor);
+    void setAdcDecimation(std::uint32_t factor);
 
     /** @brief Qualifies every peripheral trace source as `prefix.device`. */
     void setTraceSourcePrefix(std::string_view prefix);

@@ -46,7 +46,7 @@ struct WorldRunOptions {
     bool enable_deferred_prefixes{false}; ///< Experimental interruptible pure prefixes; requires JIT.
     bool enable_ram_capsules{true}; ///< Guarded reversible RAM prefixes; incompatible modes fall back automatically.
     bool stop_on_board_failure{true}; ///< Stop immediately instead of finishing other boards.
-    unsigned int adc_decimation{1}; ///< Keep 1 of N continuous ADC scans on every board.
+    std::uint32_t adc_decimation{1}; ///< Keep 1 of N continuous ADC scans on every board.
 };
 
 /** @brief Accumulated outcome for one board in a world run. */

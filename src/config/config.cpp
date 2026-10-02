@@ -5,6 +5,7 @@
 
 #include <charconv>
 #include <cctype>
+#include <cstdint>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -62,7 +63,7 @@ private:
         case 'n':
             return parseLiteral("null", JsonValue{nullptr});
         default:
-            if (std::isdigit(static_cast<unsigned char>(input_[position_])) != 0) {
+            if (std::isdigit(static_cast<std::uint8_t>(input_[position_])) != 0) {
                 return parseNumber();
             }
             return makeError("expected an object, array, string, unsigned integer, boolean, or null");
@@ -153,7 +154,7 @@ private:
             if (character == '"') {
                 return result;
             }
-            if (static_cast<unsigned char>(character) < 0x20U) {
+            if (static_cast<std::uint8_t>(character) < 0x20U) {
                 return makeError("unescaped control character in string");
             }
             if (character != '\\') {
@@ -206,7 +207,7 @@ private:
             return makeError("incomplete Unicode escape");
         }
         std::uint32_t value = 0;
-        for (int index = 0; index < 4; ++index) {
+        for (std::int32_t index = 0; index < 4; ++index) {
             const char digit = input_[position_++];
             value <<= 4U;
             if (digit >= '0' && digit <= '9') {
@@ -243,7 +244,7 @@ private:
     Result<JsonValue> parseNumber() {
         const std::size_t begin = position_;
         while (position_ < input_.size()
-               && std::isdigit(static_cast<unsigned char>(input_[position_])) != 0) {
+               && std::isdigit(static_cast<std::uint8_t>(input_[position_])) != 0) {
             ++position_;
         }
         if (position_ < input_.size()
@@ -767,7 +768,7 @@ Result<std::uint64_t> parseUnsigned(const std::string_view text) {
         return Error{ErrorCategory::invalid_argument, "numeric value has no digits", std::nullopt};
     }
 
-    int base = 10;
+    std::int32_t base = 10;
     if (digits.size() >= 2 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X')) {
         base = 16;
         digits.remove_prefix(2);

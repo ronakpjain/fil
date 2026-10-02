@@ -4,6 +4,7 @@
 #include "fil/cpu/jit.hpp"
 #if FIL_HAS_LLVM_JIT
 #include "fil/cpu/llvm_jit.hpp"
+#include <cstdint>
 #include <vector>
 #endif
 #include "fil/elf/elf_loader.hpp"
@@ -58,7 +59,7 @@ constexpr std::uint32_t xpsr_it_mask = (0x3U << 25U) | (0x3fU << 10U);
     std::ostringstream output;
     output << "unimplemented instruction pc=0x" << std::hex << std::setw(8)
            << std::setfill('0') << pc << " raw" << std::dec
-           << static_cast<unsigned int>(size * 8U) << "=0x" << std::hex
+           << static_cast<std::uint32_t>(size * 8U) << "=0x" << std::hex
            << std::setw(size == 2U ? 4 : 8) << raw;
     return output.str();
 }
@@ -1066,7 +1067,7 @@ bool CortexM4::executeJitFast(
         case InstrKind::sxtb:
         case InstrKind::sxth: {
             const std::uint32_t rotated = std::rotr(
-                state_.readRegister(op.rm), static_cast<int>(op.shift_amount));
+                state_.readRegister(op.rm), static_cast<std::int32_t>(op.shift_amount));
             const bool is_byte = op.kind == InstrKind::uxtb || op.kind == InstrKind::sxtb;
             const bool is_signed = op.kind == InstrKind::sxtb || op.kind == InstrKind::sxth;
             std::uint32_t value = is_byte ? rotated & 0xffU : rotated & 0xffffU;

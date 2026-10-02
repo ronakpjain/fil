@@ -74,7 +74,7 @@ Stm32G4::Stm32G4(
     constexpr std::array<std::string_view, 3> spi_names{"SPI1", "SPI2", "SPI3"};
     for (const auto name : spi_names) spi_.push_back(std::make_unique<SpiPeripheral>(std::string(name), &event_loop, &trace));
 
-    for (unsigned int instance = 1U; instance <= FdcanMessageRam::controllerCount; ++instance) {
+    for (std::uint32_t instance = 1U; instance <= FdcanMessageRam::controllerCount; ++instance) {
         fdcan_.push_back(std::make_unique<FdcanPeripheral>(instance, fdcan_message_ram_, &event_loop, &trace));
     }
 
@@ -175,11 +175,11 @@ Result<void> Stm32G4::mapDevices() {
 }
 
 void Stm32G4::wireInterrupts() {
-    unsigned int source = 0U;
+    std::uint32_t source = 0U;
     const auto connect = [this, &source](RegisterPeripheral& peripheral, const auto irqs) {
         const std::uint32_t source_bit = std::uint32_t{1} << source++;
         peripheral.setInterruptLevelCallback(
-            [this, irqs, source_bit](const unsigned int line, const bool asserted) {
+            [this, irqs, source_bit](const std::uint32_t line, const bool asserted) {
                 if (line >= irqs.size()) return;
                 const std::uint16_t irq = irqs[line];
                 auto& sources = irq_sources_[irq];
@@ -225,8 +225,8 @@ void Stm32G4::wireInterrupts() {
     dma_interrupt_generations_[1] = dma2_.interruptLevelCallbackGeneration();
     connect(exti_, std::array<std::uint16_t, 7>{6U, 7U, 8U, 9U, 10U, 23U, 40U});
     for (std::size_t port = 0; port < gpio_.size(); ++port) {
-        gpio_[port]->setEdgeCallback([this, port](const unsigned int pin, const bool high, const sim::SimTimeNs) {
-            exti_.notifyGpioEdge(static_cast<unsigned int>(port), pin, high);
+        gpio_[port]->setEdgeCallback([this, port](const std::uint32_t pin, const bool high, const sim::SimTimeNs) {
+            exti_.notifyGpioEdge(static_cast<std::uint32_t>(port), pin, high);
         });
     }
     // RM0440 Table 91 DMAMUX requests: USART1-3 RX 24/26/28 TX 25/27/29,
@@ -250,7 +250,7 @@ void Stm32G4::wireInterrupts() {
             }
         );
     }
-    const auto dma_enable_trigger = [this](const unsigned int) { serviceAllSerialDma(); };
+    const auto dma_enable_trigger = [this](const std::uint32_t) { serviceAllSerialDma(); };
     dma1_.setEnableCallback(dma_enable_trigger);
     dma2_.setEnableCallback(dma_enable_trigger);
     rcc_.setClockChangedCallback([this](const std::uint64_t frequency) {
@@ -277,11 +277,11 @@ bool Stm32G4::adcOwnerLocalSafe(const std::size_t adc_index) const {
     if (source < 0x40000000U
         || !memory_->isMmioDeviceRange(source, 2U, router_, source - 0x40000000U)) return false;
     bool found_channel = false;
-    for (unsigned int mux = 0U; mux < 16U; ++mux) {
+    for (std::uint32_t mux = 0U; mux < 16U; ++mux) {
         if (dmamux_.requestForChannel(mux) != request) continue;
         const bool second_dma = mux >= 8U;
         const DmaPeripheral& dma = second_dma ? dma2_ : dma1_;
-        const unsigned int channel = second_dma ? mux - 7U : mux + 1U;
+        const std::uint32_t channel = second_dma ? mux - 7U : mux + 1U;
         if (!dma.ownerLocalAdcTransferSafe(
                 channel, memory_, source, dma_interrupt_generations_[second_dma ? 1U : 0U])) return false;
         found_channel = true;
@@ -293,7 +293,7 @@ bool Stm32G4::serviceDmaRequestOnce(const std::uint8_t request) {
     const std::uint64_t generation = dmamux_.routingGeneration();
     if (dma_route_generation_ != generation) {
         dma_request_routes_.fill(0U);
-        for (unsigned int channel = 0U; channel < 16U; ++channel) {
+        for (std::uint32_t channel = 0U; channel < 16U; ++channel) {
             const std::uint8_t selected = dmamux_.requestForChannel(channel);
             dma_request_routes_[selected] |= static_cast<std::uint16_t>(1U << channel);
         }
@@ -303,7 +303,7 @@ bool Stm32G4::serviceDmaRequestOnce(const std::uint8_t request) {
     bool progressed = false;
     std::uint16_t routes = dma_request_routes_[request];
     while (routes != 0U) {
-        const auto mux_channel = static_cast<unsigned int>(std::countr_zero(routes));
+        const auto mux_channel = static_cast<std::uint32_t>(std::countr_zero(routes));
         routes &= static_cast<std::uint16_t>(routes - 1U);
         bool ok = false;
         if (mux_channel < 8U) {
@@ -328,7 +328,7 @@ void Stm32G4::serviceUsartDma(
         // model, so drain the DMA channel synchronously. Suppress re-triggering
         // during the burst; TDR writes do not re-trigger TX DMA by design.
         usart->setDmaSuppress(true);
-        for (unsigned int i = 0; i < 65536U; ++i) {
+        for (std::uint32_t i = 0; i < 65536U; ++i) {
             if (!serviceDmaRequestOnce(tx_request)) break;
         }
         usart->setDmaSuppress(false);
@@ -336,7 +336,7 @@ void Stm32G4::serviceUsartDma(
         // RX (periph->memory from RDR): only transfer while data is available,
         // otherwise DMA would consume zeros. Each RDR pop may reveal more data.
         usart->setDmaSuppress(true);
-        for (unsigned int i = 0; i < 65536U; ++i) {
+        for (std::uint32_t i = 0; i < 65536U; ++i) {
             if (!usart->hasRxData()) break;
             if (!serviceDmaRequestOnce(rx_request)) break;
         }
@@ -353,18 +353,18 @@ void Stm32G4::serviceSpiDma(
     if (spi == nullptr) return;
     spi->setDmaSuppress(true);
     if (transmit) {
-        for (unsigned int i = 0; i < 65536U; ++i) {
+        for (std::uint32_t i = 0; i < 65536U; ++i) {
             if (!serviceDmaRequestOnce(tx_request)) break;
         }
         // Full-duplex: each TX byte generated an RX byte; drain RX now that
         // TX burst is complete and suppression will be lifted for the RX loop
         // below (still suppressed here, so use direct Once with hasRxData).
-        for (unsigned int i = 0; i < 65536U; ++i) {
+        for (std::uint32_t i = 0; i < 65536U; ++i) {
             if (!spi->hasRxData()) break;
             if (!serviceDmaRequestOnce(rx_request)) break;
         }
     } else {
-        for (unsigned int i = 0; i < 65536U; ++i) {
+        for (std::uint32_t i = 0; i < 65536U; ++i) {
             if (!spi->hasRxData()) break;
             if (!serviceDmaRequestOnce(rx_request)) break;
         }
@@ -431,7 +431,7 @@ Result<void> Stm32G4::configure(const config::BoardConfig& board) {
         if (pin.pin.size() < 3 || pin.pin[0] != 'P' || pin.pin[1] < 'A' || pin.pin[1] > 'G') {
             return configError("invalid GPIO pin name '" + pin.pin + "'");
         }
-        unsigned int number = 0;
+        std::uint32_t number = 0;
         const auto conversion = std::from_chars(pin.pin.data() + 2, pin.pin.data() + pin.pin.size(), number);
         if (conversion.ec != std::errc{} || conversion.ptr != pin.pin.data() + pin.pin.size() || number > 15U) {
             return configError("invalid GPIO pin number in '" + pin.pin + "'");
@@ -477,7 +477,7 @@ Result<void> Stm32G4::configure(const config::BoardConfig& board) {
             if (source.kind == config::AdcChannelConfig::Kind::constant) device->setChannelValue(channel, source.value);
         }
         const auto channels = config.channels;
-        device->setCertifiedChannelProvider([channels](const unsigned int channel, const sim::SimTimeNs now) {
+        device->setCertifiedChannelProvider([channels](const std::uint32_t channel, const sim::SimTimeNs now) {
             const auto found = channels.find(static_cast<std::uint8_t>(channel));
             if (found == channels.end()) return std::uint16_t{0};
             const auto& source = found->second;
@@ -498,7 +498,7 @@ void Stm32G4::setAdcDiagnosticsEnabled(const bool enabled) {
     dma2_.setTransferHistoryEnabled(enabled);
 }
 
-void Stm32G4::setAdcDecimation(const unsigned int factor) {
+void Stm32G4::setAdcDecimation(const std::uint32_t factor) {
     for (auto& device : adc_) device->setDecimation(factor);
 }
 

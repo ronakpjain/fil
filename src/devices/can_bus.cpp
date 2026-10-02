@@ -1,6 +1,7 @@
 #include "fil/devices/can_bus.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <utility>
 
 namespace fil::devices {

@@ -1,6 +1,7 @@
 #include "fil/sim/trace.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <ostream>
 #include <sstream>
 #include <utility>
@@ -11,7 +12,7 @@ namespace {
 void writeEscaped(std::ostream& output, const std::string_view text) {
     static constexpr char hexadecimal[] = "0123456789abcdef";
     for (const char character : text) {
-        const auto byte = static_cast<unsigned char>(character);
+        const auto byte = static_cast<std::uint8_t>(character);
         switch (byte) {
         case '"': output << "\\\""; break;
         case '\\': output << "\\\\"; break;

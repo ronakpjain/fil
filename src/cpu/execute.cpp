@@ -252,7 +252,7 @@ std::uint16_t basePipelineCycles(const DecodedInstruction& instruction) noexcept
     case InstrKind::push:
     case InstrKind::pop:
         return static_cast<std::uint16_t>(
-            1U + static_cast<unsigned int>(std::popcount(instruction.register_list))
+            1U + static_cast<std::uint32_t>(std::popcount(instruction.register_list))
         );
     case InstrKind::b:
     case InstrKind::bl:
@@ -291,7 +291,7 @@ std::uint16_t basePipelineCycles(const DecodedInstruction& instruction) noexcept
     case InstrKind::vldm:
     case InstrKind::vstm:
         return static_cast<std::uint16_t>(
-            1U + static_cast<unsigned int>(std::popcount(instruction.register_list))
+            1U + static_cast<std::uint32_t>(std::popcount(instruction.register_list))
         );
     default:
         return 1U;
@@ -576,21 +576,21 @@ StopReason CortexM4::execute(
     }
     case InstrKind::uxtb: {
         const std::uint32_t source = std::rotr(
-            state_.readRegister(instruction.rm), static_cast<int>(instruction.shift_amount)
+            state_.readRegister(instruction.rm), static_cast<std::int32_t>(instruction.shift_amount)
         );
         state_.writeRegister(instruction.rd, source & 0xffU);
         return StopReason::step_complete;
     }
     case InstrKind::uxth: {
         const std::uint32_t source = std::rotr(
-            state_.readRegister(instruction.rm), static_cast<int>(instruction.shift_amount)
+            state_.readRegister(instruction.rm), static_cast<std::int32_t>(instruction.shift_amount)
         );
         state_.writeRegister(instruction.rd, source & 0xffffU);
         return StopReason::step_complete;
     }
     case InstrKind::sxtb: {
         std::uint32_t value = std::rotr(
-            state_.readRegister(instruction.rm), static_cast<int>(instruction.shift_amount)
+            state_.readRegister(instruction.rm), static_cast<std::int32_t>(instruction.shift_amount)
         ) & 0xffU;
         if ((value & 0x80U) != 0U) value |= 0xffffff00U;
         state_.writeRegister(instruction.rd, value);
@@ -598,7 +598,7 @@ StopReason CortexM4::execute(
     }
     case InstrKind::sxth: {
         std::uint32_t value = std::rotr(
-            state_.readRegister(instruction.rm), static_cast<int>(instruction.shift_amount)
+            state_.readRegister(instruction.rm), static_cast<std::int32_t>(instruction.shift_amount)
         ) & 0xffffU;
         if ((value & 0x8000U) != 0U) value |= 0xffff0000U;
         state_.writeRegister(instruction.rd, value);

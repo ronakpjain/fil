@@ -1,6 +1,7 @@
 #include "fil/stm32g4/peripheral.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 #include <utility>
 
@@ -12,11 +13,11 @@ constexpr std::uint32_t dma_ifcr = 0x04;
 constexpr std::uint32_t first_channel = 0x08;
 constexpr std::uint32_t channel_stride = 0x14;
 
-unsigned int normalizedDmaChannels(const unsigned int count) noexcept {
+std::uint32_t normalizedDmaChannels(const std::uint32_t count) noexcept {
     return std::clamp(count, 1U, 8U);
 }
 
-unsigned int normalizedMuxChannels(const unsigned int count) noexcept {
+std::uint32_t normalizedMuxChannels(const std::uint32_t count) noexcept {
     return std::clamp(count, 1U, 16U);
 }
 
@@ -28,7 +29,7 @@ std::uint32_t transferWidth(const std::uint32_t selector) noexcept {
 
 DmaPeripheral::DmaPeripheral(
     std::string name,
-    const unsigned int channel_count,
+    const std::uint32_t channel_count,
     mem::MemoryBus* const memory,
     sim::EventLoop* const event_loop,
     sim::TraceRecorder* const trace
@@ -48,7 +49,7 @@ void DmaPeripheral::setInterruptCallback(InterruptCallback callback) {
 }
 
 bool DmaPeripheral::ownerLocalAdcTransferSafe(
-    const unsigned int channel, const mem::MemoryBus* const expected_bus,
+    const std::uint32_t channel, const mem::MemoryBus* const expected_bus,
     const std::uint32_t expected_source, const std::uint64_t trusted_interrupt_generation
 ) const {
     if (channel == 0U || channel > channel_count_ || expected_bus == nullptr
@@ -73,7 +74,7 @@ bool DmaPeripheral::ownerLocalAdcTransferSafe(
     return expected_bus->containsWritableRamRange(static_cast<std::uint32_t>(next), 2U);
 }
 
-bool DmaPeripheral::request(const unsigned int channel) {
+bool DmaPeripheral::request(const std::uint32_t channel) {
     if (channel == 0U || channel > channel_count_) {
         return false;
     }
@@ -102,8 +103,8 @@ void DmaPeripheral::storeRegister(
     if (word_offset == dma_ifcr) {
         std::uint32_t status = registerValue(dma_isr);
         const std::uint32_t clear = value & write_mask;
-        for (unsigned int channel = 0U; channel < channel_count_; ++channel) {
-            const unsigned int shift = channel * 4U;
+        for (std::uint32_t channel = 0U; channel < channel_count_; ++channel) {
+            const std::uint32_t shift = channel * 4U;
             // CGIF clears every flag in the channel, not just the summary bit.
             const std::uint32_t flags = ((clear >> shift) & 1U) != 0U
                 ? 0xfU : ((clear >> shift) & 0xeU);
@@ -116,7 +117,7 @@ void DmaPeripheral::storeRegister(
         return;
     }
 
-    unsigned int channel = 0;
+    std::uint32_t channel = 0;
     if (channelForOffset(word_offset, channel)
         && ((previous & 1U) == 0U)
         && ((value & 1U) != 0U)) {
@@ -136,7 +137,7 @@ void DmaPeripheral::storeRegister(
 
 bool DmaPeripheral::channelForOffset(
     const std::uint32_t offset,
-    unsigned int& channel
+    std::uint32_t& channel
 ) const noexcept {
     if (offset < first_channel) {
         return false;
@@ -149,12 +150,12 @@ bool DmaPeripheral::channelForOffset(
     return channel <= channel_count_;
 }
 
-void DmaPeripheral::initializeChannel(const unsigned int channel) {
+void DmaPeripheral::initializeChannel(const std::uint32_t channel) {
     const std::uint32_t base = first_channel + (channel - 1U) * channel_stride;
     reload_counts_[channel - 1U] = registerValue(base + 0x04U) & 0xffffU;
 }
 
-void DmaPeripheral::runChannelRequest(const unsigned int channel) {
+void DmaPeripheral::runChannelRequest(const std::uint32_t channel) {
     const std::uint32_t base = first_channel + (channel - 1U) * channel_stride;
     const std::uint32_t control = registerValue(base);
     const std::uint32_t remaining = registerValue(base + 0x04U) & 0xffffU;
@@ -268,18 +269,18 @@ mem::MemoryResult<std::uint64_t> DmaPeripheral::writeMemory(
 }
 
 void DmaPeripheral::setChannelFlag(
-    const unsigned int channel,
-    const unsigned int flag_bit
+    const std::uint32_t channel,
+    const std::uint32_t flag_bit
 ) {
-    const unsigned int shift = (channel - 1U) * 4U;
+    const std::uint32_t shift = (channel - 1U) * 4U;
     setRegister(dma_isr, registerValue(dma_isr) | (1U << shift) | (1U << (shift + flag_bit)));
     updateInterruptLevels();
 }
 
 void DmaPeripheral::updateInterruptLevels() {
     const std::uint32_t status = registerValue(dma_isr);
-    for (unsigned int channel = 1U; channel <= channel_count_; ++channel) {
-        const unsigned int shift = (channel - 1U) * 4U;
+    for (std::uint32_t channel = 1U; channel <= channel_count_; ++channel) {
+        const std::uint32_t shift = (channel - 1U) * 4U;
         const std::uint32_t control = registerValue(first_channel + (channel - 1U) * channel_stride);
         const bool asserted = ((status & (1U << (shift + 1U))) != 0U
                 && (control & (1U << 1U)) != 0U)
@@ -293,7 +294,7 @@ void DmaPeripheral::updateInterruptLevels() {
 
 DmamuxPeripheral::DmamuxPeripheral(
     std::string name,
-    const unsigned int channel_count,
+    const std::uint32_t channel_count,
     sim::EventLoop* const event_loop,
     sim::TraceRecorder* const trace
 ) : RegisterPeripheral(std::move(name), 0x100, event_loop, trace),
@@ -301,7 +302,7 @@ DmamuxPeripheral::DmamuxPeripheral(
     reset();
 }
 
-std::uint8_t DmamuxPeripheral::requestForChannel(const unsigned int channel) const noexcept {
+std::uint8_t DmamuxPeripheral::requestForChannel(const std::uint32_t channel) const noexcept {
     if (channel >= channel_count_) {
         return 0;
     }

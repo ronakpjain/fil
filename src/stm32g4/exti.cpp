@@ -1,5 +1,7 @@
 #include "fil/stm32g4/peripheral.hpp"
 
+#include <cstdint>
+
 namespace fil::stm32g4 {
 namespace {
 
@@ -25,17 +27,17 @@ SyscfgPeripheral::SyscfgPeripheral(
     reset();
 }
 
-int SyscfgPeripheral::portForLine(const unsigned int line) const noexcept {
+std::int32_t SyscfgPeripheral::portForLine(const std::uint32_t line) const noexcept {
     if (line > 15U) return -1;
-    const unsigned int reg = line / 4U;
-    const unsigned int field = line % 4U;
+    const std::uint32_t reg = line / 4U;
+    const std::uint32_t field = line % 4U;
     const std::uint32_t offsets[4] = {exticr1, exticr2, exticr3, exticr4};
     const std::uint32_t value = peekRegister(offsets[reg]);
-    const unsigned int port = (value >> (field * 4U)) & 0xFU;
+    const std::uint32_t port = (value >> (field * 4U)) & 0xFU;
     // RM0440: 0=PA,1=PB,2=PC,3=PD,4=PE,5=PF,6=PG. Values 7-15 are reserved;
     // treat them as unrouted so edges never pend.
     if (port > 6U) return -1;
-    return static_cast<int>(port);
+    return static_cast<std::int32_t>(port);
 }
 
 ExtiPeripheral::ExtiPeripheral(
@@ -70,7 +72,7 @@ void ExtiPeripheral::storeRegister(
             const std::uint32_t new_pr = registerValue(pr1) | set_bits;
             setRegister(pr1, new_pr);
             setRegister(swier1, 0);
-            for (unsigned int line = 0; line < 32U; ++line) {
+            for (std::uint32_t line = 0; line < 32U; ++line) {
                 if ((set_bits & (1U << line)) != 0U) {
                     traceEvent("exti_pending", {
                         {"line", std::to_string(line)},
@@ -109,20 +111,20 @@ void ExtiPeripheral::storeRegister(
 }
 
 void ExtiPeripheral::onReset() {
-    for (unsigned int line = 0; line < 8U; ++line) {
+    for (std::uint32_t line = 0; line < 8U; ++line) {
         setInterruptLevel(line, false);
     }
 }
 
 void ExtiPeripheral::notifyGpioEdge(
-    const unsigned int port,
-    const unsigned int pin,
+    const std::uint32_t port,
+    const std::uint32_t pin,
     const bool high
 ) {
     if (pin > 15U || port > 6U) return;
     if (syscfg_ != nullptr) {
-        const int routed = syscfg_->portForLine(pin);
-        if (routed < 0 || static_cast<unsigned int>(routed) != port) return;
+        const std::int32_t routed = syscfg_->portForLine(pin);
+        if (routed < 0 || static_cast<std::uint32_t>(routed) != port) return;
     }
     const std::uint32_t mask = 1U << pin;
     const std::uint32_t rtsr = registerValue(rtsr1);
@@ -140,7 +142,7 @@ void ExtiPeripheral::notifyGpioEdge(
     updateInterruptLevels();
 }
 
-bool ExtiPeripheral::linePendingEnabled(const unsigned int line) const noexcept {
+bool ExtiPeripheral::linePendingEnabled(const std::uint32_t line) const noexcept {
     if (line > 15U) return false;
     const std::uint32_t mask = 1U << line;
     return (registerValue(pr1) & mask) != 0U && (registerValue(imr1) & mask) != 0U;
@@ -149,11 +151,11 @@ bool ExtiPeripheral::linePendingEnabled(const unsigned int line) const noexcept 
 void ExtiPeripheral::updateInterruptLevels() {
     // Lines 0-4 have dedicated NVIC IRQs; 5-9 share one; 10-15 share another.
     // RegisterPeripheral supports 8 lines; we use 0-6.
-    for (unsigned int dedicated = 0; dedicated < 5U; ++dedicated) {
+    for (std::uint32_t dedicated = 0; dedicated < 5U; ++dedicated) {
         setInterruptLevel(dedicated, linePendingEnabled(dedicated));
     }
     bool shared_5_9 = false;
-    for (unsigned int line = 5U; line <= 9U; ++line) {
+    for (std::uint32_t line = 5U; line <= 9U; ++line) {
         if (linePendingEnabled(line)) {
             shared_5_9 = true;
             break;
@@ -161,7 +163,7 @@ void ExtiPeripheral::updateInterruptLevels() {
     }
     setInterruptLevel(5, shared_5_9);
     bool shared_10_15 = false;
-    for (unsigned int line = 10U; line <= 15U; ++line) {
+    for (std::uint32_t line = 10U; line <= 15U; ++line) {
         if (linePendingEnabled(line)) {
             shared_10_15 = true;
             break;

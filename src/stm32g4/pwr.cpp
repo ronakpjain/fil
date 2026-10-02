@@ -1,5 +1,7 @@
 #include "fil/stm32g4/peripheral.hpp"
 
+#include <cstdint>
+
 namespace fil::stm32g4 {
 
 PwrPeripheral::PwrPeripheral(

@@ -9,7 +9,7 @@ namespace {
 
 TEST(CanBusTest, BroadcastsDeterministically) {
     fil::devices::VirtualCanBus bus("vehicle");
-    std::vector<int> deliveries;
+    std::vector<std::int32_t> deliveries;
     std::vector<fil::devices::CanTraceRecord> trace;
     bus.setTraceCallback([&](const auto& record) { trace.push_back(record); });
     const auto first = bus.attach("first", false, [&](const auto&, std::uint64_t) { deliveries.push_back(1); });
@@ -23,18 +23,18 @@ TEST(CanBusTest, BroadcastsDeterministically) {
     frame.data[0] = 0xaaU;
     frame.data[1] = 0x55U;
     EXPECT_TRUE(bus.send(first.value(), frame, 100U).hasValue()) << "sends valid CAN frame";
-    EXPECT_TRUE(deliveries == std::vector<int>({2})) << "skips sender without loopback";
+    EXPECT_TRUE(deliveries == std::vector<std::int32_t>({2})) << "skips sender without loopback";
     EXPECT_TRUE(trace.size() == 2 && trace[0].sequence < trace[1].sequence)
         << "traces TX then RX in stable order";
 
     deliveries.clear();
     EXPECT_TRUE(bus.inject(frame, 200U).hasValue()) << "injects external CAN frame";
-    EXPECT_TRUE(deliveries == std::vector<int>({1, 2})) << "delivers injection in attachment order";
+    EXPECT_TRUE(deliveries == std::vector<std::int32_t>({1, 2})) << "delivers injection in attachment order";
 }
 
 TEST(CanBusTest, DeliveryBarrierPrecedesObserversAndCanBeRestored) {
     fil::devices::VirtualCanBus bus("vehicle");
-    std::vector<int> order;
+    std::vector<std::int32_t> order;
     const auto sender = bus.attach("sender", false, [](const auto&, std::uint64_t) {});
     const auto receiver = bus.attach("receiver", false,
         [&](const auto&, std::uint64_t) { order.push_back(3); });
@@ -51,12 +51,12 @@ TEST(CanBusTest, DeliveryBarrierPrecedesObserversAndCanBeRestored) {
     EXPECT_FALSE(bus.send(999U, frame, 100U));
     EXPECT_TRUE(order.empty());
     ASSERT_TRUE(bus.send(sender.value(), frame, 100U));
-    EXPECT_EQ(order, (std::vector<int>{1, 2, 2, 3}));
+    EXPECT_EQ(order, (std::vector<std::int32_t>{1, 2, 2, 3}));
     auto barrier = bus.exchangeDeliveryBarrier(std::move(original));
     EXPECT_TRUE(barrier);
     order.clear();
     ASSERT_TRUE(bus.inject(frame, 200U));
-    EXPECT_EQ(order, (std::vector<int>{2, 2, 2, 3}));
+    EXPECT_EQ(order, (std::vector<std::int32_t>{2, 2, 2, 3}));
 }
 
 TEST(CanBusTest, ValidatesFramesAndAttachments) {

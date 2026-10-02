@@ -1,5 +1,6 @@
 #include "fil/sim/trace.hpp"
 
+#include <cstdint>
 #include <gtest/gtest.h>
 
 namespace {
@@ -30,7 +31,7 @@ TEST(TraceRecorderTest, ObserverRecordSurvivesRecursiveAppend) {
         if (expanding) return;
         expanding = true;
 
-        for (int index = 0; index < 1024; ++index) {
+        for (std::int32_t index = 0; index < 1024; ++index) {
             static_cast<void>(trace.record(
                 static_cast<fil::sim::SimTimeNs>(index + 1), "nested", "event"));
         }

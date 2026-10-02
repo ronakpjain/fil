@@ -12,7 +12,7 @@ namespace fil {
 /** @brief Formats an unsigned value as lowercase hexadecimal with a `0x` prefix. */
 [[nodiscard]] std::string hexValue(
     std::uint64_t value,
-    unsigned int minimum_digits = 0U
+    std::uint32_t minimum_digits = 0U
 );
 
 /** @brief Formats a 32-bit target value as eight lowercase hexadecimal digits. */

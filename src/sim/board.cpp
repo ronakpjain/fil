@@ -8,6 +8,7 @@
 #include "fil/stm32g4/stm32g4.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <utility>

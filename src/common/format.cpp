@@ -3,13 +3,14 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cstdint>
 #include <system_error>
 
 namespace fil {
 
 std::string hexValue(
     const std::uint64_t value,
-    const unsigned int minimum_digits
+    const std::uint32_t minimum_digits
 ) {
     std::array<char, 16> digits{};
     const auto [end, error] = std::to_chars(

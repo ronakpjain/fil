@@ -170,3 +170,23 @@ application-specific behavior. The optional
 [hardware comparison](hardware_comparison.md) validates deterministic architectural
 state through OpenOCD without treating physical timing as an emulator contract. See
 [Testing](testing.md) for the validation matrix.
+
+## Type conventions
+
+Every integer is a fixed-width `<cstdint>` type, always `std::`-qualified. Bare
+`int`, `unsigned`, `long`, `short`, and `long long` do not appear in declarations,
+parameters, or members. Include `<cstdint>` in any file that names one: libc++
+leaks it through other headers while libstdc++ does not, so relying on the leak
+builds on macOS and fails on Linux.
+
+Widths follow the emulated hardware. A Cortex-M4 register or peripheral index is
+`std::uint32_t`, an exception number `std::uint16_t`, a cycle budget
+`std::uint64_t`. Widening one of these to quiet a warning desynchronizes the model
+from the guest, so narrow deliberately and visibly with an explicit `static_cast`.
+
+Left alone: `char` (the character type behind `std::string` and paths), `int main()`,
+ordinary words like "unsigned integer" in comments and error strings, and the
+floating types. `float` and `double` are binary32 and binary64 on every supported
+target, but `long double` is x87 80-bit on x86-64 Linux and plain binary64 on
+AArch64 macOS; the timer and watchdog tick arithmetic relies on that wider
+significand, and no `<cstdint>` or C++23 `<stdfloat>` type can name it.

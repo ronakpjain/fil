@@ -3,6 +3,7 @@
 #include "fil/stm32g4/stm32g4.hpp"
 #include "../fixture_support.hpp"
 
+#include <cstdint>
 #include <gtest/gtest.h>
 
 #include <filesystem>
@@ -466,7 +467,7 @@ TEST(WorldTimeTest, AcceleratedLoopsPreserveSysTickAndExceptionEntry) {
 
 void warmJit(fil::sim::Board& board) {
     const auto initial = board.cpu().state();
-    for (unsigned int i = 0U; i < 60U; ++i) {
+    for (std::uint32_t i = 0U; i < 60U; ++i) {
         board.cpu().state() = initial;
         static_cast<void>(board.cpu().tryStepJitBlock());
     }
@@ -489,7 +490,7 @@ TEST(WorldTimeTest, CompactFrontierMatchesGeneralSchedulerAcrossPaddingBoundary)
         ASSERT_TRUE(compact && general);
         for (auto* world : {compact.value().get(), general.value().get()}) {
             for (std::size_t i = 0U; i < count; ++i) {
-                ASSERT_TRUE(installIdleLoop(*world, names[i], static_cast<unsigned int>(i % 3U + 1U)));
+                ASSERT_TRUE(installIdleLoop(*world, names[i], static_cast<std::uint32_t>(i % 3U + 1U)));
             }
             static_cast<void>(world->eventLoop().scheduleAt(125U, [world, names] {
                 for (const auto& name : names) {

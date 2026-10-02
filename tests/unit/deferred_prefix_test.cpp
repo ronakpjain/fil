@@ -3,6 +3,7 @@
 #include "fil/stm32g4/stm32g4.hpp"
 #include "../fixture_support.hpp"
 
+#include <cstdint>
 #include <gtest/gtest.h>
 #include <sstream>
 #include <vector>
@@ -38,7 +39,7 @@ void installCode(fil::sim::Board& board, const std::vector<std::uint8_t>& code) 
     ASSERT_TRUE(board.memory().loadBytes(board.cpu().state().r[15], code));
     // Prepare the entry without executing it, so the first interval exercises
     // deferred execution rather than only warming the instruction cache.
-    for (unsigned i = 0; i < 64U; ++i) static_cast<void>(board.cpu().prepareJitBlock());
+    for (std::uint32_t i = 0; i < 64U; ++i) static_cast<void>(board.cpu().prepareJitBlock());
 }
 
 void configureReceiver(fil::sim::Board& board) {
@@ -145,7 +146,7 @@ TEST(DeferredPrefixTest, LocalAdcEventsAndNestedGlobalObserversMatchExactExecuti
                 auto* adc = world->board("sender")->peripherals().adc("ADC1");
                 ASSERT_TRUE(adc->write(0x30U, fil::mem::AccessSize::word, 1U << 6U, {}));
                 adc->setChannelProvider(
-                    [world, observe](unsigned int, fil::sim::SimTimeNs) {
+                    [world, observe](std::uint32_t, fil::sim::SimTimeNs) {
                         observe();
                         return static_cast<std::uint16_t>(world->board("receiver")->cpu().state().r[0]);
                     });
@@ -209,7 +210,7 @@ TEST(DeferredPrefixTest, PublicObserverReplacementCannotRemoveWorldMaterializati
                 // mandatory barrier or destroy its currently running callable.
                 static_cast<void>(world->eventLoop().exchangeObservationBarrier({}));
                 world->board("sender")->peripherals().adc("ADC1")->setChannelProvider(
-                    [](unsigned int, fil::sim::SimTimeNs) { return std::uint16_t{123U}; });
+                    [](std::uint32_t, fil::sim::SimTimeNs) { return std::uint16_t{123U}; });
                 static_cast<void>(world->eventLoop().scheduleAt(at, observe));
                 static_cast<void>(world->eventLoop().scheduleAt(at + 317U, observe));
             }));
@@ -268,7 +269,7 @@ TEST(DeferredPrefixTest, WarmIdleCallPeriodEveryCutMatchesExactCpuMemoryAndTimer
         const auto base = entry.r[15] - 2U;
         for (const auto offset : {2U, 6U, 8U, 10U, 12U, 16U, 18U, 22U, 24U, 26U, 28U, 30U}) {
             speculative.value()->cpu().state().r[15] = base + offset;
-            for (unsigned i = 0U; i < 64U; ++i) static_cast<void>(speculative.value()->cpu().prepareJitBlock(true));
+            for (std::uint32_t i = 0U; i < 64U; ++i) static_cast<void>(speculative.value()->cpu().prepareJitBlock(true));
         }
         speculative.value()->cpu().state() = entry;
         const auto prefix = speculative.value()->prepareReversibleRamPrefix(36U);
@@ -347,7 +348,7 @@ TEST(DeferredPrefixTest, IdempotentPeriodAdmissionReusesRotatedPhasesWithoutExec
     const auto base = entry.r[15] - 2U;
     for (const auto offset : {2U, 6U, 8U, 10U, 12U, 16U, 18U, 22U, 24U, 26U, 28U, 30U}) {
         cached.value()->cpu().state().r[15] = base + offset;
-        for (unsigned i = 0U; i < 64U; ++i) {
+        for (std::uint32_t i = 0U; i < 64U; ++i) {
             static_cast<void>(cached.value()->cpu().prepareJitBlock(true));
         }
     }
@@ -365,7 +366,7 @@ TEST(DeferredPrefixTest, IdempotentPeriodAdmissionReusesRotatedPhasesWithoutExec
     ASSERT_TRUE(repeated);
     EXPECT_GT(repeated->memoized_count, 0U);
     EXPECT_NE(repeated->period_phase, 0U);
-    const std::uint8_t memoized = repeated->memoized_count;
+    const std::uint8_t memoized = static_cast<std::uint8_t>(repeated->memoized_count);
     const auto result = cached.value()->materializeReversibleRamPrefix(*repeated, memoized);
     warm.max_instructions = memoized;
     const auto reference = exact.value()->run(warm);
@@ -417,7 +418,7 @@ TEST(DeferredPrefixTest, RestorationInvalidatesImmutablePeriodAdmission) {
     const auto base = entry.r[15] - 2U;
     for (const auto offset : {2U, 6U, 8U, 10U, 12U, 16U, 18U, 22U, 24U, 26U, 28U, 30U}) {
         board.value()->cpu().state().r[15] = base + offset;
-        for (unsigned i = 0U; i < 64U; ++i) {
+        for (std::uint32_t i = 0U; i < 64U; ++i) {
             static_cast<void>(board.value()->cpu().prepareJitBlock(true));
         }
     }

@@ -86,7 +86,7 @@ TEST(PeripheralTest, ModelsClockFlashAndGpioStartup) {
     fil::sim::EventLoop loop;
     fil::stm32g4::GpioPeripheral gpio("GPIOC", &loop);
     std::vector<fil::stm32g4::GpioTransition> callbacks;
-    gpio.setOutputCallback([&](const unsigned int pin, const bool high, const fil::sim::SimTimeNs time) {
+    gpio.setOutputCallback([&](const std::uint32_t pin, const bool high, const fil::sim::SimTimeNs time) {
         callbacks.push_back({time, pin, high});
     });
     EXPECT_TRUE(
@@ -111,7 +111,7 @@ TEST(PeripheralTest, ModelsUsartAndSpiDataPaths) {
     fil::sim::EventLoop loop;
     fil::sim::TraceRecorder trace;
     fil::stm32g4::UsartPeripheral usart("USART1", &loop, &trace);
-    int usart_interrupts = 0;
+    std::int32_t usart_interrupts = 0;
     usart.setInterruptCallback([&]() { ++usart_interrupts; });
     EXPECT_TRUE(usart
             .write(0, fil::mem::AccessSize::word, 1U | (1U << 2U) | (1U << 3U) | (1U << 5U),
@@ -145,8 +145,8 @@ TEST(PeripheralTest, SignalsUsartDmaRequestsForTxAndRx) {
     fil::sim::EventLoop loop;
     fil::sim::TraceRecorder trace;
     fil::stm32g4::UsartPeripheral usart("USART1", &loop, &trace);
-    int tx_requests = 0;
-    int rx_requests = 0;
+    std::int32_t tx_requests = 0;
+    std::int32_t rx_requests = 0;
     usart.setDmaRequestCallback([&](const bool transmit) {
         if (transmit) ++tx_requests;
         else ++rx_requests;
@@ -182,7 +182,7 @@ TEST(PeripheralTest, SignalsUsartDmaRequestsForTxAndRx) {
 TEST(PeripheralTest, DrivesTimerAndAdcFromSimulatedTime) {
     fil::sim::EventLoop loop;
     fil::stm32g4::TimerPeripheral timer("TIM1", 1000000, &loop);
-    int timer_interrupts = 0;
+    std::int32_t timer_interrupts = 0;
     timer.setInterruptCallback([&]() { ++timer_interrupts; });
     EXPECT_TRUE(timer.write(0x2c, fil::mem::AccessSize::word, 9, write_context).hasValue())
         << "sets timer auto-reload";
@@ -252,7 +252,7 @@ TEST(PeripheralTest, LazilySynchronizesUnobservedContinuousAdc) {
     adc.setSampleHistoryEnabled(false);
     adc.setConversionDelay(5'000);
     std::vector<fil::sim::SimTimeNs> provider_times;
-    adc.setChannelProvider([&](const unsigned int, const fil::sim::SimTimeNs now) {
+    adc.setChannelProvider([&](const std::uint32_t, const fil::sim::SimTimeNs now) {
         provider_times.push_back(now);
         return static_cast<std::uint16_t>(now / 5'000U);
     });
@@ -297,7 +297,7 @@ TEST(PeripheralTest, PreservesObservableAndSingleShotAdcEvents) {
     fil::stm32g4::AdcPeripheral interrupt_adc("ADC1", &interrupt_loop, &interrupt_trace);
     interrupt_adc.setConversionDelay(5'000);
     interrupt_adc.setSampleHistoryEnabled(false);
-    int interrupts = 0;
+    std::int32_t interrupts = 0;
     interrupt_adc.setInterruptCallback([&]() { ++interrupts; });
     EXPECT_TRUE(
         interrupt_adc.write(0x04, fil::mem::AccessSize::word, 1U << 2U, write_context).hasValue())
@@ -331,10 +331,10 @@ TEST(PeripheralTest, PreservesObservableAndSingleShotAdcEvents) {
 }
 
 TEST(PeripheralTest, ReportsPeripheralInterruptLevelsAndRependsOnEnable) {
-    std::vector<std::pair<unsigned int, bool>> levels;
+    std::vector<std::pair<std::uint32_t, bool>> levels;
 
     fil::stm32g4::TimerPeripheral timer("TIM1");
-    timer.setInterruptLevelCallback([&](const unsigned int line, const bool asserted) {
+    timer.setInterruptLevelCallback([&](const std::uint32_t line, const bool asserted) {
         levels.emplace_back(line, asserted);
     });
     levels.clear();
@@ -348,7 +348,7 @@ TEST(PeripheralTest, ReportsPeripheralInterruptLevelsAndRependsOnEnable) {
 
     fil::stm32g4::SpiPeripheral spi;
     levels.clear();
-    spi.setInterruptLevelCallback([&](const unsigned int line, const bool asserted) {
+    spi.setInterruptLevelCallback([&](const std::uint32_t line, const bool asserted) {
         levels.emplace_back(line, asserted);
     });
     levels.clear();
@@ -361,7 +361,7 @@ TEST(PeripheralTest, ReportsPeripheralInterruptLevelsAndRependsOnEnable) {
 
     fil::stm32g4::AdcPeripheral adc;
     levels.clear();
-    adc.setInterruptLevelCallback([&](const unsigned int line, const bool asserted) {
+    adc.setInterruptLevelCallback([&](const std::uint32_t line, const bool asserted) {
         levels.emplace_back(line, asserted);
     });
     levels.clear();
@@ -375,7 +375,7 @@ TEST(PeripheralTest, ReportsPeripheralInterruptLevelsAndRependsOnEnable) {
 
     fil::stm32g4::DmaPeripheral dma("DMA1", 1);
     levels.clear();
-    dma.setInterruptLevelCallback([&](const unsigned int line, const bool asserted) {
+    dma.setInterruptLevelCallback([&](const std::uint32_t line, const bool asserted) {
         levels.emplace_back(line, asserted);
     });
     levels.clear();
@@ -394,7 +394,7 @@ TEST(PeripheralTest, AdcInterruptLevelMatchesEnabledStatusBits) {
     fil::stm32g4::AdcPeripheral adc("ADC1", &events);
     adc.setConversionDelay(100U);
     std::vector<bool> levels;
-    adc.setInterruptLevelCallback([&](const unsigned int line, const bool asserted) {
+    adc.setInterruptLevelCallback([&](const std::uint32_t line, const bool asserted) {
         if (line == 0U) levels.push_back(asserted);
     });
     EXPECT_EQ(levels, std::vector<bool>{false});
@@ -435,12 +435,12 @@ TEST(PeripheralTest, DmaOwnerLocalAdcTransferRejectsPublicObserversAndSubstituti
     dma.setTransferHistoryEnabled(false);
     EXPECT_TRUE(dma.ownerLocalAdcTransferSafe(1U, &memory, source, trusted_generation));
 
-    dma.setInterruptCallback([](unsigned int) {});
+    dma.setInterruptCallback([](std::uint32_t) {});
     EXPECT_FALSE(dma.ownerLocalAdcTransferSafe(1U, &memory, source, trusted_generation))
         << "legacy DMA interrupt callback is arbitrary user code";
     dma.setInterruptCallback({});
 
-    dma.setInterruptLevelCallback([](unsigned int, bool) {});
+    dma.setInterruptLevelCallback([](std::uint32_t, bool) {});
     EXPECT_FALSE(dma.ownerLocalAdcTransferSafe(1U, &memory, source, trusted_generation))
         << "public IRQ-level callback replacement invalidates the trusted generation";
     dma.setInterruptLevelCallback({});
@@ -465,12 +465,12 @@ TEST(PeripheralTest, DmaOwnerLocalAdcTransferRejectsPublicObserversAndSubstituti
 TEST(PeripheralTest, DmaGlobalFlagClearDeassertsOnlySelectedChannel) {
     fil::stm32g4::DmaPeripheral dma("DMA1", 8U);
     std::uint32_t levels = 0U;
-    dma.setInterruptLevelCallback([&](const unsigned int line, const bool asserted) {
+    dma.setInterruptLevelCallback([&](const std::uint32_t line, const bool asserted) {
         if (asserted) levels |= 1U << line;
         else levels &= ~(1U << line);
     });
     constexpr auto word = fil::mem::AccessSize::word;
-    for (const unsigned int channel : {1U, 8U}) {
+    for (const std::uint32_t channel : {1U, 8U}) {
         const std::uint32_t base = 0x08U + (channel - 1U) * 0x14U;
         ASSERT_TRUE(dma.write(base + 4U, word, 1U, {}));
         ASSERT_TRUE(dma.write(base, word, 1U, {}));
@@ -491,7 +491,7 @@ TEST(PeripheralTest, DmaGlobalFlagClearDeassertsOnlySelectedChannel) {
 TEST(PeripheralTest, UsartTransmissionCompleteCanBeAcknowledged) {
     fil::stm32g4::UsartPeripheral usart;
     std::vector<bool> levels;
-    usart.setInterruptLevelCallback([&](const unsigned int line, const bool asserted) {
+    usart.setInterruptLevelCallback([&](const std::uint32_t line, const bool asserted) {
         if (line == 0U) levels.push_back(asserted);
     });
     constexpr auto word = fil::mem::AccessSize::word;
@@ -512,8 +512,8 @@ TEST(PeripheralTest, CompletesDmaAndWatchdogSideEffects) {
     EXPECT_TRUE(memory.mapRam(0x20000000U, 64, "dma-ram").hasValue()) << "maps DMA test RAM";
     EXPECT_TRUE(memory.write32(0x20000000U, 0x11223344U).hasValue()) << "initializes DMA source";
     fil::stm32g4::DmaPeripheral dma("DMA1", 7, &memory);
-    int dma_interrupts = 0;
-    dma.setInterruptCallback([&](const unsigned int channel) {
+    std::int32_t dma_interrupts = 0;
+    dma.setInterruptCallback([&](const std::uint32_t channel) {
         if (channel == 1U) ++dma_interrupts;
     });
     EXPECT_TRUE(dma.write(0x0c, fil::mem::AccessSize::word, 1, write_context).hasValue())
@@ -549,7 +549,7 @@ TEST(PeripheralTest, CompletesDmaAndWatchdogSideEffects) {
 
     fil::sim::EventLoop loop;
     fil::stm32g4::IwdgPeripheral watchdog(true, &loop);
-    int resets = 0;
+    std::int32_t resets = 0;
     watchdog.setResetCallback([&]() { ++resets; });
     EXPECT_TRUE(watchdog.write(0, fil::mem::AccessSize::word, 0x5555U, write_context).hasValue())
         << "unlocks watchdog registers";
@@ -571,10 +571,10 @@ TEST(PeripheralTest, DecimatesContinuousAdcScansWithoutDriftingSchedule) {
     adc.setConversionDelay(5'000);
     adc.setDecimation(4);
     EXPECT_TRUE(adc.decimation() == 4U) << "decimation factor is retained";
-    adc.setChannelProvider([&](const unsigned int, const fil::sim::SimTimeNs now) {
+    adc.setChannelProvider([&](const std::uint32_t, const fil::sim::SimTimeNs now) {
         return static_cast<std::uint16_t>(now / 5'000U);
     });
-    int interrupts = 0;
+    std::int32_t interrupts = 0;
     adc.setInterruptCallback([&]() { ++interrupts; });
     EXPECT_TRUE(
         adc.write(0x04, fil::mem::AccessSize::word, (1U << 2U) | (1U << 3U), write_context)
@@ -614,7 +614,7 @@ TEST(PeripheralTest, DecimationSkipsMultiRankScansAsWholeScans) {
     adc.setDecimation(2);
     adc.setChannelValue(2, 2002U);
     adc.setChannelValue(3, 3003U);
-    std::vector<unsigned int> converted;
+    std::vector<std::uint32_t> converted;
     adc.setSampleCallback([&](const fil::stm32g4::AdcSample& sample) {
         converted.push_back(sample.channel);
     });
@@ -629,13 +629,13 @@ TEST(PeripheralTest, DecimationSkipsMultiRankScansAsWholeScans) {
 
     EXPECT_TRUE(loop.runDueEvents(10'000).events_executed == 2 && converted.size() == 2U)
         << "kept scan converts every rank in order";
-    EXPECT_TRUE((converted == std::vector<unsigned int>{2U, 3U}))
+    EXPECT_TRUE((converted == std::vector<std::uint32_t>{2U, 3U}))
         << "rank order matches the configured sequence";
     EXPECT_TRUE(loop.runDueEvents(20'000).events_executed == 1 && converted.size() == 2U)
         << "skipped scan jumps in one event without DMA requests";
     EXPECT_TRUE(loop.runDueEvents(30'000).events_executed == 2 && converted.size() == 4U)
         << "next kept scan resumes on schedule";
-    EXPECT_TRUE((converted == std::vector<unsigned int>{2U, 3U, 2U, 3U}))
+    EXPECT_TRUE((converted == std::vector<std::uint32_t>{2U, 3U, 2U, 3U}))
         << "decimation preserves multi-rank DMA alignment";
     const auto data = adc.read(0x40, fil::mem::AccessSize::word, read_context);
     EXPECT_TRUE(data && data.value() == 3003U) << "DR holds the last kept rank value";
@@ -649,12 +649,12 @@ TEST(PeripheralTest, DecimationNeverSkipsSingleShotAdc) {
     adc.setConversionDelay(5'000);
     adc.setDecimation(4);
     adc.setChannelValue(0, 1234);
-    int interrupts = 0;
+    std::int32_t interrupts = 0;
     adc.setInterruptCallback([&]() { ++interrupts; });
     EXPECT_TRUE(
         adc.write(0x04, fil::mem::AccessSize::word, 1U << 2U, write_context).hasValue())
         << "enables single-shot EOC interrupt";
-    for (int shot = 0; shot < 3; ++shot) {
+    for (std::int32_t shot = 0; shot < 3; ++shot) {
         EXPECT_TRUE(
             adc.write(0x08, fil::mem::AccessSize::word, 1U | (1U << 2U), write_context)
                 .hasValue())

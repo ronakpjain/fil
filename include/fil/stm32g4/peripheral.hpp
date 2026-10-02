@@ -30,7 +30,7 @@ namespace fil::stm32g4 {
  */
 class RegisterPeripheral : public mem::MmioDevice {
 public:
-    using InterruptLevelCallback = std::function<void(unsigned int line, bool asserted)>;
+    using InterruptLevelCallback = std::function<void(std::uint32_t line, bool asserted)>;
 
     RegisterPeripheral(
         std::string name,
@@ -118,7 +118,7 @@ protected:
     }
 
     void traceEvent(std::string type, std::vector<sim::TraceField> fields = {});
-    void setInterruptLevel(unsigned int line, bool asserted);
+    void setInterruptLevel(std::uint32_t line, bool asserted);
 
 private:
     [[nodiscard]] mem::BusFault accessFault(
@@ -339,8 +339,8 @@ protected:
 private:
     void performPageErase(std::uint32_t control);
 
-    unsigned int key_step_{0};
-    unsigned int option_key_step_{0};
+    std::uint32_t key_step_{0};
+    std::uint32_t option_key_step_{0};
     std::uint32_t acr_{0};
     std::uint64_t acr_generation_{1};
     PageEraseCallback page_erase_callback_;
@@ -406,15 +406,15 @@ private:
 /** @brief One deterministic GPIO output transition. */
 struct GpioTransition {
     sim::SimTimeNs time_ns{0};
-    unsigned int pin{0};
+    std::uint32_t pin{0};
     bool high{false};
 };
 
 /** @brief STM32G4 GPIO port with external-input overrides and output callbacks. */
 class GpioPeripheral final : public RegisterPeripheral {
 public:
-    using OutputCallback = std::function<void(unsigned int pin, bool high, sim::SimTimeNs time_ns)>;
-    using EdgeCallback = std::function<void(unsigned int pin, bool high, sim::SimTimeNs time_ns)>;
+    using OutputCallback = std::function<void(std::uint32_t pin, bool high, sim::SimTimeNs time_ns)>;
+    using EdgeCallback = std::function<void(std::uint32_t pin, bool high, sim::SimTimeNs time_ns)>;
 
     explicit GpioPeripheral(
         std::string name = "GPIO",
@@ -422,9 +422,9 @@ public:
         sim::TraceRecorder* trace = nullptr
     );
 
-    void setInput(unsigned int pin, bool high);
-    void releaseInput(unsigned int pin);
-    [[nodiscard]] bool output(unsigned int pin) const noexcept;
+    void setInput(std::uint32_t pin, bool high);
+    void releaseInput(std::uint32_t pin);
+    [[nodiscard]] bool output(std::uint32_t pin) const noexcept;
     void setOutputCallback(OutputCallback callback);
     /** @brief Observes every pin level change (external inputs and outputs) for EXTI edge detection. */
     void setEdgeCallback(EdgeCallback callback);
@@ -605,14 +605,14 @@ private:
 /** @brief ADC conversion result with selected channel metadata. */
 struct AdcSample {
     sim::SimTimeNs time_ns{0};
-    unsigned int channel{0};
+    std::uint32_t channel{0};
     std::uint16_t value{0};
 };
 
 /** @brief STM32G4 ADC model with sequenced, clock-derived conversions. */
 class AdcPeripheral final : public RegisterPeripheral {
 public:
-    using ChannelProvider = std::function<std::uint16_t(unsigned int channel, sim::SimTimeNs time_ns)>;
+    using ChannelProvider = std::function<std::uint16_t(std::uint32_t channel, sim::SimTimeNs time_ns)>;
     using SampleCallback = std::function<void(const AdcSample& sample)>;
     using InterruptCallback = std::function<void()>;
 
@@ -636,7 +636,7 @@ public:
     ) override;
 
     /** Sets a persistent external channel value that takes precedence over the configured provider. */
-    void setChannelValue(unsigned int channel, std::uint16_t value);
+    void setChannelValue(std::uint32_t channel, std::uint16_t value);
     void setChannelProvider(ChannelProvider provider);
     void setSampleCallback(SampleCallback callback);
     void setInterruptCallback(InterruptCallback callback);
@@ -652,10 +652,10 @@ public:
      * one scan per N periods. Single-shot conversions are never skipped.
      * Factor 1 (default) preserves current behavior exactly.
      */
-    void setDecimation(unsigned int factor) noexcept {
+    void setDecimation(std::uint32_t factor) noexcept {
         decimation_ = factor == 0U ? 1U : factor;
     }
-    [[nodiscard]] unsigned int decimation() const noexcept { return decimation_; }
+    [[nodiscard]] std::uint32_t decimation() const noexcept { return decimation_; }
     void setInputClockHz(std::uint64_t frequency_hz);
     /** @brief Enables timestamped sample history; disabling it permits lazy continuous conversion. */
     void setSampleHistoryEnabled(bool enabled);
@@ -681,16 +681,16 @@ private:
     void setCertifiedChannelProvider(ChannelProvider provider);
     void setCertifiedSampleCallback(SampleCallback callback, std::function<bool()> guard);
     [[nodiscard]] bool ownerLocalTrusted() const;
-    [[nodiscard]] unsigned int sequenceLength() const noexcept;
-    [[nodiscard]] unsigned int channelForRank(unsigned int rank) const noexcept;
-    [[nodiscard]] sim::SimTimeNs conversionDelayForRank(unsigned int rank) const noexcept;
+    [[nodiscard]] std::uint32_t sequenceLength() const noexcept;
+    [[nodiscard]] std::uint32_t channelForRank(std::uint32_t rank) const noexcept;
+    [[nodiscard]] sim::SimTimeNs conversionDelayForRank(std::uint32_t rank) const noexcept;
     [[nodiscard]] bool continuousMode() const noexcept;
     [[nodiscard]] bool conversionObservable() const noexcept;
     [[nodiscard]] bool lazyConversionEligible() const noexcept;
     void startConversion();
     void completeConversion();
     /** @brief Landing handler for a jumped gap of count skipped scans. */
-    void completeSkippedScans(unsigned int skipped);
+    void completeSkippedScans(std::uint32_t skipped);
     /** @brief Arms the next scan after a boundary, jumping skipped scans. */
     void beginNextScan();
     /**
@@ -703,7 +703,7 @@ private:
      * collapse exact except for the documented decimation staleness. Falls
      * back to per-rank arming when the span cannot be represented.
      */
-    void armSkippedScans(unsigned int count);
+    void armSkippedScans(std::uint32_t count);
     void materializeConversion(sim::SimTimeNs completion_time, bool observable);
     void synchronizeLazyConversions();
     void refreshConversionScheduling();
@@ -722,17 +722,17 @@ private:
     std::uint64_t certified_interrupt_generation_{0U};
     std::uint64_t input_clock_hz_{16'000'000U};
     sim::SimTimeNs conversion_delay_override_ns_{0};
-    unsigned int sequence_rank_{0};
+    std::uint32_t sequence_rank_{0};
     // Decimation state (see setDecimation): scan_index_ counts completed
     // continuous scans, skip_scan_ suppresses side effects for the rest of
     // the current scan. Both reset on start/reset; the factor persists.
-    unsigned int decimation_{1};
+    std::uint32_t decimation_{1};
     std::uint64_t scan_index_{0};
     bool skip_scan_{false};
     sim::ScheduledEvent conversion_event_;
     std::optional<sim::SimTimeNs> next_conversion_ns_;
     bool skipped_scan_event_{false};
-    unsigned int skipped_scan_count_{0U};
+    std::uint32_t skipped_scan_count_{0U};
     bool sample_history_enabled_{true};
     std::vector<AdcSample> samples_;
 };
@@ -807,7 +807,7 @@ private:
 /** @brief One serviced DMA peripheral request. */
 struct DmaTransfer {
     sim::SimTimeNs time_ns{0};
-    unsigned int channel{0};
+    std::uint32_t channel{0};
     std::uint32_t items{0};
     bool memory_to_peripheral{false};
     bool success{false};
@@ -816,12 +816,12 @@ struct DmaTransfer {
 /** @brief STM32G4 DMA controller with request-driven channel progress. */
 class DmaPeripheral final : public RegisterPeripheral {
 public:
-    using InterruptCallback = std::function<void(unsigned int channel)>;
-    using EnableCallback = std::function<void(unsigned int channel)>;
+    using InterruptCallback = std::function<void(std::uint32_t channel)>;
+    using EnableCallback = std::function<void(std::uint32_t channel)>;
 
     explicit DmaPeripheral(
         std::string name = "DMA",
-        unsigned int channel_count = 7,
+        std::uint32_t channel_count = 7,
         mem::MemoryBus* memory = nullptr,
         sim::EventLoop* event_loop = nullptr,
         sim::TraceRecorder* trace = nullptr
@@ -831,14 +831,14 @@ public:
     void setInterruptCallback(InterruptCallback callback);
     /** @brief Certifies this channel's next ADC peripheral-to-RAM halfword transfer. */
     [[nodiscard]] bool ownerLocalAdcTransferSafe(
-        unsigned channel, const mem::MemoryBus* expected_bus, std::uint32_t expected_source,
+        std::uint32_t channel, const mem::MemoryBus* expected_bus, std::uint32_t expected_source,
         std::uint64_t trusted_interrupt_generation
     ) const;
     void setEnableCallback(EnableCallback callback) { enable_callback_ = std::move(callback); }
     void setTransferHistoryEnabled(bool enabled) noexcept { transfer_history_enabled_ = enabled; }
     /** @brief Services one peripheral request for an already-enabled channel. */
-    [[nodiscard]] bool request(unsigned int channel);
-    [[nodiscard]] unsigned int channelCount() const noexcept { return channel_count_; }
+    [[nodiscard]] bool request(std::uint32_t channel);
+    [[nodiscard]] std::uint32_t channelCount() const noexcept { return channel_count_; }
     [[nodiscard]] const std::vector<DmaTransfer>& transferLog() const noexcept { return transfers_; }
 
 protected:
@@ -851,9 +851,9 @@ protected:
     ) override;
 
 private:
-    [[nodiscard]] bool channelForOffset(std::uint32_t offset, unsigned int& channel) const noexcept;
-    void initializeChannel(unsigned int channel);
-    void runChannelRequest(unsigned int channel);
+    [[nodiscard]] bool channelForOffset(std::uint32_t offset, std::uint32_t& channel) const noexcept;
+    void initializeChannel(std::uint32_t channel);
+    void runChannelRequest(std::uint32_t channel);
     [[nodiscard]] mem::MemoryResult<std::uint64_t> readMemory(
         std::uint32_t address,
         std::uint32_t width
@@ -863,10 +863,10 @@ private:
         std::uint32_t width,
         std::uint64_t value
     );
-    void setChannelFlag(unsigned int channel, unsigned int flag_bit);
+    void setChannelFlag(std::uint32_t channel, std::uint32_t flag_bit);
     void updateInterruptLevels();
 
-    unsigned int channel_count_{7};
+    std::uint32_t channel_count_{7};
     mem::MemoryBus* memory_{nullptr};
     InterruptCallback interrupt_callback_;
     EnableCallback enable_callback_;
@@ -880,12 +880,12 @@ class DmamuxPeripheral final : public RegisterPeripheral {
 public:
     explicit DmamuxPeripheral(
         std::string name = "DMAMUX",
-        unsigned int channel_count = 16,
+        std::uint32_t channel_count = 16,
         sim::EventLoop* event_loop = nullptr,
         sim::TraceRecorder* trace = nullptr
     );
 
-    [[nodiscard]] std::uint8_t requestForChannel(unsigned int channel) const noexcept;
+    [[nodiscard]] std::uint8_t requestForChannel(std::uint32_t channel) const noexcept;
     [[nodiscard]] std::uint64_t routingGeneration() const noexcept { return routing_generation_; }
 
 protected:
@@ -898,7 +898,7 @@ protected:
     ) override;
 
 private:
-    unsigned int channel_count_{16};
+    std::uint32_t channel_count_{16};
     std::uint64_t routing_generation_{1U};
 };
 
@@ -989,7 +989,7 @@ public:
     );
 
     /** @brief Returns 0-6 (PA-PG) for an EXTI line, or -1 when unroutable. */
-    [[nodiscard]] int portForLine(unsigned int line) const noexcept;
+    [[nodiscard]] std::int32_t portForLine(std::uint32_t line) const noexcept;
 };
 
 /** @brief STM32G4 EXTI with rising/falling edge triggers and NVIC lines. */
@@ -1004,7 +1004,7 @@ public:
     /** @brief Selects the SYSCFG used to resolve EXTI line to GPIO port. */
     void setSyscfg(const SyscfgPeripheral* syscfg) noexcept { syscfg_ = syscfg; }
     /** @brief Notifies EXTI of a GPIO pin level (port 0-6 for A-G, pin 0-15). */
-    void notifyGpioEdge(unsigned int port, unsigned int pin, bool high);
+    void notifyGpioEdge(std::uint32_t port, std::uint32_t pin, bool high);
 
 protected:
     [[nodiscard]] std::uint32_t loadRegister(
@@ -1022,7 +1022,7 @@ protected:
 
 private:
     void updateInterruptLevels();
-    [[nodiscard]] bool linePendingEnabled(unsigned int line) const noexcept;
+    [[nodiscard]] bool linePendingEnabled(std::uint32_t line) const noexcept;
 
     const SyscfgPeripheral* syscfg_{nullptr};
 };

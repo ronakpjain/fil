@@ -1,5 +1,6 @@
 #include "fil/stm32g4/peripheral.hpp"
 
+#include <cstdint>
 #include <utility>
 
 namespace fil::stm32g4 {
@@ -22,7 +23,7 @@ GpioPeripheral::GpioPeripheral(
     reset();
 }
 
-void GpioPeripheral::setInput(const unsigned int pin, const bool high) {
+void GpioPeripheral::setInput(const std::uint32_t pin, const bool high) {
     if (pin >= 16U) {
         return;
     }
@@ -44,7 +45,7 @@ void GpioPeripheral::setInput(const unsigned int pin, const bool high) {
     }
 }
 
-void GpioPeripheral::releaseInput(const unsigned int pin) {
+void GpioPeripheral::releaseInput(const std::uint32_t pin) {
     if (pin < 16U) {
         const bool old_level = (inputValue() & (1U << pin)) != 0U;
         external_input_mask_ = static_cast<std::uint16_t>(
@@ -61,7 +62,7 @@ void GpioPeripheral::releaseInput(const unsigned int pin) {
     }
 }
 
-bool GpioPeripheral::output(const unsigned int pin) const noexcept {
+bool GpioPeripheral::output(const std::uint32_t pin) const noexcept {
     return pin < 16U && (registerValue(odr) & (1U << pin)) != 0U;
 }
 
@@ -127,7 +128,7 @@ void GpioPeripheral::applyOutput(const std::uint32_t new_output) {
     const std::uint32_t new_levels = inputValue();
     const std::uint32_t changed_odr = previous_odr ^ next_odr;
     const std::uint32_t changed_idr = (old_levels ^ new_levels) & 0xffffU;
-    for (unsigned int pin = 0; pin < 16U; ++pin) {
+    for (std::uint32_t pin = 0; pin < 16U; ++pin) {
         const std::uint32_t mask = 1U << pin;
         if ((changed_odr & mask) != 0U) {
             const bool high = (next_odr & mask) != 0U;
@@ -151,7 +152,7 @@ std::uint32_t GpioPeripheral::inputValue() const noexcept {
     const std::uint32_t modes = registerValue(moder);
     const std::uint32_t outputs = registerValue(odr);
     std::uint32_t result = external_input_value_ & external_input_mask_;
-    for (unsigned int pin = 0; pin < 16U; ++pin) {
+    for (std::uint32_t pin = 0; pin < 16U; ++pin) {
         const std::uint32_t mask = 1U << pin;
         if ((external_input_mask_ & mask) != 0U) {
             continue;

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <ostream>
 #include <string>
 #include <utility>
@@ -31,7 +32,7 @@ void writeU16(std::span<std::uint8_t> bytes, const std::size_t offset, const std
 }
 
 void writeU32(std::span<std::uint8_t> bytes, const std::size_t offset, const std::uint32_t value) {
-    for (unsigned int index = 0U; index < 4U; ++index) {
+    for (std::uint32_t index = 0U; index < 4U; ++index) {
         bytes[offset + index] = static_cast<std::uint8_t>((value >> (index * 8U)) & 0xffU);
     }
 }

@@ -4,6 +4,7 @@
  *  @brief Testable command-line dispatch and stable process exit codes.
  */
 
+#include <cstdint>
 #include <iosfwd>
 #include <span>
 #include <string_view>
@@ -11,7 +12,7 @@
 namespace fil::cli {
 
 /** @brief Stable process status codes returned by fil commands. */
-enum class ExitCode : int {
+enum class ExitCode : std::int32_t {
     success = 0,        ///< Command completed successfully.
     usage_error = 2,    ///< Command name or arguments were invalid.
     config_error = 3,   ///< Configuration parsing or validation failed.

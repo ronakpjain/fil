@@ -5,6 +5,7 @@
 #include "fil/stm32g4/stm32g4.hpp"
 #include "../fixture_support.hpp"
 
+#include <cstdint>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -115,7 +116,7 @@ public:
     [[nodiscard]] bool redirect(const std::vector<std::uint8_t>& input) {
         original_ = ::dup(STDIN_FILENO);
         if (original_ < 0) return false;
-        int descriptors[2]{};
+        std::int32_t descriptors[2]{};
         if (::pipe(descriptors) != 0) return false;
         if (::dup2(descriptors[0], STDIN_FILENO) < 0) {
             static_cast<void>(::close(descriptors[0]));
@@ -138,7 +139,7 @@ public:
     }
 
 private:
-    int original_{-1};
+    std::int32_t original_{-1};
 };
 
 TEST(WorldTest, LoadsSharedCanFabric) {
@@ -404,11 +405,11 @@ TEST(WorldTest, ServeNetworkUsesBinaryStdioFramesForControlsAndTraces) {
         payload.push_back(static_cast<std::uint8_t>(value.size() & 0xffU));
         payload.push_back(static_cast<std::uint8_t>((value.size() >> 8U) & 0xffU));
         for (const char byte : value) {
-            payload.push_back(static_cast<std::uint8_t>(static_cast<unsigned char>(byte)));
+            payload.push_back(static_cast<std::uint8_t>(static_cast<std::uint8_t>(byte)));
         }
     };
     const auto appendU32 = [](std::vector<std::uint8_t>& payload, const std::uint32_t value) {
-        for (unsigned int index = 0U; index < 4U; ++index) {
+        for (std::uint32_t index = 0U; index < 4U; ++index) {
             payload.push_back(static_cast<std::uint8_t>((value >> (index * 8U)) & 0xffU));
         }
     };
@@ -416,7 +417,7 @@ TEST(WorldTest, ServeNetworkUsesBinaryStdioFramesForControlsAndTraces) {
         std::ostringstream encoded(std::ios::out | std::ios::binary);
         EXPECT_TRUE(fil::cli::network_protocol::writeFrame(encoded, frame));
         for (const char byte : encoded.str()) {
-            request_bytes.push_back(static_cast<std::uint8_t>(static_cast<unsigned char>(byte)));
+            request_bytes.push_back(static_cast<std::uint8_t>(static_cast<std::uint8_t>(byte)));
         }
     };
 
@@ -463,7 +464,7 @@ TEST(WorldTest, ServeNetworkUsesBinaryStdioFramesForControlsAndTraces) {
     std::vector<std::uint8_t> output;
     output.reserve(output_bytes.size());
     for (const char byte : output_bytes) {
-        output.push_back(static_cast<std::uint8_t>(static_cast<unsigned char>(byte)));
+        output.push_back(static_cast<std::uint8_t>(static_cast<std::uint8_t>(byte)));
     }
 
     fil::cli::network_protocol::FrameDecoder decoder;
@@ -513,7 +514,7 @@ TEST(WorldTest, ServeNetworkStopsOnCleanUnlimitedStdioEof) {
     const std::string encoded = out.str();
     std::vector<std::uint8_t> bytes;
     for (const char byte : encoded) {
-        bytes.push_back(static_cast<std::uint8_t>(static_cast<unsigned char>(byte)));
+        bytes.push_back(static_cast<std::uint8_t>(static_cast<std::uint8_t>(byte)));
     }
     fil::cli::network_protocol::FrameDecoder decoder;
     ASSERT_TRUE(decoder.append(bytes));

@@ -52,8 +52,8 @@ public:
     }
 
     bool shared{false};
-    int read_count{0};
-    int write_count{0};
+    std::int32_t read_count{0};
+    std::int32_t write_count{0};
     std::uint32_t last_offset{0};
     fil::mem::AccessSize last_size{fil::mem::AccessSize::byte};
     std::uint64_t last_value{0};
@@ -247,7 +247,7 @@ TEST(MemoryBusTest, HandlesRegionCacheCollisions) {
     static_cast<void>(bus.write32(0x20ff0000U, 0xaabbccddU));
 
     bool values_match = true;
-    for (unsigned int iteration = 0; iteration < 4U; ++iteration) {
+    for (std::uint32_t iteration = 0; iteration < 4U; ++iteration) {
         const auto low = bus.read32(0x20000000U);
         const auto high = bus.read32(0x20ff0000U);
         values_match = values_match
@@ -528,7 +528,7 @@ TEST(MemoryBusTest, StoreCertificatesRejectChangesToEveryTouchedCanonicalWord) {
     using fil::mem::MemoryBus;
     constexpr std::uint32_t base = 0x20000000U;
     const AccessContext cpu_store{AccessType::data_write, 0x08000100U};
-    for (unsigned path = 0U; path < 7U; ++path) {
+    for (std::uint32_t path = 0U; path < 7U; ++path) {
         SCOPED_TRACE(path);
         MemoryBus bus;
         ASSERT_TRUE(bus.mapRam(base, 64U, "ram"));

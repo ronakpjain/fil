@@ -2,6 +2,7 @@
 #include "../fixture_support.hpp"
 #include "fil/stm32g4/stm32g4.hpp"
 
+#include <cstdint>
 #include <gtest/gtest.h>
 
 #include <sstream>
@@ -99,7 +100,7 @@ bool installAndWarmJitLoop(fil::sim::Board& board, const bool mmio = false) {
     };
     if (mmio) { code[4] = 0x0aU; code[5] = 0x68U; } // ldr r2, [r1]
     if (!board.memory().loadBytes(start, code)) return false;
-    for (unsigned int i = 0U; i < 60U; ++i) {
+    for (std::uint32_t i = 0U; i < 60U; ++i) {
         board.cpu().state() = initial;
         board.cpu().state().r[1] = 0xe0001004U; // DWT_CYCCNT
         static_cast<void>(board.cpu().tryStepJitBlock());
@@ -122,7 +123,7 @@ bool warmIdempotentPeriodCache(fil::sim::Board& board) {
         || !board.memory().write32(0x20000044U, 1U)
         || !board.memory().write32(0xe0001000U, 1U)
         || !board.memory().loadBytes(board.cpu().state().r[15], code)) return false;
-    for (unsigned int i = 0U; i < 64U; ++i) {
+    for (std::uint32_t i = 0U; i < 64U; ++i) {
         static_cast<void>(board.cpu().prepareJitBlock());
     }
     fil::sim::BoardRunOptions warm;
@@ -135,7 +136,7 @@ bool warmIdempotentPeriodCache(fil::sim::Board& board) {
     const auto base = entry.r[15] - 2U;
     for (const auto offset : {2U, 6U, 8U, 10U, 12U, 16U, 18U, 22U, 24U, 26U, 28U, 30U}) {
         board.cpu().state().r[15] = base + offset;
-        for (unsigned int i = 0U; i < 64U; ++i) {
+        for (std::uint32_t i = 0U; i < 64U; ++i) {
             static_cast<void>(board.cpu().prepareJitBlock(true));
         }
     }
@@ -152,7 +153,7 @@ bool warmIdempotentPeriodCache(fil::sim::Board& board) {
 bool installBranchingReversibleProgram(fil::sim::Board& board) {
     const std::uint32_t start = board.cpu().state().r[15];
     std::vector<std::uint8_t> code;
-    for (unsigned int i = 0U; i < 80U; ++i) {
+    for (std::uint32_t i = 0U; i < 80U; ++i) {
         code.push_back(0x01U); code.push_back(0x30U); // adds r0, #1
         if (i == 5U) {
             code.push_back(0x00U); code.push_back(0xd1U); // bne +0: skip next halfword
@@ -166,8 +167,8 @@ bool installBranchingReversibleProgram(fil::sim::Board& board) {
     const auto initial = board.cpu().state();
     // Warm entry points reached after conditional/unconditional branches and
     // the 16-op CPU block cap; the Board chain itself must never execute cold.
-    for (const unsigned int instruction : {0U, 8U, 17U, 33U, 49U, 65U, 81U}) {
-        for (unsigned int attempt = 0U; attempt < 64U; ++attempt) {
+    for (const std::uint32_t instruction : {0U, 8U, 17U, 33U, 49U, 65U, 81U}) {
+        for (std::uint32_t attempt = 0U; attempt < 64U; ++attempt) {
             board.cpu().state().r[15] = start + instruction * 2U;
             static_cast<void>(board.cpu().prepareJitBlock());
         }

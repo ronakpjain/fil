@@ -4,6 +4,7 @@
 #include "fil/config/config.hpp"
 #include "../fixture_support.hpp"
 
+#include <cstdint>
 #include <gtest/gtest.h>
 
 #include <filesystem>

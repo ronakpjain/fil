@@ -1,6 +1,7 @@
 #include "fil/cortexm/system_control.hpp"
 
 #include <bit>
+#include <cstdint>
 #include <string>
 
 namespace fil::cortexm {
@@ -99,7 +100,7 @@ void SystemControl::pend(const std::uint16_t exception_number) {
     } else if (exception_number == static_cast<std::uint16_t>(ExceptionNumber::sys_tick)) {
         systick_pending_ = true;
     } else if (exception_number >= 16U && exception_number < 256U) {
-        const std::uint16_t irq = exception_number - 16U;
+        const std::uint16_t irq = static_cast<std::uint16_t>(exception_number - 16U);
         nvic_pending_[irq / 32U] |= std::uint32_t{1} << (irq % 32U);
         refreshPendingSummary();
     }
@@ -125,7 +126,7 @@ void SystemControl::clearPending(const std::uint16_t exception_number) {
     } else if (exception_number == static_cast<std::uint16_t>(ExceptionNumber::sys_tick)) {
         systick_pending_ = false;
     } else if (exception_number >= 16U && exception_number < 256U) {
-        const std::uint16_t irq = exception_number - 16U;
+        const std::uint16_t irq = static_cast<std::uint16_t>(exception_number - 16U);
         nvic_pending_[irq / 32U] &= ~(std::uint32_t{1} << (irq % 32U));
         refreshPendingSummary();
     }
@@ -136,7 +137,7 @@ void SystemControl::enter(const std::uint16_t exception_number) {
     active_exception_ = exception_number;
     noteSelectionChanged();
     if (exception_number >= 16U && exception_number < 256U) {
-        const std::uint16_t irq = exception_number - 16U;
+        const std::uint16_t irq = static_cast<std::uint16_t>(exception_number - 16U);
         nvic_active_[irq / 32U] |= std::uint32_t{1} << (irq % 32U);
     }
     clearPending(exception_number);
@@ -149,7 +150,7 @@ void SystemControl::resume(const std::uint16_t exception_number) noexcept {
 
 void SystemControl::leave(const std::uint16_t exception_number) {
     if (exception_number >= 16U && exception_number < 256U) {
-        const std::uint16_t irq = exception_number - 16U;
+        const std::uint16_t irq = static_cast<std::uint16_t>(exception_number - 16U);
         nvic_active_[irq / 32U] &= ~(std::uint32_t{1} << (irq % 32U));
     }
     if (active_exception_ == exception_number) active_exception_ = 0;
@@ -173,14 +174,14 @@ bool SystemControl::isPending(const std::uint16_t exception_number) const noexce
     if (exception_number == static_cast<std::uint16_t>(ExceptionNumber::pend_sv)) return pendsv_pending_;
     if (exception_number == static_cast<std::uint16_t>(ExceptionNumber::sys_tick)) return systick_pending_;
     if (exception_number < 16U || exception_number >= 256U) return false;
-    const std::uint16_t irq = exception_number - 16U;
+    const std::uint16_t irq = static_cast<std::uint16_t>(exception_number - 16U);
     return (nvic_pending_[irq / 32U] & (std::uint32_t{1} << (irq % 32U))) != 0;
 }
 
 bool SystemControl::isEnabled(const std::uint16_t exception_number) const noexcept {
     if (exception_number < 16U) return true;
     if (exception_number >= 256U) return false;
-    const std::uint16_t irq = exception_number - 16U;
+    const std::uint16_t irq = static_cast<std::uint16_t>(exception_number - 16U);
     return (nvic_enable_[irq / 32U] & (std::uint32_t{1} << (irq % 32U))) != 0;
 }
 
@@ -229,10 +230,10 @@ std::optional<std::uint16_t> SystemControl::selectPendingUncached(
     const std::uint32_t effective_basepri = basepri & 0xf0U;
     std::optional<std::uint16_t> selected;
     std::uint16_t selected_priority = 0x100U;
-    const auto architectural_priority = [this](const std::uint16_t exception_number) -> int {
+    const auto architectural_priority = [this](const std::uint16_t exception_number) -> std::int32_t {
         if (exception_number == static_cast<std::uint16_t>(ExceptionNumber::nmi)) return -2;
         if (exception_number == static_cast<std::uint16_t>(ExceptionNumber::hard_fault)) return -1;
-        return static_cast<int>(priority(exception_number));
+        return static_cast<std::int32_t>(priority(exception_number));
     };
     const auto consider = [&](const std::uint16_t exception_number) {
         if (!isPending(exception_number) || !isEnabled(exception_number)) return;

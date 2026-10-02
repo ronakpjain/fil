@@ -3,6 +3,7 @@
 #include "fil/common/numeric.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <utility>
 
 namespace fil::mem {

@@ -238,13 +238,13 @@ public:
     }
 
     void u32(const std::uint32_t value) {
-        for (unsigned int index = 0U; index < 4U; ++index) {
+        for (std::uint32_t index = 0U; index < 4U; ++index) {
             u8(static_cast<std::uint8_t>((value >> (index * 8U)) & 0xffU));
         }
     }
 
     void u64(const std::uint64_t value) {
-        for (unsigned int index = 0U; index < 8U; ++index) {
+        for (std::uint32_t index = 0U; index < 8U; ++index) {
             u8(static_cast<std::uint8_t>((value >> (index * 8U)) & 0xffU));
         }
     }
@@ -295,7 +295,7 @@ public:
     bool u32(std::uint32_t& value) {
         if (remaining() < 4U) return false;
         value = 0U;
-        for (unsigned int index = 0U; index < 4U; ++index) {
+        for (std::uint32_t index = 0U; index < 4U; ++index) {
             value |= static_cast<std::uint32_t>(bytes_[position_++]) << (index * 8U);
         }
         return true;
@@ -304,7 +304,7 @@ public:
     bool u64(std::uint64_t& value) {
         if (remaining() < 8U) return false;
         value = 0U;
-        for (unsigned int index = 0U; index < 8U; ++index) {
+        for (std::uint32_t index = 0U; index < 8U; ++index) {
             value |= static_cast<std::uint64_t>(bytes_[position_++]) << (index * 8U);
         }
         return true;
@@ -653,7 +653,7 @@ ExitCode runBoardCommand(
     bool enable_loop_batching = true;
     bool enable_jit = true;
     bool allow_breakpoint = false;
-    unsigned int adc_decimation = 1U;
+    std::uint32_t adc_decimation = 1U;
 
     for (std::size_t index = 2; index < args.size(); ++index) {
         const std::string_view option = args[index];
@@ -679,7 +679,7 @@ ExitCode runBoardCommand(
                     err << "fil: --adc-decimation requires a factor in [1, 1024]\n";
                     return ExitCode::usage_error;
                 }
-                adc_decimation = static_cast<unsigned int>(parsed.value());
+                adc_decimation = static_cast<std::uint32_t>(parsed.value());
             }
             else {
                 if (parsed.value() > std::numeric_limits<std::uint32_t>::max()) {
@@ -1089,7 +1089,7 @@ ExitCode runNetworkCommand(
     bool enable_deferred_prefixes = false;
     bool enable_ram_capsules = true;
     bool allow_breakpoint = false;
-    unsigned int adc_decimation = 1U;
+    std::uint32_t adc_decimation = 1U;
     std::vector<PendingCanInjection> injections;
 
     for (std::size_t index = 2; index < args.size(); ++index) {
@@ -1116,7 +1116,7 @@ ExitCode runNetworkCommand(
                     err << "fil: --adc-decimation requires a factor in [1, 1024]\n";
                     return ExitCode::usage_error;
                 }
-                adc_decimation = static_cast<unsigned int>(parsed.value());
+                adc_decimation = static_cast<std::uint32_t>(parsed.value());
             }
             else quantum = parsed.value();
         } else if (option == "--trace" || option == "--inject-can") {
@@ -1337,7 +1337,7 @@ ExitCode networkMonitorCommand(
     std::uint64_t quantum = 1'024U;
     std::optional<std::uint64_t> duration_ns;
     std::uint64_t refresh_ms = 1U;
-    unsigned int adc_decimation = 1U;
+    std::uint32_t adc_decimation = 1U;
     bool strict_mmio = false;
     bool enable_loop_batching = false;
     bool enable_jit = true;
@@ -1375,7 +1375,7 @@ ExitCode networkMonitorCommand(
                     err << "fil: --adc-decimation requires a factor in [1, 1024]\n";
                     return ExitCode::usage_error;
                 }
-                adc_decimation = static_cast<unsigned int>(parsed.value());
+                adc_decimation = static_cast<std::uint32_t>(parsed.value());
             } else if (option == "--duration-ms") {
                 if (parsed.value() > std::numeric_limits<std::uint64_t>::max() / 1'000'000ULL) {
                     err << "fil: duration overflows nanoseconds\n";
@@ -1387,9 +1387,9 @@ ExitCode networkMonitorCommand(
                     : std::optional<std::uint64_t>{parsed.value() * 1'000'000ULL};
             } else {
                 if (parsed.value() == 0U
-                    || parsed.value() > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+                    || parsed.value() > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
                     err << "fil: --refresh-ms must be between 1 and "
-                        << std::numeric_limits<int>::max() << '\n';
+                        << std::numeric_limits<std::int32_t>::max() << '\n';
                     return ExitCode::usage_error;
                 }
                 refresh_ms = parsed.value();
@@ -1671,7 +1671,7 @@ ExitCode networkMonitorCommand(
     };
     if (binary_protocol) {
         pollfd input{STDIN_FILENO, POLLIN, 0};
-        const int ready = ::poll(&input, 1, 0);
+        const std::int32_t ready = ::poll(&input, 1, 0);
         if (ready < 0 && errno != EINTR) {
             err << "fil: failed to poll serve-network stdio input\n";
             return ExitCode::runtime_error;
@@ -1737,9 +1737,9 @@ ExitCode networkMonitorCommand(
         const bool buffered = !binary_protocol && std::cin.rdbuf()->in_avail() > 0;
         // Wall pacing already waited; a blocking poll here would run the
         // simulation slower than real time by one refresh window per slice.
-        const int ready = buffered
+        const std::int32_t ready = buffered
             ? 1
-            : ::poll(&input, 1, wall_pacing ? 0 : static_cast<int>(refresh_ms));
+            : ::poll(&input, 1, wall_pacing ? 0 : static_cast<std::int32_t>(refresh_ms));
         if (ready < 0) {
             if (binary_protocol && errno == EINTR) continue;
             if (!expectations.empty()) expectation_evaluator.finish(world.value()->eventLoop().now());
@@ -1873,7 +1873,7 @@ public:
     ScopedSigpipeIgnore& operator=(const ScopedSigpipeIgnore&) = delete;
 
 private:
-    using SignalHandler = void (*)(int);
+    using SignalHandler = void (*)(std::int32_t);
     SignalHandler previous_{SIG_ERR};
 };
 

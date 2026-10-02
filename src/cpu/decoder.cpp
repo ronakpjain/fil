@@ -3,11 +3,12 @@
 #include <array>
 #include <bit>
 #include <cstddef>
+#include <cstdint>
 
 namespace fil::cpu {
 namespace {
 
-template <unsigned int Bits>
+template <std::uint32_t Bits>
 [[nodiscard]] constexpr std::int32_t signExtend(const std::uint32_t value) noexcept {
     static_assert(Bits > 0 && Bits < 32);
     constexpr std::uint32_t sign = std::uint32_t{1} << (Bits - 1U);
@@ -72,7 +73,7 @@ struct ExpandedImmediate {
     }
 
     const std::uint32_t unrotated = 0x80U | (imm12 & 0x7fU);
-    const auto rotation = static_cast<int>((imm12 >> 7U) & 0x1fU);
+    const auto rotation = static_cast<std::int32_t>((imm12 >> 7U) & 0x1fU);
     const std::uint32_t value = std::rotr(unrotated, rotation);
     return ExpandedImmediate{value, true, (value & 0x80000000U) != 0U};
 }
@@ -690,7 +691,7 @@ struct ExpandedImmediate {
         ((second >> 10U) & 0x1cU) | ((second >> 6U) & 0x3U)
     );
     const auto width = static_cast<std::uint8_t>((second & 0x1fU) + 1U);
-    if (static_cast<unsigned int>(lsb) + width > 32U) return std::nullopt;
+    if (static_cast<std::uint32_t>(lsb) + width > 32U) return std::nullopt;
     auto result = base32(first, second, InstrKind::ubfx, OperandForm::immediate);
     result.rn = static_cast<std::uint8_t>(first & 0x0fU);
     result.rd = static_cast<std::uint8_t>((second >> 8U) & 0x0fU);

@@ -4,6 +4,7 @@
 #include "fil/common/numeric.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -301,7 +302,7 @@ bool readUleb(
     std::uint32_t& result
 ) {
     result = 0;
-    unsigned int shift = 0;
+    std::uint32_t shift = 0;
     while (cursor < end && shift < 35U) {
         const std::uint8_t byte = bytes[cursor++];
         result |= static_cast<std::uint32_t>(byte & 0x7fU) << shift;

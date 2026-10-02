@@ -32,7 +32,7 @@ public:
         std::uint32_t, fil::mem::AccessSize
     ) const noexcept override { return fil::mem::MmioDomain::shared; }
 
-    unsigned int writes{0};
+    std::uint32_t writes{0};
 };
 
 [[nodiscard]] std::vector<std::uint8_t> halfwords(

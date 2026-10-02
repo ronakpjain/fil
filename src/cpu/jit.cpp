@@ -1,6 +1,7 @@
 #include "fil/cpu/jit.hpp"
 
 #include <algorithm>
+#include <cstdint>
 
 namespace fil::cpu {
 

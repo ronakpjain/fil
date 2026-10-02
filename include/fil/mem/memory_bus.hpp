@@ -477,14 +477,14 @@ private:
     ) noexcept;
 
     [[nodiscard]] MemoryResult<std::uint64_t> read(
-        std::uint32_t address, AccessSize size, const AccessContext& context, unsigned int alias_depth
+        std::uint32_t address, AccessSize size, const AccessContext& context, std::uint32_t alias_depth
     ) const;
     [[nodiscard]] MemoryResult<std::uint64_t> write(
         std::uint32_t address,
         AccessSize size,
         std::uint64_t value,
         const AccessContext& context,
-        unsigned int alias_depth
+        std::uint32_t alias_depth
     );
     [[nodiscard]] Result<void> addRegion(std::unique_ptr<Region> region);
     [[nodiscard]] const Region* find(std::uint32_t address) const;

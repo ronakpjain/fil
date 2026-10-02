@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -70,7 +71,7 @@ void AdcCommonPeripheral::storeRegister(
 void AdcCommonPeripheral::onReset() { updateMemberClocks(); }
 
 void AdcCommonPeripheral::updateMemberClocks() {
-    const unsigned int mode = (registerValue(0x08U) >> 16U) & 0x3U;
+    const std::uint32_t mode = (registerValue(0x08U) >> 16U) & 0x3U;
     // CKMODE 00 selects the asynchronous ADC kernel clock. RCC ADC12SEL /
     // ADC345SEL and PLLP/HSI source rates are not yet modeled; use SYSCLK as
     // the explicit deterministic fallback. Synchronous modes are modeled as
@@ -103,7 +104,7 @@ mem::MemoryResult<std::uint64_t> AdcPeripheral::write(
     return result;
 }
 
-void AdcPeripheral::setChannelValue(const unsigned int channel, const std::uint16_t value) {
+void AdcPeripheral::setChannelValue(const std::uint32_t channel, const std::uint16_t value) {
     synchronizeLazyConversions();
     if (channel < channel_values_.size()) {
         channel_values_[channel] = static_cast<std::uint16_t>(std::min<std::uint16_t>(value, 0x0fffU));
@@ -269,13 +270,13 @@ void AdcPeripheral::onReset() {
     skip_scan_ = false;
 }
 
-unsigned int AdcPeripheral::sequenceLength() const noexcept {
-    return std::min<unsigned int>((registerValue(sqr1) & 0x0fU) + 1U, 16U);
+std::uint32_t AdcPeripheral::sequenceLength() const noexcept {
+    return std::min<std::uint32_t>((registerValue(sqr1) & 0x0fU) + 1U, 16U);
 }
 
-unsigned int AdcPeripheral::channelForRank(const unsigned int rank) const noexcept {
+std::uint32_t AdcPeripheral::channelForRank(const std::uint32_t rank) const noexcept {
     std::uint32_t sequence_register = sqr1;
-    unsigned int shift = 6U;
+    std::uint32_t shift = 6U;
     if (rank >= 14U) {
         sequence_register = sqr4;
         shift = 6U * (rank - 14U);
@@ -288,16 +289,16 @@ unsigned int AdcPeripheral::channelForRank(const unsigned int rank) const noexce
     } else {
         shift = 6U + 6U * rank;
     }
-    const unsigned int channel = (registerValue(sequence_register) >> shift) & 0x1fU;
+    const std::uint32_t channel = (registerValue(sequence_register) >> shift) & 0x1fU;
     return channel < channel_values_.size() ? channel : 0U;
 }
 
-sim::SimTimeNs AdcPeripheral::conversionDelayForRank(const unsigned int rank) const noexcept {
+sim::SimTimeNs AdcPeripheral::conversionDelayForRank(const std::uint32_t rank) const noexcept {
     if (conversion_delay_override_ns_ != 0U) return conversion_delay_override_ns_;
-    const unsigned int channel = channelForRank(rank);
+    const std::uint32_t channel = channelForRank(rank);
     const std::uint32_t sample_register = channel <= 9U ? smpr1 : smpr2;
-    const unsigned int sample_shift = 3U * (channel <= 9U ? channel : channel - 10U);
-    const unsigned int sample_selector =
+    const std::uint32_t sample_shift = 3U * (channel <= 9U ? channel : channel - 10U);
+    const std::uint32_t sample_selector =
         (registerValue(sample_register) >> sample_shift) & 0x7U;
     static constexpr std::array<std::uint16_t, 8> sample_half_cycles{
         5U, 13U, 25U, 49U, 95U, 185U, 495U, 1281U,
@@ -305,7 +306,7 @@ sim::SimTimeNs AdcPeripheral::conversionDelayForRank(const unsigned int rank) co
     static constexpr std::array<std::uint8_t, 4> conversion_half_cycles{
         25U, 21U, 17U, 13U,
     };
-    const unsigned int resolution = (registerValue(cfgr) >> 3U) & 0x3U;
+    const std::uint32_t resolution = (registerValue(cfgr) >> 3U) & 0x3U;
     const std::uint64_t half_cycles =
         sample_half_cycles[sample_selector] + conversion_half_cycles[resolution];
     const std::uint64_t denominator = 2U * std::max<std::uint64_t>(input_clock_hz_, 1U);
@@ -384,7 +385,7 @@ void AdcPeripheral::completeConversion() {
     }
 }
 
-void AdcPeripheral::completeSkippedScans(const unsigned int skipped) {
+void AdcPeripheral::completeSkippedScans(const std::uint32_t skipped) {
     skipped_scan_event_ = false;
     skipped_scan_count_ = 0U;
     sequence_rank_ = 0U;
@@ -403,7 +404,7 @@ void AdcPeripheral::beginNextScan() {
     // event granularity collapses. The span repeats the live scan period;
     // timing rewrites during a gap land at the next kept scan at latest.
     if (decimation_ > 1U) {
-        const unsigned int upcoming = static_cast<unsigned int>(
+        const std::uint32_t upcoming = static_cast<std::uint32_t>(
             scan_index_ % decimation_);
         if (upcoming != 0U) {
             skip_scan_ = true;
@@ -419,12 +420,12 @@ void AdcPeripheral::beginNextScan() {
     armNextConversion(currentTime() + delay);
 }
 
-void AdcPeripheral::armSkippedScans(const unsigned int count) {
+void AdcPeripheral::armSkippedScans(const std::uint32_t count) {
     const sim::SimTimeNs now = currentTime();
-    const unsigned int length = sequenceLength();
+    const std::uint32_t length = sequenceLength();
     sim::SimTimeNs period = 0U;
     bool representable = length > 0U && count > 0U;
-    for (unsigned int rank = 0U; rank < length && representable; ++rank) {
+    for (std::uint32_t rank = 0U; rank < length && representable; ++rank) {
         const sim::SimTimeNs delay = conversionDelayForRank(rank);
         representable = delay <= std::numeric_limits<sim::SimTimeNs>::max() - period;
         period += delay;
@@ -449,7 +450,7 @@ void AdcPeripheral::materializeConversion(
     const sim::SimTimeNs completion_time,
     const bool observable
 ) {
-    const unsigned int channel = channelForRank(sequence_rank_);
+    const std::uint32_t channel = channelForRank(sequence_rank_);
     const std::uint16_t value = channel_overrides_[channel] || !channel_provider_
         ? channel_values_[channel]
         : channel_provider_(channel, completion_time);
@@ -480,7 +481,7 @@ void AdcPeripheral::synchronizeLazyConversions() {
     const sim::SimTimeNs now = currentTime();
     if (now < *next_conversion_ns_) return;
     if (skipped_scan_event_) {
-        const unsigned int skipped = skipped_scan_count_;
+        const std::uint32_t skipped = skipped_scan_count_;
         next_conversion_ns_.reset();
         completeSkippedScans(skipped);
         return;
@@ -517,7 +518,7 @@ void AdcPeripheral::armNextConversion(const sim::SimTimeNs completion_time) {
 void AdcPeripheral::scheduleConversionEvent() {
     if (eventLoop() == nullptr || !next_conversion_ns_) return;
     if (skipped_scan_event_) {
-        const unsigned int skipped = skipped_scan_count_;
+        const std::uint32_t skipped = skipped_scan_count_;
         static_cast<void>(conversion_event_.scheduleOwnerLocalAt(*next_conversion_ns_, [this, skipped]() {
             next_conversion_ns_.reset();
             completeSkippedScans(skipped);

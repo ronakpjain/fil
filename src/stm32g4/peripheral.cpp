@@ -4,6 +4,7 @@
 #include "fil/common/numeric.hpp"
 
 #include <array>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -53,7 +54,7 @@ void RegisterPeripheral::setInterruptLevelCallback(InterruptLevelCallback callba
     interrupt_level_callback_ = std::move(callback);
     ++interrupt_level_callback_generation_;
     if (interrupt_level_callback_) {
-        for (unsigned int line = 0; line < interrupt_levels_.size(); ++line) {
+        for (std::uint32_t line = 0; line < interrupt_levels_.size(); ++line) {
             interrupt_level_callback_(line, interrupt_levels_[line]);
         }
     }
@@ -156,7 +157,7 @@ mem::MemoryResult<std::uint64_t> RegisterPeripheral::write(
 
 void RegisterPeripheral::reset() {
     registers_ = reset_values_;
-    for (unsigned int line = 0; line < interrupt_levels_.size(); ++line) {
+    for (std::uint32_t line = 0; line < interrupt_levels_.size(); ++line) {
         setInterruptLevel(line, false);
     }
     onReset();
@@ -219,7 +220,7 @@ sim::SimTimeNs RegisterPeripheral::currentTime() const noexcept {
     return event_loop_ == nullptr ? 0 : event_loop_->now();
 }
 
-void RegisterPeripheral::setInterruptLevel(const unsigned int line, const bool asserted) {
+void RegisterPeripheral::setInterruptLevel(const std::uint32_t line, const bool asserted) {
     if (line >= interrupt_levels_.size() || interrupt_levels_[line] == asserted) return;
     interrupt_levels_[line] = asserted;
     if (interrupt_level_callback_) interrupt_level_callback_(line, asserted);

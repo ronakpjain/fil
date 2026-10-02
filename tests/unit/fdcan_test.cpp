@@ -79,12 +79,12 @@ TEST(FdcanTest, TransmitsAndReceivesThroughMessageRam) {
     writeWord(sender, fil::stm32g4::FdcanPeripheral::cccrOffset, 0U);
     writeWord(receiver, fil::stm32g4::FdcanPeripheral::cccrOffset, 0U);
 
-    std::vector<unsigned int> sender_interrupts;
-    std::vector<unsigned int> receiver_interrupts;
+    std::vector<std::uint32_t> sender_interrupts;
+    std::vector<std::uint32_t> receiver_interrupts;
     sender.setInterruptCallback(
-        [&](const unsigned int line) { sender_interrupts.push_back(line); });
+        [&](const std::uint32_t line) { sender_interrupts.push_back(line); });
     receiver.setInterruptCallback(
-        [&](const unsigned int line) { receiver_interrupts.push_back(line); });
+        [&](const std::uint32_t line) { receiver_interrupts.push_back(line); });
 
     writeWord(receiver, fil::stm32g4::FdcanPeripheral::ieOffset,
               fil::stm32g4::FdcanPeripheral::interruptRxFifo0New);
@@ -103,9 +103,9 @@ TEST(FdcanTest, TransmitsAndReceivesThroughMessageRam) {
 
     writeWord(sender, fil::stm32g4::FdcanPeripheral::txbarOffset, 1U);
 
-    EXPECT_TRUE(receiver_interrupts == std::vector<unsigned int>({0U}))
+    EXPECT_TRUE(receiver_interrupts == std::vector<std::uint32_t>({0U}))
         << "RX FIFO new-message interrupt uses line 0";
-    EXPECT_TRUE(sender_interrupts == std::vector<unsigned int>({1U}))
+    EXPECT_TRUE(sender_interrupts == std::vector<std::uint32_t>({1U}))
         << "TX-complete interrupt follows ILS to line 1";
 
     const std::uint32_t rx_status = readWord(receiver, fil::stm32g4::FdcanPeripheral::rxf0sOffset);
@@ -168,8 +168,8 @@ TEST(FdcanTest, GatesPendingEventsThroughInterruptRegisters) {
     fil::stm32g4::FdcanPeripheral controller(2U, ram);
     writeWord(controller, fil::stm32g4::FdcanPeripheral::cccrOffset, 0U);
 
-    std::vector<unsigned int> interrupts;
-    controller.setInterruptCallback([&](const unsigned int line) { interrupts.push_back(line); });
+    std::vector<std::uint32_t> interrupts;
+    controller.setInterruptCallback([&](const std::uint32_t line) { interrupts.push_back(line); });
 
     fil::devices::CanFrame frame;
     frame.id = 0x55U;
@@ -184,7 +184,7 @@ TEST(FdcanTest, GatesPendingEventsThroughInterruptRegisters) {
     writeWord(controller, fil::stm32g4::FdcanPeripheral::ilsOffset, 1U);
     EXPECT_TRUE(interrupts.empty()) << "disabled line suppresses an enabled pending event";
     writeWord(controller, fil::stm32g4::FdcanPeripheral::ileOffset, 1U << 1U);
-    EXPECT_TRUE(interrupts == std::vector<unsigned int>({1U}))
+    EXPECT_TRUE(interrupts == std::vector<std::uint32_t>({1U}))
         << "enabling ILE asserts the ILS-selected line for a pending event";
 }
 

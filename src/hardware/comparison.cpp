@@ -55,7 +55,7 @@ std::string hex32(const std::uint32_t value) {
 void writeJsonString(std::ostream& output, const std::string_view text) {
     output << '"';
     for (const char value : text) {
-        const auto byte = static_cast<unsigned char>(value);
+        const auto byte = static_cast<std::uint8_t>(value);
         switch (byte) {
         case '"': output << "\\\""; break;
         case '\\': output << "\\\\"; break;
@@ -67,7 +67,7 @@ void writeJsonString(std::ostream& output, const std::string_view text) {
         default:
             if (byte < 0x20U) {
                 output << "\\u00" << std::hex << std::setw(2) << std::setfill('0')
-                       << static_cast<unsigned int>(byte) << std::dec;
+                       << static_cast<std::uint32_t>(byte) << std::dec;
             } else {
                 output << static_cast<char>(byte);
             }
@@ -136,7 +136,7 @@ bool rangeIsInspectable(
 }
 
 struct ProcessOutput {
-    int exit_code{0};
+    std::int32_t exit_code{0};
     bool timed_out{false};
     std::string text;
 };
@@ -150,7 +150,7 @@ Result<ProcessOutput> runProcess(
         return error(ErrorCategory::invalid_argument, "process argument list is empty");
     }
 
-    int output_pipe[2]{};
+    std::int32_t output_pipe[2]{};
     if (::pipe(output_pipe) != 0) {
         return error(ErrorCategory::io, "unable to create process output pipe: "
             + std::string(std::strerror(errno)));
@@ -175,7 +175,7 @@ Result<ProcessOutput> runProcess(
     argv.push_back(nullptr);
 
     pid_t pid = 0;
-    const int spawn_error = posix_spawnp(
+    const std::int32_t spawn_error = posix_spawnp(
         &pid, argv.front(), &actions, nullptr, argv.data(), environ
     );
     static_cast<void>(posix_spawn_file_actions_destroy(&actions));
@@ -186,11 +186,11 @@ Result<ProcessOutput> runProcess(
             + std::string(std::strerror(spawn_error)));
     }
 
-    const int flags = ::fcntl(output_pipe[0], F_GETFL, 0);
+    const std::int32_t flags = ::fcntl(output_pipe[0], F_GETFL, 0);
     if (flags >= 0) static_cast<void>(::fcntl(output_pipe[0], F_SETFL, flags | O_NONBLOCK));
 
     ProcessOutput output;
-    int status = 0;
+    std::int32_t status = 0;
     bool child_done = false;
     bool pipe_done = false;
     const auto started = std::chrono::steady_clock::now();
@@ -235,9 +235,9 @@ Result<ProcessOutput> runProcess(
 #endif
 }
 
-long long processId() noexcept {
+std::int64_t processId() noexcept {
 #if defined(__APPLE__) || defined(__unix__)
-    return static_cast<long long>(::getpid());
+    return static_cast<std::int64_t>(::getpid());
 #else
     return 0LL;
 #endif
@@ -266,7 +266,7 @@ private:
 
 bool safeOpenOcdToken(const std::string_view text, const bool allow_slash) {
     return !text.empty() && std::all_of(text.begin(), text.end(), [allow_slash](const char value) {
-        const auto byte = static_cast<unsigned char>(value);
+        const auto byte = static_cast<std::uint8_t>(value);
         return std::isalnum(byte) != 0 || value == '_' || value == '-' || value == '.'
             || (allow_slash && value == '/');
     });
@@ -327,7 +327,7 @@ Result<std::vector<std::uint8_t>> readBinaryFile(
     std::vector<std::uint8_t> bytes;
     bytes.reserve(raw.size());
     std::transform(raw.begin(), raw.end(), std::back_inserter(bytes), [](const char byte) {
-        return static_cast<std::uint8_t>(static_cast<unsigned char>(byte));
+        return static_cast<std::uint8_t>(static_cast<std::uint8_t>(byte));
     });
     if (bytes.size() != expected_size) {
         return error(ErrorCategory::io, "OpenOCD memory dump has unexpected size: "

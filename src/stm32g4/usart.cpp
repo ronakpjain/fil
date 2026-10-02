@@ -1,5 +1,6 @@
 #include "fil/stm32g4/peripheral.hpp"
 
+#include <cstdint>
 #include <utility>
 
 namespace fil::stm32g4 {

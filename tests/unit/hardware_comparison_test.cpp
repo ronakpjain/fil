@@ -3,6 +3,7 @@
 #include "fil/sim/board.hpp"
 #include "../fixture_support.hpp"
 
+#include <cstdint>
 #include <gtest/gtest.h>
 
 #include <chrono>

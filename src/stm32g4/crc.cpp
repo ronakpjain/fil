@@ -64,11 +64,11 @@ void CrcPeripheral::onReset() {
 void CrcPeripheral::update(const std::uint32_t data_word) {
     // CRC-32/MPEG-2 word-wise update: process the four bytes most-significant
     // byte first with no bit reflection and no final XOR.
-    for (unsigned int byte_index = 0U; byte_index < 4U; ++byte_index) {
+    for (std::uint32_t byte_index = 0U; byte_index < 4U; ++byte_index) {
         const std::uint32_t data_byte =
             (data_word >> (24U - byte_index * 8U)) & 0xffU;
         crc_ ^= data_byte << 24U;
-        for (unsigned int bit = 0U; bit < 8U; ++bit) {
+        for (std::uint32_t bit = 0U; bit < 8U; ++bit) {
             crc_ = (crc_ & 0x80000000U) != 0U
                 ? (crc_ << 1U) ^ poly_
                 : (crc_ << 1U);

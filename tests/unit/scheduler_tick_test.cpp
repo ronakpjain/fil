@@ -1,5 +1,6 @@
 #include "fil/sim/board.hpp"
 
+#include <cstdint>
 #include <gtest/gtest.h>
 
 #include <array>

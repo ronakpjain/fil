@@ -3,6 +3,7 @@
 
 #include "../fixture_support.hpp"
 
+#include <cstdint>
 #include <gtest/gtest.h>
 
 #include <filesystem>
@@ -218,7 +219,7 @@ TEST(Stm32G4Test, CertifiesOnlyTrustedAdcEventsAndRechecksPendingHooks) {
     EXPECT_EQ(dma_value.value(), 321U) << "certified ADC DMA writes into RAM without a global callback";
 
     observations.clear();
-    adc->setChannelProvider([](unsigned int, fil::sim::SimTimeNs) { return std::uint16_t{123U}; });
+    adc->setChannelProvider([](std::uint32_t, fil::sim::SimTimeNs) { return std::uint16_t{123U}; });
     ASSERT_EQ(events.runOwnedEvents(2U, 20U).events_executed, 1U);
     ASSERT_EQ(observations.size(), 1U);
     EXPECT_EQ(observations.back(), fil::sim::EventObservation::global)
@@ -226,7 +227,7 @@ TEST(Stm32G4Test, CertifiesOnlyTrustedAdcEventsAndRechecksPendingHooks) {
 }
 
 TEST(Stm32G4Test, PublicAdcHookChangesForceGlobalDispatch) {
-    for (const unsigned int mutation : {0U, 1U, 2U}) {
+    for (const std::uint32_t mutation : {0U, 1U, 2U}) {
         fil::sim::EventLoop events;
         fil::sim::TraceRecorder trace;
         trace.setEnabled(false);
@@ -262,7 +263,7 @@ TEST(Stm32G4Test, PublicAdcHookChangesForceGlobalDispatch) {
         } else if (mutation == 1U) {
             adc->setInterruptCallback([]() {});
         } else {
-            adc->setInterruptLevelCallback([](unsigned int, bool) {});
+            adc->setInterruptLevelCallback([](std::uint32_t, bool) {});
         }
         std::vector<fil::sim::EventObservation> observations;
         static_cast<void>(events.exchangeObservationBarrier(
@@ -304,7 +305,7 @@ TEST(Stm32G4Test, ObservationBarrierRechecksAfterProviderReplacement) {
             fil::sim::EventObservation observation) {
             observations.push_back(observation);
             if (observation == fil::sim::EventObservation::owner_local) {
-                adc->setChannelProvider([](unsigned int, fil::sim::SimTimeNs) {
+                adc->setChannelProvider([](std::uint32_t, fil::sim::SimTimeNs) {
                     return std::uint16_t{123U};
                 });
             }
@@ -631,7 +632,7 @@ TEST(Stm32G4Test, RoutesIntegratedPeripherals) {
         << "routes scripted USART RX byte";
     auto uart_write = mcu.value()->router().write(0x00013828U, fil::mem::AccessSize::word, 0x5aU, {});
     std::ifstream uart_input(uart_log, std::ios::binary);
-    const int logged_byte = uart_input.get();
+    const std::int32_t logged_byte = uart_input.get();
     EXPECT_TRUE(uart_write && logged_byte == 0x5a) << "writes configured USART TX byte log";
     auto fdcan_read = mcu.value()->router().read(
         fil::stm32g4::FdcanPeripheral::baseAddresses[0] - 0x40000000U +
