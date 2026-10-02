@@ -39,6 +39,23 @@ TEST(PeripheralTest, StoresRegistersAndUnknownMmio) {
         << "strict unknown MMIO returns an absolute device fault";
 }
 
+TEST(PeripheralTest, ModelsRangeOneBoostControl) {
+    fil::stm32g4::PwrPeripheral pwr;
+    const auto normal = pwr.read(0x80U, fil::mem::AccessSize::word, read_context);
+    ASSERT_TRUE(normal);
+    EXPECT_EQ(normal.value(), 1U << 8U);
+    ASSERT_TRUE(pwr.write(0x80U, fil::mem::AccessSize::word,
+                          normal.value() & ~(1U << 8U), write_context));
+    const auto boost = pwr.read(0x80U, fil::mem::AccessSize::word, read_context);
+    ASSERT_TRUE(boost);
+    EXPECT_EQ(boost.value(), 0U);
+    pwr.reset();
+    const auto reset = pwr.read(0x80U, fil::mem::AccessSize::word, read_context);
+    ASSERT_TRUE(reset);
+    EXPECT_EQ(reset.value(), 1U << 8U);
+    EXPECT_FALSE(pwr.read(0x84U, fil::mem::AccessSize::word, read_context));
+}
+
 TEST(PeripheralTest, ModelsClockFlashAndGpioStartup) {
     fil::stm32g4::RccPeripheral rcc;
     EXPECT_TRUE(rcc.write(0, fil::mem::AccessSize::word, (1U << 16U) | (1U << 24U), write_context)

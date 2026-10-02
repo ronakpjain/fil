@@ -5,10 +5,13 @@ namespace fil::stm32g4 {
 PwrPeripheral::PwrPeripheral(
     sim::EventLoop* const event_loop,
     sim::TraceRecorder* const trace
-) : RegisterPeripheral("PWR", 0x40, event_loop, trace) {
+) : RegisterPeripheral("PWR", 0x84, event_loop, trace) {
     // STM32G4 resets in voltage-scaling range 1, which is required for flash
     // programming at the firmware's configured clock rate.
     setResetValue(0x00U, 1U << 9U);
+    // CR5 at offset 0x80 resets to Range 1 normal mode. Firmware clears
+    // R1MODE to enable boost before selecting a clock above 150 MHz.
+    setResetValue(0x80U, 1U << 8U);
     reset();
 }
 
