@@ -58,6 +58,29 @@ struct Board::IdempotentPeriodCertificate {
     std::uint64_t flash_acr_generation{0U};
 };
 
+struct Board::RamNeutralTransitionCertificate {
+    static constexpr std::size_t max_instructions = ReversibleRamPrefix::max_instructions;
+    std::uint8_t count{0U};
+    ReversibleRamPrefix::IntegerSnapshot entry{};
+    bool entry_have_fetch{false};
+    std::uint32_t entry_fetch_end{0U};
+    std::array<ReversibleRamPrefix::IntegerSnapshot, max_instructions + 1U> states{};
+    std::array<std::uint32_t, max_instructions> pcs{};
+    std::array<std::uint8_t, max_instructions> sizes{};
+    std::array<std::uint32_t, max_instructions> raw{};
+    std::array<std::uint16_t, max_instructions> instruction_cycles{};
+    std::array<std::uint64_t, max_instructions + 1U> cumulative_cycles{};
+    std::array<mem::MemoryBus::ReadFootprint, max_instructions + 1U> footprints{};
+    std::array<bool, max_instructions + 1U> have_fetch{};
+    std::array<std::uint32_t, max_instructions + 1U> fetch_end{};
+    mem::MemoryBus::ReadFootprint full_footprint{};
+    mem::MemoryBus::SideEffectCheckpoint checkpoint{};
+    std::uint64_t restoration_generation{0U};
+    std::uint64_t execution_generation{0U};
+    std::uint64_t clock_hz{0U};
+    std::uint64_t flash_generation{0U};
+};
+
 struct Board::TransactionCheckpoint {
     EventOwner owner{shared_event_owner};
     cpu::CpuState cpu_state;
@@ -161,6 +184,11 @@ Result<void> Board::reset() {
     loop_observations_ = {};
     loop_observation_generation_ = 1U;
     idempotent_period_cache_.reset();
+    ram_neutral_transition_cache_ = {};
+    transition_validation_checkpoints_ = {};
+    transition_restoration_generations_.fill(memory_.restorationGeneration());
+    transition_hotness_.fill(0U);
+    transition_probes_ = {};
     period_validation_checkpoint_ = {};
     period_validation_restoration_generation_ = memory_.restorationGeneration();
     read_footprint_boundary_.reset();
@@ -646,7 +674,19 @@ std::optional<Board::ReversibleRamPrefix> Board::prepareReversibleRamPrefix(
 bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
     const std::size_t max_instructions, const std::optional<SimTimeNs> deadline,
     const bool allow_single_prefix, const bool owner_local_barrier_installed) {
-    const std::size_t limit = std::min(max_instructions, ReversibleRamPrefix::max_instructions);
+    prefix.count = 0U;
+    prefix.memoized_count = 0U;
+    prefix.compressed_period = false;
+    prefix.period_length = 0U;
+    prefix.period_cycles = 0U;
+    prefix.first_fetch_delta = 0;
+    prefix.folded_instructions = 0U;
+    prefix.period_certificate.reset();
+    prefix.transition_certificate.reset();
+    prefix.period_phase = 0U;
+    prefix.evaluated.count = 0U;
+    prefix.evaluated.result = cpu::FastStepResult{};
+    std::size_t limit = std::min(max_instructions, DeferredPurePrefix::max_memoized_instructions);
     if (limit < 2U || !memory_.writeJournalTracking() || blockBoundaryPending()) return false;
     const auto frequency = peripherals_->rcc().systemClockHz();
     if (frequency == 0U || time_fraction_ >= frequency) return false;
@@ -674,16 +714,9 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
     }
     if (cycle_credit == 0U) return false;
 
-    prefix.count = 0U;
-    prefix.folded_instructions = 0U;
-    prefix.period_certificate.reset();
-    prefix.period_phase = 0U;
-    prefix.memoized_count = 0U;
     // The fixed-capacity metadata arrays are live only below their count.
     // Avoid value-initializing all 64 entries on every admission; callers must
     // likewise consult only the admitted prefix.
-    prefix.evaluated.count = 0U;
-    prefix.evaluated.result = cpu::FastStepResult{};
     prefix.start_time_ns = now;
     prefix.entry_pc = cpu_->state().r[15];
     prefix.entry_state.capture(cpu_->state());
@@ -695,6 +728,29 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
     prefix.entry_read_footprint = memory_.readFootprint();
     prefix.entry_have_fetch = have_last_fetch_;
     prefix.entry_fetch_end = last_fetch_end_;
+    const std::size_t transition_bucket = ((prefix.entry_pc >> 1U)
+        ^ (prefix.entry_pc >> 5U)) & (transition_bucket_count - 1U);
+    auto& probe = transition_probes_[transition_bucket];
+    const auto restoration_generation = memory_.restorationGeneration();
+    const bool same_probe = probe.valid && probe.entry.matches(cpu_->state())
+        && probe.have_fetch == prefix.entry_have_fetch
+        && probe.fetch_end == prefix.entry_fetch_end
+        && probe.execution_generation == prefix.execution_generation
+        && probe.restoration_generation == restoration_generation
+        && probe.clock_hz == frequency && probe.flash_generation == prefix.flash_generation;
+    if (same_probe) {
+        if (probe.observations < transition_hotness_threshold) ++probe.observations;
+    } else {
+        probe.entry = prefix.entry_state;
+        probe.valid = true;
+        probe.have_fetch = prefix.entry_have_fetch;
+        probe.fetch_end = prefix.entry_fetch_end;
+        probe.observations = 1U;
+        probe.execution_generation = prefix.execution_generation;
+        probe.restoration_generation = restoration_generation;
+        probe.clock_hz = frequency;
+        probe.flash_generation = prefix.flash_generation;
+    }
     const auto restore_entry = [&] {
         const auto current = memory_.sideEffectCheckpoint();
         if (current.mutation_sequence != prefix.memory_checkpoint.mutation_sequence
@@ -776,9 +832,7 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
             valid = false;
             for (std::size_t i = 0U; i < cert.count; ++i) {
                 if (prefix.entry_pc == cert.pcs[i]
-                    && cpu::bitwiseEqual(cpu_->state(), cert.states[i])
-                    && have_last_fetch_ == cert.have_fetch[i]
-                    && last_fetch_end_ == cert.fetch_end[i]) {
+                    && cpu::bitwiseEqual(cpu_->state(), cert.states[i])) {
                     phase = i;
                     valid = true;
                     break;
@@ -788,42 +842,111 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
         if (!valid) {
             idempotent_period_cache_.reset();
         } else {
-            std::uint64_t cycles = 0U;
-            bool admitted = true;
-            for (std::size_t n = 0U; n < limit; ++n) {
-                const std::size_t index = (phase + n) % cert.count;
-                const auto charged = cert.instruction_cycles[index];
-                if (charged == 0U || charged > cycle_credit - std::min(cycle_credit, cycles)) {
-                    admitted = false;
-                    break;
+            const bool compressed = frequency <= nanoseconds_per_second;
+            std::size_t admission_limit = std::min<std::size_t>(limit,
+                compressed ? DeferredPurePrefix::max_memoized_instructions
+                           : DeferredPurePrefix::max_instructions);
+            const bool current_sequential = have_last_fetch_
+                && last_fetch_end_ == prefix.entry_pc;
+            const std::size_t first_index = phase;
+            std::int64_t first_delta = 0;
+            if (compressed) {
+                const bool certified_sequential = cert.have_fetch[first_index]
+                    && cert.fetch_end[first_index] == cert.pcs[first_index];
+                const auto certified_stall = flash.fetchStallCycles(
+                    cert.pcs[first_index], certified_sequential);
+                const auto current_stall = flash.fetchStallCycles(
+                    cert.pcs[first_index], current_sequential);
+                first_delta = static_cast<std::int64_t>(current_stall)
+                    - static_cast<std::int64_t>(certified_stall);
+                prefix.compressed_period = true;
+                prefix.period_length = cert.count;
+                prefix.first_fetch_delta = first_delta;
+                prefix.period_cycles = cert.cumulative_cycles[cert.count];
+                std::uint64_t rotated_cycles = 0U;
+                for (std::size_t n = 0U; n < cert.count; ++n) {
+                    const auto index = (phase + n) % cert.count;
+                    const auto charged = static_cast<std::uint64_t>(cert.instruction_cycles[index]);
+                    if (charged == 0U) {
+                        prefix.compressed_period = false;
+                        break;
+                    }
+                    rotated_cycles += charged;
+                    prefix.rotated_cumulative_cycles[n] = rotated_cycles;
                 }
-                cycles += charged;
-                if (systick && cycles >= *systick) { admitted = false; break; }
-                const SimTimeNs elapsed = elapsed_for_span(cycles);
-                if (horizon && elapsed >= *horizon - now) { admitted = false; break; }
-                const SimTimeNs completion = saturatingAdd(now, elapsed);
-                if (completion <= now || (prefix.count != 0U
-                    && completion <= prefix.completion_times_ns[prefix.count - 1U])) {
-                    admitted = false;
-                    break;
+                if (prefix.compressed_period) {
+                    prefix.period_cycles = rotated_cycles;
+                    // Find the longest valid leading prefix using monotone cycle credit.
+                    std::size_t low = 0U, high = admission_limit;
+                    while (low < high) {
+                        const auto mid = low + (high - low + 1U) / 2U;
+                        const auto full = mid / cert.count;
+                        const auto rem = mid % cert.count;
+                        auto total = full * rotated_cycles
+                            + (rem == 0U ? 0U : prefix.rotated_cumulative_cycles[rem - 1U]);
+                        if (first_delta < 0) total -= static_cast<std::uint64_t>(-first_delta);
+                        else total += static_cast<std::uint64_t>(first_delta);
+                        if (total <= cycle_credit && total < 65536U) low = mid;
+                        else high = mid - 1U;
+                    }
+                    prefix.count = low;
+                    prefix.memoized_count = low;
+                    if (low != 0U) {
+                        const auto elapsed = (prefix.cumulativeCycles(low - 1U)
+                            * nanoseconds_per_second + prefix.time_fraction) / frequency;
+                        if (elapsed >= std::numeric_limits<SimTimeNs>::max() - now) {
+                            // Saturated timestamps can no longer certify strict
+                            // completion order. Re-admit through the bounded array path.
+                            prefix.compressed_period = false;
+                            prefix.period_length = 0U;
+                            prefix.period_cycles = 0U;
+                            prefix.first_fetch_delta = 0;
+                            prefix.count = 0U;
+                            prefix.memoized_count = 0U;
+                        }
+                    }
                 }
-                prefix.evaluated.pcs[n] = cert.pcs[index];
-                prefix.evaluated.sizes[n] = cert.sizes[index];
-                prefix.evaluated.instruction_cycles[n] = charged;
-                prefix.cumulative_cycles[n] = cycles;
-                prefix.completion_times_ns[n] = completion;
-                prefix.count = static_cast<std::uint8_t>(n + 1U);
+            }
+            if (!prefix.compressed_period) {
+                admission_limit = std::min(admission_limit, DeferredPurePrefix::max_instructions);
+                std::uint64_t cycles = 0U;
+                for (std::size_t n = 0U; n < admission_limit; ++n) {
+                    const auto index = (phase + n) % cert.count;
+                    std::uint64_t charged = cert.instruction_cycles[index];
+                    if (n == 0U) {
+                        const bool certified_sequential = cert.have_fetch[index]
+                            && cert.fetch_end[index] == cert.pcs[index];
+                        if (current_sequential != certified_sequential) {
+                            charged = charged - flash.fetchStallCycles(cert.pcs[index], certified_sequential)
+                                + flash.fetchStallCycles(cert.pcs[index], current_sequential);
+                        }
+                    }
+                    if (charged == 0U || charged > cycle_credit - std::min(cycle_credit, cycles)
+                        || cycles + charged >= 65536U) break;
+                    cycles += charged;
+                    if (systick && cycles >= *systick) break;
+                    const auto elapsed = elapsed_for_span(cycles);
+                    if (horizon && elapsed >= *horizon - now) break;
+                    const auto completion = saturatingAdd(now, elapsed);
+                    if (completion <= now || (prefix.count != 0U
+                        && completion <= prefix.completion_times_ns[prefix.count - 1U])) break;
+                    prefix.cumulative_cycles[prefix.count] = cycles;
+                    prefix.completion_times_ns[prefix.count] = completion;
+                    ++prefix.count;
+                }
+            } else {
+                // The cycle-credit calculation already excludes SysTick and the
+                // horizon. Positive cycles at <=1GHz guarantee strict progress.
+                prefix.count = std::min(prefix.count, admission_limit);
+            }
+            if (prefix.count < (allow_single_prefix ? 1U : 2U)) {
+                prefix.count = 0U;
+                prefix.memoized_count = 0U;
+                prefix.compressed_period = false;
+            } else {
                 prefix.evaluated.result = cpu::FastStepResult{};
                 prefix.evaluated.result.reason = cpu::StopReason::step_complete;
-                prefix.evaluated.result.instructions = prefix.count;
-                prefix.evaluated.result.instruction_address = cert.pcs[index];
-                prefix.evaluated.result.raw = cert.raw[index];
-                prefix.evaluated.result.instruction_size = cert.sizes[index];
-                prefix.evaluated.result.cycles = static_cast<std::uint16_t>(cycles);
-            }
-            if (!admitted || prefix.count < (allow_single_prefix ? 1U : 2U)) {
-                prefix.count = 0U;
-            } else {
+                prefix.evaluated.result.instructions = static_cast<std::uint32_t>(prefix.count);
                 const std::size_t end_phase = (phase + prefix.count) % cert.count;
                 cpu_->state() = cert.states[end_phase];
                 have_last_fetch_ = cert.have_fetch[end_phase];
@@ -831,7 +954,8 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
                 prefix.period_certificate = idempotent_period_cache_;
                 prefix.period_phase = static_cast<std::uint8_t>(phase);
                 prefix.memoized_count = prefix.count;
-                prefix.evaluated.count = prefix.count;
+                prefix.evaluated.count = static_cast<std::uint8_t>(std::min<std::size_t>(
+                    prefix.count, ReversibleRamPrefix::max_instructions));
                 prefix.memory_checkpoint = memory_.sideEffectCheckpoint();
                 prefix.evaluated_checkpoint = prefix.memory_checkpoint;
                 period_validation_checkpoint_ = prefix.memory_checkpoint;
@@ -840,6 +964,67 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
             }
         }
     }
+    // Periods remain preferred. Search only four ways in this PC hash bucket;
+    // an entry/fetch mismatch is a miss, not a reason to evict another phase.
+    const std::size_t first_slot = transition_bucket * transition_ways;
+    for (std::size_t way = 0U; way < transition_ways; ++way) {
+        const std::size_t slot = first_slot + way;
+        const auto cert = ram_neutral_transition_cache_[slot];
+        if (!cert || cert->count == 0U
+            || !cert->entry.matches(cpu_->state())
+            || cert->entry_have_fetch != prefix.entry_have_fetch
+            || cert->entry_fetch_end != prefix.entry_fetch_end) continue;
+        const bool valid = memory_.restorationGeneration() == cert->restoration_generation
+            && memory_.restorationGeneration() == transition_restoration_generations_[slot]
+            && memory_.ramInputsCompatibleSince(transition_validation_checkpoints_[slot], cert->full_footprint)
+            && memory_.executionGeneration() == cert->execution_generation
+            && frequency == cert->clock_hz
+            && prefix.flash_generation == cert->flash_generation;
+        if (!valid) {
+            ram_neutral_transition_cache_[slot].reset();
+            transition_hotness_[slot] = 0U;
+            continue;
+        }
+        std::uint64_t cycles = 0U;
+        for (std::size_t i = 0U; i < cert->count && i < limit; ++i) {
+            const auto charged = cert->instruction_cycles[i];
+            if (charged == 0U || charged > cycle_credit - std::min(cycle_credit, cycles)
+                || cycles + charged >= 65536U) break;
+            cycles += charged;
+            if (systick && cycles >= *systick) break;
+            const auto elapsed = elapsed_for_span(cycles);
+            if (horizon && elapsed >= *horizon - now) break;
+            const auto completion = saturatingAdd(now, elapsed);
+            if (completion <= now) break;
+            prefix.cumulative_cycles[i] = cycles;
+            prefix.completion_times_ns[i] = completion;
+            ++prefix.count;
+        }
+        if (prefix.count < (allow_single_prefix ? 1U : 2U)) {
+            prefix.count = 0U;
+            continue;
+        }
+        prefix.memoized_count = prefix.count;
+        prefix.transition_certificate = cert;
+        prefix.transition_cache_slot = slot;
+        prefix.transition_validation_checkpoint = memory_.sideEffectCheckpoint();
+        prefix.transition_restoration_generation = memory_.restorationGeneration();
+        prefix.evaluated.result.reason = cpu::StopReason::step_complete;
+        prefix.evaluated.result.instructions = static_cast<std::uint32_t>(prefix.count);
+        prefix.evaluated.count = static_cast<std::uint8_t>(prefix.count);
+        cert->states[prefix.count].restore(cpu_->state());
+        have_last_fetch_ = cert->have_fetch[prefix.count];
+        last_fetch_end_ = cert->fetch_end[prefix.count];
+        prefix.memory_checkpoint = memory_.sideEffectCheckpoint();
+        prefix.evaluated_checkpoint = prefix.memory_checkpoint;
+        transition_validation_checkpoints_[slot] = prefix.transition_validation_checkpoint;
+        transition_restoration_generations_[slot] = prefix.transition_restoration_generation;
+        ++transition_hotness_[slot];
+        return true;
+    }
+    // The ordinary reversible-evaluation metadata remains fixed-capacity;
+    // only a validated period certificate can admit the larger compressed span.
+    limit = std::min(limit, ReversibleRamPrefix::max_instructions);
     ReversibleRamPrefix::ReversibleExecution speculative;
     speculative.count = 0U;
     speculative.result = cpu::FastStepResult{};
@@ -921,8 +1106,8 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
                     }
                     budget.remaining_cycles -= period_cycles;
                 }
-                speculative.count = prefix.count;
-                speculative.result.instructions = prefix.count;
+                speculative.count = static_cast<std::uint8_t>(prefix.count);
+                speculative.result.instructions = static_cast<std::uint32_t>(prefix.count);
                 // The canonical state is already the exact full-period endpoint.
                 // Do not append a speculative partial period to this certificate.
                 break;
@@ -981,6 +1166,94 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
         }
     }
     prefix.evaluated_checkpoint = memory_.sideEffectCheckpoint();
+
+    // Re-run a short RAM-neutral span to retain per-instruction CPU endpoints
+    // and read footprints. Crucially, a neutral replay needs no journal restore:
+    // restoreSideEffects advances restorationGeneration even for an empty undo.
+    if (probe.observations >= transition_hotness_threshold
+        && prefix.count <= RamNeutralTransitionCertificate::max_instructions
+        && prefix.count >= 2U
+        && prefix.evaluated_checkpoint.mutation_sequence == prefix.memory_checkpoint.mutation_sequence
+        && memory_.readFootprintTracking()) {
+        auto cert = std::make_shared<RamNeutralTransitionCertificate>();
+        cert->count = static_cast<std::uint8_t>(prefix.count);
+        cert->entry = prefix.entry_state;
+        cert->entry_have_fetch = prefix.entry_have_fetch;
+        cert->entry_fetch_end = prefix.entry_fetch_end;
+        cert->checkpoint = prefix.memory_checkpoint;
+        cert->execution_generation = prefix.execution_generation;
+        cert->clock_hz = prefix.clock_hz;
+        cert->flash_generation = prefix.flash_generation;
+        cert->states[0] = prefix.entry_state;
+        cert->have_fetch[0] = prefix.entry_have_fetch;
+        cert->fetch_end[0] = prefix.entry_fetch_end;
+        const auto endpoint = cpu_->state();
+        const auto endpoint_footprint = memory_.readFootprint();
+        const bool endpoint_have_fetch = have_last_fetch_;
+        const auto endpoint_fetch_end = last_fetch_end_;
+        memory_.restoreReadFootprint(mem::MemoryBus::ReadFootprint{});
+        prefix.entry_state.restore(cpu_->state());
+        have_last_fetch_ = prefix.entry_have_fetch;
+        last_fetch_end_ = prefix.entry_fetch_end;
+        bool valid = true;
+        {
+            ReversibleMemoryGuard guard(memory_);
+            for (std::size_t i = 0U; i < prefix.count; ++i) {
+                const auto step = cpu_->stepFast();
+                if (step.reason != cpu::StopReason::step_complete || step.instructions != 1U
+                    || memory_.sideEffectCheckpoint().mutation_sequence
+                        != prefix.memory_checkpoint.mutation_sequence) {
+                    valid = false;
+                    break;
+                }
+                auto part = memory_.takeReadFootprint();
+                if (!part.complete) { valid = false; break; }
+                cert->pcs[i] = step.instruction_address;
+                cert->raw[i] = step.raw;
+                cert->sizes[i] = step.instruction_size;
+                cert->instruction_cycles[i] = static_cast<std::uint16_t>(
+                    prefix.cumulative_cycles[i] - (i == 0U ? 0U : prefix.cumulative_cycles[i - 1U]));
+                cert->cumulative_cycles[i + 1U] = prefix.cumulative_cycles[i];
+                cert->states[i + 1U].capture(cpu_->state());
+                cert->footprints[i + 1U] = part;
+                cert->have_fetch[i + 1U] = true;
+                cert->fetch_end[i + 1U] = step.instruction_address + step.instruction_size;
+                for (std::size_t word = 0U; word < part.words.size(); ++word)
+                    cert->full_footprint.words[word] |= part.words[word];
+                cert->full_footprint.complete = cert->full_footprint.complete && part.complete;
+            }
+        }
+        const auto after_replay = memory_.sideEffectCheckpoint();
+        if (after_replay.mutation_sequence != prefix.memory_checkpoint.mutation_sequence) {
+            valid = false;
+            static_cast<void>(memory_.restoreSideEffects(prefix.memory_checkpoint));
+        }
+        valid = valid && cpu::bitwiseEqual(cpu_->state(), endpoint)
+            && memory_.mmioUnchangedSince(prefix.memory_checkpoint)
+            && memory_.executionGeneration() == prefix.execution_generation
+            && peripherals_->rcc().systemClockHz() == prefix.clock_hz
+            && peripherals_->flash().acrGeneration() == prefix.flash_generation;
+        cpu_->state() = endpoint;
+        have_last_fetch_ = endpoint_have_fetch;
+        last_fetch_end_ = endpoint_fetch_end;
+        memory_.restoreReadFootprint(endpoint_footprint);
+        if (valid && cert->full_footprint.complete) {
+            cert->restoration_generation = memory_.restorationGeneration();
+            std::size_t slot = first_slot;
+            for (std::size_t way = 0U; way < transition_ways; ++way) {
+                const auto candidate = first_slot + way;
+                if (!ram_neutral_transition_cache_[candidate]) {
+                    slot = candidate;
+                    break;
+                }
+                if (transition_hotness_[candidate] < transition_hotness_[slot]) slot = candidate;
+            }
+            ram_neutral_transition_cache_[slot] = std::move(cert);
+            transition_validation_checkpoints_[slot] = prefix.memory_checkpoint;
+            transition_restoration_generations_[slot] = memory_.restorationGeneration();
+            transition_hotness_[slot] = probe.observations;
+        }
+    }
     return true;
 }
 
@@ -995,6 +1268,42 @@ Board::ConcurrentStepResult Board::materializeReversibleRamPrefix(
         || memory_.executionGeneration() != prefix.execution_generation
         || time_fraction_ != prefix.time_fraction) {
         throw std::logic_error("stale reversible RAM prefix");
+    }
+    if (prefix.transition_certificate && prefix.memoized_count != 0U) {
+        const auto& cert = *prefix.transition_certificate;
+        if (count > prefix.memoized_count || count > cert.count
+            || prefix.transition_cache_slot >= transition_slot_count
+            || ram_neutral_transition_cache_[prefix.transition_cache_slot] != prefix.transition_certificate
+            || memory_.restorationGeneration() != cert.restoration_generation
+            || memory_.restorationGeneration() != prefix.transition_restoration_generation
+            || memory_.restorationGeneration() != transition_restoration_generations_[prefix.transition_cache_slot]
+            || !cert.states[prefix.memoized_count].matches(cpu_->state())) {
+            if (prefix.transition_cache_slot < transition_slot_count
+                && ram_neutral_transition_cache_[prefix.transition_cache_slot] == prefix.transition_certificate) {
+                ram_neutral_transition_cache_[prefix.transition_cache_slot].reset();
+                transition_hotness_[prefix.transition_cache_slot] = 0U;
+            }
+            throw std::logic_error("stale RAM-neutral transition certificate");
+        }
+        cert.states[count].restore(cpu_->state());
+        have_last_fetch_ = cert.have_fetch[count];
+        last_fetch_end_ = cert.fetch_end[count];
+        auto footprint = prefix.entry_read_footprint;
+        for (std::size_t n = 0U; n < count; ++n) {
+            const auto& part = cert.footprints[n + 1U];
+            for (std::size_t word = 0U; word < footprint.words.size(); ++word)
+                footprint.words[word] |= part.words[word];
+            footprint.complete = footprint.complete && part.complete;
+        }
+        memory_.restoreReadFootprint(footprint);
+        auto result = prefix.evaluated.result;
+        result.instructions = static_cast<std::uint32_t>(count);
+        result.instruction_address = cert.pcs[count - 1U];
+        result.raw = cert.raw[count - 1U];
+        result.instruction_size = cert.sizes[count - 1U];
+        const auto cycles = prefix.cumulative_cycles[count - 1U];
+        result.cycles = static_cast<std::uint16_t>(cycles);
+        return ConcurrentStepResult{result, accountCycles(cycles)};
     }
     if (prefix.period_certificate && prefix.memoized_count != 0U) {
         const auto& cert = *prefix.period_certificate;
@@ -1013,7 +1322,7 @@ Board::ConcurrentStepResult Board::materializeReversibleRamPrefix(
             idempotent_period_cache_.reset();
             throw std::logic_error("stale idempotent period certificate");
         }
-        std::uint64_t cycles = prefix.cumulative_cycles[count - 1U];
+        const std::uint64_t cycles = prefix.cumulativeCycles(count - 1U);
         const std::size_t end_phase = (prefix.period_phase + count) % cert.count;
         cpu_->state() = cert.states[end_phase];
         have_last_fetch_ = cert.have_fetch[end_phase];
@@ -1036,10 +1345,11 @@ Board::ConcurrentStepResult Board::materializeReversibleRamPrefix(
         memory_.restoreReadFootprint(footprint);
         auto result = prefix.evaluated.result;
         const auto last = count - 1U;
-        result.instructions = static_cast<std::uint8_t>(count);
-        result.instruction_address = prefix.evaluated.pcs[last];
-        result.raw = cert.raw[(prefix.period_phase + last) % cert.count];
-        result.instruction_size = prefix.evaluated.sizes[last];
+        const auto last_phase = (prefix.period_phase + last) % cert.count;
+        result.instructions = static_cast<std::uint32_t>(count);
+        result.instruction_address = cert.pcs[last_phase];
+        result.raw = cert.raw[last_phase];
+        result.instruction_size = cert.sizes[last_phase];
         result.cycles = static_cast<std::uint16_t>(cycles);
         return ConcurrentStepResult{result, accountCycles(cycles)};
     }

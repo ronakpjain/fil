@@ -388,9 +388,11 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                 || (!all && state.ready_time_ns > at)) continue;
             const auto& prefix = state.ram_active
                 ? static_cast<const Board::DeferredPurePrefix&>(*state.ram) : *state.deferred;
-            std::size_t count = 1U;
-            while (count < prefix.count && prefix.completion_times_ns[count - 1U] < at) ++count;
-            const SimTimeNs completion = prefix.completion_times_ns[count - 1U];
+            // Most barriers settle the entire prefix. Avoid scanning every
+            // internal completion; preserve the first equal timestamp when
+            // zero-duration instructions or saturated clocks produce ties.
+            const std::size_t count = prefix.cutCount(at);
+            const SimTimeNs completion = prefix.completionTime(count - 1U);
             if (count < prefix.count) ++output.deferred_truncations;
             auto owner = event_loop_.useOwner(static_cast<EventOwner>(index));
             state.step = state.ram_active
@@ -1379,7 +1381,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                     const auto remaining = options.max_instructions_per_board
                         - output.boards[index].result.instructions;
                     const auto maximum = options.enable_ram_capsules
-                        ? Board::ReversibleRamPrefix::max_instructions
+                        ? Board::DeferredPurePrefix::max_memoized_instructions
                         : cpu::CortexM4::JitStepOutcome::max_block;
                     const auto limit = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, maximum));
                     const auto lane_deadline = deadline == 0U
@@ -1387,6 +1389,14 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                     if (options.enable_ram_capsules) {
                         if (!state.ram) state.ram.emplace();
                         state.ram_active = board.prepareReversibleRamPrefix(*state.ram, limit, lane_deadline, true, true);
+                        if (state.ram_active && state.ram->memoized_count != 0U) {
+                            ++output.memoized_prefixes;
+                            ++output.boards[index].memoized_prefixes;
+                            output.boards[index].memoized_instructions = saturatingAdd(
+                                output.boards[index].memoized_instructions, state.ram->memoized_count);
+                            output.memoized_instructions = saturatingAdd(
+                                output.memoized_instructions, state.ram->memoized_count);
+                        }
                     } else {
                         state.deferred = board.prepareDeferredPurePrefix(limit, lane_deadline);
                     }
@@ -1395,7 +1405,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                         // it and executing the same instruction a second time.
                         // It is an ordinary eager step, not a hidden future span.
                         state.step = board.materializeReversibleRamPrefix(*state.ram, 1U);
-                        state.ready_time_ns = state.ram->completion_times_ns[0U];
+                        state.ready_time_ns = state.ram->completionTime(0U);
                         state.ram_active = false;
                         state.in_flight = true;
                         ++output.dispatches;
@@ -1406,7 +1416,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                     if (state.ram_active || state.deferred) {
                         const auto& prefix = state.ram_active
                             ? static_cast<const Board::DeferredPurePrefix&>(*state.ram) : *state.deferred;
-                        state.ready_time_ns = prefix.completion_times_ns[prefix.count - 1U];
+                        state.ready_time_ns = prefix.completionTime(prefix.count - 1U);
                         state.in_flight = true;
                         ++state.same_time_dispatches;
                         ++output.dispatches;

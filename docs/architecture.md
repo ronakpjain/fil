@@ -127,6 +127,20 @@ otherwise all checkpoints are restored and exact frontier scheduling resumes.
 Tracing disables transactional epochs because speculative trace records cannot be
 retracted. The path remains opt-in through `--transactional-slices`.
 
+### Guarded RAM periods
+
+Eligible network commands use reversible private-RAM capsules. Uncached spans
+speculate at most 64 integer/backed-memory instructions and stop before MMIO or
+unsafe boundaries. Naturally recurring, RAM-neutral periods can instead reuse
+immutable CPU/fetch phase certificates guarded by code, clock, flash, RAM-input,
+and restoration generations. Their timing is represented by one rotated period
+plus a first-fetch correction, not a large per-instruction array. Cached spans
+may represent up to 4096 instructions while remaining bounded by events,
+SysTick, deadlines, and cycle-result capacity. Observation barriers select the
+exact started prefix and restore its certified phase; all peripheral callbacks
+still execute in their original order. See [Performance](performance.md) for
+eligibility and benchmark controls.
+
 ### Loop batching
 
 When a side-effect-free polling loop returns to the exact same architectural and

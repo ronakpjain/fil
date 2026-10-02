@@ -1248,6 +1248,8 @@ ExitCode runNetworkCommand(
         << "lockstep_bursts: " << result.value().lockstep_bursts << '\n';
     if (enable_deferred_prefixes || enable_ram_capsules) {
         out << "deferred_prefixes: " << result.value().deferred_prefixes << '\n'
+            << "memoized_prefixes: " << result.value().memoized_prefixes << '\n'
+            << "memoized_instructions: " << result.value().memoized_instructions << '\n'
             << "deferred_instructions: " << result.value().deferred_instructions << '\n'
             << "deferred_truncations: " << result.value().deferred_truncations << '\n';
     }
@@ -1273,6 +1275,11 @@ ExitCode runNetworkCommand(
             << " pc=0x" << std::hex << board.result.diagnostic.next_pc << std::dec << '\n';
         if (!board.result.message.empty() && !board.result.succeeded()) {
             out << "  message: " << board.result.message << '\n';
+        }
+        if (enable_ram_capsules) {
+            out << "memoized_ram: board=" << board.name
+                << " prefixes=" << board.memoized_prefixes
+                << " admitted_instructions=" << board.memoized_instructions << '\n';
         }
         if (sim::Board* instance = world.value()->board(board.name)) {
             if (enable_jit) printNativeJitStats(out, instance->cpu(), board.name);

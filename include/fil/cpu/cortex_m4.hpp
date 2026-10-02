@@ -155,19 +155,18 @@ struct RunResult {
 
 /** @brief Allocation-free result for the successful per-instruction hot path. */
 struct FastStepResult {
-    // Keep the successful hot result within the host's two-register return
-    // ABI (16 bytes) instead of requiring an out-pointer and stack copies.
+    // Keep the successful hot result compact; the instruction counter is wide
+    // enough for compressed period materialization.
     StopReason reason{StopReason::step_complete};
     bool suppress_loop_observation{false};
     std::uint8_t instruction_size{0};
-    std::uint8_t instructions{0};
+    std::uint32_t instructions{0};
     std::uint32_t instruction_address{0};
     std::uint32_t raw{0};
     // Widened from 8 to 16 bits: realistic pipeline + flash-stall totals
     // reach ~21 cycles (e.g. 16-register LDM to PC with wait states).
     std::uint16_t cycles{0};
 };
-static_assert(sizeof(FastStepResult) <= 16U);
 
 /** @brief Minimal deterministic Cortex-M4 Thumb interpreter. */
 class CortexM4 {

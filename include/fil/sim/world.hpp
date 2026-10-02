@@ -54,6 +54,8 @@ struct WorldBoardRunResult {
     std::string name; ///< Stable board name from its board configuration.
     BoardRunResult result; ///< Aggregate counters and latest board diagnostic.
     bool terminal{false}; ///< Whether this board itself reached a terminal boundary.
+    std::uint64_t memoized_prefixes{0}; ///< RAM-period certificate admissions for this board.
+    std::uint64_t memoized_instructions{0}; ///< Logical instructions admitted by those certificates (before cuts).
 };
 
 /** @brief Aggregate outcome of one deterministic virtual-time world run. */
@@ -75,6 +77,8 @@ struct WorldRunResult {
     std::uint64_t lockstep_bursts{0}; ///< Tight exact multi-board dispatch loops entered.
     std::uint64_t deferred_prefixes{0}; ///< Certified pure prefixes admitted without eager execution.
     std::uint64_t deferred_instructions{0}; ///< Instructions evaluated by deferred materialization.
+    std::uint64_t memoized_prefixes{0}; ///< Admissions served by a validated RAM-period certificate.
+    std::uint64_t memoized_instructions{0}; ///< Logical instructions admitted by RAM-period certificates (before cuts).
     std::uint64_t deferred_truncations{0}; ///< Prefixes shortened by an observation barrier.
     std::vector<WorldBoardRunResult> boards; ///< Outcomes in network configuration order.
     std::string message;

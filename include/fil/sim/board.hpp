@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <array>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <string>
 
@@ -74,6 +75,7 @@ struct BoardRunResult {
 /** @brief Loaded and wired firmware board instance. */
 class Board {
     struct IdempotentPeriodCertificate;
+    struct RamNeutralTransitionCertificate;
 public:
     struct TransactionCheckpoint;
 
@@ -89,8 +91,9 @@ public:
      */
     struct DeferredPurePrefix {
         static constexpr std::size_t max_instructions = 64U;
+        static constexpr std::size_t max_memoized_instructions = 4096U;
         SimTimeNs start_time_ns{0};
-        std::uint8_t count{0};
+        std::size_t count{0};
         std::array<SimTimeNs, max_instructions> completion_times_ns{};
         std::uint32_t entry_pc{0};
         std::uint64_t flash_generation{0};
@@ -98,6 +101,39 @@ public:
         std::uint64_t clock_hz{0};
         std::uint64_t time_fraction{0};
         std::array<std::uint64_t, max_instructions> cumulative_cycles{};
+        std::size_t memoized_count{0};
+        bool compressed_period{false};
+        std::size_t period_length{0};
+        std::uint64_t period_cycles{0};
+        std::int64_t first_fetch_delta{0};
+        std::array<std::uint64_t, max_instructions> rotated_cumulative_cycles{};
+
+        [[nodiscard]] std::uint64_t cumulativeCycles(const std::size_t index) const noexcept {
+            if (!compressed_period || period_length == 0U) return cumulative_cycles[index];
+            const auto completed = index + 1U;
+            const auto remainder = completed % period_length;
+            const auto cycles = (completed / period_length) * period_cycles
+                + (remainder == 0U ? 0U : rotated_cumulative_cycles[remainder - 1U]);
+            return first_fetch_delta < 0
+                ? cycles - static_cast<std::uint64_t>(-first_fetch_delta)
+                : cycles + static_cast<std::uint64_t>(first_fetch_delta);
+        }
+        [[nodiscard]] SimTimeNs completionTime(const std::size_t index) const noexcept {
+            if (!compressed_period) return completion_times_ns[index];
+            const auto cycles = cumulativeCycles(index);
+            const auto elapsed = (cycles * 1'000'000'000ULL + time_fraction) / clock_hz;
+            return elapsed > std::numeric_limits<SimTimeNs>::max() - start_time_ns
+                ? std::numeric_limits<SimTimeNs>::max() : start_time_ns + elapsed;
+        }
+        [[nodiscard]] std::size_t cutCount(const SimTimeNs at) const noexcept {
+            std::size_t low = 0U, high = count;
+            while (low < high) {
+                const auto mid = low + (high - low) / 2U;
+                if (completionTime(mid) < at) low = mid + 1U;
+                else high = mid;
+            }
+            return low == count ? count : low + 1U;
+        }
     };
 
     /**
@@ -167,8 +203,11 @@ public:
         bool entry_have_fetch{false};
         std::uint32_t entry_fetch_end{0};
         std::shared_ptr<const IdempotentPeriodCertificate> period_certificate;
+        std::shared_ptr<const RamNeutralTransitionCertificate> transition_certificate;
+        mem::MemoryBus::SideEffectCheckpoint transition_validation_checkpoint{};
+        std::uint64_t transition_restoration_generation{0U};
+        std::size_t transition_cache_slot{0U};
         std::uint8_t period_phase{0U};
-        std::uint8_t memoized_count{0U};
     };
 
     /** Result of executing and charging one (possibly batched) board prefix. */
@@ -436,6 +475,28 @@ private:
     std::array<LoopObservation, 256> loop_observations_{};
     // Bounded to the most recently certified natural period.
     std::shared_ptr<const IdempotentPeriodCertificate> idempotent_period_cache_;
+    static constexpr std::size_t transition_bucket_count = 16U;
+    static constexpr std::size_t transition_ways = 4U;
+    static constexpr std::size_t transition_slot_count = transition_bucket_count * transition_ways;
+    static constexpr std::uint8_t transition_hotness_threshold = 8U;
+    struct TransitionProbe {
+        ReversibleRamPrefix::IntegerSnapshot entry{};
+        bool valid{false};
+        bool have_fetch{false};
+        std::uint32_t fetch_end{0U};
+        std::uint8_t observations{0U};
+        std::uint64_t execution_generation{0U};
+        std::uint64_t restoration_generation{0U};
+        std::uint64_t clock_hz{0U};
+        std::uint64_t flash_generation{0U};
+    };
+    std::array<std::shared_ptr<const RamNeutralTransitionCertificate>, transition_slot_count>
+        ram_neutral_transition_cache_{};
+    std::array<mem::MemoryBus::SideEffectCheckpoint, transition_slot_count>
+        transition_validation_checkpoints_{};
+    std::array<std::uint64_t, transition_slot_count> transition_restoration_generations_{};
+    std::array<std::uint32_t, transition_slot_count> transition_hotness_{};
+    std::array<TransitionProbe, transition_bucket_count> transition_probes_{};
     mem::MemoryBus::SideEffectCheckpoint period_validation_checkpoint_{};
     std::uint64_t period_validation_restoration_generation_{0U};
     std::uint64_t loop_observation_generation_{1U};
