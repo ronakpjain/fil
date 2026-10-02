@@ -19,21 +19,21 @@ NETWORK = "configs/networks/per_vehicle.json"
 
 
 def run(binary, duration_ms, *, jit=True, trace=None, no_loop_batching=False,
-        deferred_prefixes=False, ram_capsules=False):
+        deferred_prefixes=False, ram_capsules=True):
     command = [
         str(binary), "run-network", NETWORK,
         "--duration-ms", str(duration_ms),
         "--max-instructions", "1000000000", "--quantum", "1024",
         "--strict-mmio", "--adc-decimation", "1",
     ]
-    if jit:
-        command.append("--jit")
-    if no_loop_batching or ram_capsules:
+    if not jit:
+        command.append("--no-jit")
+    if no_loop_batching:
         command.append("--no-loop-batching")
-    if deferred_prefixes and jit:
+    if deferred_prefixes:
         command.append("--deferred-prefixes")
-    if ram_capsules and jit:
-        command.append("--ram-capsules")
+    if not ram_capsules:
+        command.append("--no-ram-capsules")
     if trace is not None:
         command.extend(["--trace", str(trace)])
     start = time.perf_counter()
@@ -73,13 +73,14 @@ def main():
     parser.add_argument("--reps", type=int, default=3)
     parser.add_argument("--check-trace", action="store_true",
                         help="compare 1,000 ms interpreter/JIT traces before timing")
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--no-loop-batching", action="store_true",
-                      help="use the compact exact single-instruction scheduler")
-    mode.add_argument("--deferred-prefixes", action="store_true",
-                      help="use experimental interruptible pure JIT prefixes")
-    mode.add_argument("--ram-capsules", action="store_true",
-                      help="use experimental private-RAM JIT spans (disables loop batching)")
+    parser.add_argument("--no-loop-batching", action="store_true",
+                        help="disable loop batching (already off by default); use --no-ram-capsules for exact dispatch")
+    parser.add_argument("--deferred-prefixes", action="store_true",
+                        help="use experimental interruptible pure JIT prefixes")
+    parser.add_argument("--no-jit", action="store_true",
+                        help="disable the default JIT")
+    parser.add_argument("--no-ram-capsules", action="store_true",
+                        help="disable default private-RAM JIT capsules")
     args = parser.parse_args()
     if args.duration_ms <= 0 or args.reps <= 0:
         parser.error("duration and repetitions must be positive")
@@ -88,11 +89,13 @@ def main():
         with tempfile.TemporaryDirectory(prefix="fil-network-check-") as directory:
             reference = pathlib.Path(directory) / "interpreter.jsonl"
             candidate = pathlib.Path(directory) / "jit.jsonl"
-            _, reference_summary = run(binary, 1000, jit=False, trace=reference, no_loop_batching=True)
+            _, reference_summary = run(binary, 1000, jit=False, trace=reference,
+                                        no_loop_batching=True, ram_capsules=False)
             _, candidate_summary = run(binary, 1000, trace=candidate,
+                                       jit=not args.no_jit,
                                        no_loop_batching=args.no_loop_batching,
                                        deferred_prefixes=args.deferred_prefixes,
-                                       ram_capsules=args.ram_capsules)
+                                       ram_capsules=not args.no_ram_capsules)
             if reference_summary != candidate_summary:
                 raise RuntimeError("Full-network interpreter/JIT counters or final board PCs differ")
             if not filecmp.cmp(reference, candidate, shallow=False):
@@ -110,9 +113,10 @@ def main():
         summaries = []
         for label, executable, measurements in binaries:
             wall, summary = run(executable, args.duration_ms,
+                                jit=not args.no_jit,
                                 no_loop_batching=args.no_loop_batching,
                                 deferred_prefixes=args.deferred_prefixes,
-                                ram_capsules=args.ram_capsules)
+                                ram_capsules=not args.no_ram_capsules)
             measurements.append(wall)
             summaries.append(summary)
             print(f"Run {repetition + 1} ({label}): wall={wall:.3f}s "

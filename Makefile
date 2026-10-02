@@ -48,7 +48,7 @@ PGO_PROFILE ?= $(PGO_GENERATE_BUILD_DIR)/fil.profdata
 PGO_PROFILE_PATH = $(call root_path,$(PGO_PROFILE))
 PGO_PROFILE_PATTERN ?= $(PGO_GENERATE_BUILD_DIR)/fil-%p.profraw
 # Representative default; override for a local firmware checkout or workload.
-PGO_TRAIN_ARGS ?= run-network configs/networks/per_vehicle.json --duration-ms 1000 --max-instructions 50000000 --quantum 1024 --strict-mmio --jit --adc-decimation 1
+PGO_TRAIN_ARGS ?= run-network configs/networks/per_vehicle.json --duration-ms 1000 --max-instructions 50000000 --quantum 1024 --strict-mmio --adc-decimation 1
 PGO_CXX ?= clang++
 
 ifeq ($(strip $(LLVM_PROFDATA)),)

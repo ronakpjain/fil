@@ -8,6 +8,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
 
@@ -22,8 +23,8 @@ TEST(SmokeTest, HelpIsSuccessful) {
     EXPECT_TRUE(result == fil::cli::ExitCode::success) << "--help returns success";
     EXPECT_TRUE(out.str().find("Usage:") != std::string::npos) << "--help prints usage";
     EXPECT_TRUE(err.str().empty()) << "--help does not print an error";
-    EXPECT_NE(out.str().find("--jit"), std::string::npos);
-    EXPECT_EQ(out.str().find("--no-jit"), std::string::npos);
+    EXPECT_NE(out.str().find("--no-jit"), std::string::npos);
+    EXPECT_EQ(out.str().find("--jit"), std::string::npos);
 }
 
 /// @brief Verifies unknown commands produce a usage error.
@@ -40,21 +41,33 @@ TEST(SmokeTest, UnknownCommandIsAUsageError) {
         << "unknown command prints a diagnostic";
 }
 
-TEST(SmokeTest, JitIsTheOnlyExplicitJitOption) {
-    for (const std::string_view command : {"run", "run-network", "watch-network"}) {
-        for (const std::string_view option : {"--jit", "--no-jit"}) {
-            const std::string_view args[]{command, "missing-jit-config.json", option};
+TEST(SmokeTest, NegativeJitAndCapsuleOptionsAreAccepted) {
+    for (const std::string_view command : {"run", "run-network", "watch-network", "serve-network"}) {
+        for (const std::string_view option : {
+                 "--no-jit", "--no-ram-capsules", "--no-loop-batching"}) {
+            if (command == "run" && option == "--no-ram-capsules") continue;
+            std::vector<std::string_view> args{command, "missing-jit-config.json", option};
+            if (command == "serve-network") {
+                args.push_back("--transport");
+                args.push_back("stdio");
+            }
             std::ostringstream out;
             std::ostringstream err;
             const auto result = fil::cli::run(args, out, err);
-            if (option == "--jit") {
-                EXPECT_NE(result, fil::cli::ExitCode::usage_error);
-                EXPECT_EQ(err.str().find("unknown"), std::string::npos);
-            } else {
-                EXPECT_EQ(result, fil::cli::ExitCode::usage_error);
-                EXPECT_NE(err.str().find("unknown"), std::string::npos);
-            }
+            EXPECT_NE(result, fil::cli::ExitCode::usage_error) << command << " " << option;
+            EXPECT_EQ(err.str().find("unknown"), std::string::npos) << command << " " << option;
         }
+    }
+}
+
+TEST(SmokeTest, PositiveJitAndCapsuleAndLoopBatchOptionsAreRejected) {
+    for (const std::string_view option : {"--jit", "--ram-capsules", "--loop-batching"}) {
+        const std::string_view args[]{"run", "missing-jit-config.json", option};
+        std::ostringstream out;
+        std::ostringstream err;
+        const auto result = fil::cli::run(args, out, err);
+        EXPECT_EQ(result, fil::cli::ExitCode::usage_error) << option;
+        EXPECT_NE(err.str().find("unknown"), std::string::npos) << option;
     }
 }
 

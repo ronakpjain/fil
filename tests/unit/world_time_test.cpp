@@ -583,6 +583,7 @@ TEST(WorldTimeTest, SynchronizedPureJitBlocksMatchInterpreter) {
     options.max_instructions_per_board = 5'003U;
     options.enable_loop_batching = false;
     options.enable_jit = false;
+    options.enable_ram_capsules = false;
     const auto reference = exact.value()->run(options);
     options.enable_jit = true;
     const auto result = jit.value()->run(options);
@@ -633,6 +634,7 @@ TEST(WorldTimeTest, SynchronizedJitAdmitsDifferentPurePrefixLengths) {
     options.max_instructions_per_board = 100U;
     options.enable_loop_batching = false;
     options.enable_jit = false;
+    options.enable_ram_capsules = false;
     const auto reference = exact.value()->run(options);
     options.enable_jit = true;
     const auto result = jit.value()->run(options);
@@ -678,6 +680,7 @@ TEST(WorldTimeTest, SynchronizedJitMatchesMemoryStepToPureBatch) {
     options.max_instructions_per_board = 100U;
     options.enable_loop_batching = false;
     options.enable_jit = false;
+    options.enable_ram_capsules = false;
     const auto reference = exact.value()->run(options);
     options.enable_jit = true;
     const auto result = jit.value()->run(options);
@@ -832,6 +835,7 @@ TEST(WorldTimeTest, ExactSchedulerRestoresMemoryTrackingWhenCallbacksThrow) {
     }));
     auto options = runOptions(1'000U);
     options.enable_loop_batching = false;
+    options.enable_ram_capsules = false;
     EXPECT_THROW(static_cast<void>(world.value()->run(options)), std::runtime_error);
     EXPECT_TRUE(memory.readFootprintTracking());
     EXPECT_TRUE(memory.writeJournalTracking());
@@ -872,6 +876,7 @@ TEST(WorldTimeTest, CompactExactSchedulerMatchesGeneralWithEventsAndZeroTimeStep
             options.instruction_quantum = 1U;
             options.enable_loop_batching = false;
             options.enable_jit = jit;
+            options.enable_ram_capsules = false;
             const auto candidate = exact.value()->run(options);
             // Spin observation selects the original general scheduler, with
             // batching disabled and an unreachable spin-stop threshold.

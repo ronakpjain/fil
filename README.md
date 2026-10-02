@@ -49,18 +49,22 @@ for contracts and safety.
 
 ## Performance
 
-Our recommended baseline is Release + supported IPO, interpreter execution,
-proven-loop batching, and ADC decimation 1. Use strict MMIO for validation;
-the compatibility CLI default is lenient. Keep JIT and speculative schedulers
-opt-in until matching real-firmware measurements justify them.
+Our recommended baseline is Release + supported IPO, the default JIT with
+network RAM capsules, and ADC decimation 1. Plain `run-network` uses the
+validated fast path without enabling flags. Use strict MMIO for validation;
+the compatibility CLI default is lenient. Transactional slices and deferred
+prefixes remain experimental opt-ins. `--no-jit` selects the interpreter and
+automatically disables RAM capsules.
 
 The default run preserves modeled instruction, event, and peripheral behavior.
-Decoded-instruction and memory caches, bounded scheduler bursts, event ownership,
-and proven idle-loop batching reduce host overhead. Release builds use IPO when
-supported; optional PGO trains on a representative workload.
+Decoded-instruction and memory caches, bounded scheduler bursts, guarded RAM
+capsules on network commands, and proven-loop batching on single-board `run`
+reduce host overhead. Network loop batching is off by default. Release builds
+use IPO when supported; optional PGO trains on a representative workload.
 
-`--adc-decimation N` (1–1024, default 1) is an **opt-in fidelity tradeoff** for
-continuous ADC scans: only one scan in N produces samples, DMA, and interrupts.
+ADC decimation 1 is the full-fidelity default. `--adc-decimation N` (1–1024)
+is an **opt-in fidelity tradeoff** for continuous ADC scans: only one scan in N
+produces samples, DMA, and interrupts.
 It can accelerate ADC-heavy workloads but changes firmware-visible behavior.
 Do not use it for fidelity comparisons.
 

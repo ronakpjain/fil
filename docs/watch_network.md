@@ -85,16 +85,21 @@ error and ignored without stopping the simulation.
 | `--max-instructions N` | Set the per-board instruction budget used for each run slice. |
 | `--quantum N` | Set the deterministic network scheduling quantum; defaults to `1024`. |
 | `--adc-decimation N` | Keep one of every `N` continuous ADC scans; factor 1–1024, default 1. |
-| `--jit` | Opt into experimental cached/native execution; off by default, not a speed guarantee. |
-| `--trace-instr` | Emit instruction trace events; add `--live-filter instr` to print them. |
-| `--detect-spin` | Enable spin-loop detection; off by default. |
+| `--no-jit` | JIT is on by default; disable cached/native execution. Positive `--jit` is rejected. |
+| `--trace-instr` | Emit instruction trace events; add `--live-filter instr` to print them. This safely disables RAM capsules. |
+| `--detect-spin` | Enable spin-loop detection; off by default. This diagnostic safely disables RAM capsules. |
+| `--no-ram-capsules` | Disable guarded RAM capsules, which are on by default when eligible. |
 | `--strict-mmio` | Treat accesses outside modeled MMIO blocks as faults. |
 | `--lenient-mmio` | Use lenient MMIO handling; this is the default. |
-| `--no-loop-batching` | Disable proven-loop batching; batching is on by default. |
+| `--no-loop-batching` | Network loop batching is already off by default, so this option does not enable or otherwise change batching. There is no positive `--loop-batching` option. |
 | `--control-stdin` | Accepted compatibility marker; standard input is always monitored. |
 
 See [Options and recommended defaults](options.md) for the complete build/CLI
-reference. Experimental network scheduler flags are not accepted by this command.
+reference. Transactional and deferred experimental scheduler flags are not
+accepted by this command. Capsule guards preserve event and observation ordering;
+custom callbacks and unsupported DMA paths remain barriers. JIT-off, tracing,
+and spin diagnostics safely disable capsules rather than failing because of
+their default-on state.
 `watch-network` prints selected events as human-readable lines; the companion
 [`serve-network --transport stdio`](serve_network.md) uses a documented binary
 protocol instead.

@@ -6,13 +6,15 @@ For board/network JSON fields see [Configuration](configuration.md).
 
 ## Opinionated policy
 
-Prefer **Release + supported IPO, the interpreter, proven-loop batching, and ADC
-decimation 1**. This keeps the modeled peripheral behavior intact without paying
-experimental compilation/rollback overhead. Keep spin detection and instruction
-tracing off unless diagnosing a failure. Use `--strict-mmio` for validation so
-missing peripheral coverage is visible; the CLI's compatibility default remains
-lenient. Do not promote JIT or experimental schedulers based on synthetic tests.
-Measure the actual firmware first, including startup.
+Prefer **Release + supported IPO, the default JIT, guarded network RAM capsules,
+and ADC decimation 1**. Plain `run-network` uses the validated fast path without
+enabling flags. `run` retains single-board loop batching by default; network loop
+batching is off. `--no-jit` selects the interpreter and automatically disables
+RAM capsules. Instruction tracing, spin detection, transactional slices, and
+deferred prefixes also disable capsules safely. Use `--strict-mmio` for
+validation so missing peripheral coverage is visible; the CLI's compatibility
+default remains lenient. Transactional slices and deferred prefixes remain
+experimental opt-ins. Measure the actual firmware first, including startup.
 
 For interactive use retain wall pacing and the default `can_tx` filter. Add
 `can_rx` only when needed. For throughput use `run-network`, not a paced monitor.
@@ -48,16 +50,17 @@ These are recommendations, not hidden overrides. The actual defaults follow.
 | `--duration-ms N` | `run`: board config `default_duration_ms` (schema default 1000); network: 1000; watch: unlimited. Watch `0` explicitly means unlimited. |
 | `--max-instructions N` | `run`: board config `max_instructions` (schema default 50,000,000); network: 50,000,000 per board; watch: 50,000,000 per board **per slice**. |
 | `--trace FILE` | `run` and `run-network` write JSONL only when requested. `watch-network` and `serve-network` do not accept this option. See [Tracing](tracing.md). |
-| `--trace-instr` | Off; enables instruction events and prevents batched execution. |
+| `--trace-instr` | Off; enables instruction events, prevents batched execution, and disables RAM capsules. |
 | `--strict-mmio` / `--lenient-mmio` | Lenient; strict faults on unmodeled MMIO. |
-| `--detect-spin` | Off; diagnostic stopping on proven repeated CPU state. Legitimate idle loops can trigger it. |
-| `--no-loop-batching` | Batching is on; disables proven-loop skipping. |
-| `--jit` | Off; enables cached handlers and native LLVM when built/eligible. Not a speed guarantee. |
+| `--detect-spin` | Off; diagnostic stopping on proven repeated CPU state. Legitimate idle loops can trigger it; enabling it disables RAM capsules. |
+| `--no-loop-batching` | Network loop batching is off already; on single-board `run`, disables the default proven-loop batching. There is no positive `--loop-batching` option. |
+| `--no-jit` | JIT is on by default; disables JIT and automatically disables RAM capsules. Positive `--jit` is rejected. |
 | `--adc-decimation N` | 1; range 1–1024. Values above 1 change continuous ADC sample/DMA/interrupt behavior. |
 
-`run` and `run-network` additionally accept `--no-detect-spin` and
-`--loop-batching` to explicitly restore those settings, and `--allow-breakpoint`
-(default off) to permit a breakpoint stop without treating it as failure.
+`run` and `run-network` additionally accept `--no-detect-spin` to explicitly
+restore the default, and `--allow-breakpoint` (default off) to permit a
+breakpoint stop without treating it as failure. Loop batching has no positive
+enable flag.
 
 ### Single-board only
 
@@ -70,12 +73,18 @@ are passed to `run`, symbol resolution takes precedence over the address.
 | --- | --- |
 | `--quantum N` | 1024; must be nonzero. Scheduling work cap, not permission to cross observable events. Also accepted by watch and serve. |
 | `--inject-can BUS[@TIME_MS]:ID:HEXDATA` | None; repeatable scheduled CAN injection. Omitted time means time zero. |
-| `--transactional-slices` / `--no-transactional-slices` | Off; experimental reversible parallel lane epochs. Worker execution requires multiple boards, no tracing, and no spin detection. |
-| `--deferred-prefixes` | Off; experimental pure deferred prefixes. Requires `--jit`; incompatible with instruction tracing, spin detection, transactional slices, and RAM capsules. |
-| `--ram-capsules` | Off; experimental reversible private-RAM prefixes, including guarded spans across other boards' audited ADC events. Every conversion is retained; custom callbacks and unsupported DMA paths remain global observation barriers. Requires `--jit --no-loop-batching`; incompatible with deferred prefixes, instruction tracing, spin detection, and transactional slices. |
+| `--transactional-slices` / `--no-transactional-slices` | Off; experimental reversible parallel lane epochs. Worker execution requires multiple boards, no tracing, and no spin detection. Enabling it disables RAM capsules. |
+| `--deferred-prefixes` | Off; experimental pure deferred prefixes. Requires JIT; enabling it disables RAM capsules. It cannot be combined with instruction tracing, spin detection, or transactional slices. |
+| `--no-ram-capsules` | Network capsules are on by default when eligible; disables guarded reversible private-RAM prefixes. Positive `--ram-capsules` is rejected. Audited ADC conversions remain observable; custom callbacks and unsupported DMA paths remain global observation barriers. Capsules are safely disabled when JIT is off or tracing, spin detection, transactional slices, or deferred prefixes are enabled. |
 
-Experimental scheduler flags above are **run-network only**. See
-[Performance](performance.md) for observation barriers and ownership restrictions.
+Transactional slices and deferred prefixes are **run-network only**;
+`--no-ram-capsules` is accepted by all network commands. The plain
+`run-network` command uses the validated fast path without additional mode flags.
+Capsule guards preserve observation ordering; guarded local ADC observations
+are eligible only when their audited provider/wiring, interrupt hooks, DMA
+source, and directly backed RAM transfer satisfy the guards. Unsupported or
+custom observation paths remain barriers. See [Performance](performance.md) for
+details and concurrency restrictions.
 There is no current `--execution-windows` CLI flag.
 
 ### Watch and serve
@@ -173,7 +182,7 @@ See [Hardware comparison](hardware_comparison.md) before connecting a target.
   `PGO_PROFILE_PATTERN=build-pgo-generate/fil-%p.profraw`.
   `PGO_TRAIN_ARGS` defaults to the six-board PER network, 1000 ms,
   50,000,000 instructions, quantum 1024, strict MMIO, JIT, ADC decimation 1.
-  **Override it to match the interpreter/scheduler you deploy**; the default
-  training command is not the runtime default.
+  **Override it to match the scheduler you deploy**; the default training
+  command is not a guarantee of matching your runtime workload.
 
 For reproducible real-network measurements see [Performance](performance.md).

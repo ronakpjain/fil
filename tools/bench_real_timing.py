@@ -198,18 +198,19 @@ def main():
                            "--max-instructions", "200000000", "--strict-mmio"]),
             ("idle16 x1 no-batch", ["run", boards["idle"], "--duration-ms", "1000",
                                     "--max-instructions", "200000000", "--strict-mmio",
-                                    "--no-loop-batching"]),
+                                    "--no-loop-batching", "--no-jit", "--no-ram-capsules"]),
             ("idle16 x6", ["run-network", net, "--duration-ms", "1000",
                            "--max-instructions", "200000000", "--quantum", "1024",
                            "--strict-mmio"]),
             ("idle16 x6 no-batch", ["run-network", net, "--duration-ms", "1000",
                                     "--max-instructions", "200000000", "--quantum", "1024",
-                                    "--strict-mmio", "--no-loop-batching"]),
+                                    "--strict-mmio", "--no-loop-batching",
+                                    "--no-jit", "--no-ram-capsules"]),
             ("pll170 x1", ["run", boards["pll"], "--duration-ms", "1000",
                            "--max-instructions", "400000000", "--strict-mmio"]),
             ("pll170 x1 no-batch", ["run", boards["pll"], "--duration-ms", "1000",
                                     "--max-instructions", "400000000", "--strict-mmio",
-                                    "--no-loop-batching"]),
+                                    "--no-loop-batching", "--no-jit", "--no-ram-capsules"]),
         ]
         print("%-20s %12s %12s %6s %12s %10s %9s" % (
             "case", "instructions", "cycles", "cpi", "time_ns", "wall_s", "x_realtime"))

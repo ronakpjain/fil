@@ -10,13 +10,18 @@ The timing model includes instruction costs, branch penalties, and flash fetch s
 
 ## Recommended defaults
 
-Use Release with supported IPO, interpreter execution, proven-loop batching, and
-ADC decimation 1 as the conservative baseline. Leave JIT and speculative
-schedulers off until matched real-firmware measurements justify them. Prefer
-strict MMIO for validation, although compatibility-oriented CLI parsing defaults
-to lenient MMIO. Keep instruction tracing and spin detection off for throughput;
-keep wall pacing on for interactive monitoring. See [Options](options.md) for
-all runtime/build flags, actual defaults, and recommended command presets.
+Use Release with supported IPO, the default JIT, guarded network RAM capsules,
+and ADC decimation 1 as the baseline. Plain `run-network` uses its validated
+fast path without enabling flags. Network loop batching is off; single-board
+`run` batches proven loops unless `--no-loop-batching` is supplied. Use
+`--no-jit` for the interpreter reference; it automatically disables capsules.
+Instruction tracing, spin detection, transactional slices, and deferred
+prefixes also disable capsules safely. Transactional slices and deferred
+prefixes remain experimental opt-ins. Prefer strict MMIO for validation,
+although compatibility-oriented CLI parsing defaults to lenient MMIO. Keep
+instruction tracing and spin detection off for throughput; keep wall pacing on
+for interactive monitoring. See [Options](options.md) for all runtime/build
+flags and actual defaults.
 
 ## Execution optimizations
 
@@ -27,15 +32,15 @@ all runtime/build flags, actual defaults, and recommended command presets.
 | Pending-exception selection cache | Reuses exact exception selection for unchanged CPU masks and system-control generation. Selection-affecting mutations invalidate the cache; the cached takable-pending check avoids rescanning priorities without suppressing eligible exceptions. |
 | Native compilation pipeline | Uses LLVM's O0 module pipeline to limit optimization-pass overhead for small integer kernels. This is a compile-time/runtime tradeoff, not evidence of an end-to-end firmware speedup. |
 | Event-aware scheduling | Bounds execution by events, interrupts, instruction budgets, and simulated-time deadlines. Event insertion prunes retired owner-queue heads so global-only dispatch does not retain every completed ADC callback until shutdown; live event ordering and conversion effects are unchanged. |
-| Loop batching | Batches proven repeated loops; unproven paths execute normally. Disable with `--no-loop-batching`. `--detect-spin` requests loop detection; `--trace-instr` retains instruction-level execution. |
-| Cached JIT handlers | `--jit` opts into specialized handlers and prepared blocks, with fallback for unsupported or unsafe operations. |
+| Loop batching | Single-board `run` batches proven repeated loops by default; network commands do not. `--no-loop-batching` disables batching where active. Unproven paths execute normally; tracing retains instruction-level execution. |
+| Cached JIT handlers | JIT is on by default; `--no-jit` selects the interpreter and also disables RAM capsules. Specialized handlers and prepared blocks fall back for unsupported or unsafe operations. |
 | Native LLVM JIT | Emits host machine code for a conservative integer subset when LLVM support is available. Memory/MMIO, system, and floating-point operations retain existing paths. Lazy initialization, hotness gates, and a 32-kernel LRU with admission hysteresis bound retained kernels and reduce startup/churn costs; they do not guarantee profitability. See [Native LLVM JIT](llvm-jit.md). |
-| Exact network fast path | With loop batching, tracing, spin detection, and speculative modes disabled, up to 64 lanes use compact single-instruction dispatch without loop-proof state. Networks of up to eight boards use a fixed-width timestamp reduction, retaining all tied completions and deterministic board ordering. |
+| Validated network fast path | Plain `run-network` uses compact single-instruction dispatch without loop-proof state. Networks of up to eight boards use a fixed-width timestamp reduction, retaining all tied completions and deterministic board ordering. |
 | Transactional lane slices | Opt-in reversible parallel epochs commit only admissible work; observation-sensitive work falls back. Requires multiple boards without tracing or spin detection for worker execution. |
-| Deferred pure / RAM prefixes | Opt-in delayed evaluation and reversible private-RAM spans reduce eager dispatch where boundary proofs permit. Admission reuses live-count metadata rather than clearing/copying capacity-sized buffers, and avoids optional period certification when the current span cannot fold a period. The exact cycle-conversion table covers complete capsule spans. These are experiments, not defaults or native RAM JIT kernels. |
+| Deferred pure / RAM prefixes | Guarded reversible private-RAM capsules are enabled by default on eligible network commands. Deferred pure prefixes and transactional slices remain experimental opt-ins. Observation barriers and rollback preserve modeled effects; capsules are not native RAM JIT kernels. |
 | Build optimization | Release, supported IPO/LTO, and representative optional Clang PGO reduce host overhead without changing modeled ADC fidelity. |
 
-The interpreter is the default. JIT execution is experimental and does not guarantee a speedup. Synchronized network bursts may use different per-lane instruction counts only when every lane reaches the same exact simulated-time frontier. Multi-instruction prefixes stop before memory/MMIO, and event, deadline, and SysTick boundaries gate admission; mismatched work falls back to exact single-instruction dispatch. General asynchronous network dispatch also remains single-instruction: another lane may schedule a shared event that was not visible when a block's horizon was checked.
+JIT is enabled by default, but does not guarantee a speedup. Use `--no-jit` for the interpreter reference; this also disables RAM capsules. Synchronized network bursts may use different per-lane instruction counts only when every lane reaches the same exact simulated-time frontier. Multi-instruction prefixes stop before memory/MMIO, and event, deadline, and SysTick boundaries gate admission; mismatched work falls back to exact single-instruction dispatch. General asynchronous network dispatch also remains single-instruction: another lane may schedule a shared event that was not visible when a block's horizon was checked.
 
 ## Build
 
@@ -45,7 +50,7 @@ make BUILD_DIR=build-release BUILD_TYPE=Release IPO=ON test
 
 - IPO/LTO is enabled when supported. Debug and sanitizer builds are not throughput baselines.
 - CMake attempts native LLVM discovery by default; LLVM 18 or newer and a 64-bit host are required.
-- Without LLVM, `--jit` uses cached handlers only. Check configure output for backend availability.
+- Without LLVM, JIT uses cached handlers only. Check configure output for native backend availability.
 - CMake overrides: `FIL_ENABLE_LLVM_JIT=OFF` disables native support; `LLVM_DIR` selects an installation; `FIL_LLVM_COMPONENT_LINKING=ON` selects component-library linking.
 
 ### Profile-guided optimization
@@ -59,9 +64,9 @@ The target cleans old PGO outputs, builds, trains, merges profiles, rebuilds wit
 - Override training with `PGO_TRAIN_ARGS='run-network ...'`.
 - Use matching `PGO_CXX` and `LLVM_PROFDATA` versions.
 - Retrain after material code, firmware, or toolchain changes.
-- Match the scheduling mode too. For compact exact-network measurements, train
-  with `PGO_TRAIN_ARGS='run-network configs/networks/per_vehicle.json --duration-ms 5000 --max-instructions 1000000000 --quantum 1024 --strict-mmio --jit --no-loop-batching --adc-decimation 1'`.
-  This retains every ADC conversion and does not itself establish realtime throughput.
+- Match the scheduling mode too. Plain `run-network` uses the validated fast
+  path; leave it unadorned unless measuring an experimental mode. ADC
+  decimation 1 retains every conversion.
 - Individual stages: `pgo-generate`, `pgo-train`, `pgo-merge`, `pgo-use`, `pgo-test`.
 
 ## Network comparison
@@ -72,12 +77,12 @@ The configuration requires firmware from the sibling PER checkout.
 /usr/bin/time -p ./build-release/fil run-network configs/networks/per_vehicle.json \
   --duration-ms 5000 --max-instructions 250000000 --quantum 1024 --strict-mmio --adc-decimation 1
 /usr/bin/time -p ./build-release/fil run-network configs/networks/per_vehicle.json \
-  --duration-ms 5000 --max-instructions 250000000 --quantum 1024 --strict-mmio --jit --adc-decimation 1
+  --duration-ms 5000 --max-instructions 250000000 --quantum 1024 --strict-mmio --no-jit --no-ram-capsules --adc-decimation 1
 ```
 
 Record wall time, stop reason, simulated time, instruction/cycle counts, and JIT diagnostics. Increase the instruction limit if necessary.
 
-With `--jit`, `run` and `run-network` report per-board `native_jit` diagnostics. Positive `executions` and `instructions` confirm generated code ran, not that it was faster. Account for additional diagnostics when comparing summaries; do not discard guest-visible differences.
+With JIT enabled (the default), `run` and `run-network` report per-board `native_jit` diagnostics. Positive `executions` and `instructions` confirm generated code ran, not that it was faster. Account for additional diagnostics when comparing summaries; do not discard guest-visible differences.
 
 ### Transactional scheduling
 
@@ -93,11 +98,11 @@ can outweigh useful work.
 
 ### Exact and deferred scheduling
 
-`--no-loop-batching` selects a compact exact single-instruction network scheduler when instruction tracing, spin detection, and transactional/deferred execution are disabled. It removes loop-proof bookkeeping, not target instructions or peripheral effects. General lockstep bursts require a proven pure fixed-cost multi-instruction frontier; scalar timing predictions alone do not authorize a burst.
+Network commands use the compact exact single-instruction scheduler by default; no network batching toggle is needed. This removes loop-proof bookkeeping, not target instructions or peripheral effects. General lockstep bursts require a proven pure fixed-cost multi-instruction frontier; scalar timing predictions alone do not authorize a burst.
 
-`run-network --jit --deferred-prefixes` is an experimental, default-off alternative. It cannot be combined with instruction tracing, spin detection, transactional slices, or RAM capsules. It leaves certified pure CPU prefixes unevaluated until their completion or an observation barrier. Scheduled events and synchronous CAN delivery materialize only the instructions the exact scheduler has already started. Event-phase and CPU-dispatch-phase barriers preserve different equal-timestamp ordering. Public mutable board/CPU APIs must not be used concurrently with a deferred run. The current pure-prefix coverage is limited; this option is not a claim of faster-than-realtime throughput. Pure-prefix-only full-network validation still measures below realtime with ADC decimation 1; a faster-than-realtime result must be established on matching current firmware, not inferred from the available mechanisms.
+`run-network --deferred-prefixes` is an experimental, default-off alternative. It safely disables the default RAM capsules and cannot be combined with instruction tracing, spin detection, or transactional slices. It leaves certified pure CPU prefixes unevaluated until their completion or an observation barrier. Scheduled events and synchronous CAN delivery materialize only the instructions the exact scheduler has already started. Event-phase and CPU-dispatch-phase barriers preserve different equal-timestamp ordering. Public mutable board/CPU APIs must not be used concurrently with a deferred run. The current pure-prefix coverage is limited; this option is not a claim of faster-than-realtime throughput. Pure-prefix-only full-network validation still measures below realtime with ADC decimation 1; a faster-than-realtime result must be established on matching current firmware, not inferred from the available mechanisms.
 
-`run-network --jit --no-loop-batching --ram-capsules` is a separate default-off experiment. It chains up to 64 cached fast-handler instructions across integer branches and standalone branch/call links, permitting only journaled, reversible writes to non-executable private RAM. MMIO, FP/system operations, executable stores, and unsupported handlers end the span. Conservative cycle credit prevents crossing known observation, SysTick, or deadline bounds; dynamic observation cuts restore RAM/integer state and replay only the instructions already started. CAN delivery and board-failure draining are observation barriers. CPU/RAM state must not be inspected or modified while a prefix is active except through scheduled callbacks, which materialize it first. Run options are snapshotted per invocation.
+Guarded RAM capsules are enabled by default on eligible network commands; `--no-ram-capsules` disables them. They safely disable themselves when JIT is off, or when instruction tracing, spin detection, transactional slices, or deferred prefixes are enabled. Only journaled, reversible writes to non-executable private RAM are admitted; MMIO, FP/system operations, executable stores, unsupported handlers, and unsafe event boundaries end a span. CAN delivery and board-failure draining are observation barriers. CPU/RAM state must not be inspected or modified while a prefix is active except through scheduled callbacks, which materialize it first. Reentrant or concurrent mutation of a running World is unsupported. Run options are snapshotted per invocation.
 
 Audited ADC conversions can be owner-local observations: a capsule may span
 another board's conversions while its own conversions still materialize it.
@@ -118,35 +123,35 @@ Standalone Board admission retains its global horizon. Reentrant/concurrent
 mutation of a running World is unsupported; if a run throws, discard that World
 rather than inspecting or resuming potentially speculative state.
 
-A bounded, immutable period certificate can avoid execution and replay for naturally recurring spans whose RAM bytes remain unchanged after every instruction, including idempotent stores. Compilation records each CPU/fetch endpoint and charged cycle cost. Reuse requires matching CPU/fetch phase, historical execution/clock/FLASH generations, complete canonical RAM read-and-store footprints, usable journal history, and an unchanged restoration token. Unrelated external RAM changes may remain compatible; changed inputs, journal rewinds, reset, and transaction restoration reject reuse. Cuts reconstruct the selected period phase without modifying RAM and charge cycles once using the admission's original timing fraction. This does not omit ADC conversions, DMA, interrupts, or observation barriers. JIT diagnostics describe actual handler work, not the logical instructions represented by a cached period. This path uses cached handlers, not LLVM-native RAM kernels. With guarded local ADC observations and matched capsule PGO, sustained full-network measurements can exceed realtime without ADC decimation. It remains opt-in: validate the same firmware, host, callbacks, and build rather than extrapolating to other configurations.
+A bounded, immutable period certificate can avoid execution and replay for naturally recurring spans whose RAM bytes remain unchanged after every instruction, including idempotent stores. Compilation records each CPU/fetch endpoint and charged cycle cost. Reuse requires matching CPU/fetch phase, historical execution/clock/FLASH generations, complete canonical RAM read-and-store footprints, usable journal history, and an unchanged restoration token. Unrelated external RAM changes may remain compatible; changed inputs, journal rewinds, reset, and transaction restoration reject reuse. Cuts reconstruct the selected period phase without modifying RAM and charge cycles once using the admission's original timing fraction. This does not omit ADC conversions, DMA, interrupts, or observation barriers. JIT diagnostics describe actual handler work, not the logical instructions represented by a cached period. This path uses cached handlers, not LLVM-native RAM kernels. Capsule eligibility remains guarded: audited local ADC observations may be crossed only when provider/wiring, interrupt hooks, DMA identity, and the next directly backed RAM transfer satisfy the checks. Custom callbacks and unsupported DMA remain global observation barriers. Concurrency or reentrant mutation of a running World is unsupported; after a run throws, discard that World rather than inspecting or resuming potentially speculative state.
 
-A repeatable full-network benchmark includes startup, checks all six boards reach the deadline, and exits unsuccessfully when median throughput is not above realtime:
+The full-network benchmark helper uses JIT and RAM capsules by default. Its
+negative scheduling flags disable those defaults; it does not expose positive
+`--jit` or `--ram-capsules` switches. A repeatable benchmark includes startup,
+checks all six boards reach the deadline, and exits unsuccessfully when median
+throughput is not above realtime:
 
 ```bash
-python3 tools/bench_full_network.py --binary build-pgo/fil --reps 3 \
-  --no-loop-batching --check-trace
+python3 tools/bench_full_network.py --binary build-pgo/fil --reps 3 --check-trace
 ```
 
-Use `--ram-capsules` instead of `--no-loop-batching` in the benchmark helper to measure that experiment; the helper supplies its required CLI scheduling flags automatically.
+To benchmark the interpreter reference, explicitly use
+`--no-jit --no-ram-capsules`. Other negative helper flags likewise disable their
+default mode.
 
 For sustained before/after comparisons, add `--reference-binary path/to/reference/fil`
-and use a longer duration such as `--duration-ms 60000 --reps 3`. The helper
-alternates reference/candidate run order, requires matching counters and final
-board PCs, and reports relative speedup separately from absolute realtime
-throughput. A candidate that improves on the reference but remains below
-realtime still exits unsuccessfully. Both binaries use JIT and ADC decimation 1.
+and use an appropriate longer duration. The helper alternates reference/candidate
+run order and checks matching counters and final board PCs. Explicitly request
+`--no-jit --no-ram-capsules` when the intended reference is the interpreter.
 Keep compiler flags and firmware identical and train PGO for each source version
 with the scheduler being measured. Clean-rebuild profile-use objects when
 replacing a profile in place; mixed old/new profile summaries can break ThinLTO.
 
-A sustained capsule check uses the same helper with an explicit longer duration:
-
-```bash
-python3 tools/bench_full_network.py --binary build-pgo/fil \
-  --duration-ms 60000 --reps 3 --ram-capsules --check-trace
-```
-
-The optional trace check compares 1,000 ms against exact single-instruction execution with the same firmware and ADC decimation 1. Retrain PGO with the scheduling options being measured; an old profile is not a matched baseline. For RAM-capsule measurements, add `--ram-capsules` to the training invocation as well as the benchmark.
+For longer matched comparisons, use the same helper with an explicit duration.
+The optional trace check compares against exact single-instruction execution
+with the same firmware and ADC decimation 1. Retrain PGO with the scheduling
+options being measured; an old profile is not a matched baseline. To test the
+interpreter explicitly, pass `--no-jit --no-ram-capsules` to the helper.
 
 ## ADC decimation
 

@@ -259,7 +259,16 @@ Result<void> World::initialize(const bool strict_mmio) {
 Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
     // Run configuration is immutable for this invocation, including across
     // peripheral callbacks. Keep a non-aliased snapshot for the hot scheduler.
-    const WorldRunOptions options = requested_options;
+    const WorldRunOptions options = [&] {
+        auto effective = requested_options;
+        // Fast defaults must not turn diagnostic or alternative schedulers
+        // into invalid combinations. Their exact paths retain full fidelity.
+        effective.enable_ram_capsules = effective.enable_ram_capsules
+            && effective.enable_jit && !effective.enable_loop_batching
+            && !effective.enable_deferred_prefixes && !effective.trace_instructions
+            && !effective.detect_spin && !effective.enable_transactional_slices;
+        return effective;
+    }();
     if (options.instruction_quantum == 0U) {
         return argumentError("world instruction quantum must be nonzero");
     }
@@ -267,10 +276,6 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
         return argumentError("world spin threshold must be nonzero when spin detection is enabled");
     }
 
-    if (options.enable_ram_capsules
-        && (options.enable_deferred_prefixes || options.enable_loop_batching)) {
-        return argumentError("RAM capsules require no loop batching and no deferred-pure option");
-    }
     if ((options.enable_deferred_prefixes || options.enable_ram_capsules)
         && (!options.enable_jit || options.trace_instructions || options.detect_spin
             || options.enable_transactional_slices)) {

@@ -25,6 +25,12 @@ def output(*, board_count=6, board_stop="time-budget", time_ns=1_000_000_000, in
 
 
 class FullNetworkValidationTest(unittest.TestCase):
+    def invoke(self, arguments, runner):
+        with (mock.patch.object(sys, "argv", ["bench_full_network.py", *arguments]),
+              mock.patch.object(BENCH, "run", side_effect=runner),
+              contextlib.redirect_stdout(io.StringIO())):
+            return BENCH.main()
+
     def run_summary(self, text, **options):
         result = subprocess.CompletedProcess([], 0, stdout=text, stderr="")
         with mock.patch.object(BENCH.subprocess, "run", return_value=result) as run:
@@ -50,13 +56,39 @@ class FullNetworkValidationTest(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     self.run_summary(text)
 
-    def test_experimental_modes_keep_full_rate_and_required_flags(self):
-        (_, _), call = self.run_summary(output(), ram_capsules=True)
+    def test_fast_defaults_and_explicit_fallback_flags(self):
+        (_, _), call = self.run_summary(output())
+        self.assertNotIn("--no-jit", call.args[0])
+        self.assertNotIn("--no-ram-capsules", call.args[0])
+        (_, _), call = self.run_summary(
+            output(), jit=False, ram_capsules=False, no_loop_batching=True)
+        self.assertIn("--no-jit", call.args[0])
+        self.assertIn("--no-ram-capsules", call.args[0])
         self.assertIn("--no-loop-batching", call.args[0])
-        self.assertIn("--ram-capsules", call.args[0])
-        (_, _), call = self.run_summary(output(), jit=False, ram_capsules=True)
-        self.assertNotIn("--ram-capsules", call.args[0])
         self.assertNotIn("--jit", call.args[0])
+        self.assertNotIn("--ram-capsules", call.args[0])
+
+    def test_main_accepts_negative_options_and_defaults_to_capsules(self):
+        calls = []
+
+        def run(binary, duration, **options):
+            calls.append(options)
+            return 1.0, {"time_ns": "5000000000", "instructions": "42"}
+
+        self.invoke(["--reps", "1"], run)
+        self.assertEqual(calls[0]["jit"], True)
+        self.assertEqual(calls[0]["ram_capsules"], True)
+        calls.clear()
+        self.invoke(["--reps", "1", "--no-jit", "--no-ram-capsules",
+                     "--no-loop-batching"], run)
+        self.assertEqual(calls[0]["jit"], False)
+        self.assertEqual(calls[0]["ram_capsules"], False)
+        self.assertTrue(calls[0]["no_loop_batching"])
+
+    def test_positive_legacy_flags_are_rejected(self):
+        for option in ("--jit", "--ram-capsules", "--loop-batching"):
+            with self.subTest(option=option), self.assertRaises(SystemExit):
+                self.invoke([option], lambda *args, **kwargs: None)
 
 
 class FullNetworkBenchmarkTest(unittest.TestCase):

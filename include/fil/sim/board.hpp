@@ -54,7 +54,7 @@ struct BoardRunOptions {
     bool detect_spin{false};                     ///< Stop on a proven exact-state loop.
     std::uint64_t spin_threshold{1'000'000};     ///< Logical instructions in a repeated exact-state loop.
     bool enable_loop_batching{true};             ///< Fast-forward proven side-effect-free loops.
-    bool enable_jit{false};                      ///< Opt-in cached hot-path compilation.
+    bool enable_jit{true};                       ///< Cached hot-path compilation, enabled by default.
     unsigned int adc_decimation{1}; ///< Keep 1 of N continuous ADC scans; higher skips side effects.
 };
 
@@ -244,7 +244,7 @@ public:
         SimTimeNs deadline_ns,
         bool enable_loop_batching = true,
         bool trap_all_mmio = false,
-        bool enable_jit = false
+        bool enable_jit = true
     );
 
     /** @brief Captures reversible CPU, RAM, system, scheduler, and lane-clock state. */
