@@ -67,6 +67,8 @@ def run(binary, duration_ms, *, jit=True, trace=None, no_loop_batching=False,
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=pathlib.Path, default=ROOT / "build-pgo" / "fil")
+    parser.add_argument("--reference-binary", type=pathlib.Path,
+                        help="time a matched baseline in alternating run order")
     parser.add_argument("--duration-ms", type=int, default=5000)
     parser.add_argument("--reps", type=int, default=3)
     parser.add_argument("--check-trace", action="store_true",
@@ -97,15 +99,33 @@ def main():
                 raise RuntimeError("Full-network interpreter/JIT traces differ")
         print("1,000 ms full-network traces, counters and final board PCs: identical", flush=True)
     times = []
+    reference_times = []
+    reference_binary = args.reference_binary.resolve() if args.reference_binary else None
     for repetition in range(args.reps):
-        wall, summary = run(binary, args.duration_ms, no_loop_batching=args.no_loop_batching,
-                            deferred_prefixes=args.deferred_prefixes, ram_capsules=args.ram_capsules)
-        times.append(wall)
-        print(f"Run {repetition + 1}: wall={wall:.3f}s "
-              f"simulated={int(summary['time_ns']) / 1e9:.9f}s "
-              f"instructions={summary['instructions']}", flush=True)
+        binaries = [("candidate", binary, times)]
+        if reference_binary is not None:
+            binaries.append(("reference", reference_binary, reference_times))
+            if repetition % 2 == 0:
+                binaries.reverse()
+        summaries = []
+        for label, executable, measurements in binaries:
+            wall, summary = run(executable, args.duration_ms,
+                                no_loop_batching=args.no_loop_batching,
+                                deferred_prefixes=args.deferred_prefixes,
+                                ram_capsules=args.ram_capsules)
+            measurements.append(wall)
+            summaries.append(summary)
+            print(f"Run {repetition + 1} ({label}): wall={wall:.3f}s "
+                  f"simulated={int(summary['time_ns']) / 1e9:.9f}s "
+                  f"instructions={summary['instructions']}", flush=True)
+        if len(summaries) == 2 and summaries[0] != summaries[1]:
+            raise RuntimeError("Reference/candidate counters or final board PCs differ")
     median = statistics.median(times)
     throughput = args.duration_ms / 1000 / median
+    if reference_times:
+        reference_median = statistics.median(reference_times)
+        print(f"Reference median: {reference_median:.3f}s; "
+              f"candidate speedup: {reference_median / median:.3f}x", flush=True)
     print(f"ADC decimation: 1; all six boards reached the time budget")
     print(f"Median: {median:.3f}s; throughput: {throughput:.3f}x realtime")
     return 0 if median < args.duration_ms / 1000 else 1

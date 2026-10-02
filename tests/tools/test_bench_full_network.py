@@ -1,15 +1,18 @@
-"""Fast checks for the full-network benchmark's validation (no firmware needed)."""
+"""Tests for alternating, fidelity-matched full-network measurements."""
 
+import contextlib
 import importlib.util
+import io
 import pathlib
+import sys
 import subprocess
 import unittest
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-spec = importlib.util.spec_from_file_location("bench_full_network", ROOT / "tools/bench_full_network.py")
-bench = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(bench)
+SPEC = importlib.util.spec_from_file_location("bench_full_network", ROOT / "tools/bench_full_network.py")
+BENCH = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(BENCH)
 
 
 def output(*, board_count=6, board_stop="time-budget", time_ns=1_000_000_000, instructions=60):
@@ -21,12 +24,12 @@ def output(*, board_count=6, board_stop="time-budget", time_ns=1_000_000_000, in
     ])
 
 
-class FullNetworkBenchmarkTest(unittest.TestCase):
+class FullNetworkValidationTest(unittest.TestCase):
     def run_summary(self, text, **options):
         result = subprocess.CompletedProcess([], 0, stdout=text, stderr="")
-        with mock.patch.object(bench.subprocess, "run", return_value=result) as run:
-            with mock.patch.object(bench.time, "perf_counter", side_effect=[10.0, 10.5]):
-                measured = bench.run(pathlib.Path("/tmp/fil"), 1000, **options)
+        with mock.patch.object(BENCH.subprocess, "run", return_value=result) as run:
+            with mock.patch.object(BENCH.time, "perf_counter", side_effect=[10.0, 10.5]):
+                measured = BENCH.run(pathlib.Path("/tmp/fil"), 1000, **options)
         return measured, run.call_args
 
     def test_full_rate_and_completed_boards_are_required(self):
@@ -54,6 +57,50 @@ class FullNetworkBenchmarkTest(unittest.TestCase):
         (_, _), call = self.run_summary(output(), jit=False, ram_capsules=True)
         self.assertNotIn("--ram-capsules", call.args[0])
         self.assertNotIn("--jit", call.args[0])
+
+
+class FullNetworkBenchmarkTest(unittest.TestCase):
+    def invoke(self, arguments, runner):
+        with mock.patch.object(sys, "argv", ["bench_full_network.py", *arguments]), \
+                mock.patch.object(BENCH, "run", side_effect=runner), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            result = BENCH.main()
+        return result, output.getvalue()
+
+    def test_reference_alternates_order_and_matches_options(self):
+        calls = []
+
+        def run(binary, duration, **options):
+            calls.append((binary.name, duration, options))
+            return (2.0 if binary.name == "reference" else 1.0), {
+                "time_ns": "5000000000", "instructions": "42"}
+
+        result, output = self.invoke([
+            "--binary", "candidate", "--reference-binary", "reference",
+            "--reps", "2", "--no-loop-batching"], run)
+        self.assertEqual(result, 0)
+        self.assertEqual([call[0] for call in calls],
+                         ["reference", "candidate", "candidate", "reference"])
+        self.assertTrue(all(call[1] == 5000 and call[2]["no_loop_batching"] for call in calls))
+        self.assertIn("candidate speedup: 2.000x", output)
+
+    def test_mismatched_results_are_rejected(self):
+        def run(binary, duration, **options):
+            return 1.0, {"time_ns": "5000000000", "instructions": binary.name}
+
+        with self.assertRaisesRegex(RuntimeError, "Reference/candidate"):
+            self.invoke(["--binary", "candidate", "--reference-binary", "reference"], run)
+
+    def test_below_realtime_still_fails_even_when_faster_than_reference(self):
+        def run(binary, duration, **options):
+            return (9.0 if binary.name == "reference" else 6.0), {
+                "time_ns": "5000000000", "instructions": "42"}
+
+        result, output = self.invoke([
+            "--binary", "candidate", "--reference-binary", "reference", "--reps", "1"], run)
+        self.assertEqual(result, 1)
+        self.assertIn("candidate speedup: 1.500x", output)
+        self.assertIn("throughput: 0.833x realtime", output)
 
 
 if __name__ == "__main__":

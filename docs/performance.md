@@ -110,6 +110,16 @@ python3 tools/bench_full_network.py --binary build-pgo/fil --reps 3 \
 
 Use `--ram-capsules` instead of `--no-loop-batching` in the benchmark helper to measure that experiment; the helper supplies its required CLI scheduling flags automatically.
 
+For sustained before/after comparisons, add `--reference-binary path/to/reference/fil`
+and use a longer duration such as `--duration-ms 60000 --reps 3`. The helper
+alternates reference/candidate run order, requires matching counters and final
+board PCs, and reports relative speedup separately from absolute realtime
+throughput. A candidate that improves on the reference but remains below
+realtime still exits unsuccessfully. Both binaries use JIT and ADC decimation 1.
+Keep compiler flags and firmware identical and train PGO for each source version
+with the scheduler being measured. Clean-rebuild profile-use objects when
+replacing a profile in place; mixed old/new profile summaries can break ThinLTO.
+
 The optional trace check compares 1,000 ms against exact single-instruction execution with the same firmware and ADC decimation 1. Retrain PGO with the scheduling options being measured; an old profile is not a matched baseline. For RAM-capsule measurements, add `--ram-capsules` to the training invocation as well as the benchmark.
 
 ## ADC decimation
