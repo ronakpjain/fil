@@ -229,6 +229,30 @@ TEST(BoardTest, ReversibleRamPrefixChainsBranchesAndReplaysLongCuts) {
                                        full_exact.value()->cpu().state()));
 }
 
+TEST(BoardTest, ReusableReversibleRamOutputUsesOnlyLiveMetadata) {
+    auto board = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(board);
+    ASSERT_TRUE(installBranchingReversibleProgram(*board.value()));
+
+    fil::sim::Board::ReversibleRamPrefix prefix;
+    ASSERT_TRUE(board.value()->prepareReversibleRamPrefix(prefix, 64U));
+    ASSERT_EQ(prefix.count, 64U);
+    ASSERT_TRUE(board.value()->reset());
+    ASSERT_TRUE(installBranchingReversibleProgram(*board.value()));
+
+    ASSERT_TRUE(board.value()->prepareReversibleRamPrefix(prefix, 17U));
+    EXPECT_EQ(prefix.count, 17U);
+    EXPECT_EQ(prefix.evaluated.count, prefix.count);
+    for (std::size_t i = 0U; i < prefix.count; ++i) {
+        EXPECT_NE(prefix.evaluated.pcs[i], 0U);
+        EXPECT_NE(prefix.completion_times_ns[i], 0U);
+        if (i != 0U) {
+            EXPECT_GT(prefix.completion_times_ns[i], prefix.completion_times_ns[i - 1U]);
+            EXPECT_GT(prefix.cumulative_cycles[i], prefix.cumulative_cycles[i - 1U]);
+        }
+    }
+}
+
 TEST(BoardTest, IdempotentPeriodCacheRejectsChangedFlashClockAndCodeGeneration) {
     {
         auto board = fil::sim::Board::load(fixtureBoard());

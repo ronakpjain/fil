@@ -445,7 +445,9 @@ private:
     /// Divide-free cycles->ns conversion: (c*1e9)/F split into quotient and
     /// remainder per cycle count. Remainder plus carry is always < 2*F, so
     /// the per-step carry resolves with one compare (exact, no division).
-    static constexpr std::size_t cycle_table_size = 128U;
+    // Cover complete 64-instruction capsule spans as well as single steps;
+    // the conversion remains exact, with division retained for larger jumps.
+    static constexpr std::size_t cycle_table_size = 1024U;
     struct CycleTableEntry { std::uint64_t quotient{0}; std::uint64_t remainder{0}; };
     mutable std::array<CycleTableEntry, cycle_table_size> cycle_table_{};
     mutable std::uint64_t cycle_table_hz_{0};

@@ -674,7 +674,11 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
     prefix.period_certificate.reset();
     prefix.period_phase = 0U;
     prefix.memoized_count = 0U;
-    prefix.evaluated = {};
+    // The fixed-capacity metadata arrays are live only below their count.
+    // Avoid value-initializing all 64 entries on every admission; callers must
+    // likewise consult only the admitted prefix.
+    prefix.evaluated.count = 0U;
+    prefix.evaluated.result = cpu::FastStepResult{};
     prefix.start_time_ns = now;
     prefix.entry_pc = cpu_->state().r[15];
     prefix.entry_state.capture(cpu_->state());
@@ -831,7 +835,9 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
             }
         }
     }
-    ReversibleRamPrefix::ReversibleExecution speculative{};
+    ReversibleRamPrefix::ReversibleExecution speculative;
+    speculative.count = 0U;
+    speculative.result = cpu::FastStepResult{};
     bool stop = false;
     bool boundary_cut = false;
     std::uint64_t cycles = 0U;
@@ -884,7 +890,13 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
                     == prefix.memory_checkpoint.mutation_sequence
                 && memory_.sideEffectsRestoredSince(prefix.memory_checkpoint)) {
                 const std::uint64_t period_cycles = cycles;
-                if (period <= IdempotentPeriodCertificate::max_instructions) {
+                // Certification replays a whole period. Build the optional
+                // cache only when this admission can immediately fold at least
+                // one period; otherwise the extra execution cannot shorten
+                // this capsule and a later admission may certify if useful.
+                const bool can_fold = limit - prefix.count >= period
+                    && period_cycles <= budget.remaining_cycles;
+                if (can_fold && period <= IdempotentPeriodCertificate::max_instructions) {
                     prefix.period_certificate = buildIdempotentPeriodCertificate(
                         period, period_cycles);
                 }
@@ -947,9 +959,21 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
         if (replayed.count != prefix.count) {
             throw std::logic_error("reversible RAM admission replay count differs");
         }
-        prefix.evaluated = std::move(replayed);
+        prefix.evaluated.result = replayed.result;
+        prefix.evaluated.count = replayed.count;
+        for (std::size_t i = 0U; i < replayed.count; ++i) {
+            prefix.evaluated.pcs[i] = replayed.pcs[i];
+            prefix.evaluated.sizes[i] = replayed.sizes[i];
+            prefix.evaluated.instruction_cycles[i] = replayed.instruction_cycles[i];
+        }
     } else {
-        prefix.evaluated = std::move(speculative);
+        prefix.evaluated.result = speculative.result;
+        prefix.evaluated.count = speculative.count;
+        for (std::size_t i = 0U; i < speculative.count; ++i) {
+            prefix.evaluated.pcs[i] = speculative.pcs[i];
+            prefix.evaluated.sizes[i] = speculative.sizes[i];
+            prefix.evaluated.instruction_cycles[i] = speculative.instruction_cycles[i];
+        }
     }
     prefix.evaluated_checkpoint = memory_.sideEffectCheckpoint();
     return true;
