@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <initializer_list>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -13,9 +14,19 @@
 
 namespace fil::config::detail {
 
-/** @brief Small JSON value tree shared by the versioned input loaders. */
+/** @brief Small JSON value tree shared by the versioned input loaders.
+ *
+ * The recursive member of an object is held by `std::unique_ptr` on purpose.
+ * `JsonValue` is still incomplete while `Storage` is declared, and an object entry
+ * type that embeds it by value (`std::pair<std::string, JsonValue>`) forces the
+ * standard library to instantiate that pair's members with an incomplete argument,
+ * which libstdc++ rejects outright (libc++ happens to defer it). `unique_ptr` is
+ * explicitly allowed to be instantiated with an incomplete type, so the same header
+ * compiles against every standard library.
+ */
 struct JsonValue {
-    using Object = std::vector<std::pair<std::string, JsonValue>>;
+    using Member = std::pair<std::string, std::unique_ptr<JsonValue>>;
+    using Object = std::vector<Member>;
     using Array = std::vector<JsonValue>;
     using Storage = std::variant<std::nullptr_t, bool, std::uint64_t, std::string, Object, Array>;
 

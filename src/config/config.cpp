@@ -102,7 +102,10 @@ private:
             if (!value) {
                 return value.error();
             }
-            object.emplace_back(std::move(key).value(), std::move(value).value());
+            object.emplace_back(
+                std::move(key).value(),
+                std::make_unique<JsonValue>(std::move(value).value())
+            );
 
             skipWhitespace();
             if (consume('}')) {
@@ -334,7 +337,7 @@ Result<JsonValue> loadJson(const std::filesystem::path& path) {
 const JsonValue* find(const JsonValue::Object& object, const std::string_view key) {
     for (const auto& [candidate, value] : object) {
         if (candidate == key) {
-            return &value;
+            return value.get();
         }
     }
     return nullptr;
@@ -543,7 +546,7 @@ Result<std::vector<GpioPinConfig>> parseGpio(
     if (!pins) return pins.error();
     std::vector<GpioPinConfig> result;
     for (const auto& [pin, definition] : *pins.value()) {
-        auto object = requireObject(definition, path, "GPIO pin '" + pin + "'");
+        auto object = requireObject(*definition, path, "GPIO pin '" + pin + "'");
         if (!object) return object.error();
         auto unknown = rejectUnknown(*object.value(), path, {"mode", "value", "trace"});
         if (!unknown) return unknown.error();
@@ -582,7 +585,7 @@ Result<std::vector<CanControllerConfig>> parseCan(
     if (!controllers) return controllers.error();
     std::vector<CanControllerConfig> result;
     for (const auto& [instance, definition] : *controllers.value()) {
-        auto object = requireObject(definition, path, "CAN controller '" + instance + "'");
+        auto object = requireObject(*definition, path, "CAN controller '" + instance + "'");
         if (!object) return object.error();
         auto unknown = rejectUnknown(*object.value(), path, {"bus", "loopback"});
         if (!unknown) return unknown.error();
@@ -608,7 +611,7 @@ Result<std::vector<UsartConfig>> parseUsart(
     if (!controllers) return controllers.error();
     std::vector<UsartConfig> result;
     for (const auto& [instance, definition] : *controllers.value()) {
-        auto object = requireObject(definition, path, "USART '" + instance + "'");
+        auto object = requireObject(*definition, path, "USART '" + instance + "'");
         if (!object) return object.error();
         auto unknown = rejectUnknown(*object.value(), path, {"tx_log", "rx"});
         if (!unknown) return unknown.error();
@@ -692,7 +695,7 @@ Result<std::vector<AdcConfig>> parseAdc(
     if (!controllers) return controllers.error();
     std::vector<AdcConfig> result;
     for (const auto& [instance, definition] : *controllers.value()) {
-        auto object = requireObject(definition, path, "ADC '" + instance + "'");
+        auto object = requireObject(*definition, path, "ADC '" + instance + "'");
         if (!object) return object.error();
         auto unknown = rejectUnknown(*object.value(), path, {"channels"});
         if (!unknown) return unknown.error();
@@ -707,7 +710,7 @@ Result<std::vector<AdcConfig>> parseAdc(
             if (!channel || channel.value() > 31U) {
                 return configError(path, "ADC channel name must be an integer from 0 through 31");
             }
-            auto parsed = parseAdcChannel(source, path, instance + ".channels." + channel_name);
+            auto parsed = parseAdcChannel(*source, path, instance + ".channels." + channel_name);
             if (!parsed) return parsed.error();
             config.channels.emplace(static_cast<std::uint8_t>(channel.value()), std::move(parsed).value());
         }
@@ -725,7 +728,7 @@ Result<std::vector<SpiConfig>> parseSpi(
     if (!controllers) return controllers.error();
     std::vector<SpiConfig> result;
     for (const auto& [instance, definition] : *controllers.value()) {
-        auto object = requireObject(definition, path, "SPI '" + instance + "'");
+        auto object = requireObject(*definition, path, "SPI '" + instance + "'");
         if (!object) return object.error();
         auto unknown = rejectUnknown(*object.value(), path, {"device"});
         if (!unknown) return unknown.error();
@@ -966,7 +969,7 @@ Result<NetworkConfig> loadNetworkConfig(const std::filesystem::path& path) {
     config.name = std::move(name).value();
     config.source_path = source_path.value();
     for (const auto& [bus_name, definition] : *buses.value()) {
-        auto bus = requireObject(definition, source_path.value(), "CAN bus '" + bus_name + "'");
+        auto bus = requireObject(*definition, source_path.value(), "CAN bus '" + bus_name + "'");
         if (!bus) return bus.error();
         auto bus_unknown = rejectUnknown(*bus.value(), source_path.value(), {"type", "bitrate"});
         if (!bus_unknown) return bus_unknown.error();
