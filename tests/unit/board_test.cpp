@@ -254,6 +254,41 @@ TEST(BoardTest, ReusableReversibleRamOutputUsesOnlyLiveMetadata) {
     }
 }
 
+TEST(BoardTest, IdempotentPeriodCacheReusesNonzeroPeriodPhase) {
+    auto exact = fil::sim::Board::load(fixtureBoard());
+    auto speculative = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(exact && speculative);
+    ASSERT_TRUE(warmIdempotentPeriodCache(*exact.value()));
+    ASSERT_TRUE(warmIdempotentPeriodCache(*speculative.value()));
+
+    // Establish a certificate, then leave the cached cycle at a nonzero phase.
+    const auto seed = speculative.value()->prepareReversibleRamPrefix(36U);
+    ASSERT_TRUE(seed);
+    ASSERT_TRUE(seed->period_certificate);
+    const auto first = speculative.value()->materializeReversibleRamPrefix(*seed, 1U);
+    fil::sim::BoardRunOptions one;
+    one.duration_ns = 0U;
+    one.enable_loop_batching = false;
+    one.max_instructions = 1U;
+    const auto first_reference = exact.value()->run(one);
+    ASSERT_EQ(first.cpu_result.instructions, first_reference.instructions);
+    ASSERT_EQ(first.cpu_result.cycles, first_reference.cycles);
+    ASSERT_TRUE(fil::cpu::bitwiseEqual(speculative.value()->cpu().state(),
+                                       exact.value()->cpu().state()));
+
+    const auto cached = speculative.value()->prepareReversibleRamPrefix(12U);
+    ASSERT_TRUE(cached);
+    EXPECT_GT(cached->memoized_count, 0U)
+        << "a valid period certificate must be reusable from an interior phase";
+    const auto committed = speculative.value()->materializeReversibleRamPrefix(
+        *cached, cached->count);
+    one.max_instructions = cached->count;
+    const auto reference = exact.value()->run(one);
+    EXPECT_EQ(committed.cpu_result.cycles, reference.cycles);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(speculative.value()->cpu().state(),
+                                       exact.value()->cpu().state()));
+}
+
 TEST(BoardTest, IdempotentPeriodCacheRejectsChangedFlashClockAndCodeGeneration) {
     {
         auto board = fil::sim::Board::load(fixtureBoard());
