@@ -36,7 +36,7 @@ This document describes the decoder and executor currently in this repository. I
 | Bit and extend | `CLZ`, `UBFX`, `SXTB`, `SXTH`, `UXTB`, `UXTH` | Representative real encodings are unit covered; wide extend supports rotations by multiples of eight. |
 | Loads and stores | wide `LDR`, `STR`, `LDRB`, `STRB`, `LDRH`, `STRH`, `LDRSB`, `LDRSH`, plus `LDRD`, `STRD` | Selected literal, 12-bit immediate, register-offset, pre-index, post-index, and writeback forms are implemented. Real doubleword stack forms are unit covered. |
 | Multiple transfer | wide `PUSH`, `POP`, `LDM`, `STM` | Implemented for accepted register lists and increment-after/decrement-before forms. EXC_RETURN through POP/LDM is recognized. |
-| Branch | conditional and unconditional `B.W`, `BL` | Decode and execution are unit covered for representative branches. Immediate `BLX` is not implemented. |
+| Branch | conditional and unconditional `B.W`, `BL`, `TBB`, `TBH` | Decode and execution are unit covered for representative branches. Table branches perform byte/halfword data reads and branch to `PC+4 + 2*entry`; Immediate `BLX` is not implemented. |
 | Special registers | `MRS`, `MSR` | Supported registers are IPSR for reads; MSP, PSP, PRIMASK, BASEPRI, BASEPRI_MAX, FAULTMASK, and CONTROL as applicable. Representative FreeRTOS forms are unit covered. |
 | Ordering | `DMB`, `DSB`, `ISB`, wide `NOP` | Decoded and unit covered as deterministic no-ops in this single-threaded model. |
 | FP loads/stores | `VLDR`, `VSTR`, `VSTM`, `VLDM` | Positive/negative base and PC-relative scalar transfers are implemented for S registers and D-register bit pairs. S-register lists and D-register `VPUSH`/`VPOP` aliases use adjacent S-register storage. FreeRTOS `VSTMDB {s16-s31}` and `VLDMIA {s16-s31}` context forms are unit covered. |
@@ -81,7 +81,7 @@ Unsupported encodings fail as `unimplemented-instruction`; they are not treated 
 - exclusive and acquire/release operations such as `LDREX` and `STREX`;
 - signed or accumulating long multiplies not listed above;
 - DSP, SIMD, saturating, packing, and parallel add/subtract families other than `UADD8` and `SEL`;
-- `RBIT`, signed bitfield extract, bitfield insert/clear, and table branches;
+- `RBIT`, signed bitfield extract, bitfield insert/clear;
 - immediate `BLX`, coprocessor encodings outside the listed VFP subset, preload hints, and cache-maintenance operations;
 - MPU behavior, unprivileged memory permission enforcement, and debug instruction semantics.
 

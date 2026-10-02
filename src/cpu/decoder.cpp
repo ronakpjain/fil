@@ -867,6 +867,20 @@ struct ExpandedImmediate {
     const std::uint16_t first,
     const std::uint16_t second
 ) {
+    if ((first & 0xfff0U) == 0xe8d0U) {
+        const std::uint16_t table_op = second & 0xfff0U;
+        if (table_op != 0xf000U && table_op != 0xf010U) return std::nullopt;
+        const auto rn = static_cast<std::uint8_t>(first & 0x0fU);
+        const auto rm = static_cast<std::uint8_t>(second & 0x0fU);
+        if (rn == 13U || rm == 13U || rm == 15U) return std::nullopt;
+        auto result = base32(
+            first, second, table_op == 0xf000U ? InstrKind::tbb : InstrKind::tbh,
+            OperandForm::register_value
+        );
+        result.rn = rn;
+        result.rm = rm;
+        return result;
+    }
     if ((first & 0xfe40U) == 0xe840U) {
         auto result = base32(
             first, second,
@@ -881,7 +895,8 @@ struct ExpandedImmediate {
         result.add = (first & 0x0080U) != 0U;
         result.writeback = (first & 0x0020U) != 0U;
         if ((!result.index && !result.writeback) || result.rn == 15U
-            || result.rd == 15U || result.ra == 15U || result.rd == result.ra
+            || result.rd == 15U || result.ra == 15U
+            || (result.kind == InstrKind::ldrd && result.rd == result.ra)
             || (result.writeback && (result.rn == result.rd || result.rn == result.ra))) {
             return std::nullopt;
         }

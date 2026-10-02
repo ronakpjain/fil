@@ -2143,6 +2143,9 @@ bool CortexM4::peekPredictableCycles(std::uint16_t& cycles_out) const noexcept {
     // branches evaluate exactly from pre-state below, replicating stepFast's
     // `r15 != fallthrough` refill rule including pathological coincidences.
     switch (decoded.kind) {
+    case InstrKind::tbb:
+    case InstrKind::tbh:
+        return false;
     case InstrKind::mov:
     case InstrKind::ldr:
     case InstrKind::ldrb:

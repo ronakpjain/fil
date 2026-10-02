@@ -123,6 +123,8 @@ enum class InstrKind : std::uint8_t {
     bl,
     bx,
     blx,
+    tbb,
+    tbh,
     cbz,
     cbnz,
     it,

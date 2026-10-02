@@ -63,6 +63,90 @@ void prepare(fil::cpu::CortexM4& cpu, const std::uint32_t pc = flash_base) {
     cpu.state().r[13] = cpu.state().msp;
 }
 
+TEST(CpuStepTest, ExecutesTbbAndTbhWithArchitecturalPcAndPreservesFlags) {
+    for (const bool halfword : {false, true}) {
+        fil::mem::MemoryBus bus;
+        ASSERT_TRUE(bus.mapRam(flash_base, 64U, "table-branch-code", true).hasValue());
+        ASSERT_TRUE(bus.mapRam(ram_base, 256U, "table-branch-data").hasValue());
+        const std::uint16_t first = 0xe8d0U;
+        const std::uint16_t second = halfword ? 0xf012U : 0xf001U;
+        ASSERT_TRUE(bus.write16(flash_base, first, {fil::mem::AccessType::data_write, 0U}));
+        ASSERT_TRUE(bus.write16(flash_base + 2U, second, {fil::mem::AccessType::data_write, 0U}));
+        const std::uint32_t table = ram_base + 0x20U;
+        ASSERT_TRUE(bus.write8(table + (halfword ? 4U : 1U), 3U,
+            {fil::mem::AccessType::data_write, 0U}));
+        ASSERT_TRUE(bus.write16(table + 4U, 3U,
+            {fil::mem::AccessType::data_write, 0U}));
+        if (halfword) {
+            const auto entry = bus.read16(table + 4U,
+                {fil::mem::AccessType::data_read, flash_base});
+            ASSERT_TRUE(entry);
+            EXPECT_EQ(entry.value(), 3U);
+        } else {
+            const auto entry = bus.read8(table + 1U,
+                {fil::mem::AccessType::data_read, flash_base});
+            ASSERT_TRUE(entry);
+            EXPECT_EQ(entry.value(), 3U);
+        }
+
+        fil::cpu::CortexM4 cpu(bus);
+        prepare(cpu);
+        cpu.state().r[0] = table;
+        cpu.state().r[halfword ? 2U : 1U] = halfword ? 2U : 1U;
+        cpu.state().xpsr |= fil::cpu::xpsr_n | fil::cpu::xpsr_c | fil::cpu::xpsr_v;
+        const std::uint32_t preserved_flags = cpu.state().xpsr
+            & (fil::cpu::xpsr_n | fil::cpu::xpsr_z | fil::cpu::xpsr_c | fil::cpu::xpsr_v);
+        const auto result = cpu.step();
+        ASSERT_EQ(result.reason, fil::cpu::StopReason::step_complete);
+        EXPECT_EQ(cpu.state().r[15], flash_base + 10U)
+            << "table branch target is PC+4 plus twice the loaded entry";
+        EXPECT_EQ(cpu.state().xpsr
+            & (fil::cpu::xpsr_n | fil::cpu::xpsr_z | fil::cpu::xpsr_c | fil::cpu::xpsr_v),
+            preserved_flags) << "TBB/TBH preserve APSR flags";
+        EXPECT_EQ(result.cycles, 4U) << "taken table branch includes the branch refill";
+    }
+}
+
+TEST(CpuStepTest, StrdStoresRepeatedSourceRegisterTwice) {
+    fil::mem::MemoryBus bus;
+    ASSERT_TRUE(bus.mapRam(flash_base, 64U, "strd-code", true).hasValue());
+    ASSERT_TRUE(bus.mapRam(ram_base, 256U, "strd-data").hasValue());
+    ASSERT_TRUE(bus.write16(flash_base, 0xe9c0U,
+        {fil::mem::AccessType::data_write, 0U}));
+    ASSERT_TRUE(bus.write16(flash_base + 2U, 0x3303U,
+        {fil::mem::AccessType::data_write, 0U}));
+    fil::cpu::CortexM4 cpu(bus);
+    prepare(cpu);
+    cpu.state().r[0] = ram_base + 0x20U;
+    cpu.state().r[3] = 0x12345678U;
+    const auto result = cpu.step();
+    ASSERT_EQ(result.reason, fil::cpu::StopReason::step_complete);
+    const auto first = bus.read32(ram_base + 0x2cU,
+        {fil::mem::AccessType::data_read, flash_base});
+    const auto second = bus.read32(ram_base + 0x30U,
+        {fil::mem::AccessType::data_read, flash_base});
+    ASSERT_TRUE(first && second);
+    EXPECT_EQ(first.value(), 0x12345678U);
+    EXPECT_EQ(second.value(), 0x12345678U);
+}
+
+TEST(CpuStepTest, TbbDataFaultStopsWithoutBranching) {
+    fil::mem::MemoryBus bus;
+    ASSERT_TRUE(bus.mapRam(flash_base, 64U, "table-branch-code", true).hasValue());
+    ASSERT_TRUE(bus.write16(flash_base, 0xe8d0U,
+        {fil::mem::AccessType::data_write, 0U}));
+    ASSERT_TRUE(bus.write16(flash_base + 2U, 0xf001U,
+        {fil::mem::AccessType::data_write, 0U}));
+    fil::cpu::CortexM4 cpu(bus);
+    prepare(cpu);
+    cpu.state().r[0] = 0x40000000U;
+    cpu.state().r[1] = 0U;
+    const auto result = cpu.step();
+    EXPECT_EQ(result.reason, fil::cpu::StopReason::bus_fault);
+    EXPECT_EQ(cpu.state().r[15], flash_base + 4U) << "faulting table load does not branch";
+    EXPECT_TRUE(result.diagnostic.bus_fault.has_value()) << "reports the table data fault";
+}
+
 TEST(CpuStepTest, ComparesCpuStateByStoredRepresentation) {
     fil::cpu::CpuState left;
     left.s[0] = std::bit_cast<float>(0x7fc00001U);

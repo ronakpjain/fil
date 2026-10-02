@@ -86,6 +86,8 @@ JitBoundary classifyJitBoundary(const DecodedInstruction& instruction) noexcept 
     case InstrKind::cbnz:
         return JitBoundary::control_flow;
 
+    case InstrKind::tbb:
+    case InstrKind::tbh:
     case InstrKind::it:
     case InstrKind::dmb:
     case InstrKind::dsb:

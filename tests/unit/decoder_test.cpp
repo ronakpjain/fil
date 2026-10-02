@@ -81,6 +81,27 @@ TEST(DecoderTest, DecodesRepresentativeThirtyTwoBitFamilies) {
     const auto pop = fil::cpu::decode32(0xe8bdU, 0x81f0U);
     EXPECT_TRUE(push && push->kind == fil::cpu::InstrKind::push) << "decodes wide PUSH alias";
     EXPECT_TRUE(pop && pop->kind == fil::cpu::InstrKind::pop) << "decodes wide POP alias";
+
+    const auto tbb = fil::cpu::decode32(0xe8d0U, 0xf001U);
+    const auto tbh = fil::cpu::decode32(0xe8d2U, 0xf013U);
+    EXPECT_TRUE(tbb && tbb->kind == fil::cpu::InstrKind::tbb && tbb->rn == 0U && tbb->rm == 1U)
+        << "decodes TBB register operands";
+    EXPECT_TRUE(tbh && tbh->kind == fil::cpu::InstrKind::tbh && tbh->rn == 2U && tbh->rm == 3U)
+        << "decodes TBH register operands";
+    EXPECT_TRUE(!fil::cpu::decode32(0xe8d0U, 0xf021U))
+        << "rejects reserved table-branch second-halfword encoding";
+    EXPECT_TRUE(!fil::cpu::decode32(0xe8ddU, 0xf001U))
+        << "rejects SP table base";
+    EXPECT_TRUE(!fil::cpu::decode32(0xe8d0U, 0xf00fU))
+        << "rejects PC table offset";
+
+    const auto strd_same_source = fil::cpu::decode32(0xe9c0U, 0x3303U);
+    const auto ldrd_same_destination = fil::cpu::decode32(0xe9d0U, 0x3303U);
+    EXPECT_TRUE(strd_same_source && strd_same_source->kind == fil::cpu::InstrKind::strd
+        && strd_same_source->rd == 3U && strd_same_source->ra == 3U)
+        << "accepts STRD with the same source register in both words";
+    EXPECT_TRUE(!ldrd_same_destination)
+        << "rejects LDRD with repeated destination registers";
 }
 
 TEST(DecoderTest, DecodesRealG4AndFreeRtosEncodings) {

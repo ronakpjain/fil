@@ -258,6 +258,8 @@ std::uint16_t basePipelineCycles(const DecodedInstruction& instruction) noexcept
     case InstrKind::bl:
     case InstrKind::blx:
     case InstrKind::bx:
+    case InstrKind::tbb:
+    case InstrKind::tbh:
         // Base covers fetch/decode/link; the taken-path refill (+2) is
         // added by the stepper when the PC proves discontinuous.
         return 2U;
@@ -829,6 +831,28 @@ StopReason CortexM4::execute(
             return StopReason::step_complete;
         }
         if (!state_.branchWritePc(target)) return failInvalid("branch exchange selected non-Thumb state");
+        return StopReason::step_complete;
+    }
+    case InstrKind::tbb:
+    case InstrKind::tbh: {
+        const std::uint32_t base = state_.readRegister(instruction.rn);
+        const std::uint32_t offset = state_.readRegister(instruction.rm);
+        const std::uint32_t address = base
+            + (instruction.kind == InstrKind::tbh ? offset * 2U : offset);
+        const mem::AccessContext context{
+            mem::AccessType::data_read, state_.currentInstrAddr()
+        };
+        std::uint32_t entry = 0U;
+        if (instruction.kind == InstrKind::tbb) {
+            const auto loaded = memory_.read8(address, context);
+            if (!loaded) return failBus(loaded.fault(), "TBB table byte load failed");
+            entry = loaded.value();
+        } else {
+            const auto loaded = memory_.read16(address, context);
+            if (!loaded) return failBus(loaded.fault(), "TBH table halfword load failed");
+            entry = loaded.value();
+        }
+        state_.r[15] = state_.architecturalPcForRead() + entry * 2U;
         return StopReason::step_complete;
     }
     case InstrKind::cbz:

@@ -481,6 +481,8 @@ std::string_view instructionName(const cpu::InstrKind kind) noexcept {
     case InstrKind::bl: return "bl";
     case InstrKind::bx: return "bx";
     case InstrKind::blx: return "blx";
+    case InstrKind::tbb: return "tbb";
+    case InstrKind::tbh: return "tbh";
     case InstrKind::cbz: return "cbz";
     case InstrKind::cbnz: return "cbnz";
     case InstrKind::it: return "it";
