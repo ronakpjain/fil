@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -71,6 +72,97 @@ TEST(EventLoopTest, TracksLocalAndSharedEventOwnership) {
                      3U,
                  }))
         << "nested events inherit their callback owner deterministically";
+}
+
+TEST(EventLoopTest, ObservationBarrierReportsDefaultGlobalEventsAndNestedOrder) {
+    fil::sim::EventLoop loop;
+    using Observation = fil::sim::EventObservation;
+    std::vector<std::tuple<fil::sim::SimTimeNs, fil::sim::EventOwner, Observation>> observed;
+    static_cast<void>(loop.exchangeObservationBarrier([&](const auto time, const auto owner, const auto kind) {
+        observed.emplace_back(time, owner, kind);
+    }));
+    std::vector<int> callbacks;
+    {
+        auto scope = loop.useOwner(7U);
+        static_cast<void>(loop.scheduleAt(4U, [&] {
+            callbacks.push_back(1);
+            static_cast<void>(loop.scheduleAfter(0U, [&] { callbacks.push_back(3); }));
+        }));
+        static_cast<void>(loop.scheduleAt(4U, [&] { callbacks.push_back(2); }));
+    }
+    EXPECT_EQ(loop.runDueEvents(4U).events_executed, 3U);
+    EXPECT_EQ(callbacks, (std::vector<int>{1, 2, 3}));
+    EXPECT_EQ(observed.size(), 3U);
+    EXPECT_EQ(observed[0], (std::tuple{4U, 7U, Observation::global}));
+    EXPECT_EQ(observed[1], (std::tuple{4U, 7U, Observation::global}));
+    EXPECT_EQ(observed[2], (std::tuple{4U, 7U, Observation::global}));
+}
+
+TEST(EventLoopTest, SelfClearingObserverSnapshotSurvivesNestedEventScheduling) {
+    fil::sim::EventLoop loop;
+    unsigned observations = 0U;
+    std::vector<int> callbacks;
+    static_cast<void>(loop.exchangeObservationBarrier([&](auto, auto, auto) {
+        ++observations;
+        const auto previous = loop.exchangeObservationBarrier({});
+        EXPECT_TRUE(static_cast<bool>(previous));
+        static_cast<void>(loop.scheduleAfter(0U, [&] { callbacks.push_back(2); }));
+    }));
+    static_cast<void>(loop.scheduleAt(1U, [&] { callbacks.push_back(1); }));
+
+    EXPECT_EQ(loop.runDueEvents(1U).events_executed, 2U);
+    EXPECT_EQ(observations, 1U);
+    EXPECT_EQ(callbacks, (std::vector<int>{1, 2}));
+}
+
+TEST(EventLoopTest, ObservationBarrierExceptionRestoresInvocationOwner) {
+    fil::sim::EventLoop loop;
+    static_cast<void>(loop.exchangeObservationBarrier([](auto, auto, auto) {
+        throw std::runtime_error("observer failed");
+    }));
+    {
+        auto scope = loop.useOwner(9U);
+        static_cast<void>(loop.scheduleAt(3U, [] {}));
+    }
+    EXPECT_THROW(static_cast<void>(loop.runDueEvents(3U)), std::runtime_error);
+    EXPECT_EQ(loop.activeOwner(), fil::sim::shared_event_owner);
+}
+
+TEST(EventLoopTest, OwnedInvocationObservesTimestampAndOwnerBeforeCallback) {
+    fil::sim::EventLoop loop;
+    std::vector<int> sequence;
+    static_cast<void>(loop.exchangeObservationBarrier([&](const auto time, const auto owner, const auto kind) {
+        EXPECT_EQ(time, 6U);
+        EXPECT_EQ(owner, 5U);
+        EXPECT_EQ(kind, fil::sim::EventObservation::global);
+        sequence.push_back(1);
+    }));
+    {
+        auto scope = loop.useOwner(5U);
+        static_cast<void>(loop.scheduleAt(6U, [&] {
+            EXPECT_EQ(loop.activeOwner(), 5U);
+            sequence.push_back(2);
+        }));
+    }
+    EXPECT_EQ(loop.runOwnedEvents(5U, 6U).events_executed, 1U);
+    EXPECT_EQ(sequence, (std::vector<int>{1, 2}));
+    EXPECT_EQ(loop.activeOwner(), fil::sim::shared_event_owner);
+}
+
+TEST(EventLoopTest, ObservationHorizonsIncludeOwnerAndGlobalEventsAndPruneCancellation) {
+    fil::sim::EventLoop loop;
+    fil::sim::EventId canceled = 0U;
+    {
+        auto scope = loop.useOwner(2U);
+        canceled = loop.scheduleAt(1U, [] {});
+        static_cast<void>(loop.scheduleAt(8U, [] {}));
+    }
+    EXPECT_TRUE(loop.cancel(canceled));
+    EXPECT_EQ(loop.nextObservationTime(2U), 8U);
+    EXPECT_EQ(loop.nextObservationTime(3U), 8U);
+    static_cast<void>(loop.scheduleAt(5U, [] {}));
+    EXPECT_EQ(loop.nextObservationTime(3U), 5U);
+    EXPECT_EQ(loop.nextObservationTime(fil::sim::shared_event_owner), 5U);
 }
 
 TEST(EventLoopTest, InsertionPrunesGloballyRetiredOwnerCallbacks) {

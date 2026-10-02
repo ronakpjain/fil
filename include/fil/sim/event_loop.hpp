@@ -11,7 +11,10 @@
 #include <optional>
 #include <limits>
 
+namespace fil::stm32g4 { class AdcPeripheral; }
+
 namespace fil::sim {
+class World;
 
 /** @brief Nanoseconds on the monotonically increasing simulation clock. */
 using SimTimeNs = std::uint64_t;
@@ -24,6 +27,10 @@ using EventCallback = std::function<void()>;
 
 /** @brief Board lane responsible for an event, or the shared simulation domain. */
 using EventOwner = std::uint32_t;
+
+/** @brief Classification reported immediately before an event callback. */
+enum class EventObservation { global, owner_local };
+using ObservationBarrier = std::function<void(SimTimeNs, EventOwner, EventObservation)>;
 
 /** @brief Owner used by CAN and other cross-board events. */
 inline constexpr EventOwner shared_event_owner = std::numeric_limits<EventOwner>::max();
@@ -45,6 +52,9 @@ struct EventRunResult {
  */
 class EventLoop {
 public:
+    using EventObservation = fil::sim::EventObservation;
+    using ObservationBarrier = fil::sim::ObservationBarrier;
+
     struct OwnerCheckpoint {
         EventOwner owner{shared_event_owner};
         SimTimeNs time_ns{0};
@@ -129,6 +139,12 @@ public:
     /** @brief Gets the earliest live timestamp for one board or the shared queue. */
     [[nodiscard]] std::optional<SimTimeNs> nextScheduledTime(EventOwner owner);
 
+    /** @brief Replaces the observation barrier and returns the previous observer. */
+    [[nodiscard]] ObservationBarrier exchangeObservationBarrier(ObservationBarrier barrier);
+
+    /** @brief Earliest owner event or globally observed event time. */
+    [[nodiscard]] std::optional<SimTimeNs> nextObservationTime(EventOwner owner);
+
     /** @brief Enables locking for concurrent owner-lane access. Set before workers start. */
     void setConcurrentAccess(bool enabled) noexcept;
 
@@ -139,6 +155,16 @@ public:
     [[nodiscard]] std::size_t maximumSameTimeEvents() const noexcept;
 
 private:
+    friend class ScheduledEvent;
+    friend class World;
+
+    [[nodiscard]] ObservationBarrier exchangeSchedulerObservationBarrier(
+        ObservationBarrier barrier
+    );
+    [[nodiscard]] EventId scheduleOwnerLocalAt(
+        SimTimeNs at, EventCallback callback, std::function<bool()> locality_guard
+    );
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
@@ -167,6 +193,11 @@ public:
     [[nodiscard]] EventId id() const noexcept { return id_; }
 
 private:
+    friend class ::fil::stm32g4::AdcPeripheral;
+
+    [[nodiscard]] EventId scheduleOwnerLocalAt(
+        SimTimeNs at, EventCallback callback, std::function<bool()> locality_guard
+    );
     [[nodiscard]] EventCallback retireBefore(EventCallback callback);
 
     EventLoop* loop_{nullptr};

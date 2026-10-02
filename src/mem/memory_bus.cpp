@@ -805,6 +805,28 @@ bool MemoryBus::containsWritableRange(
     return false;
 }
 
+bool MemoryBus::containsWritableRamRange(
+    const std::uint32_t address, const std::uint64_t size
+) const noexcept {
+    if (size == 0U || size > std::numeric_limits<std::uint32_t>::max()) return false;
+    const Region* region = find(address);
+    return region != nullptr && region->info.kind == RegionKind::ram
+        && region->info.writable
+        && region->containsRange(address, static_cast<std::uint32_t>(size));
+}
+
+bool MemoryBus::isMmioDeviceRange(
+    const std::uint32_t address, const std::uint32_t size,
+    const MmioDevice& device, const std::uint32_t expected_offset
+) const noexcept {
+    if (size == 0U) return false;
+    const Region* region = find(address);
+    return region != nullptr && region->info.kind == RegionKind::mmio
+        && region->device == &device && region->info.readable
+        && address - region->info.base == expected_offset
+        && region->containsRange(address, size);
+}
+
 void MemoryBus::addReadFootprint(
     ReadFootprint& footprint, const std::uint32_t address
 ) noexcept {

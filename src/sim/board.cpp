@@ -645,15 +645,20 @@ std::optional<Board::ReversibleRamPrefix> Board::prepareReversibleRamPrefix(
 
 bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
     const std::size_t max_instructions, const std::optional<SimTimeNs> deadline,
-    const bool allow_single_prefix) {
+    const bool allow_single_prefix, const bool owner_local_barrier_installed) {
     const std::size_t limit = std::min(max_instructions, ReversibleRamPrefix::max_instructions);
     if (limit < 2U || !memory_.writeJournalTracking() || blockBoundaryPending()) return false;
     const auto frequency = peripherals_->rcc().systemClockHz();
     if (frequency == 0U || time_fraction_ >= frequency) return false;
     const auto now = event_loop_->now();
     auto horizon = deadline;
-    if (const auto event = event_loop_->nextScheduledTime();
-        event && (!horizon || *event < *horizon)) horizon = *event;
+    // Only a World-installed callback barrier permits evaluation across another
+    // lane's audited local ADC event. Standalone callers retain the global
+    // horizon because no observer is available to materialize later cuts.
+    const auto owner = event_loop_->activeOwner();
+    const auto event = !owner_local_barrier_installed || owner == shared_event_owner
+        ? event_loop_->nextScheduledTime() : event_loop_->nextObservationTime(owner);
+    if (event && (!horizon || *event < *horizon)) horizon = *event;
     if (horizon && *horizon <= now) return false;
     const auto systick = system_->cyclesUntilSysTickInterrupt();
     if (systick && *systick == 0U) return false;

@@ -107,6 +107,7 @@ private:
     void serviceUsartDma(UsartPeripheral* usart, std::uint8_t tx_request, std::uint8_t rx_request, bool transmit);
     void serviceSpiDma(SpiPeripheral* spi, std::uint8_t tx_request, std::uint8_t rx_request, bool transmit);
     void serviceAllSerialDma();
+    [[nodiscard]] bool adcOwnerLocalSafe(std::size_t adc_index) const;
     [[nodiscard]] Result<void> map(
         std::uint32_t absolute_address,
         RegisterPeripheral& device
@@ -115,6 +116,8 @@ private:
     cortexm::SystemControl& system_;
     mem::MmioRouter router_;
     std::array<std::uint32_t, 240> irq_sources_{};
+    std::array<std::uint64_t, 2> dma_interrupt_generations_{};
+    mem::MemoryBus* memory_{nullptr};
 
     RccPeripheral rcc_;
     FlashPeripheral flash_;

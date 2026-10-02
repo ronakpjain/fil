@@ -399,6 +399,52 @@ TEST(PeripheralTest, AdcInterruptLevelMatchesEnabledStatusBits) {
     EXPECT_EQ(levels, (std::vector<bool>{false, true, false, true, false}));
 }
 
+TEST(PeripheralTest, DmaOwnerLocalAdcTransferRejectsPublicObserversAndSubstitutions) {
+    fil::mem::MemoryBus memory;
+    ASSERT_TRUE(memory.mapRam(0x20000000U, 0x100U, "dma-local-ram"));
+    fil::sim::TraceRecorder trace;
+    fil::stm32g4::DmaPeripheral dma("DMA1", 7U, &memory, nullptr, &trace);
+    constexpr auto word = fil::mem::AccessSize::word;
+    constexpr std::uint32_t source = 0x50000040U;
+    const auto trusted_generation = dma.interruptLevelCallbackGeneration();
+    ASSERT_TRUE(dma.write(0x0cU, word, 2U, {}));
+    ASSERT_TRUE(dma.write(0x10U, word, source, {}));
+    ASSERT_TRUE(dma.write(0x14U, word, 0x20000000U, {}));
+    // Halfword peripheral-to-memory, with a writable-RAM destination.
+    ASSERT_TRUE(dma.write(0x08U, word, 1U | (1U << 8U) | (1U << 10U), {}));
+
+    EXPECT_TRUE(dma.ownerLocalAdcTransferSafe(1U, &memory, source, trusted_generation))
+        << "diagnostic history alone does not prevent trusted owner-local DMA";
+    dma.setTransferHistoryEnabled(false);
+    EXPECT_TRUE(dma.ownerLocalAdcTransferSafe(1U, &memory, source, trusted_generation));
+
+    dma.setInterruptCallback([](unsigned int) {});
+    EXPECT_FALSE(dma.ownerLocalAdcTransferSafe(1U, &memory, source, trusted_generation))
+        << "legacy DMA interrupt callback is arbitrary user code";
+    dma.setInterruptCallback({});
+
+    dma.setInterruptLevelCallback([](unsigned int, bool) {});
+    EXPECT_FALSE(dma.ownerLocalAdcTransferSafe(1U, &memory, source, trusted_generation))
+        << "public IRQ-level callback replacement invalidates the trusted generation";
+    dma.setInterruptLevelCallback({});
+    const auto refreshed_generation = dma.interruptLevelCallbackGeneration();
+    ASSERT_NE(refreshed_generation, trusted_generation);
+
+    trace.setObserver([](const fil::sim::TraceRecord&) {});
+    EXPECT_FALSE(dma.ownerLocalAdcTransferSafe(1U, &memory, source, refreshed_generation))
+        << "a real trace observer is an external callback even without retained history";
+    trace.setObserver({});
+    EXPECT_TRUE(dma.ownerLocalAdcTransferSafe(1U, &memory, source, refreshed_generation));
+
+    fil::mem::MemoryBus replacement;
+    ASSERT_TRUE(replacement.mapRam(0x20000000U, 0x100U, "replacement-ram"));
+    EXPECT_FALSE(dma.ownerLocalAdcTransferSafe(1U, &replacement, source, refreshed_generation))
+        << "the exact MemoryBus identity is part of the transfer certificate";
+    dma.setMemory(&replacement);
+    EXPECT_FALSE(dma.ownerLocalAdcTransferSafe(1U, &memory, source, refreshed_generation));
+    EXPECT_TRUE(dma.ownerLocalAdcTransferSafe(1U, &replacement, source, refreshed_generation));
+}
+
 TEST(PeripheralTest, DmaGlobalFlagClearDeassertsOnlySelectedChannel) {
     fil::stm32g4::DmaPeripheral dma("DMA1", 8U);
     std::uint32_t levels = 0U;

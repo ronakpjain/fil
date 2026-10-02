@@ -51,6 +51,7 @@ void RegisterPeripheral::setTraceSourcePrefix(const std::string_view prefix) {
 
 void RegisterPeripheral::setInterruptLevelCallback(InterruptLevelCallback callback) {
     interrupt_level_callback_ = std::move(callback);
+    ++interrupt_level_callback_generation_;
     if (interrupt_level_callback_) {
         for (unsigned int line = 0; line < interrupt_levels_.size(); ++line) {
             interrupt_level_callback_(line, interrupt_levels_[line]);

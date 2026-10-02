@@ -21,6 +21,8 @@ struct EventLoop::Impl {
         std::uint64_t sequence{0};
         EventOwner owner{shared_event_owner};
         EventCallback callback;
+        std::function<bool()> locality_guard;
+        bool globally_observed{true};
         bool live{true};
     };
 
@@ -43,7 +45,10 @@ struct EventLoop::Impl {
     bool concurrent_access{false};
     EventOwner serial_active_owner{shared_event_owner};
     Queue events;
+    Queue globally_observed_events;
     std::unordered_map<EventOwner, Queue> owner_events;
+    std::shared_ptr<const ObservationBarrier> observation_barrier;
+    ObservationBarrier scheduler_observation_barrier;
     std::unordered_map<EventId, EventPtr> live_events;
     std::unordered_map<EventOwner, SimTimeNs> owner_now;
     std::unordered_map<EventOwner, std::uint64_t> owner_generation;
@@ -102,12 +107,39 @@ struct EventLoop::Impl {
     void retire(const EventPtr& event) {
         event->live = false;
         live_events.erase(event->id);
+        discardDeadFront(globally_observed_events);
         ++owner_generation[event->owner];
     }
 
     void markOwner(EventRunResult& result, const EventOwner owner) const noexcept {
         if (owner < 64U) result.local_owner_mask |= std::uint64_t{1U} << owner;
         else result.shared_event_executed = true;
+    }
+
+    EventId schedule(
+        const SimTimeNs at, EventCallback callback,
+        std::function<bool()> locality_guard = {}
+    ) {
+        if (!callback) throw std::invalid_argument("simulation event callback is empty");
+        if (at < timeFor(currentOwner())) {
+            throw std::invalid_argument("cannot schedule a simulation event in the past");
+        }
+        if (next_id == 0U) throw std::overflow_error("simulation event identifier space exhausted");
+        const EventId id = next_id++;
+        const EventOwner owner = currentOwner();
+        const bool globally_observed = !locality_guard || owner == shared_event_owner;
+        auto event = std::make_shared<Event>(Event{
+            at, id, next_sequence++, owner, std::move(callback),
+            std::move(locality_guard), globally_observed, true,
+        });
+        events.push(event);
+        if (globally_observed) globally_observed_events.push(event);
+        auto& owner_queue = owner_events[owner];
+        discardDeadFront(owner_queue);
+        owner_queue.push(event);
+        live_events.emplace(id, event);
+        ++owner_generation[owner];
+        return id;
     }
 
     void invoke(const EventPtr& event, EventRunResult& result) {
@@ -119,6 +151,32 @@ struct EventLoop::Impl {
         const EventOwner previous_owner = currentOwner();
         setCurrentOwner(event->owner);
         try {
+            const std::shared_ptr<const ObservationBarrier> observer = observation_barrier;
+            const bool owner_local = event->owner != shared_event_owner &&
+                event->locality_guard && event->locality_guard();
+            const EventObservation classification = owner_local
+                ? EventObservation::owner_local : EventObservation::global;
+
+            if (scheduler_observation_barrier) {
+                scheduler_observation_barrier(
+                    event->at, event->owner,
+                    observer ? EventObservation::global : classification
+                );
+            }
+            if (observer && *observer) (*observer)(event->at, event->owner, classification);
+
+            // Observers can alter ADC hooks. Preserve the invocation snapshot so
+            // downgrade notification still reaches an observer that clears its slot.
+            if (owner_local && !event->locality_guard()) {
+                if (scheduler_observation_barrier) {
+                    scheduler_observation_barrier(
+                        event->at, event->owner, EventObservation::global
+                    );
+                }
+                if (observer && *observer) {
+                    (*observer)(event->at, event->owner, EventObservation::global);
+                }
+            }
             event->callback();
         } catch (...) {
             setCurrentOwner(previous_owner);
@@ -167,29 +225,15 @@ EventId EventLoop::scheduleAfter(const SimTimeNs delta, EventCallback callback) 
 
 EventId EventLoop::scheduleAt(const SimTimeNs at, EventCallback callback) {
     Impl::Lock lock(*impl_);
-    if (!callback) throw std::invalid_argument("simulation event callback is empty");
-    if (at < now()) {
-        throw std::invalid_argument("cannot schedule a simulation event in the past");
-    }
-    if (impl_->next_id == 0U) {
-        throw std::overflow_error("simulation event identifier space exhausted");
-    }
+    return impl_->schedule(at, std::move(callback));
+}
 
-    const EventId id = impl_->next_id++;
-    const EventOwner owner = impl_->currentOwner();
-    auto event = std::make_shared<Impl::Event>(Impl::Event{
-        at, id, impl_->next_sequence++, owner, std::move(callback), true,
-    });
-    impl_->events.push(event);
-    auto& owner_queue = impl_->owner_events[owner];
-    // Global dispatch retires events without popping their owner-queue copy.
-    // Exact network runs may never query owner queues, so prune retired heads
-    // here rather than retaining every conversion until loop destruction.
-    Impl::discardDeadFront(owner_queue);
-    owner_queue.push(event);
-    impl_->live_events.emplace(id, std::move(event));
-    ++impl_->owner_generation[owner];
-    return id;
+EventId EventLoop::scheduleOwnerLocalAt(
+    const SimTimeNs at, EventCallback callback, std::function<bool()> locality_guard
+) {
+    Impl::Lock lock(*impl_);
+    if (!locality_guard) throw std::invalid_argument("owner-local event requires a locality guard");
+    return impl_->schedule(at, std::move(callback), std::move(locality_guard));
 }
 
 bool EventLoop::cancel(const EventId id) noexcept {
@@ -198,6 +242,7 @@ bool EventLoop::cancel(const EventId id) noexcept {
     const auto found = impl_->live_events.find(id);
     if (found == impl_->live_events.end()) return false;
     found->second->live = false;
+    Impl::discardDeadFront(impl_->globally_observed_events);
     ++impl_->owner_generation[found->second->owner];
     impl_->live_events.erase(found);
     return true;
@@ -293,6 +338,7 @@ EventRunResult EventLoop::advanceBy(const SimTimeNs delta) {
 void EventLoop::clear() noexcept {
     Impl::Lock lock(*impl_);
     impl_->events = {};
+    impl_->globally_observed_events = {};
     impl_->owner_events.clear();
     impl_->live_events.clear();
     impl_->owner_generation.clear();
@@ -357,6 +403,36 @@ std::optional<SimTimeNs> EventLoop::nextScheduledTime(const EventOwner owner) {
     return queue->top()->at;
 }
 
+ObservationBarrier EventLoop::exchangeObservationBarrier(ObservationBarrier barrier) {
+    Impl::Lock lock(*impl_);
+    ObservationBarrier previous;
+    if (impl_->observation_barrier) previous = *impl_->observation_barrier;
+    impl_->observation_barrier = barrier
+        ? std::make_shared<const ObservationBarrier>(std::move(barrier)) : nullptr;
+    return previous;
+}
+
+ObservationBarrier EventLoop::exchangeSchedulerObservationBarrier(
+    ObservationBarrier barrier
+) {
+    Impl::Lock lock(*impl_);
+    std::swap(impl_->scheduler_observation_barrier, barrier);
+    return barrier;
+}
+
+std::optional<SimTimeNs> EventLoop::nextObservationTime(const EventOwner owner) {
+    Impl::Lock lock(*impl_);
+    Impl::Queue* const owner_queue = impl_->ownerQueue(owner);
+    Impl::discardDeadFront(impl_->globally_observed_events);
+    std::optional<SimTimeNs> result;
+    if (owner_queue != nullptr && !owner_queue->empty()) result = owner_queue->top()->at;
+    if (!impl_->globally_observed_events.empty()) {
+        const SimTimeNs global_time = impl_->globally_observed_events.top()->at;
+        if (!result || global_time < *result) result = global_time;
+    }
+    return result;
+}
+
 void EventLoop::setConcurrentAccess(const bool enabled) noexcept {
     std::lock_guard lock(impl_->mutex);
     impl_->concurrent_access = enabled;
@@ -402,6 +478,18 @@ EventId ScheduledEvent::scheduleAt(
     cancel();
     if (loop_ == nullptr) return 0U;
     id_ = loop_->scheduleAt(at, retireBefore(std::move(callback)));
+    return id_;
+}
+
+EventId ScheduledEvent::scheduleOwnerLocalAt(
+    const SimTimeNs at, EventCallback callback, std::function<bool()> locality_guard
+) {
+    if (!callback) throw std::invalid_argument("scheduled event callback is empty");
+    cancel();
+    if (loop_ == nullptr) return 0U;
+    id_ = loop_->scheduleOwnerLocalAt(
+        at, retireBefore(std::move(callback)), std::move(locality_guard)
+    );
     return id_;
 }
 

@@ -1,6 +1,7 @@
 #include "fil/stm32g4/peripheral.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 namespace fil::stm32g4 {
@@ -44,6 +45,32 @@ DmaPeripheral::DmaPeripheral(
 
 void DmaPeripheral::setInterruptCallback(InterruptCallback callback) {
     interrupt_callback_ = std::move(callback);
+}
+
+bool DmaPeripheral::ownerLocalAdcTransferSafe(
+    const unsigned int channel, const mem::MemoryBus* const expected_bus,
+    const std::uint32_t expected_source, const std::uint64_t trusted_interrupt_generation
+) const {
+    if (channel == 0U || channel > channel_count_ || expected_bus == nullptr
+        || memory_ != expected_bus || interrupt_callback_ || traceObserverActive()
+        || interruptLevelCallbackGeneration() != trusted_interrupt_generation) return false;
+    const std::uint32_t base = first_channel + (channel - 1U) * channel_stride;
+    const std::uint32_t control = peekRegister(base);
+    const std::uint32_t remaining = peekRegister(base + 0x04U) & 0xffffU;
+    const std::uint32_t reload = reload_counts_[channel - 1U];
+    if ((control & 1U) == 0U || remaining == 0U || reload == 0U || remaining > reload
+        || (control & (1U << 4U)) != 0U
+        || ((control >> 8U) & 3U) != 1U || ((control >> 10U) & 3U) != 1U
+        || (control & (1U << 6U)) != 0U
+        || peekRegister(base + 0x08U) != expected_source) return false;
+
+    const std::uint32_t transferred = reload - remaining;
+    const std::uint32_t initial_destination = peekRegister(base + 0x0cU);
+    const bool destination_increment = (control & (1U << 7U)) != 0U;
+    const std::uint64_t next = static_cast<std::uint64_t>(initial_destination)
+        + (destination_increment ? static_cast<std::uint64_t>(transferred) * 2U : 0U);
+    if (next > std::numeric_limits<std::uint32_t>::max()) return false;
+    return expected_bus->containsWritableRamRange(static_cast<std::uint32_t>(next), 2U);
 }
 
 bool DmaPeripheral::request(const unsigned int channel) {

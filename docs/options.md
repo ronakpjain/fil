@@ -72,7 +72,7 @@ are passed to `run`, symbol resolution takes precedence over the address.
 | `--inject-can BUS[@TIME_MS]:ID:HEXDATA` | None; repeatable scheduled CAN injection. Omitted time means time zero. |
 | `--transactional-slices` / `--no-transactional-slices` | Off; experimental reversible parallel lane epochs. Worker execution requires multiple boards, no tracing, and no spin detection. |
 | `--deferred-prefixes` | Off; experimental pure deferred prefixes. Requires `--jit`; incompatible with instruction tracing, spin detection, transactional slices, and RAM capsules. |
-| `--ram-capsules` | Off; experimental reversible private-RAM prefixes. Requires `--jit --no-loop-batching`; incompatible with deferred prefixes, instruction tracing, spin detection, and transactional slices. |
+| `--ram-capsules` | Off; experimental reversible private-RAM prefixes, including guarded spans across other boards' audited ADC events. Every conversion is retained; custom callbacks and unsupported DMA paths remain global observation barriers. Requires `--jit --no-loop-batching`; incompatible with deferred prefixes, instruction tracing, spin detection, and transactional slices. |
 
 Experimental scheduler flags above are **run-network only**. See
 [Performance](performance.md) for observation barriers and ownership restrictions.

@@ -56,6 +56,9 @@ public:
     /** @brief Observes newly appended records without changing stored trace output. */
     void setObserver(Observer observer) { observer_ = std::move(observer); }
 
+    /** @brief Whether trace emission can invoke an arbitrary external observer. */
+    [[nodiscard]] bool hasObserver() const noexcept { return static_cast<bool>(observer_); }
+
     /**
      * @brief Restricts recorded types to an allowlist (empty allows all).
      *

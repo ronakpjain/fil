@@ -95,11 +95,30 @@ can outweigh useful work.
 
 `--no-loop-batching` selects a compact exact single-instruction network scheduler when instruction tracing, spin detection, and transactional/deferred execution are disabled. It removes loop-proof bookkeeping, not target instructions or peripheral effects. General lockstep bursts require a proven pure fixed-cost multi-instruction frontier; scalar timing predictions alone do not authorize a burst.
 
-`run-network --jit --deferred-prefixes` is an experimental, default-off alternative. It cannot be combined with instruction tracing, spin detection, transactional slices, or RAM capsules. It leaves certified pure CPU prefixes unevaluated until their completion or an observation barrier. Scheduled events and synchronous CAN delivery materialize only the instructions the exact scheduler has already started. Event-phase and CPU-dispatch-phase barriers preserve different equal-timestamp ordering. Public mutable board/CPU APIs must not be used concurrently with a deferred run. The current pure-prefix coverage is limited; this option is not a claim of faster-than-realtime throughput. Current full-network validation still measures below realtime with ADC decimation 1; a faster-than-realtime result must be established on matching current firmware, not inferred from the available mechanisms.
+`run-network --jit --deferred-prefixes` is an experimental, default-off alternative. It cannot be combined with instruction tracing, spin detection, transactional slices, or RAM capsules. It leaves certified pure CPU prefixes unevaluated until their completion or an observation barrier. Scheduled events and synchronous CAN delivery materialize only the instructions the exact scheduler has already started. Event-phase and CPU-dispatch-phase barriers preserve different equal-timestamp ordering. Public mutable board/CPU APIs must not be used concurrently with a deferred run. The current pure-prefix coverage is limited; this option is not a claim of faster-than-realtime throughput. Pure-prefix-only full-network validation still measures below realtime with ADC decimation 1; a faster-than-realtime result must be established on matching current firmware, not inferred from the available mechanisms.
 
-`run-network --jit --no-loop-batching --ram-capsules` is a separate default-off experiment. It chains up to 64 cached fast-handler instructions across integer branches and standalone branch/call links, permitting only journaled, reversible writes to non-executable private RAM. MMIO, FP/system operations, executable stores, and unsupported handlers end the span. Conservative cycle credit prevents crossing known event, SysTick, or deadline bounds; dynamic observation cuts restore RAM/integer state and replay only the instructions already started. CAN delivery and board-failure draining are observation barriers. CPU/RAM state must not be inspected or modified while a prefix is active except through scheduled callbacks, which materialize it first. Run options are snapshotted per invocation.
+`run-network --jit --no-loop-batching --ram-capsules` is a separate default-off experiment. It chains up to 64 cached fast-handler instructions across integer branches and standalone branch/call links, permitting only journaled, reversible writes to non-executable private RAM. MMIO, FP/system operations, executable stores, and unsupported handlers end the span. Conservative cycle credit prevents crossing known observation, SysTick, or deadline bounds; dynamic observation cuts restore RAM/integer state and replay only the instructions already started. CAN delivery and board-failure draining are observation barriers. CPU/RAM state must not be inspected or modified while a prefix is active except through scheduled callbacks, which materialize it first. Run options are snapshotted per invocation.
 
-A bounded, immutable period certificate can avoid execution and replay for naturally recurring spans whose RAM bytes remain unchanged after every instruction, including idempotent stores. Compilation records each CPU/fetch endpoint and charged cycle cost. Reuse requires matching CPU/fetch phase, historical execution/clock/FLASH generations, complete canonical RAM read-and-store footprints, usable journal history, and an unchanged restoration token. Unrelated external RAM changes may remain compatible; changed inputs, journal rewinds, reset, and transaction restoration reject reuse. Cuts reconstruct the selected period phase without modifying RAM and charge cycles once using the admission's original timing fraction. This does not omit ADC conversions, DMA, interrupts, or observation barriers. JIT diagnostics describe actual handler work, not the logical instructions represented by a cached period. This path uses cached handlers, not LLVM-native RAM kernels; it remains below realtime in current full-network measurements and is not promoted to the default scheduler.
+Audited ADC conversions can be owner-local observations: a capsule may span
+another board's conversions while its own conversions still materialize it.
+Ownership alone is not sufficient. Ordinary scheduled callbacks remain global,
+and guards are checked immediately before callback execution. Certification
+requires built-in ADC providers and sample wiring, unchanged interrupt hooks,
+matching DMA bus/source-device identity, and the actual next halfword DMA
+transfer fitting directly backed RAM. Public hook replacements, unsupported DMA
+transfers, and active trace observers force global materialization. Retaining
+trace history without an observer remains eligible. No ADC conversion, DMA
+write, interrupt, or sample is omitted.
+
+World installs a private mandatory callback barrier, separate from the public
+observer slot; an observer cannot disable scheduler synchronization by replacing
+itself. Events retain timestamp/insertion ordering and precede CPU completion at
+equal times. Synchronous CAN delivery retains its all-board observation barrier.
+Standalone Board admission retains its global horizon. Reentrant/concurrent
+mutation of a running World is unsupported; if a run throws, discard that World
+rather than inspecting or resuming potentially speculative state.
+
+A bounded, immutable period certificate can avoid execution and replay for naturally recurring spans whose RAM bytes remain unchanged after every instruction, including idempotent stores. Compilation records each CPU/fetch endpoint and charged cycle cost. Reuse requires matching CPU/fetch phase, historical execution/clock/FLASH generations, complete canonical RAM read-and-store footprints, usable journal history, and an unchanged restoration token. Unrelated external RAM changes may remain compatible; changed inputs, journal rewinds, reset, and transaction restoration reject reuse. Cuts reconstruct the selected period phase without modifying RAM and charge cycles once using the admission's original timing fraction. This does not omit ADC conversions, DMA, interrupts, or observation barriers. JIT diagnostics describe actual handler work, not the logical instructions represented by a cached period. This path uses cached handlers, not LLVM-native RAM kernels. With guarded local ADC observations and matched capsule PGO, sustained full-network measurements can exceed realtime without ADC decimation. It remains opt-in: validate the same firmware, host, callbacks, and build rather than extrapolating to other configurations.
 
 A repeatable full-network benchmark includes startup, checks all six boards reach the deadline, and exits unsuccessfully when median throughput is not above realtime:
 
@@ -119,6 +138,13 @@ realtime still exits unsuccessfully. Both binaries use JIT and ADC decimation 1.
 Keep compiler flags and firmware identical and train PGO for each source version
 with the scheduler being measured. Clean-rebuild profile-use objects when
 replacing a profile in place; mixed old/new profile summaries can break ThinLTO.
+
+A sustained capsule check uses the same helper with an explicit longer duration:
+
+```bash
+python3 tools/bench_full_network.py --binary build-pgo/fil \
+  --duration-ms 60000 --reps 3 --ram-capsules --check-trace
+```
 
 The optional trace check compares 1,000 ms against exact single-instruction execution with the same firmware and ADC decimation 1. Retrain PGO with the scheduling options being measured; an old profile is not a matched baseline. For RAM-capsule measurements, add `--ram-capsules` to the training invocation as well as the benchmark.
 

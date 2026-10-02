@@ -207,11 +207,13 @@ void Stm32G4::wireInterrupts() {
     constexpr std::array<std::uint8_t, 4> adc_dma_requests{5U, 36U, 37U, 38U};
     for (std::size_t index = 0; index < adc_.size(); ++index) {
         connect(*adc_[index], std::array<std::uint16_t, 1>{18U});
-        adc_[index]->setSampleCallback(
+        adc_[index]->setCertifiedSampleCallback(
             [this, request = adc_dma_requests[index]](const AdcSample&) {
                 serviceDmaRequest(request);
-            }
+            },
+            [this, index]() { return adcOwnerLocalSafe(index); }
         );
+        adc_[index]->setCertifiedChannelProvider({});
     }
     constexpr std::array<std::array<std::uint16_t, 2>, 3> fdcan_irqs{{
         {{21U, 22U}}, {{86U, 87U}}, {{88U, 89U}},
@@ -220,7 +222,9 @@ void Stm32G4::wireInterrupts() {
         connect(*fdcan_[index], fdcan_irqs[index]);
     }
     connect(dma1_, std::array<std::uint16_t, 8>{11U, 12U, 13U, 14U, 15U, 16U, 17U, 96U});
+    dma_interrupt_generations_[0] = dma1_.interruptLevelCallbackGeneration();
     connect(dma2_, std::array<std::uint16_t, 8>{56U, 57U, 58U, 59U, 60U, 97U, 98U, 99U});
+    dma_interrupt_generations_[1] = dma2_.interruptLevelCallbackGeneration();
     connect(exti_, std::array<std::uint16_t, 7>{6U, 7U, 8U, 9U, 10U, 23U, 40U});
     for (std::size_t port = 0; port < gpio_.size(); ++port) {
         gpio_[port]->setEdgeCallback([this, port](const unsigned int pin, const bool high, const sim::SimTimeNs) {
@@ -261,6 +265,29 @@ void Stm32G4::wireInterrupts() {
 
 void Stm32G4::serviceDmaRequest(const std::uint8_t request) {
     static_cast<void>(serviceDmaRequestOnce(request));
+}
+
+bool Stm32G4::adcOwnerLocalSafe(const std::size_t adc_index) const {
+    if (adc_index >= adc_.size() || memory_ == nullptr) return false;
+    constexpr std::array<std::uint8_t, 4> requests{5U, 36U, 37U, 38U};
+    constexpr std::array<std::uint32_t, 4> data_registers{
+        0x50000040U, 0x50000140U, 0x50000440U, 0x50000540U,
+    };
+    const std::uint8_t request = requests[adc_index];
+    const std::uint32_t source = data_registers[adc_index];
+    if (source < 0x40000000U
+        || !memory_->isMmioDeviceRange(source, 2U, router_, source - 0x40000000U)) return false;
+    bool found_channel = false;
+    for (unsigned int mux = 0U; mux < 16U; ++mux) {
+        if (dmamux_.requestForChannel(mux) != request) continue;
+        const bool second_dma = mux >= 8U;
+        const DmaPeripheral& dma = second_dma ? dma2_ : dma1_;
+        const unsigned int channel = second_dma ? mux - 7U : mux + 1U;
+        if (!dma.ownerLocalAdcTransferSafe(
+                channel, memory_, source, dma_interrupt_generations_[second_dma ? 1U : 0U])) return false;
+        found_channel = true;
+    }
+    return found_channel;
 }
 
 bool Stm32G4::serviceDmaRequestOnce(const std::uint8_t request) {
@@ -367,6 +394,7 @@ void Stm32G4::serviceAllSerialDma() {
 }
 
 void Stm32G4::attachMemory(mem::MemoryBus& memory) noexcept {
+    memory_ = &memory;
     dma1_.setMemory(&memory);
     dma2_.setMemory(&memory);
 
@@ -450,7 +478,7 @@ Result<void> Stm32G4::configure(const config::BoardConfig& board) {
             if (source.kind == config::AdcChannelConfig::Kind::constant) device->setChannelValue(channel, source.value);
         }
         const auto channels = config.channels;
-        device->setChannelProvider([channels](const unsigned int channel, const sim::SimTimeNs now) {
+        device->setCertifiedChannelProvider([channels](const unsigned int channel, const sim::SimTimeNs now) {
             const auto found = channels.find(static_cast<std::uint8_t>(channel));
             if (found == channels.end()) return std::uint16_t{0};
             const auto& source = found->second;

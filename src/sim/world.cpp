@@ -362,7 +362,8 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
     // started, including the active instruction when the observation falls
     // strictly between two completion timestamps. No future suffix is run.
     const auto materialize_deferred = [&](const SimTimeNs at, const bool all,
-                                          const std::size_t dispatch_index) {
+                                          const std::size_t dispatch_index,
+                                          const std::optional<std::size_t> owner_only = std::nullopt) {
         const bool use_mask = states.size() <= 64U;
         auto pending = active_capsule_mask;
         std::size_t fallback_index = 0U;
@@ -376,6 +377,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                 if (fallback_index == states.size()) break;
                 index = fallback_index++;
             }
+            if (owner_only && index != *owner_only) continue;
             auto& state = states[index];
             if ((!use_mask && !state.deferred && !state.ram_active)
                 || (!all && state.ready_time_ns > at)) continue;
@@ -435,6 +437,29 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
             }
         }
     };
+    struct EventBarrierGuard {
+        EventLoop* loop;
+        EventLoop::ObservationBarrier previous;
+        ~EventBarrierGuard() {
+            static_cast<void>(loop->exchangeSchedulerObservationBarrier(std::move(previous)));
+        }
+    };
+    std::unique_ptr<EventBarrierGuard> event_barrier_guard;
+    if (deferred_enabled) {
+        event_barrier_guard = std::make_unique<EventBarrierGuard>();
+        event_barrier_guard->loop = &event_loop_;
+        auto previous = event_loop_.exchangeSchedulerObservationBarrier({});
+        event_barrier_guard->previous = std::move(previous);
+        static_cast<void>(event_loop_.exchangeSchedulerObservationBarrier(
+            [&](const SimTimeNs at, const EventOwner owner,
+                      const EventObservation observation) {
+                if (observation == EventObservation::owner_local && owner < states.size()) {
+                    materialize_deferred(at, true, states.size(), owner);
+                } else {
+                    materialize_deferred(at, true, states.size());
+                }
+            }));
+    }
     struct DeliveryBarrierGuard {
         devices::VirtualCanBus* bus;
         devices::VirtualCanBus::DeliveryBarrier previous;
@@ -1356,7 +1381,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                         ? std::nullopt : std::optional<SimTimeNs>{deadline};
                     if (options.enable_ram_capsules) {
                         if (!state.ram) state.ram.emplace();
-                        state.ram_active = board.prepareReversibleRamPrefix(*state.ram, limit, lane_deadline, true);
+                        state.ram_active = board.prepareReversibleRamPrefix(*state.ram, limit, lane_deadline, true, true);
                     } else {
                         state.deferred = board.prepareDeferredPurePrefix(limit, lane_deadline);
                     }
@@ -1434,12 +1459,18 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
             const auto next_event = event_loop_.nextScheduledTime();
             if (next_event && *next_event <= next_completion) {
                 next_completion = *next_event;
-                materialize_deferred(next_completion, true, states.size());
+                // Each callback's guarded observation barrier materializes
+                // its owner or all lanes immediately before it runs.
             } else {
                 materialize_deferred(next_completion, false, states.size());
             }
         }
         const auto events = event_loop_.runDueEvents(next_completion);
+        if (deferred_enabled) {
+            // Event callbacks precede instruction completion at equal times.
+            // Publish any remaining natural completions only after callbacks.
+            materialize_deferred(events.stopped_at, false, states.size());
+        }
         output.event_callbacks = saturatingAdd(output.event_callbacks, events.events_executed);
         if (events.same_time_limit_hit) {
             trace_.record(event_loop_.now(), config_.name, "event_livelock");

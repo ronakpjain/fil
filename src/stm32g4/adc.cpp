@@ -73,18 +73,47 @@ void AdcPeripheral::setChannelValue(const unsigned int channel, const std::uint1
 
 void AdcPeripheral::setChannelProvider(ChannelProvider provider) {
     synchronizeLazyConversions();
+    certified_provider_ = false;
     channel_provider_ = std::move(provider);
+}
+
+void AdcPeripheral::setCertifiedChannelProvider(ChannelProvider provider) {
+    synchronizeLazyConversions();
+    channel_provider_ = std::move(provider);
+    certified_provider_ = true;
+    refreshConversionScheduling();
 }
 
 void AdcPeripheral::setSampleCallback(SampleCallback callback) {
     synchronizeLazyConversions();
     sample_callback_ = std::move(callback);
+    certified_sample_callback_ = false;
+    owner_local_guard_ = {};
     refreshConversionScheduling();
+}
+
+void AdcPeripheral::setCertifiedSampleCallback(
+    SampleCallback callback, std::function<bool()> guard
+) {
+    synchronizeLazyConversions();
+    sample_callback_ = std::move(callback);
+    owner_local_guard_ = std::move(guard);
+    certified_sample_callback_ = true;
+    certified_interrupt_generation_ = interruptLevelCallbackGeneration();
+    refreshConversionScheduling();
+}
+
+bool AdcPeripheral::ownerLocalTrusted() const {
+    return certified_sample_callback_ && certified_provider_ && !interrupt_callback_
+        && !traceObserverActive()
+        && certified_interrupt_generation_ == interruptLevelCallbackGeneration()
+        && owner_local_guard_ && owner_local_guard_();
 }
 
 void AdcPeripheral::setInterruptCallback(InterruptCallback callback) {
     synchronizeLazyConversions();
     interrupt_callback_ = std::move(callback);
+    certified_sample_callback_ = false;
     setInterruptLevel(0, (registerValue(ier) & registerValue(isr) & (eoc | eos)) != 0U);
     refreshConversionScheduling();
 }
@@ -339,10 +368,10 @@ void AdcPeripheral::armSkippedScans(const unsigned int count) {
         conversion_event_.cancel();
         return;
     }
-    static_cast<void>(conversion_event_.scheduleAt(next_conversion_ns_.value(), [this, count]() {
+    static_cast<void>(conversion_event_.scheduleOwnerLocalAt(next_conversion_ns_.value(), [this, count]() {
         next_conversion_ns_.reset();
         completeSkippedScans(count);
-    }));
+    }, [this]() { return ownerLocalTrusted(); }));
 }
 
 void AdcPeripheral::materializeConversion(
@@ -410,10 +439,10 @@ void AdcPeripheral::armNextConversion(const sim::SimTimeNs completion_time) {
 
 void AdcPeripheral::scheduleConversionEvent() {
     if (eventLoop() == nullptr || !next_conversion_ns_) return;
-    static_cast<void>(conversion_event_.scheduleAt(*next_conversion_ns_, [this]() {
+    static_cast<void>(conversion_event_.scheduleOwnerLocalAt(*next_conversion_ns_, [this]() {
         next_conversion_ns_.reset();
         completeConversion();
-    }));
+    }, [this]() { return ownerLocalTrusted(); }));
 }
 
 void AdcPeripheral::cancelConversion() noexcept {

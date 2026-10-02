@@ -10,6 +10,243 @@
 
 namespace {
 
+TEST(Stm32G4Test, CertifiesOnlyTrustedAdcEventsAndRechecksPendingHooks) {
+    fil::sim::EventLoop events;
+    fil::sim::TraceRecorder trace;
+    trace.setEnabled(false);
+    fil::cortexm::SystemControl system;
+    auto mcu = fil::stm32g4::Stm32G4::create(events, trace, system, true);
+    ASSERT_TRUE(mcu);
+    fil::mem::MemoryBus memory;
+    ASSERT_TRUE(memory.mapRam(0x20000000U, 0x1000U, "ram"));
+    ASSERT_TRUE(memory.mapMmio(0x40000000U, 0x20000000U,
+                              mcu.value()->router(), "peripherals"));
+    mcu.value()->attachMemory(memory);
+    auto& peripherals = mcu.value()->router();
+    ASSERT_TRUE(peripherals.write(0x20800U, fil::mem::AccessSize::word, 5U, {}));
+    ASSERT_TRUE(peripherals.write(0x2000cU, fil::mem::AccessSize::word, 1U, {}));
+    ASSERT_TRUE(peripherals.write(0x20010U, fil::mem::AccessSize::word, 0x50000040U, {}));
+    ASSERT_TRUE(peripherals.write(0x20014U, fil::mem::AccessSize::word, 0x20000000U, {}));
+    ASSERT_TRUE(peripherals.write(0x20008U, fil::mem::AccessSize::word,
+                                  1U | (1U << 8U) | (1U << 10U), {}));
+    mcu.value()->setAdcDiagnosticsEnabled(false);
+    auto* adc = mcu.value()->adc("ADC1");
+    ASSERT_NE(adc, nullptr);
+    adc->setConversionDelay(10U);
+    adc->setChannelValue(0U, 321U);
+    std::vector<fil::sim::EventObservation> observations;
+    static_cast<void>(events.exchangeObservationBarrier(
+        [&](fil::sim::SimTimeNs, fil::sim::EventOwner, fil::sim::EventObservation observation) {
+            observations.push_back(observation);
+        }));
+    {
+        auto owner = events.useOwner(2U);
+        ASSERT_TRUE(adc->write(0x0cU, fil::mem::AccessSize::word, (1U << 13U) | 1U, {}));
+        ASSERT_TRUE(adc->write(0x08U, fil::mem::AccessSize::word, 1U | (1U << 2U), {}));
+    }
+    ASSERT_EQ(events.runOwnedEvents(2U, 10U).events_executed, 1U);
+    ASSERT_EQ(observations.size(), 1U);
+    EXPECT_EQ(observations.back(), fil::sim::EventObservation::owner_local);
+    const auto dma_value = memory.read16(0x20000000U);
+    ASSERT_TRUE(dma_value);
+    EXPECT_EQ(dma_value.value(), 321U) << "certified ADC DMA writes into RAM without a global callback";
+
+    observations.clear();
+    adc->setChannelProvider([](unsigned int, fil::sim::SimTimeNs) { return std::uint16_t{123U}; });
+    ASSERT_EQ(events.runOwnedEvents(2U, 20U).events_executed, 1U);
+    ASSERT_EQ(observations.size(), 1U);
+    EXPECT_EQ(observations.back(), fil::sim::EventObservation::global)
+        << "a public provider replacement invalidates certification before dispatch";
+}
+
+TEST(Stm32G4Test, PublicAdcHookChangesForceGlobalDispatch) {
+    for (const unsigned int mutation : {0U, 1U, 2U}) {
+        fil::sim::EventLoop events;
+        fil::sim::TraceRecorder trace;
+        trace.setEnabled(false);
+        fil::cortexm::SystemControl system;
+        auto mcu = fil::stm32g4::Stm32G4::create(events, trace, system, true);
+        ASSERT_TRUE(mcu);
+        fil::mem::MemoryBus memory;
+        ASSERT_TRUE(memory.mapRam(0x20000000U, 0x1000U, "ram"));
+        ASSERT_TRUE(memory.mapMmio(0x40000000U, 0x20000000U,
+                                   mcu.value()->router(), "peripherals"));
+        mcu.value()->attachMemory(memory);
+        auto& peripherals = mcu.value()->router();
+        ASSERT_TRUE(peripherals.write(0x20800U, fil::mem::AccessSize::word, 5U, {}));
+        ASSERT_TRUE(peripherals.write(0x2000cU, fil::mem::AccessSize::word, 1U, {}));
+        ASSERT_TRUE(peripherals.write(0x20010U, fil::mem::AccessSize::word, 0x50000040U, {}));
+        ASSERT_TRUE(peripherals.write(0x20014U, fil::mem::AccessSize::word, 0x20000000U, {}));
+        ASSERT_TRUE(peripherals.write(0x20008U, fil::mem::AccessSize::word,
+                                      1U | (1U << 8U) | (1U << 10U), {}));
+        mcu.value()->setAdcDiagnosticsEnabled(false);
+        auto* adc = mcu.value()->adc("ADC1");
+        ASSERT_NE(adc, nullptr);
+        adc->setConversionDelay(10U);
+        adc->setChannelValue(0U, 321U);
+        {
+            auto owner = events.useOwner(2U);
+            ASSERT_TRUE(adc->write(0x0cU, fil::mem::AccessSize::word,
+                                   (1U << 13U) | 1U, {}));
+            ASSERT_TRUE(adc->write(0x08U, fil::mem::AccessSize::word,
+                                   1U | (1U << 2U), {}));
+        }
+        if (mutation == 0U) {
+            adc->setSampleCallback([](const fil::stm32g4::AdcSample&) {});
+        } else if (mutation == 1U) {
+            adc->setInterruptCallback([]() {});
+        } else {
+            adc->setInterruptLevelCallback([](unsigned int, bool) {});
+        }
+        std::vector<fil::sim::EventObservation> observations;
+        static_cast<void>(events.exchangeObservationBarrier(
+            [&](fil::sim::SimTimeNs, fil::sim::EventOwner,
+                fil::sim::EventObservation observation) { observations.push_back(observation); }));
+        ASSERT_EQ(events.runOwnedEvents(2U, 10U).events_executed, 1U);
+        ASSERT_EQ(observations.size(), 1U);
+        EXPECT_EQ(observations.front(), fil::sim::EventObservation::global)
+            << "public ADC hook mutation " << mutation << " invalidates owner-local trust";
+    }
+}
+
+TEST(Stm32G4Test, ObservationBarrierRechecksAfterProviderReplacement) {
+    fil::sim::EventLoop events;
+    fil::sim::TraceRecorder trace;
+    trace.setEnabled(false);
+    fil::cortexm::SystemControl system;
+    auto mcu = fil::stm32g4::Stm32G4::create(events, trace, system, true);
+    ASSERT_TRUE(mcu);
+    fil::mem::MemoryBus memory;
+    ASSERT_TRUE(memory.mapRam(0x20000000U, 0x1000U, "ram"));
+    ASSERT_TRUE(memory.mapMmio(0x40000000U, 0x20000000U,
+                               mcu.value()->router(), "peripherals"));
+    mcu.value()->attachMemory(memory);
+    auto& peripherals = mcu.value()->router();
+    ASSERT_TRUE(peripherals.write(0x20800U, fil::mem::AccessSize::word, 5U, {}));
+    ASSERT_TRUE(peripherals.write(0x2000cU, fil::mem::AccessSize::word, 1U, {}));
+    ASSERT_TRUE(peripherals.write(0x20010U, fil::mem::AccessSize::word, 0x50000040U, {}));
+    ASSERT_TRUE(peripherals.write(0x20014U, fil::mem::AccessSize::word, 0x20000000U, {}));
+    ASSERT_TRUE(peripherals.write(0x20008U, fil::mem::AccessSize::word,
+                                  1U | (1U << 8U) | (1U << 10U), {}));
+    mcu.value()->setAdcDiagnosticsEnabled(false);
+    auto* adc = mcu.value()->adc("ADC1");
+    ASSERT_NE(adc, nullptr);
+    adc->setConversionDelay(10U);
+    std::vector<fil::sim::EventObservation> observations;
+    static_cast<void>(events.exchangeObservationBarrier(
+        [&](fil::sim::SimTimeNs, fil::sim::EventOwner,
+            fil::sim::EventObservation observation) {
+            observations.push_back(observation);
+            if (observation == fil::sim::EventObservation::owner_local) {
+                adc->setChannelProvider([](unsigned int, fil::sim::SimTimeNs) {
+                    return std::uint16_t{123U};
+                });
+            }
+        }));
+    {
+        auto owner = events.useOwner(2U);
+        ASSERT_TRUE(adc->write(0x0cU, fil::mem::AccessSize::word,
+                               (1U << 13U) | 1U, {}));
+        ASSERT_TRUE(adc->write(0x08U, fil::mem::AccessSize::word,
+                               1U | (1U << 2U), {}));
+    }
+    ASSERT_EQ(events.runOwnedEvents(2U, 10U).events_executed, 1U);
+    EXPECT_EQ(observations, (std::vector<fil::sim::EventObservation>{
+        fil::sim::EventObservation::owner_local, fil::sim::EventObservation::global
+    })) << "provider replacement during observation adds a downgrade barrier before callback";
+}
+
+TEST(Stm32G4Test, ReplacingAttachedMemoryBusInvalidatesAdcDmaLocality) {
+    fil::sim::EventLoop events;
+    fil::sim::TraceRecorder trace;
+    trace.setEnabled(false);
+    fil::cortexm::SystemControl system;
+    auto mcu = fil::stm32g4::Stm32G4::create(events, trace, system, true);
+    ASSERT_TRUE(mcu);
+    fil::mem::MemoryBus trusted_router;
+    ASSERT_TRUE(trusted_router.mapRam(0x20000000U, 0x1000U, "trusted-ram"));
+    ASSERT_TRUE(trusted_router.mapMmio(0x40000000U, 0x20000000U,
+                                       mcu.value()->router(), "peripherals"));
+    mcu.value()->attachMemory(trusted_router);
+    auto& peripherals = mcu.value()->router();
+    ASSERT_TRUE(peripherals.write(0x20800U, fil::mem::AccessSize::word, 5U, {}));
+    ASSERT_TRUE(peripherals.write(0x2000cU, fil::mem::AccessSize::word, 1U, {}));
+    ASSERT_TRUE(peripherals.write(0x20010U, fil::mem::AccessSize::word, 0x50000040U, {}));
+    ASSERT_TRUE(peripherals.write(0x20014U, fil::mem::AccessSize::word, 0x20000000U, {}));
+    ASSERT_TRUE(peripherals.write(0x20008U, fil::mem::AccessSize::word,
+                                  1U | (1U << 8U) | (1U << 10U), {}));
+    mcu.value()->setAdcDiagnosticsEnabled(false);
+    auto* adc = mcu.value()->adc("ADC1");
+    ASSERT_NE(adc, nullptr);
+    adc->setConversionDelay(10U);
+    adc->setChannelValue(0U, 321U);
+    {
+        auto owner = events.useOwner(2U);
+        ASSERT_TRUE(adc->write(0x0cU, fil::mem::AccessSize::word,
+                               (1U << 13U) | 1U, {}));
+        ASSERT_TRUE(adc->write(0x08U, fil::mem::AccessSize::word,
+                               1U | (1U << 2U), {}));
+    }
+    fil::mem::MemoryBus source_fake_bus;
+    fil::stm32g4::UnknownMmioDevice source_fake_peripherals("source-fake-peripherals", 0x40000000U);
+    ASSERT_TRUE(source_fake_bus.mapRam(0x20000000U, 0x1000U, "source-fake-ram"));
+    ASSERT_TRUE(source_fake_bus.mapMmio(0x40000000U, 0x20000000U,
+                                        source_fake_peripherals, "source-fake-peripherals"));
+    mcu.value()->attachMemory(source_fake_bus);
+    std::vector<fil::sim::EventObservation> observations;
+    static_cast<void>(events.exchangeObservationBarrier(
+        [&](fil::sim::SimTimeNs, fil::sim::EventOwner,
+            fil::sim::EventObservation observation) { observations.push_back(observation); }));
+    ASSERT_EQ(events.runOwnedEvents(2U, 10U).events_executed, 1U);
+    ASSERT_EQ(observations.size(), 1U);
+    EXPECT_EQ(observations.front(), fil::sim::EventObservation::global)
+        << "an equivalent source-fake mapping is not the trusted router MemoryBus";
+}
+
+TEST(Stm32G4Test, PartiallyConsumedAdcDmaRechecksNextDestinationRange) {
+    fil::sim::EventLoop events;
+    fil::sim::TraceRecorder trace;
+    trace.setEnabled(false);
+    fil::cortexm::SystemControl system;
+    auto mcu = fil::stm32g4::Stm32G4::create(events, trace, system, true);
+    ASSERT_TRUE(mcu);
+    fil::mem::MemoryBus memory;
+    ASSERT_TRUE(memory.mapRam(0x20000000U, 0x1000U, "ram"));
+    ASSERT_TRUE(memory.mapMmio(0x40000000U, 0x20000000U,
+                              mcu.value()->router(), "peripherals"));
+    mcu.value()->attachMemory(memory);
+    auto& peripherals = mcu.value()->router();
+    ASSERT_TRUE(peripherals.write(0x20800U, fil::mem::AccessSize::word, 5U, {}));
+    ASSERT_TRUE(peripherals.write(0x2000cU, fil::mem::AccessSize::word, 2U, {}));
+    ASSERT_TRUE(peripherals.write(0x20010U, fil::mem::AccessSize::word, 0x50000040U, {}));
+    ASSERT_TRUE(peripherals.write(0x20014U, fil::mem::AccessSize::word, 0x20000ffeU, {}));
+    ASSERT_TRUE(peripherals.write(0x20008U, fil::mem::AccessSize::word,
+                                  1U | (1U << 7U) | (1U << 8U) | (1U << 10U), {}));
+    mcu.value()->setAdcDiagnosticsEnabled(false);
+    auto* adc = mcu.value()->adc("ADC1");
+    ASSERT_NE(adc, nullptr);
+    adc->setConversionDelay(10U);
+    adc->setChannelValue(0U, 321U);
+    std::vector<fil::sim::EventObservation> observations;
+    static_cast<void>(events.exchangeObservationBarrier(
+        [&](fil::sim::SimTimeNs, fil::sim::EventOwner, fil::sim::EventObservation observation) {
+            observations.push_back(observation);
+        }));
+    {
+        auto owner = events.useOwner(2U);
+        ASSERT_TRUE(adc->write(0x0cU, fil::mem::AccessSize::word, (1U << 13U) | 1U, {}));
+        ASSERT_TRUE(adc->write(0x08U, fil::mem::AccessSize::word, 1U | (1U << 2U), {}));
+    }
+    EXPECT_EQ(events.runOwnedEvents(2U, 10U).events_executed, 1U);
+    ASSERT_EQ(observations.size(), 1U);
+    EXPECT_EQ(observations.back(), fil::sim::EventObservation::owner_local);
+    observations.clear();
+    EXPECT_EQ(events.runOwnedEvents(2U, 20U).events_executed, 1U);
+    ASSERT_EQ(observations.size(), 1U);
+    EXPECT_EQ(observations.back(), fil::sim::EventObservation::global)
+        << "the effective next halfword is outside RAM, despite a RAM starting address";
+}
+
 TEST(Stm32G4Test, FdcanInterruptRependsUntilSourceCleared) {
     using Fdcan = fil::stm32g4::FdcanPeripheral;
     fil::sim::EventLoop events;

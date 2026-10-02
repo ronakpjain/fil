@@ -348,6 +348,13 @@ public:
      */
     [[nodiscard]] bool containsWritableRange(std::uint32_t address, std::uint64_t size) const noexcept;
 
+    /** @brief Side-effect-free proof of a directly mapped writable RAM range (no aliases). */
+    [[nodiscard]] bool containsWritableRamRange(std::uint32_t address, std::uint64_t size) const noexcept;
+
+    /** @brief Proves the actual direct MMIO device and device-relative offset of an access. */
+    [[nodiscard]] bool isMmioDeviceRange(std::uint32_t address, std::uint32_t size,
+        const MmioDevice& device, std::uint32_t expected_offset) const noexcept;
+
     /** @brief Enables/disables conservative data-read footprint collection (enabled by default). */
     void setReadFootprintTracking(bool enabled) noexcept;
     [[nodiscard]] bool readFootprintTracking() const noexcept { return read_footprint_tracking_; }

@@ -60,6 +60,179 @@ void configureReceiver(fil::sim::Board& board) {
     ASSERT_TRUE(board.memory().loadBytes(board.image().vectorBase() + 37U * 4U, bytes));
 }
 
+void configureLocalAdc(fil::sim::World& world, const fil::sim::EventOwner owner) {
+    auto& board = *world.board("sender");
+    world.trace().setEnabled(false);
+    board.peripherals().setAdcDiagnosticsEnabled(false);
+    auto* adc = board.peripherals().adc("ADC1");
+    ASSERT_NE(adc, nullptr);
+    adc->setConversionDelay(100U);
+    adc->setChannelValue(0U, 321U);
+    ASSERT_TRUE(board.memory().write32(0x40020800U, 5U));
+    ASSERT_TRUE(board.memory().write32(0x4002000cU, 4U));
+    ASSERT_TRUE(board.memory().write32(0x40020010U, 0x50000040U));
+    ASSERT_TRUE(board.memory().write32(0x40020014U, 0x20000100U));
+    ASSERT_TRUE(board.memory().write32(0x40020008U,
+        1U | (1U << 5U) | (1U << 7U) | (1U << 8U) | (1U << 10U)));
+    auto scope = world.eventLoop().useOwner(owner);
+    ASSERT_TRUE(adc->write(0x0cU, fil::mem::AccessSize::word,
+        (1U << 13U) | 3U, {}));
+    ASSERT_TRUE(adc->write(0x08U, fil::mem::AccessSize::word, 5U, {}));
+}
+
+TEST(DeferredPrefixTest, OwnerLocalAdcHorizonAllowsUnrelatedRamSpanButNotOrdinaryOwnedCallback) {
+    DeferredNetwork files;
+    auto world = fil::sim::World::load(files.config(false), true);
+    ASSERT_TRUE(world);
+    auto& receiver = *world.value()->board("receiver");
+    installCode(receiver, {0x00U,0xbfU, 0x00U,0xbfU, 0x00U,0xbfU, 0x00U,0xbfU,
+                          0x00U,0xbfU, 0x00U,0xbfU, 0x00U,0xbfU, 0x00U,0xbfU,
+                          0xf6U,0xe7U});
+    configureLocalAdc(*world.value(), 0U);
+    ASSERT_EQ(world.value()->eventLoop().nextScheduledTime(), 100U);
+    ASSERT_FALSE(world.value()->eventLoop().nextObservationTime(1U));
+    auto owner = world.value()->eventLoop().useOwner(1U);
+    fil::sim::Board::ReversibleRamPrefix prefix;
+    ASSERT_TRUE(receiver.prepareReversibleRamPrefix(prefix, 64U, std::nullopt, true, true));
+    EXPECT_GT(prefix.count, 16U);
+    EXPECT_GT(prefix.completion_times_ns[prefix.count - 1U], 100U);
+    static_cast<void>(receiver.materializeReversibleRamPrefix(prefix, 1U));
+    if (receiver.prepareReversibleRamPrefix(prefix, 64U, std::nullopt, true)) {
+        EXPECT_LE(prefix.count, 1U) << "standalone admission retains the global ADC horizon";
+        static_cast<void>(receiver.materializeReversibleRamPrefix(prefix, 1U));
+    }
+    {
+        auto other_owner = world.value()->eventLoop().useOwner(0U);
+        static_cast<void>(world.value()->eventLoop().scheduleAt(100U, [] {}));
+    }
+    EXPECT_EQ(world.value()->eventLoop().nextObservationTime(1U), 100U);
+}
+
+TEST(DeferredPrefixTest, LocalAdcEventsAndNestedGlobalObserversMatchExactExecution) {
+    for (const bool receiver_first : {false, true}) {
+        DeferredNetwork files;
+        const auto config = files.config(receiver_first);
+        auto reference = fil::sim::World::load(config, true);
+        auto candidate = fil::sim::World::load(config, true);
+        ASSERT_TRUE(reference && candidate);
+        std::vector<std::vector<std::uint32_t>> expected_observations, actual_observations;
+        for (auto* world : {reference.value().get(), candidate.value().get()}) {
+            for (const auto name : {"sender", "receiver"}) {
+                auto& board = *world->board(name);
+                board.cpu().state().r[1] = 0x20000040U;
+                installCode(board, {0x01U,0x20U, 0x08U,0x60U, 0x01U,0x30U,
+                                   0x48U,0x60U, 0x00U,0xbfU, 0xf9U,0xe7U});
+            }
+            configureLocalAdc(*world, receiver_first ? 1U : 0U);
+            auto* observations = world == reference.value().get()
+                ? &expected_observations : &actual_observations;
+            const auto observe = [world, observations] {
+                std::vector<std::uint32_t> values;
+                for (const auto name : {"sender", "receiver"}) {
+                    auto& board = *world->board(name);
+                    values.push_back(board.cpu().state().r[15]);
+                    values.push_back(board.cpu().state().r[0]);
+                    values.push_back(board.memory().read32(0x20000040U).value());
+                    values.push_back(board.memory().read32(0x20000100U).value());
+                }
+                observations->push_back(std::move(values));
+            };
+            static_cast<void>(world->eventLoop().scheduleAt(2100U, [world, observe] {
+                observe();
+                static_cast<void>(world->eventLoop().scheduleAt(2100U, observe));
+                // Changing a pending provider dynamically makes its ADC event
+                // globally observing; its peer reads must see exact state.
+                auto* adc = world->board("sender")->peripherals().adc("ADC1");
+                ASSERT_TRUE(adc->write(0x30U, fil::mem::AccessSize::word, 1U << 6U, {}));
+                adc->setChannelProvider(
+                    [world, observe](unsigned int, fil::sim::SimTimeNs) {
+                        observe();
+                        return static_cast<std::uint16_t>(world->board("receiver")->cpu().state().r[0]);
+                    });
+            }));
+            static_cast<void>(world->eventLoop().scheduleAt(3201U, observe));
+        }
+        fil::sim::WorldRunOptions options;
+        options.duration_ns = 10000U;
+        options.max_instructions_per_board = 10000U;
+        options.enable_loop_batching = false;
+        const auto expected = reference.value()->run(options);
+        options.enable_jit = true;
+        options.enable_ram_capsules = true;
+        const auto actual = candidate.value()->run(options);
+        ASSERT_TRUE(expected && actual);
+        EXPECT_GT(actual.value().deferred_prefixes, 0U);
+        EXPECT_EQ(actual.value().instructions, expected.value().instructions);
+        EXPECT_EQ(actual.value().cycles, expected.value().cycles);
+        EXPECT_EQ(actual.value().event_callbacks, expected.value().event_callbacks);
+        EXPECT_EQ(actual.value().end_time_ns, expected.value().end_time_ns);
+        EXPECT_EQ(actual_observations, expected_observations);
+        for (const auto name : {"sender", "receiver"}) {
+            auto& actual_board = *candidate.value()->board(name);
+            auto& expected_board = *reference.value()->board(name);
+            EXPECT_TRUE(fil::cpu::bitwiseEqual(actual_board.cpu().state(), expected_board.cpu().state()));
+            for (const auto address : {0x20000040U, 0x20000044U, 0x20000100U, 0x20000104U}) {
+                EXPECT_EQ(actual_board.memory().read32(address).value(),
+                          expected_board.memory().read32(address).value());
+            }
+        }
+    }
+}
+
+TEST(DeferredPrefixTest, PublicObserverReplacementCannotRemoveWorldMaterialization) {
+    DeferredNetwork files;
+    const auto config = files.config(false);
+    auto reference = fil::sim::World::load(config, true);
+    auto candidate = fil::sim::World::load(config, true);
+    ASSERT_TRUE(reference && candidate);
+    std::vector<std::vector<std::uint32_t>> expected_values, actual_values;
+    for (auto* world : {reference.value().get(), candidate.value().get()}) {
+        for (const auto name : {"sender", "receiver"}) {
+            installCode(*world->board(name), {0x01U,0x30U, 0x00U,0xbfU,
+                0x00U,0xbfU, 0x00U,0xbfU, 0x00U,0xbfU, 0xf9U,0xe7U});
+        }
+        configureLocalAdc(*world, 0U);
+        auto* values = world == reference.value().get() ? &expected_values : &actual_values;
+        const auto observe = [world, values] {
+            values->push_back({world->board("sender")->cpu().state().r[15],
+                world->board("sender")->cpu().state().r[0],
+                world->board("receiver")->cpu().state().r[15],
+                world->board("receiver")->cpu().state().r[0]});
+        };
+        static_cast<void>(world->eventLoop().exchangeObservationBarrier(
+            [world, observe, changed = false](fil::sim::SimTimeNs at,
+                fil::sim::EventOwner, fil::sim::EventObservation) mutable {
+                observe();
+                if (changed) return;
+                changed = true;
+                // A self-removing observer cannot remove the scheduler's
+                // mandatory barrier or destroy its currently running callable.
+                static_cast<void>(world->eventLoop().exchangeObservationBarrier({}));
+                world->board("sender")->peripherals().adc("ADC1")->setChannelProvider(
+                    [](unsigned int, fil::sim::SimTimeNs) { return std::uint16_t{123U}; });
+                static_cast<void>(world->eventLoop().scheduleAt(at, observe));
+                static_cast<void>(world->eventLoop().scheduleAt(at + 317U, observe));
+            }));
+    }
+    fil::sim::WorldRunOptions options;
+    options.duration_ns = 10000U;
+    options.max_instructions_per_board = 10000U;
+    options.enable_loop_batching = false;
+    const auto expected = reference.value()->run(options);
+    options.enable_jit = true;
+    options.enable_ram_capsules = true;
+    const auto actual = candidate.value()->run(options);
+    ASSERT_TRUE(expected && actual);
+    EXPECT_EQ(actual_values, expected_values);
+    EXPECT_GE(actual_values.size(), 3U);
+    EXPECT_EQ(actual.value().instructions, expected.value().instructions);
+    EXPECT_EQ(actual.value().cycles, expected.value().cycles);
+    for (const auto name : {"sender", "receiver"}) {
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.value()->board(name)->cpu().state(),
+            reference.value()->board(name)->cpu().state()));
+    }
+}
+
 TEST(DeferredPrefixTest, WarmIdleCallPeriodEveryCutMatchesExactCpuMemoryAndTimers) {
     // A small FreeRTOS-style idle call: the callee saves/restores R3/LR and
     // polls a private-RAM deletion count, then the caller polls the ready count.

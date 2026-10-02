@@ -88,6 +88,29 @@ fil::mem::MemoryBus basicBus() {
 }
 
 /** @brief Verifies little-endian aligned, unaligned, and alias accesses. */
+TEST(MemoryBusTest, LocalityRangeProofsVerifyActualMappingsWithoutEffects) {
+    fil::mem::MemoryBus memory;
+    RecordingMmio trusted, other;
+    ASSERT_TRUE(memory.mapRam(0x20000000U, 16U, "ram"));
+    ASSERT_TRUE(memory.mapFlash(0x08000000U, 16U, "flash"));
+    ASSERT_TRUE(memory.mapAlias(0x10000000U, 0x20000000U, 16U, "ram-alias"));
+    ASSERT_TRUE(memory.mapMmio(0x40000000U, 16U, trusted, "trusted"));
+    const auto checkpoint = memory.sideEffectCheckpoint();
+    EXPECT_TRUE(memory.containsWritableRamRange(0x2000000eU, 2U));
+    EXPECT_FALSE(memory.containsWritableRamRange(0x2000000eU, 3U));
+    EXPECT_FALSE(memory.containsWritableRamRange(0x20000000U, 0U));
+    EXPECT_FALSE(memory.containsWritableRamRange(0x20000000U, 0x100000000ULL));
+    EXPECT_FALSE(memory.containsWritableRamRange(0x08000000U, 2U));
+    EXPECT_FALSE(memory.containsWritableRamRange(0x10000000U, 2U));
+    EXPECT_TRUE(memory.isMmioDeviceRange(0x40000004U, 2U, trusted, 4U));
+    EXPECT_FALSE(memory.isMmioDeviceRange(0x40000004U, 2U, other, 4U));
+    EXPECT_FALSE(memory.isMmioDeviceRange(0x40000004U, 2U, trusted, 0U));
+    EXPECT_FALSE(memory.isMmioDeviceRange(0x4000000fU, 2U, trusted, 15U));
+    EXPECT_EQ(trusted.read_count, 0);
+    EXPECT_EQ(trusted.write_count, 0);
+    EXPECT_TRUE(memory.sideEffectsRestoredSince(checkpoint));
+}
+
 TEST(MemoryBusTest, ReadsAndWritesBackedMemory) {
     auto bus = basicBus();
     const std::vector<std::uint8_t> flash = {0x10, 0x21, 0x32, 0x43, 0x54, 0x65};

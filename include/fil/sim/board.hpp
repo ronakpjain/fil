@@ -230,7 +230,8 @@ public:
     [[nodiscard]] bool prepareReversibleRamPrefix(
         ReversibleRamPrefix& out, std::size_t max_instructions,
         std::optional<SimTimeNs> deadline = std::nullopt,
-        bool allow_single_prefix = false);
+        bool allow_single_prefix = false,
+        bool owner_local_barrier_installed = false);
 
     /** @brief Commits the started prefix, restoring/replaying an interrupted suffix. */
     [[nodiscard]] ConcurrentStepResult materializeReversibleRamPrefix(

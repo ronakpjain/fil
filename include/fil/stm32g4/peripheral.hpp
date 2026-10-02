@@ -72,6 +72,9 @@ public:
 
     /** @brief Observes level-sensitive interrupt requests, one callback per changed line. */
     void setInterruptLevelCallback(InterruptLevelCallback callback);
+    [[nodiscard]] std::uint64_t interruptLevelCallbackGeneration() const noexcept {
+        return interrupt_level_callback_generation_;
+    }
 
     /** @brief Qualifies future trace sources as `prefix.device`; empty restores the device name. */
     void setTraceSourcePrefix(std::string_view prefix);
@@ -104,6 +107,10 @@ protected:
         return trace_ != nullptr && trace_->enabled();
     }
 
+    [[nodiscard]] bool traceObserverActive() const noexcept {
+        return traceEnabled() && trace_->hasObserver();
+    }
+
     /// Reports whether a trace type would be recorded (enabled and allowlisted).
     /// Producers of hot event types must check this before building fields.
     [[nodiscard]] bool tracePasses(std::string_view type) const noexcept {
@@ -130,6 +137,7 @@ private:
     sim::TraceRecorder* trace_{nullptr};
     std::array<bool, 8> interrupt_levels_{};
     InterruptLevelCallback interrupt_level_callback_;
+    std::uint64_t interrupt_level_callback_generation_{0U};
 };
 
 /** @brief One observed access handled by a lenient unknown MMIO device. */
@@ -647,6 +655,10 @@ protected:
     void onReset() override;
 
 private:
+    friend class Stm32G4;
+    void setCertifiedChannelProvider(ChannelProvider provider);
+    void setCertifiedSampleCallback(SampleCallback callback, std::function<bool()> guard);
+    [[nodiscard]] bool ownerLocalTrusted() const;
     [[nodiscard]] unsigned int sequenceLength() const noexcept;
     [[nodiscard]] unsigned int channelForRank(unsigned int rank) const noexcept;
     [[nodiscard]] sim::SimTimeNs conversionDelayForRank(unsigned int rank) const noexcept;
@@ -682,6 +694,10 @@ private:
     ChannelProvider channel_provider_;
     SampleCallback sample_callback_;
     InterruptCallback interrupt_callback_;
+    bool certified_provider_{false};
+    bool certified_sample_callback_{false};
+    std::function<bool()> owner_local_guard_;
+    std::uint64_t certified_interrupt_generation_{0U};
     std::uint64_t input_clock_hz_{16'000'000U};
     sim::SimTimeNs conversion_delay_override_ns_{0};
     unsigned int sequence_rank_{0};
@@ -789,6 +805,11 @@ public:
 
     void setMemory(mem::MemoryBus* memory) noexcept { memory_ = memory; }
     void setInterruptCallback(InterruptCallback callback);
+    /** @brief Certifies this channel's next ADC peripheral-to-RAM halfword transfer. */
+    [[nodiscard]] bool ownerLocalAdcTransferSafe(
+        unsigned channel, const mem::MemoryBus* expected_bus, std::uint32_t expected_source,
+        std::uint64_t trusted_interrupt_generation
+    ) const;
     void setEnableCallback(EnableCallback callback) { enable_callback_ = std::move(callback); }
     void setTransferHistoryEnabled(bool enabled) noexcept { transfer_history_enabled_ = enabled; }
     /** @brief Services one peripheral request for an already-enabled channel. */
