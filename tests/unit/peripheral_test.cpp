@@ -1091,6 +1091,214 @@ TEST(PeripheralTest, WwdgCounterAndCfrPrescalerSetTimeoutDeadline) {
 }
 
 
+TEST(PeripheralTest, UsartAcknowledgementsIdleRefillAndInterruptGates) {
+    fil::sim::EventLoop loop;
+    fil::stm32g4::UsartPeripheral uart("USART1", &loop);
+    ASSERT_TRUE(uart.write(0, fil::mem::AccessSize::word, 1U | (1U << 2U) | (1U << 3U), write_context)); // UE, RE, TE
+    auto status = uart.read(0x1c, fil::mem::AccessSize::word, read_context);
+    ASSERT_TRUE(status);
+    EXPECT_NE(status.value() & ((1U << 21U) | (1U << 22U)), 0U);
+    EXPECT_EQ(status.value() & ((1U << 21U) | (1U << 22U)), (1U << 21U) | (1U << 22U));
+
+    uart.setIdleGap(10U);
+    uart.injectRx(0x31U);
+    ASSERT_EQ(loop.runDueEvents(10U).events_executed, 1U);
+    status = uart.read(0x1c, fil::mem::AccessSize::word, read_context);
+    ASSERT_TRUE(status);
+    EXPECT_NE(status.value() & (1U << 4U), 0U); // IDLE
+    ASSERT_TRUE(uart.write(0x20, fil::mem::AccessSize::word, 1U << 4U, write_context)); // IDLECF
+    EXPECT_EQ(uart.peekRegister(0x1c) & (1U << 4U), 0U);
+    ASSERT_TRUE(uart.write(0x18, fil::mem::AccessSize::word, 1U << 3U, write_context)); // RXFRQ
+    EXPECT_FALSE(uart.hasRxData());
+    EXPECT_EQ(uart.peekRegister(0x1c) & (1U << 5U), 0U);
+
+    unsigned int provider_calls = 0;
+    uart.setRxProvider([&](std::uint64_t) -> std::optional<std::uint8_t> {
+        return provider_calls++ == 0U ? std::optional<std::uint8_t>{0x5aU} : std::nullopt;
+    });
+    status = uart.read(0x1c, fil::mem::AccessSize::word, read_context); // status observation refills an empty RDR
+    ASSERT_TRUE(status);
+    EXPECT_NE(status.value() & (1U << 5U), 0U);
+    auto received = uart.read(0x24, fil::mem::AccessSize::byte, read_context);
+    ASSERT_TRUE(received);
+    EXPECT_EQ(received.value(), 0x5aU);
+
+}
+
+TEST(PeripheralTest, UsartInterruptEnablesIndependentlyAssertAndDeassert) {
+    const std::array<std::pair<std::uint32_t, std::uint32_t>, 4> gates{{
+        {1U << 4U, 1U << 4U}, {1U << 5U, 1U << 5U},
+        {1U << 6U, 1U << 6U}, {1U << 7U, 1U << 7U},
+    }};
+    for (const auto [enable, flag] : gates) {
+        fil::sim::EventLoop loop;
+        fil::stm32g4::UsartPeripheral uart("USART1", &loop);
+        std::vector<bool> levels;
+        uart.setInterruptLevelCallback([&](std::uint32_t line, bool asserted) {
+            if (line == 0U) levels.push_back(asserted);
+        });
+        levels.clear();
+        ASSERT_TRUE(uart.write(0U, fil::mem::AccessSize::word, 1U, write_context)); // UE, no source enable
+        ASSERT_TRUE(uart.write(0x20U, fil::mem::AccessSize::word, 0xffffffffU, write_context)); // clear TC/IDLE/etc.
+        ASSERT_TRUE(uart.write(0U, fil::mem::AccessSize::word, 1U | enable, write_context));
+        if (flag == (1U << 4U)) {
+            uart.setIdleGap(10U);
+            uart.injectRx(0x11U);
+            ASSERT_EQ(loop.runDueEvents(10U).events_executed, 1U);
+        } else if (flag == (1U << 5U)) {
+            uart.injectRx(0x11U);
+        } else if (flag == (1U << 6U)) {
+            ASSERT_TRUE(uart.write(0x28U, fil::mem::AccessSize::byte, 0x55U, write_context));
+        }
+        ASSERT_EQ(levels, (std::vector<bool>{true})) << "CR1 enable " << enable << " asserts only its pending source";
+        ASSERT_TRUE(uart.write(0U, fil::mem::AccessSize::word, 1U, write_context)); // disable only interrupt gate; status remains
+        EXPECT_EQ(levels, (std::vector<bool>{true, false}));
+        EXPECT_NE(uart.peekRegister(0x1cU) & flag, 0U) << "status survives interrupt masking";
+    }
+}
+
+TEST(PeripheralTest, SpiConsumesFramesAndSignalsReceiveDma) {
+    fil::stm32g4::SpiPeripheral spi("SPI1");
+    std::vector<bool> requests;
+    spi.setDmaRequestCallback([&](bool tx) { requests.push_back(tx); });
+    std::vector<std::uint8_t> seen;
+    spi.setTransferCallback([&](std::span<const std::uint8_t> tx, std::uint64_t) {
+        seen.assign(tx.begin(), tx.end());
+        return std::vector<std::uint8_t>{0xa5U, 0x5aU};
+    });
+    ASSERT_TRUE(spi.write(0x04, fil::mem::AccessSize::word, 1U, write_context)); // RXDMAEN
+    ASSERT_TRUE(spi.write(0x0c, fil::mem::AccessSize::halfword, 0x1234U, write_context));
+    EXPECT_EQ(seen, (std::vector<std::uint8_t>{0x34U, 0x12U}));
+    ASSERT_TRUE(spi.read(0x08, fil::mem::AccessSize::word, read_context));
+    EXPECT_NE(spi.peekRegister(0x08) & 1U, 0U);
+    auto rx = spi.read(0x0c, fil::mem::AccessSize::halfword, read_context);
+    ASSERT_TRUE(rx);
+    EXPECT_EQ(rx.value(), 0x5aa5U);
+    EXPECT_EQ(spi.peekRegister(0x08) & 1U, 0U);
+    EXPECT_EQ(requests, (std::vector<bool>{false}));
+    EXPECT_EQ(spi.transferLog().size(), 1U);
+}
+
+TEST(PeripheralTest, DmaWidthsIncrementsCircularAndFailureFlags) {
+    fil::mem::MemoryBus bus;
+    ASSERT_TRUE(bus.mapRam(0x20000000U, 0x100U, "dma-contract"));
+    ASSERT_TRUE(bus.write16(0x20000000U, 0x1234U));
+    ASSERT_TRUE(bus.write16(0x20000002U, 0x5678U));
+    fil::stm32g4::DmaPeripheral dma("DMA1", 2U, &bus);
+    // Channel 1: memory-to-peripheral, halfword widths, both address increments.
+    ASSERT_TRUE(dma.write(0x0c, fil::mem::AccessSize::word, 2U, write_context));
+    ASSERT_TRUE(dma.write(0x10, fil::mem::AccessSize::word, 0x20000020U, write_context));
+    ASSERT_TRUE(dma.write(0x14, fil::mem::AccessSize::word, 0x20000000U, write_context));
+    const std::uint32_t ccr = 1U | (1U << 4U) | (1U << 5U) | (1U << 6U) | (1U << 7U) |
+                              (1U << 8U) | (1U << 10U);
+    ASSERT_TRUE(dma.write(0x08, fil::mem::AccessSize::word, ccr, write_context));
+    ASSERT_TRUE(dma.request(1U));
+    ASSERT_TRUE(dma.request(1U));
+    EXPECT_EQ(bus.read16(0x20000020U).value(), 0x1234U);
+    EXPECT_EQ(bus.read16(0x20000022U).value(), 0x5678U);
+    // CIRC was selected in CCR: terminal count reloads and EN remains asserted.
+    EXPECT_EQ(dma.peekRegister(0x0c), 2U);
+    EXPECT_NE(dma.peekRegister(0x08) & 1U, 0U);
+    EXPECT_NE(dma.peekRegister(0) & (1U << 1U), 0U);
+
+    fil::stm32g4::DmaPeripheral circular("DMA1-CIRC", 1U, &bus);
+    ASSERT_TRUE(circular.write(0x0c, fil::mem::AccessSize::word, 1U, write_context));
+    ASSERT_TRUE(circular.write(0x10, fil::mem::AccessSize::word, 0x20000030U, write_context));
+    ASSERT_TRUE(circular.write(0x14, fil::mem::AccessSize::word, 0x20000000U, write_context));
+    ASSERT_TRUE(circular.write(0x08, fil::mem::AccessSize::word, 1U | (1U << 5U), write_context)); // CIRC, fil::mem::AccessSize::byte widths
+    ASSERT_TRUE(circular.request(1U));
+    EXPECT_EQ(circular.peekRegister(0x0c), 1U); // CNDTR reloads at TC
+    EXPECT_NE(circular.peekRegister(0x08) & 1U, 0U); // EN remains set
+    EXPECT_TRUE(circular.request(1U)); // next circular cycle
+
+    // No attached memory is a modeled transfer error: TEIF, disable, TEIE IRQ.
+    fil::stm32g4::DmaPeripheral failing("DMA2", 1U);
+    std::vector<bool> irq;
+    failing.setInterruptLevelCallback([&](std::uint32_t, bool value) { irq.push_back(value); });
+    ASSERT_TRUE(failing.write(0x0c, fil::mem::AccessSize::word, 1U, write_context));
+    ASSERT_TRUE(failing.write(0x10, fil::mem::AccessSize::word, 0x50000000U, write_context));
+    ASSERT_TRUE(failing.write(0x14, fil::mem::AccessSize::word, 0x20000000U, write_context));
+    ASSERT_TRUE(failing.write(0x08, fil::mem::AccessSize::word, 1U | (1U << 3U), write_context));
+    ASSERT_TRUE(failing.request(1U));
+    EXPECT_NE(failing.peekRegister(0) & (1U << 3U), 0U);
+    EXPECT_EQ(failing.peekRegister(0x08) & 1U, 0U);
+    ASSERT_TRUE(failing.write(0x04, fil::mem::AccessSize::word, 1U << 3U, write_context)); // CTEIF1
+    EXPECT_EQ(failing.peekRegister(0), 0U);
+    EXPECT_FALSE(irq.empty());
+    EXPECT_FALSE(irq.back());
+}
+
+TEST(PeripheralTest, DmaByteHalfwordWordAndBothDirectionsHonorIncrementBits) {
+    struct WidthCase { std::uint32_t selector; std::uint32_t width; };
+    constexpr std::array widths{WidthCase{0U, 1U}, WidthCase{1U, 2U}, WidthCase{2U, 4U}};
+    constexpr std::array increment_modes{
+        std::pair{false, false}, std::pair{true, false},
+        std::pair{false, true}, std::pair{true, true},
+    };
+    for (const WidthCase width : widths) {
+        for (const bool memory_to_peripheral : {false, true}) {
+            for (const auto [pinc, minc] : increment_modes) {
+                fil::mem::MemoryBus bus;
+                ASSERT_TRUE(bus.mapRam(0x20000000U, 0x100U, "dma-width-matrix"));
+                fil::stm32g4::DmaPeripheral dma("DMA", 1U, &bus);
+                const std::uint32_t peripheral = 0x20000040U;
+                const std::uint32_t memory = 0x20000000U;
+                const std::array<std::uint32_t, 2> values{0x12345678U, 0x9abcdef0U};
+                const bool input_increment = memory_to_peripheral ? minc : pinc;
+                const auto writeItem = [&](const std::uint32_t address, const std::uint32_t value) {
+                    if (width.width == 1U) return bus.write8(address, static_cast<std::uint8_t>(value));
+                    if (width.width == 2U) return bus.write16(address, static_cast<std::uint16_t>(value));
+                    return bus.write32(address, value);
+                };
+                for (std::uint32_t i = 0; i < 2U; ++i) {
+                    const std::uint32_t input = memory_to_peripheral ? memory : peripheral;
+                    ASSERT_TRUE(writeItem(input + (input_increment ? i * width.width : 0U), values[i]));
+                }
+                ASSERT_TRUE(dma.write(0x0cU, fil::mem::AccessSize::word, 2U, write_context));
+                ASSERT_TRUE(dma.write(0x10U, fil::mem::AccessSize::word, peripheral, write_context));
+                ASSERT_TRUE(dma.write(0x14U, fil::mem::AccessSize::word, memory, write_context));
+                std::uint32_t ccr = 1U | (width.selector << 8U) | (width.selector << 10U);
+                if (memory_to_peripheral) ccr |= 1U << 4U;
+                if (pinc) ccr |= 1U << 6U;
+                if (minc) ccr |= 1U << 7U;
+                ASSERT_TRUE(dma.write(0x08U, fil::mem::AccessSize::word, ccr, write_context));
+                ASSERT_TRUE(dma.request(1U));
+                ASSERT_TRUE(dma.request(1U));
+                const std::uint32_t output = memory_to_peripheral ? peripheral : memory;
+                const bool output_increment = memory_to_peripheral ? pinc : minc;
+                const std::uint32_t expected_items = output_increment ? 2U : 1U;
+                for (std::uint32_t i = 0; i < expected_items; ++i) {
+                    const std::uint32_t index = output_increment ? i : 0U;
+                    auto actual = width.width == 1U
+                        ? fil::mem::MemoryResult<std::uint64_t>{bus.read8(output + index * width.width).value()}
+                        : width.width == 2U
+                            ? fil::mem::MemoryResult<std::uint64_t>{bus.read16(output + index * width.width).value()}
+                            : fil::mem::MemoryResult<std::uint64_t>{bus.read32(output + index * width.width).value()};
+                    ASSERT_TRUE(actual);
+                    const std::uint32_t source_index = output_increment && input_increment ? i : 1U;
+                    const std::uint64_t width_mask = width.width == 1U ? 0xffU
+                        : width.width == 2U ? 0xffffU : 0xffffffffU;
+                    EXPECT_EQ(actual.value(), values[source_index] & width_mask)
+                        << "width=" << width.width << " DIR=" << memory_to_peripheral
+                        << " PINC=" << pinc << " MINC=" << minc;
+                }
+            }
+        }
+    }
+}
+
+TEST(PeripheralTest, DmamuxRequestSelectorAndReadOnlyClearStatus) {
+    fil::stm32g4::DmamuxPeripheral mux("DMAMUX", 2U);
+    ASSERT_TRUE(mux.write(0x00, fil::mem::AccessSize::word, 0x55U, write_context));
+    EXPECT_EQ(mux.requestForChannel(0U), 0x55U);
+    const auto generation = mux.routingGeneration();
+    ASSERT_TRUE(mux.write(0x00, fil::mem::AccessSize::word, 0x55U, write_context));
+    EXPECT_EQ(mux.routingGeneration(), generation);
+    // CSR is read-only, with no modeled source that can raise SOFx.
+    ASSERT_TRUE(mux.write(0x80, fil::mem::AccessSize::word, 1U, write_context));
+    EXPECT_EQ(mux.peekRegister(0x80), 0U);
+}
+
 } // namespace
 
 /** @brief Runs STM32G4 peripheral foundation unit tests. */

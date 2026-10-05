@@ -172,6 +172,60 @@ timer families are described in RM0440 §30.5, RM0440 §31.7 and RM0440 §32.4.
 | WWDG CR reload/enable, CFR prescaler, refresh and reset-disabled callback setting | RM0440 §36.3.2 enable; RM0440 §36.3.3 down-counter; RM0440 §36.3.4 timeout; RM0440 §36.5.1 `CR`; RM0440 §36.5.2 `CFR` | `PeripheralTest.WwdgCounterAndCfrPrescalerSetTimeoutDeadline` | **Model contract**, not full WWDG conformance: no live down-counter/window/EWI, and model WDGA clearing cancels the timer although hardware WDGA cannot be cleared by software. |
 | WWDG SR/EWI and integrated MCU reset | RM0440 §36.4 interrupts; RM0440 §36.5.3 `SR` | No conformance test claimed | **Unsupported/unverified**. Integrated watchdogs are constructed reset-disabled; standalone reset callbacks are tested, not a full MCU restart. |
 
+### USART
+
+| Behavior | Reference | Named test evidence | Fidelity / limits |
+|---|---|---|---|
+| UE/TE/RE drive TEACK/REACK | RM0440 §40.8.1 `CR1`; RM0440 §40.8.9 `ISR` | `PeripheralTest.UsartAcknowledgementsIdleRefillAndInterruptGates` | Tested acknowledge subset; no baud/clock-domain modeling. |
+| IDLE after the modeled gap and IDLECF clear; RXFRQ drains the queue and RXNE | RM0440 §40.5.6 receiver; RM0440 §40.8.8 `RQR`; RM0440 §40.8.9 `ISR`; RM0440 §40.8.11 `ICR` | `PeripheralTest.UsartAcknowledgementsIdleRefillAndInterruptGates` | Idle gap is an emulator approximation, not baud/frame timing. |
+| Each CR1 source independently gates its status onto the interrupt line, and masking preserves status | RM0440 §40.8.1 `CR1` RXNEIE/IDLEIE/TCIE/TXEIE | `PeripheralTest.UsartInterruptEnablesIndependentlyAssertAndDeassert` | Gate/level subset; TXE without data is asserted by the idle model. |
+| RDR pop, TDR byte log/callback, immediate TC, RX queue and TX path | RM0440 §40.5.5 transmitter; RM0440 §40.5.6 receiver; RM0440 §40.8.12 `RDR`; RM0440 §40.8.13 `TDR` | `PeripheralTest.ModelsUsartAndSpiDataPaths`; `PeripheralTest.UsartTransmissionCompleteCanBeAcknowledged`; `Stm32G4Test.UsartInterruptStopsRependingAfterReceiveConsumed`; `Stm32G4Test.RoutesIntegratedPeripherals` | Instantaneous byte model; no framing/parity/FIFO/CTS/RTS/synchronous modes. |
+| CR3 DMAT/DMAR request generation | RM0440 §40.5.19 DMA; RM0440 §40.8.4 `CR3` | `PeripheralTest.SignalsUsartDmaRequestsForTxAndRx`; `Stm32G4Test.IntegratedUsartAndSpiTransfersReachDmaThroughDmamux` | Request/flag subset with an integrated DMA route; no baud-paced transfer timing. |
+| Status-observation RX provider refill | No hardware equivalent | `PeripheralTest.UsartAcknowledgementsIdleRefillAndInterruptGates` | **Simulator contract**: the provider is pulled when firmware observes an empty receiver. |
+
+### SPI
+
+| Behavior | Reference | Named test evidence | Fidelity / limits |
+|---|---|---|---|
+| DR write transfers bytes/halfwords per access width, callback/echo response, RX queue consumed by DR read, RXNE/TXE/brief BSY, transfer log | RM0440 §42.5.9 transfer procedure; RM0440 §42.5.10 status flags; RM0440 §42.9.3 `SR`; RM0440 §42.9.4 `DR` | `PeripheralTest.SpiConsumesFramesAndSignalsReceiveDma`; `PeripheralTest.ModelsUsartAndSpiDataPaths` | Immediate modeled response; only byte/halfword widths regardless of configured DS. No serial clock/polarity/phase/NSS sequencing. |
+| CR2 RXNEIE/TXEIE interrupt gates and RXDMAEN/TXDMAEN requests | RM0440 §42.9.2 `CR2` | `PeripheralTest.SpiConsumesFramesAndSignalsReceiveDma`; `PeripheralTest.ReportsPeripheralInterruptLevelsAndRependsOnEnable`; `Stm32G4Test.IntegratedUsartAndSpiTransfersReachDmaThroughDmamux` | Request/gate subset with an integrated DMA route; FIFO depth/CRC/underrun/overrun/I2S unsupported. |
+
+### DMA and DMAMUX
+
+| Behavior | Reference | Named test evidence | Fidelity / limits |
+|---|---|---|---|
+| Byte/halfword/word widths in both directions with PINC/MINC matrices | RM0440 §12.4.5 channel controls; RM0440 §12.4.6 data width | `PeripheralTest.DmaByteHalfwordWordAndBothDirectionsHonorIncrementBits` | Tested width/direction/increment subset; no alignment/FIFO/arbitration enforcement. |
+| CNDTR decrement/reload, circular mode keeps EN, TCIF/TEIF flags, disable on complete/error, TCIE/TEIE IRQ, IFCR individual and global clears | RM0440 §12.4.3 transfers; RM0440 §12.4.5 `CIRC`; RM0440 §12.4.7 error management; RM0440 §12.6.1 `ISR`; RM0440 §12.6.2 `IFCR`; RM0440 §12.6.3 `CCRx`; RM0440 §12.6.4 `CNDTRx` | `PeripheralTest.DmaWidthsIncrementsCircularAndFailureFlags`; `PeripheralTest.CompletesDmaAndWatchdogSideEffects`; `PeripheralTest.DmaGlobalFlagClearDeassertsOnlySelectedChannel` | No half-transfer progress, transfer timing, bursts beyond serial draining, or hardware bus-error detail. Requests are software/callback-driven. |
+| DMAMUX request selector retained, routing generation stable, CSR read-only with no modeled overrun source | RM0440 §13.6.1 `CxCR`; RM0440 §13.6.2 `CSR` | `PeripheralTest.DmamuxRequestSelectorAndReadOnlyClearStatus`; `PeripheralTest.CompletesDmaAndWatchdogSideEffects` | Selector/storage subset. Overrun flags are never generated, so CFR clearing of a set SOFx is untestable; request generators and synchronization logic are absent. |
+| Peripheral-to-DMA routing through DMAMUX selectors | RM0440 §13.6.1 `CxCR` | `Stm32G4Test.Adc5RoutesItsDmaRequestAndDedicatedInterrupt`; `Stm32G4Test.IntegratedUsartAndSpiTransfersReachDmaThroughDmamux` | Tested ADC5/USART1-TX/SPI1-RX routes; not every request ID end to end. |
+
+### FDCAN
+
+Only RX FIFO 0 (three elements) and three TX buffers are functional. There is
+no bit timing, arbitration, ACK/retry, error accounting, TX event FIFO,
+RX FIFO 1, or full M_CAN configuration-rule conformance. XIDAM is stored but
+not applied.
+
+| Behavior | Reference | Named test evidence | Fidelity / limits |
+|---|---|---|---|
+| INIT/CCE/clock-stop transitions | RM0440 §44.4.6 `CCCR` | `FdcanTest.ModelsClockStopAndInitTransitions` | Tested control subset. |
+| Shared message-RAM bounds, little-endian element layout | RM0440 §44.3.6 message RAM | `FdcanTest.ExposesSharedMessageRamAsMmio`; `FdcanTest.TransmitsAndReceivesThroughMessageRam` | Fixed three-slice layout; detached TX completes locally. |
+| Standard range filter, nonmatch reject, FIFO0 full/lost, acknowledge release and overwrite payload | RM0440 §44.3.11 standard filters; RM0440 §44.3.6 message RAM; RM0440 §44.3.7 FIFO acknowledge; RM0440 §44.4.19 `RXGFC`; RM0440 §44.4.22 `RXF0S`; RM0440 §44.4.23 `RXF0A` | `FdcanTest.FdcanStandardRangeFifoFullAndAck`; `FdcanTest.FiltersAgainstThePerMessageRamLists` | Tested FIFO0 subset including overwritten-element payload. |
+| Extended range filter and nonmatch reject; standard and extended dual-ID and classic-mask filters | RM0440 §44.3.11 standard filters; RM0440 §44.3.12 extended filters | `FdcanTest.FdcanExtendedRangeFilterAndNonmatchReject`; `FdcanTest.FdcanStandardDualIdAndMaskFiltersAcceptOnlyMatches`; `FdcanTest.FdcanExtendedDualIdAndMaskFiltersAcceptOnlyMatches` | Tested filter forms; remaining mask/dual-ID combinations and XIDAM-gated matching are not asserted. |
+| Classic/FD payload encode through DLC 9, TX buffer requests/status and invalid-bit rejection | RM0440 §44.3.8 RX element; RM0440 §44.3.9 TX element; RM0440 §44.4.26 TX buffer configuration | `FdcanTest.FdcanStandardRangeFifoFullAndAck`; `FdcanTest.FdcanTransmitBuffersTrackRequestsAndIgnoreInvalidBits`; `FdcanTest.TransmitsAndReceivesThroughMessageRam` | Tested buffer/payload subset; TX queue/cancel and error behavior are simplified. |
+| IR W1C with IE/ILS/ILE line gating on both interrupt lines | RM0440 §44.4.15 `IR`; RM0440 §44.4.16 `IE`; RM0440 §44.4.17 `ILS`; RM0440 §44.4.18 `ILE` | `FdcanTest.GatesPendingEventsThroughInterruptRegisters`; `Stm32G4Test.FdcanInterruptRependsUntilSourceCleared`; `Stm32G4Test.FdcanInterruptLineRoutingAndDisableUpdateNvicLevels` | Tested gate/line subset. |
+
+### SYSCFG and EXTI
+
+Only EXTI lines 0–15 are modeled; bank-2 lines, EMR event output and other
+SYSCFG functions are storage-only or unsupported.
+
+| Behavior | Reference | Named test evidence | Fidelity / limits |
+|---|---|---|---|
+| EXTICR1–4 port routing across PA–PG with reserved values rejected | RM0440 §10.2.3 `EXTICR1`; RM0440 §10.2.4 `EXTICR2`; RM0440 §10.2.5 `EXTICR3`; RM0440 §10.2.6 `EXTICR4` | `Stm32G4Test.SyscfgRoutesEveryExtiLineAcrossAllPortsAndRejectsReserved`; `Stm32G4Test.ExtiRoutesGpioEdgeToNvic` | Tested routing subset. |
+| GPIO edge trigger, dedicated 0–4 and shared 5–9/10–15 outputs, IMR gating and PR W1C | RM0440 §15.3.3 edge trigger; RM0440 §15.3.4 interrupt behavior; RM0440 §15.4 EXTI block diagram; RM0440 §15.5.1 `IMR1`; RM0440 §15.5.3 `RTSR1`; RM0440 §15.5.4 `FTSR1`; RM0440 §15.5.6 `PR1` | `Stm32G4Test.ExtiDedicatedAndSharedInterruptOutputsAssertAndClear`; `Stm32G4Test.ExtiRoutesGpioEdgeToNvic`; `Stm32G4Test.ExtiIgnoresUnroutedPortAndFallingWithoutTrigger`; `Stm32G4Test.ExtiSharedLinesOrIntoSingleIrq` | Tested line/bank-1 subset. |
+| SWIER W1S software trigger, selective PR clear, masking preserves latched PR | RM0440 §15.5.5 `SWIER1`; RM0440 §15.5.6 `PR1` | `Stm32G4Test.ExtiSoftwareTriggerW1SAndSelectivePendingClear` | Tested software-trigger subset. |
+
 ## Cortex-M system window
 
 The separate `0xe0000000..0xe00fffff` system device implements:

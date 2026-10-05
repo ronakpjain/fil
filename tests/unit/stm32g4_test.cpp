@@ -1,4 +1,5 @@
 #include "fil/cortexm/system_control.hpp"
+#include "fil/mem/memory_bus.hpp"
 #include "fil/stm32g4/stm32g4.hpp"
 
 #include "../fixture_support.hpp"
@@ -8,8 +9,15 @@
 
 #include <filesystem>
 #include <fstream>
+#include <optional>
+#include <span>
+#include <vector>
 
 namespace {
+
+constexpr fil::mem::AccessContext read_context{fil::mem::AccessType::data_read, 0};
+constexpr fil::mem::AccessContext write_context{fil::mem::AccessType::data_write, 0};
+
 
 // DMA/locality tests need an explicitly selected and enabled ADC kernel clock.
 auto createAdcMcu(fil::sim::EventLoop& events, fil::sim::TraceRecorder& trace,
@@ -754,6 +762,122 @@ TEST(Stm32G4Test, ExtiSharedLinesOrIntoSingleIrq) {
     ASSERT_TRUE(mcu.value()->router().write(0x00010414U, word, 1U << 6U, {}));
     system.leave(39U);
     EXPECT_FALSE(system.hasEnabledPending());
+}
+
+TEST(Stm32G4Test, SyscfgRoutesEveryExtiLineAcrossAllPortsAndRejectsReserved) {
+    fil::stm32g4::SyscfgPeripheral syscfg;
+    fil::stm32g4::ExtiPeripheral exti;
+    exti.setSyscfg(&syscfg);
+    ASSERT_TRUE(exti.write(0x00U, fil::mem::AccessSize::word, 0xffffU, write_context));
+    ASSERT_TRUE(exti.write(0x08U, fil::mem::AccessSize::word, 0xffffU, write_context));
+    for (std::uint32_t line = 0; line < 16U; ++line) {
+        const std::uint32_t register_offset = 0x08U + (line / 4U) * 4U;
+        const std::uint32_t shift = (line % 4U) * 4U;
+        const std::uint32_t port = line % 7U;
+        const std::uint32_t old_value = syscfg.peekRegister(register_offset);
+        ASSERT_TRUE(syscfg.write(register_offset, fil::mem::AccessSize::word,
+                                 (old_value & ~(0xfU << shift)) | (port << shift), write_context));
+        EXPECT_EQ(syscfg.portForLine(line), static_cast<std::int32_t>(port));
+        exti.notifyGpioEdge(port, line, true);
+        EXPECT_NE(exti.peekRegister(0x14U) & (1U << line), 0U) << "EXTI line=" << line;
+        ASSERT_TRUE(exti.write(0x14U, fil::mem::AccessSize::word, 1U << line, write_context));
+        EXPECT_EQ(exti.peekRegister(0x14U) & (1U << line), 0U);
+    }
+    for (std::uint32_t line = 0; line < 16U; ++line) {
+        const std::uint32_t register_offset = 0x08U + (line / 4U) * 4U;
+        const std::uint32_t shift = (line % 4U) * 4U;
+        for (std::uint32_t reserved = 7U; reserved < 16U; ++reserved) {
+            const std::uint32_t old_value = syscfg.peekRegister(register_offset);
+            ASSERT_TRUE(syscfg.write(register_offset, fil::mem::AccessSize::word,
+                                     (old_value & ~(0xfU << shift)) | (reserved << shift), write_context));
+            EXPECT_EQ(syscfg.portForLine(line), -1);
+            for (std::uint32_t port = 0; port < 7U; ++port) exti.notifyGpioEdge(port, line, true);
+            EXPECT_EQ(exti.peekRegister(0x14U) & (1U << line), 0U)
+                << "reserved EXTICR selector=" << reserved << " line=" << line;
+        }
+    }
+}
+
+TEST(Stm32G4Test, ExtiDedicatedAndSharedInterruptOutputsAssertAndClear) {
+    constexpr std::array<std::pair<std::uint32_t, std::uint32_t>, 9> routes{{
+        {0U, 0U}, {1U, 1U}, {2U, 2U}, {3U, 3U}, {4U, 4U},
+        {5U, 5U}, {9U, 5U}, {10U, 6U}, {15U, 6U},
+    }};
+    for (const auto [pin, output] : routes) {
+        fil::stm32g4::ExtiPeripheral exti;
+        std::vector<bool> transitions;
+        exti.setInterruptLevelCallback([&](std::uint32_t line, bool level) {
+            if (line == output) transitions.push_back(level);
+        });
+        transitions.clear();
+        ASSERT_TRUE(exti.write(0x00U, fil::mem::AccessSize::word, 1U << pin, write_context));
+        ASSERT_TRUE(exti.write(0x10U, fil::mem::AccessSize::word, 1U << pin, write_context));
+        EXPECT_EQ(transitions, (std::vector<bool>{true})) << "pin=" << pin;
+        ASSERT_TRUE(exti.write(0x14U, fil::mem::AccessSize::word, 1U << pin, write_context));
+        EXPECT_EQ(transitions, (std::vector<bool>{true, false})) << "pin=" << pin;
+    }
+}
+
+TEST(Stm32G4Test, IntegratedUsartAndSpiTransfersReachDmaThroughDmamux) {
+    fil::sim::EventLoop loop;
+    fil::sim::TraceRecorder trace;
+    trace.setEnabled(false);
+    fil::cortexm::SystemControl system;
+    auto created = fil::stm32g4::Stm32G4::create(loop, trace, system);
+    ASSERT_TRUE(created);
+    auto& mcu = *created.value();
+    fil::mem::MemoryBus bus;
+    ASSERT_TRUE(bus.mapRam(0x20000000U, 0x100U, "serial-dma"));
+    ASSERT_TRUE(bus.mapMmio(0x40000000U, 0x20000000U, mcu.router(), "peripherals"));
+    mcu.attachMemory(bus);
+    const auto reg = [&](std::uint32_t address, std::uint32_t value) {
+        return mcu.router().write(address, fil::mem::AccessSize::word, value, write_context);
+    };
+
+    // USART1 TX DMA request 25 -> DMAMUX channel 0 -> DMA1 channel 1.
+    ASSERT_TRUE(bus.write8(0x20000000U, 0x41U));
+    ASSERT_TRUE(bus.write8(0x20000001U, 0x42U));
+    ASSERT_TRUE(reg(0x20800U, 25U));
+    ASSERT_TRUE(reg(0x2000cU, 2U));
+    ASSERT_TRUE(reg(0x20010U, 0x40013828U));
+    ASSERT_TRUE(reg(0x20014U, 0x20000000U));
+    ASSERT_TRUE(reg(0x20008U, 1U | (1U << 4U) | (1U << 7U)));
+    ASSERT_TRUE(reg(0x13808U, 1U << 7U)); // USART1 DMAT
+    auto* uart = mcu.usart("USART1");
+    ASSERT_NE(uart, nullptr);
+    ASSERT_EQ(uart->txLog().size(), 2U);
+    EXPECT_EQ(uart->txLog()[0].value, 0x41U);
+    EXPECT_EQ(uart->txLog()[1].value, 0x42U);
+
+    // SPI1 RX request 10 -> DMAMUX channel 1 -> DMA1 channel 2.
+    auto* spi = mcu.spi("SPI1");
+    ASSERT_NE(spi, nullptr);
+    spi->setTransferCallback([](std::span<const std::uint8_t>, std::uint64_t) {
+        return std::vector<std::uint8_t>{0xa5U};
+    });
+    ASSERT_TRUE(reg(0x20804U, 10U));
+    ASSERT_TRUE(reg(0x20020U, 1U));
+    ASSERT_TRUE(reg(0x20024U, 0x4001300cU));
+    ASSERT_TRUE(reg(0x20028U, 0x20000010U));
+    ASSERT_TRUE(reg(0x2001cU, 1U));
+    ASSERT_TRUE(reg(0x13004U, 1U)); // SPI1 RXDMAEN
+    ASSERT_TRUE(reg(0x1300cU, 0x55U)); // starts peripheral exchange
+    auto received = bus.read8(0x20000010U);
+    ASSERT_TRUE(received);
+    EXPECT_EQ(received.value(), 0xa5U);
+}
+
+TEST(Stm32G4Test, ExtiSoftwareTriggerW1SAndSelectivePendingClear) {
+    fil::stm32g4::ExtiPeripheral exti;
+    std::vector<std::pair<std::uint32_t, bool>> levels;
+    exti.setInterruptLevelCallback([&](std::uint32_t line, bool level) { levels.emplace_back(line, level); });
+    ASSERT_TRUE(exti.write(0x00, fil::mem::AccessSize::word, (1U << 3U) | (1U << 10U), write_context)); // IMR1
+    ASSERT_TRUE(exti.write(0x10, fil::mem::AccessSize::word, (1U << 3U) | (1U << 10U), write_context)); // SWIER1 W1S
+    EXPECT_EQ(exti.peekRegister(0x14) & ((1U << 3U) | (1U << 10U)), (1U << 3U) | (1U << 10U));
+    ASSERT_TRUE(exti.write(0x14, fil::mem::AccessSize::word, 1U << 3U, write_context)); // PR1 W1C only line 3
+    EXPECT_EQ(exti.peekRegister(0x14) & ((1U << 3U) | (1U << 10U)), 1U << 10U);
+    ASSERT_TRUE(exti.write(0x00, fil::mem::AccessSize::word, 0U, write_context));
+    EXPECT_EQ(exti.peekRegister(0x14) & (1U << 10U), 1U << 10U); // masking leaves PR latched
 }
 
 } // namespace
