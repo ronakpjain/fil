@@ -1,6 +1,6 @@
 # Native LLVM JIT
 
-JIT execution is enabled by default. When the executable was built with LLVM support, the native backend emits LLVM IR, runs the O0 module pipeline, and materializes **host machine code** through ORC LLJIT. Generated kernels do not call the interpreter. Use `--no-jit` to select the interpreter reference; this also disables network RAM capsules.
+JIT execution is automatic. When the executable was built with LLVM support, the native backend emits LLVM IR, runs the O0 module pipeline, and materializes **host machine code** through ORC LLJIT. Generated kernels do not call the interpreter. Without LLVM support, JIT uses cached handlers; unsupported, cold, or unsafe execution falls back to the interpreter/cached handlers.
 
 Unsupported, cold, or unsafe execution uses the existing interpreter/cached handlers. A native backend is not automatically a speedup: compilation and function-call costs remain, and the network scheduler still preserves each observable instruction boundary.
 
@@ -58,4 +58,4 @@ executable's Release/IPO/PGO build settings are separate from this JIT pipeline.
 
 Native-specific tests compare emitted kernels and CPU integration against repeated interpreter steps, including arithmetic flag edges, prefix limits, branches, preserved FP state, exceptional-context fallback, and code invalidation. Existing event, interrupt, scheduler, and MMIO differential tests also run with LLVM enabled. See `performance.md` for measurements and their limitations.
 
-For comparisons, use the same LLVM-enabled executable with and without JIT (use `--no-jit` for the interpreter reference), identical firmware/ADC settings, and alternating runs. Include compilation in end-to-end timings rather than reporting only an already-warmed kernel. Strip only `native_jit` diagnostic lines when comparing simulator summary output; compare traces without filtering. ADC decimation changes guest-visible behavior and must be held fixed within each comparison.
+For execution-path correctness, native-specific tests compare emitted kernels and CPU integration against repeated interpreter steps. For performance comparisons, compare distinct builds or revisions on identical firmware and ADC settings, alternate run order, and include compilation in end-to-end timings rather than reporting only an already-warmed kernel. Do not label identical CLI runs as JIT/interpreter alternatives. Strip only `native_jit` diagnostic lines when comparing simulator summary output; compare traces without filtering. ADC decimation changes guest-visible behavior and must be held fixed within each comparison.

@@ -19,8 +19,7 @@ make test
 The checked-in board/network configurations reference external firmware images.
 `make benchmark` instead generates synthetic fixtures and requires no external
 firmware. Run `make help` for build, sanitizer, PGO, and CLI shortcuts.
-See [Options and recommended defaults](docs/options.md) for the complete command
-and build reference, including experimental modes and Make-wrapper differences.
+See [CLI options](docs/options.md) for commands, controls, and defaults.
 
 ## Model and interfaces
 
@@ -49,18 +48,21 @@ for contracts and safety.
 
 ## Performance
 
-Our recommended baseline is Release + supported IPO, the default JIT with
-network RAM capsules, and ADC decimation 1. Plain `run-network` uses the
-validated fast path without enabling flags. Use strict MMIO for validation;
-the compatibility CLI default is lenient. Transactional slices and deferred
-prefixes remain experimental opt-ins. `--no-jit` selects the interpreter and
-automatically disables RAM capsules.
+Our recommended baseline is Release + supported IPO, automatic JIT, eligible
+guarded RAM capsules, and ADC decimation 1. Plain `run-network` uses the
+validated fast path without enabling flags. JIT, proven single-board batching,
+and eligible guarded RAM capsules are automatic; network loop batching remains
+off. Diagnostic modes such as instruction tracing and spin detection safely
+fall back from optimizations when needed. Use strict MMIO for validation; the
+compatibility CLI default is lenient. Experimental scheduler implementations
+remain internal APIs, not CLI modes.
 
 The default run preserves modeled instruction, event, and peripheral behavior.
-Decoded-instruction and memory caches, bounded scheduler bursts, guarded RAM
-capsules on network commands, and proven-loop batching on single-board `run`
-reduce host overhead. Network loop batching is off by default. Release builds
-use IPO when supported; optional PGO trains on a representative workload.
+Decoded-instruction and memory caches, bounded scheduler bursts, eligible
+guarded RAM capsules on network commands, and proven-loop batching on
+single-board `run` reduce host overhead. Network loop batching is off by default.
+Release builds use IPO when supported; optional PGO trains on a representative
+workload.
 
 ADC decimation 1 is the full-fidelity default. `--adc-decimation N` (1–1024)
 is an **opt-in fidelity tradeoff** for continuous ADC scans: only one scan in N

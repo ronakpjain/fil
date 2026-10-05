@@ -18,13 +18,12 @@ The service sends a `HELLO` frame after loading the network, then streams select
 trace records and replies to client requests. Trace filtering follows
 `watch-network`: the default is `can_tx`; use repeatable `--live-filter TYPE` (or
 `--trace-type TYPE`) to select other event types. `--trace-instr` enables
-instruction records. `--duration-ms`, `--refresh-ms`, `--max-instructions`,
-`--quantum`, `--adc-decimation`, `--strict-mmio`, `--lenient-mmio`,
-`--no-wall-pacing`, `--no-loop-batching`, `--no-jit`, `--no-ram-capsules`,
-and `--detect-spin` retain the corresponding watch behavior. JIT and guarded
-RAM capsules are on by default when eligible; positive `--jit` and
-`--ram-capsules` are rejected. Network loop batching is off by default.
-Instruction tracing, spin detection, and `--no-jit` safely disable capsules.
+instruction records. `--duration-ms`, `--refresh-ms`, `--max-instructions`, `--quantum`,
+`--adc-decimation`, `--strict-mmio`, `--lenient-mmio`, `--no-wall-pacing`, and
+`--detect-spin` retain the corresponding watch behavior. JIT is automatic and
+guarded RAM capsules are automatic when eligible. Network loop batching remains
+off. Instruction tracing and spin detection retain diagnostic safety fallbacks
+that can disable capsules.
 `--transport stdio` is required; any other transport is rejected.
 
 ## Wire framing

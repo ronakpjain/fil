@@ -3,8 +3,8 @@
 #
 # Generates hand-assembled Thumb ELF fixtures, runs fixed-simulation-time
 # workloads, and reports instructions/cycles/CPI/wall time/throughput.
-# Workloads run on one board and a synthetic six-board network, with loop
-# batching enabled and disabled.
+# Workloads run on one board and a synthetic six-board network using the
+# automatic execution path.
 
 set -euo pipefail
 
@@ -209,9 +209,6 @@ run_case() {
         0) case_args=("${case_args_0[@]}") ;;
         1) case_args=("${case_args_1[@]}") ;;
         2) case_args=("${case_args_2[@]}") ;;
-        3) case_args=("${case_args_3[@]}") ;;
-        4) case_args=("${case_args_4[@]}") ;;
-        5) case_args=("${case_args_5[@]}") ;;
         *) fail "unknown benchmark case: $case_id" ;;
     esac
     TIMEFORMAT='%6R'
@@ -298,25 +295,19 @@ write_configs "$run_root" "$idle_elf" "$pll_elf"
 
 case_names=(
     'idle16 x1'
-    'idle16 x1 no-batch'
     'idle16 x6'
-    'idle16 x6 no-batch'
     'pll170 x1'
-    'pll170 x1 no-batch'
 )
-declare -a case_args_0 case_args_1 case_args_2 case_args_3 case_args_4 case_args_5
+declare -a case_args_0 case_args_1 case_args_2
 case_args_0=(run "$run_root/idle.json" --duration-ms 1000 --max-instructions 200000000 --strict-mmio)
-case_args_1=(run "$run_root/idle.json" --duration-ms 1000 --max-instructions 200000000 --strict-mmio --no-loop-batching --no-jit)
-case_args_2=(run-network "$run_root/six.json" --duration-ms 1000 --max-instructions 200000000 --quantum 1024 --strict-mmio)
-case_args_3=(run-network "$run_root/six.json" --duration-ms 1000 --max-instructions 200000000 --quantum 1024 --strict-mmio --no-loop-batching --no-jit --no-ram-capsules)
-case_args_4=(run "$run_root/pll.json" --duration-ms 1000 --max-instructions 400000000 --strict-mmio)
-case_args_5=(run "$run_root/pll.json" --duration-ms 1000 --max-instructions 400000000 --strict-mmio --no-loop-batching --no-jit)
+case_args_1=(run-network "$run_root/six.json" --duration-ms 1000 --max-instructions 200000000 --quantum 1024 --strict-mmio)
+case_args_2=(run "$run_root/pll.json" --duration-ms 1000 --max-instructions 400000000 --strict-mmio)
 
 printf '%-20s %12s %12s %6s %12s %10s %9s\n' \
     case instructions cycles cpi time_ns wall_s x_realtime
 printf '%s\n' 'model: variable CPI + FLASH_ACR wait states + ART; deadline overshoot < 1 ms is atomic batch completion'
 ok=1
-for i in 0 1 2 3 4 5; do
+for i in 0 1 2; do
     args_name="case_args_$i"
     run_case "$fil" "$i" "$reps" "$run_root"
     vals=$(<"$CASE_VALS")

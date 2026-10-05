@@ -85,21 +85,18 @@ error and ignored without stopping the simulation.
 | `--max-instructions N` | Set the per-board instruction budget used for each run slice. |
 | `--quantum N` | Set the deterministic network scheduling quantum; defaults to `1024`. |
 | `--adc-decimation N` | Keep one of every `N` continuous ADC scans; factor 1–1024, default 1. |
-| `--no-jit` | JIT is on by default; disable cached/native execution. Positive `--jit` is rejected. |
-| `--trace-instr` | Emit instruction trace events; add `--live-filter instr` to print them. This safely disables RAM capsules. |
-| `--detect-spin` | Enable spin-loop detection; off by default. This diagnostic safely disables RAM capsules. |
-| `--no-ram-capsules` | Disable guarded RAM capsules, which are on by default when eligible. |
+| `--trace-instr` | Emit instruction trace events; add `--live-filter instr` to print them. This diagnostic safely disables eligible RAM capsules. |
+| `--detect-spin` | Enable spin-loop detection; off by default. This diagnostic safely disables eligible RAM capsules. |
 | `--strict-mmio` | Treat accesses outside modeled MMIO blocks as faults. |
 | `--lenient-mmio` | Use lenient MMIO handling; this is the default. |
-| `--no-loop-batching` | Network loop batching is already off by default, so this option does not enable or otherwise change batching. There is no positive `--loop-batching` option. |
 | `--control-stdin` | Accepted compatibility marker; standard input is always monitored. |
 
-See [Options and recommended defaults](options.md) for the complete build/CLI
-reference. Transactional and deferred experimental scheduler flags are not
-accepted by this command. Capsule guards preserve event and observation ordering;
-custom callbacks and unsupported DMA paths remain barriers. JIT-off, tracing,
-and spin diagnostics safely disable capsules rather than failing because of
-their default-on state.
+See [CLI options](options.md) for the command reference and defaults. Experimental transactional and deferred scheduler implementations
+remain internal APIs, not CLI modes. JIT and eligible guarded RAM capsules are
+automatic; network loop batching remains off. Capsule guards preserve event and
+observation ordering; custom callbacks and unsupported DMA paths remain barriers.
+Tracing and spin diagnostics safely disable capsules rather than failing because
+of their automatic availability.
 `watch-network` prints selected events as human-readable lines; the companion
 [`serve-network --transport stdio`](serve_network.md) uses a documented binary
 protocol instead.

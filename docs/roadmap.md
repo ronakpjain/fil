@@ -14,9 +14,9 @@ This roadmap lists deliberate gaps; it is not a release schedule.
    and timer PWM/capture-compare behavior.
 3. **Improve fault fidelity.** Convert more decode and memory failures into modeled
    UsageFault, BusFault, and HardFault escalation while retaining clear diagnostics.
-4. **Measure scheduler changes.** Keep transactional worker epochs opt-in until they
-   show a repeatable benefit across representative workloads and preserve exact
-   traces.
+4. **Measure scheduler changes.** Keep transactional worker epochs internal until
+   they show a repeatable benefit across representative workloads and preserve
+   exact traces; experimental scheduler implementations are not CLI modes.
 5. **Automate compatibility evidence.** Run the external firmware decoder audit and smoke
    matrix in an environment where the firmware artifacts and ARM tools are
    available.

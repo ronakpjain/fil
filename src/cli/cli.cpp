@@ -701,8 +701,6 @@ ExitCode runBoardCommand(
         else if (option == "--trace-instr") trace_instructions = true;
         else if (option == "--detect-spin") detect_spin = true;
         else if (option == "--no-detect-spin") detect_spin = false;
-        else if (option == "--no-loop-batching") enable_loop_batching = false;
-        else if (option == "--no-jit") enable_jit = false;
         else if (option == "--allow-breakpoint") allow_breakpoint = true;
         else {
             err << "fil: unknown run option: " << option << '\n';
@@ -1085,8 +1083,6 @@ ExitCode runNetworkCommand(
     bool detect_spin = false;
     bool enable_loop_batching = false;
     bool enable_jit = true;
-    bool enable_transactional_slices = false;
-    bool enable_deferred_prefixes = false;
     bool enable_ram_capsules = true;
     bool allow_breakpoint = false;
     std::uint32_t adc_decimation = 1U;
@@ -1140,12 +1136,6 @@ ExitCode runNetworkCommand(
         else if (option == "--trace-instr") trace_instructions = true;
         else if (option == "--detect-spin") detect_spin = true;
         else if (option == "--no-detect-spin") detect_spin = false;
-        else if (option == "--no-loop-batching") enable_loop_batching = false;
-        else if (option == "--no-jit") enable_jit = false;
-        else if (option == "--deferred-prefixes") enable_deferred_prefixes = true;
-        else if (option == "--no-ram-capsules") enable_ram_capsules = false;
-        else if (option == "--transactional-slices") enable_transactional_slices = true;
-        else if (option == "--no-transactional-slices") enable_transactional_slices = false;
         else if (option == "--allow-breakpoint") allow_breakpoint = true;
         else {
             err << "fil: unknown run-network option: " << option << '\n';
@@ -1215,8 +1205,6 @@ ExitCode runNetworkCommand(
     options.detect_spin = detect_spin;
     options.enable_loop_batching = enable_loop_batching;
     options.enable_jit = enable_jit;
-    options.enable_transactional_slices = enable_transactional_slices;
-    options.enable_deferred_prefixes = enable_deferred_prefixes;
     options.enable_ram_capsules = enable_ram_capsules;
     options.adc_decimation = adc_decimation;
     auto result = world.value()->run(options);
@@ -1246,7 +1234,7 @@ ExitCode runNetworkCommand(
         << "transactional_instructions: "
         << result.value().transactional_instructions << '\n'
         << "lockstep_bursts: " << result.value().lockstep_bursts << '\n';
-    if (enable_deferred_prefixes || enable_ram_capsules) {
+    if (enable_ram_capsules) {
         out << "deferred_prefixes: " << result.value().deferred_prefixes << '\n'
             << "memoized_prefixes: " << result.value().memoized_prefixes << '\n'
             << "memoized_instructions: " << result.value().memoized_instructions << '\n'
@@ -1410,9 +1398,6 @@ ExitCode networkMonitorCommand(
         else if (option == "--no-wall-pacing") wall_pacing = false;
         else if (option == "--trace-instr") trace_instructions = true;
         else if (option == "--detect-spin") detect_spin = true;
-        else if (option == "--no-loop-batching") enable_loop_batching = false;
-        else if (option == "--no-jit") enable_jit = false;
-        else if (option == "--no-ram-capsules") enable_ram_capsules = false;
         else if (option != "--control-stdin") {
             err << "fil: unknown " << command_name << " option: " << option << '\n';
             return ExitCode::usage_error;
@@ -1942,28 +1927,26 @@ void printHelp(std::ostream& out) {
         << "                                  Serve binary stdio control and traces\n"
         << "  compare-stlink <board.json>    Compare emulator state with STM32G4 hardware\n\n"
         << "Defaults: JIT on, network RAM capsules on, ADC decimation 1.\n"
-        << "Diagnostic/alternative schedulers automatically bypass RAM capsules.\n\n"
+        << "Fidelity-preserving speedups are automatic; diagnostics retain safe fallbacks.\n"
+        << "ADC decimation above 1 trades fidelity for speed.\n\n"
         << "Run options:\n"
         << "  --duration-ms N --max-instructions N --trace FILE --trace-instr\n"
         << "  --strict-mmio --stop-address ADDR --stop-at-symbol NAME --allow-breakpoint\n"
-        << "  --detect-spin --no-loop-batching --no-jit --adc-decimation N\n\n"
+        << "  --detect-spin --adc-decimation N\n\n"
         << "ST-Link comparison options:\n"
         << "  --flash --memory ADDR:LENGTH --register NAME --ignore-register NAME\n"
         << "  --stop-address ADDR --stop-at-symbol NAME --max-instructions N\n"
         << "  --serial ID --openocd PATH --timeout-ms N --artifacts DIRECTORY\n\n"
         << "Network options:\n"
         << "  --duration-ms N --max-instructions N --quantum N --trace FILE\n"
-        << "  --strict-mmio --trace-instr --detect-spin --no-loop-batching --no-jit --allow-breakpoint\n"
+        << "  --strict-mmio --trace-instr --detect-spin --allow-breakpoint\n"
         << "  --adc-decimation N (keep 1 of N continuous ADC scans)\n"
-        << "  --transactional-slices (experimental parallel lane epochs)\n"
-        << "  --deferred-prefixes (experimental interruptible pure JIT prefixes)\n"
-        << "  --no-ram-capsules (disable guarded reversible RAM prefixes)\n"
         << "  --inject-can BUS[@TIME_MS]:ID:HEXDATA\n\n"
         << "Watch-network options:\n"
         << "  --duration-ms N --refresh-ms N --max-instructions N --quantum N\n"
         << "  --adc-decimation N (keep 1 of N continuous ADC scans)\n"
         << "  --trace-type TYPE (alias: --live-filter; repeatable) --strict-mmio --trace-instr --detect-spin\n"
-        << "  --no-loop-batching --no-jit --no-ram-capsules --control-stdin\n"
+        << "  --control-stdin\n"
         << "  --no-wall-pacing (watch runs slices back-to-back instead of real time)\n"
         << "  watch also stops early when all boards reach terminal CPU boundaries\n"
         << "  stdin: BUS:ID:HEXDATA, adc BOARD INSTANCE CHANNEL VALUE,\n"
@@ -1973,7 +1956,6 @@ void printHelp(std::ostream& out) {
         << "  --duration-ms N --refresh-ms N --max-instructions N --quantum N\n"
         << "  --live-filter TYPE (repeatable), --trace-instr, --no-wall-pacing\n"
         << "  --adc-decimation N --strict-mmio --lenient-mmio --detect-spin\n"
-        << "  --no-loop-batching --no-jit --no-ram-capsules\n"
         << "  See docs/serve_network.md for the versioned binary protocol.\n";
 }
 

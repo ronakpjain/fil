@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Measure the full PER network with JIT and ADC decimation 1.
-# Timings include startup and JIT compilation. Optional trace comparison checks
-# interpreter/JIT equivalence before collecting measurements.
+# Measure the full PER network using the automatic execution path and ADC decimation 1.
+# Timings include startup and JIT compilation.
 
 set -euo pipefail
 
@@ -18,11 +17,6 @@ Options:
   --duration-ms N           simulated duration per measurement (default: 5000)
   --reps N                  repetitions per executable (default: 3)
   --min-throughput X        required realtime ratio (default: above 1.0)
-  --check-trace             compare 1,000 ms interpreter/JIT traces first
-  --no-loop-batching        disable loop batching
-  --deferred-prefixes       enable experimental interruptible JIT prefixes
-  --no-jit                  disable JIT
-  --no-ram-capsules         disable private-RAM JIT capsules
   -h, --help                show this help
 EOF
 }
@@ -53,11 +47,6 @@ duration_ms=5000
 reps=3
 min_throughput=
 threshold_requested=0
-check_trace=0
-no_loop_batching=0
-deferred_prefixes=0
-no_jit=0
-no_ram_capsules=0
 
 while (($#)); do
     case $1 in
@@ -95,11 +84,6 @@ while (($#)); do
             shift
             ;;
         --min-throughput=*) min_throughput=${1#*=}; threshold_requested=1; shift ;;
-        --check-trace) check_trace=1; shift ;;
-        --no-loop-batching) no_loop_batching=1; shift ;;
-        --deferred-prefixes) deferred_prefixes=1; shift ;;
-        --no-jit) no_jit=1; shift ;;
-        --no-ram-capsules) no_ram_capsules=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) fail "unrecognized argument: $1" ;;
     esac
@@ -133,7 +117,7 @@ run_number=0
 
 # On success, RUN_NORMALIZED, RUN_TIME_NS, RUN_INSTRUCTIONS, and RUN_WALL are set.
 run_network() {
-    local executable=$1 duration=$2 jit=$3 trace=$4 no_batch=$5 deferred=$6 capsules=$7
+    local executable=$1 duration=$2
     local stdout_file stderr_file timing_file raw_file normalized_file validation_file
     local wall status
     local -a command
@@ -148,13 +132,6 @@ run_network() {
         --duration-ms "$duration"
         --max-instructions "$((duration * 1000000))" --quantum 1024
         --strict-mmio --adc-decimation 1)
-    ((jit)) || command+=(--no-jit)
-    ((no_batch)) && command+=(--no-loop-batching)
-    ((deferred)) && command+=(--deferred-prefixes)
-    ((capsules)) || command+=(--no-ram-capsules)
-    if [[ -n $trace ]]; then
-        command+=(--trace "$trace")
-    fi
 
     TIMEFORMAT='%6R'
     if (cd "$ROOT_DIR" && { time "${command[@]}" </dev/null > "$stdout_file" 2> "$stderr_file"; }) 2> "$timing_file"; then
@@ -291,22 +268,6 @@ print_measurement() {
         "$number" "$label" "$wall_display" "$simulated" "$RUN_INSTRUCTIONS"
 }
 
-if ((check_trace)); then
-    reference_trace="$work_dir/interpreter.jsonl"
-    candidate_trace="$work_dir/jit.jsonl"
-    run_network "$binary" 1000 0 "$reference_trace" 1 0 0
-    interpreter_summary=$RUN_NORMALIZED
-    run_network "$binary" 1000 "$((1 - no_jit))" "$candidate_trace" \
-        "$no_loop_batching" "$deferred_prefixes" "$((1 - no_ram_capsules))"
-    if ! cmp -s "$interpreter_summary" "$RUN_NORMALIZED"; then
-        fail 'Full-network interpreter/JIT counters or final board PCs differ'
-    fi
-    if ! cmp -s "$reference_trace" "$candidate_trace"; then
-        fail 'Full-network interpreter/JIT traces differ'
-    fi
-    printf '1,000 ms full-network traces, counters and final board PCs: identical\n'
-fi
-
 candidate_times=()
 reference_times=()
 for ((repetition = 0; repetition < reps; repetition++)); do
@@ -326,8 +287,7 @@ for ((repetition = 0; repetition < reps; repetition++)); do
             executable=$reference_binary
             measurements_name=reference_times
         fi
-        run_network "$executable" "$duration_ms" "$((1 - no_jit))" '' \
-            "$no_loop_batching" "$deferred_prefixes" "$((1 - no_ram_capsules))"
+        run_network "$executable" "$duration_ms"
         print_measurement "$((repetition + 1))" "$label"
         if [[ $measurements_name == candidate_times ]]; then
             candidate_times+=("$RUN_WALL")

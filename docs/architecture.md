@@ -125,7 +125,8 @@ Persistent lane workers may run reversible slices concurrently. An epoch commits
 only when every board reaches the same MMIO-free boundary before the next event;
 otherwise all checkpoints are restored and exact frontier scheduling resumes.
 Tracing disables transactional epochs because speculative trace records cannot be
-retracted. The path remains opt-in through `--transactional-slices`.
+retracted. Transactional and deferred scheduler implementations remain internal
+APIs and are not exposed as CLI modes.
 
 ### Guarded RAM periods
 

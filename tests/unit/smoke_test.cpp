@@ -23,7 +23,13 @@ TEST(SmokeTest, HelpIsSuccessful) {
     EXPECT_TRUE(result == fil::cli::ExitCode::success) << "--help returns success";
     EXPECT_TRUE(out.str().find("Usage:") != std::string::npos) << "--help prints usage";
     EXPECT_TRUE(err.str().empty()) << "--help does not print an error";
-    EXPECT_NE(out.str().find("--no-jit"), std::string::npos);
+    EXPECT_EQ(out.str().find("--no-jit"), std::string::npos);
+    EXPECT_EQ(out.str().find("--no-loop-batching"), std::string::npos);
+    EXPECT_EQ(out.str().find("--no-ram-capsules"), std::string::npos);
+    EXPECT_NE(out.str().find("--adc-decimation"), std::string::npos);
+    EXPECT_EQ(out.str().find("--transactional-slices"), std::string::npos);
+    EXPECT_EQ(out.str().find("--deferred-prefixes"), std::string::npos);
+    EXPECT_NE(out.str().find("trades fidelity for speed"), std::string::npos);
     EXPECT_EQ(out.str().find("--jit"), std::string::npos);
 }
 
@@ -41,10 +47,11 @@ TEST(SmokeTest, UnknownCommandIsAUsageError) {
         << "unknown command prints a diagnostic";
 }
 
-TEST(SmokeTest, NegativeJitAndCapsuleOptionsAreAccepted) {
+TEST(SmokeTest, ExecutionSlowdownSwitchesAreRejected) {
     for (const std::string_view command : {"run", "run-network", "watch-network", "serve-network"}) {
         for (const std::string_view option : {
-                 "--no-jit", "--no-ram-capsules", "--no-loop-batching"}) {
+                 "--no-jit", "--no-ram-capsules", "--no-loop-batching",
+                 "--transactional-slices", "--no-transactional-slices", "--deferred-prefixes"}) {
             if (command == "run" && option == "--no-ram-capsules") continue;
             std::vector<std::string_view> args{command, "missing-jit-config.json", option};
             if (command == "serve-network") {
@@ -54,9 +61,23 @@ TEST(SmokeTest, NegativeJitAndCapsuleOptionsAreAccepted) {
             std::ostringstream out;
             std::ostringstream err;
             const auto result = fil::cli::run(args, out, err);
-            EXPECT_NE(result, fil::cli::ExitCode::usage_error) << command << " " << option;
-            EXPECT_EQ(err.str().find("unknown"), std::string::npos) << command << " " << option;
+            EXPECT_EQ(result, fil::cli::ExitCode::usage_error) << command << " " << option;
+            EXPECT_NE(err.str().find("unknown"), std::string::npos) << command << " " << option;
         }
+    }
+}
+
+TEST(SmokeTest, FidelityReducingAdcDecimationRemainsExplicitlyAvailable) {
+    for (const std::string_view command : {"run", "run-network", "watch-network", "serve-network"}) {
+        std::vector<std::string_view> args{command, "missing-adc-config.json", "--adc-decimation", "4"};
+        if (command == "serve-network") {
+            args.push_back("--transport");
+            args.push_back("stdio");
+        }
+        std::ostringstream out;
+        std::ostringstream err;
+        EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::config_error) << command;
+        EXPECT_EQ(err.str().find("unknown"), std::string::npos) << command;
     }
 }
 
