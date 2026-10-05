@@ -152,10 +152,14 @@ See [Hardware comparison](hardware_comparison.md) before connecting a target.
 `clean`/`clean-all` remove only configured root-level build directories.
 
 - Build: `BUILD_DIR=build`, `BUILD_TYPE=Release`, `JOBS`=host CPU count,
+  `CTEST_JOBS`=host CPU count (CTest concurrency, independent of `JOBS`),
   `TESTS=ON`, `DOCS=ON`, `IPO=ON`, `ASAN=OFF`, `UBSAN=OFF`,
   `PGO_GENERATE=OFF`, empty `FIL_PGO_PROFILE` and `PER_FIRMWARE_DIR`.
   `GENERATOR`, `CMAKE_ARGS`, `BUILD_ARGS`, `CTEST_ARGS` pass extra settings.
   Tools are overridable with `CMAKE` and `CTEST`.
+  `test`, `test-per`, `test-debug`, `test-sanitize`, and `pgo-test` run CTest
+  with `--parallel`, so tests from different files run concurrently while each
+  test process stays single-board deterministic.
 - Directory presets: `DEBUG_BUILD_DIR=build-debug`,
   `RELEASE_BUILD_DIR=build-release`, `SANITIZE_BUILD_DIR=build-sanitize`,
   `PGO_GENERATE_BUILD_DIR=build-pgo-generate`, `PGO_BUILD_DIR=build-pgo`.

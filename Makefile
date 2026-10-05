@@ -11,6 +11,8 @@ BUILD_PATH = $(call root_path,$(BUILD_DIR))
 BUILD_TYPE ?= Release
 GENERATOR ?=
 JOBS ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+# CTest concurrency; defaults to JOBS and can be tuned independently for heavy suites.
+CTEST_JOBS ?= $(JOBS)
 
 TESTS ?= ON
 DOCS ?= ON
@@ -174,7 +176,7 @@ compare-stlink:
 	"$(FIL_PATH)" compare-stlink "$(COMPARE_CONFIG)" $(COMPARE_ARGS)
 
 test: build
-	$(CTEST) --test-dir "$(BUILD_PATH)" --output-on-failure -C "$(BUILD_TYPE)" $(CTEST_ARGS)
+	$(CTEST) --test-dir "$(BUILD_PATH)" --parallel "$(CTEST_JOBS)" --output-on-failure -C "$(BUILD_TYPE)" $(CTEST_ARGS)
 
 check: test
 
@@ -185,7 +187,7 @@ test-per:
 	@test -n "$(strip $(PER_FIRMWARE_DIR))" || { \
 		echo "Set PER_FIRMWARE_DIR to the external PER firmware output directory." >&2; exit 2; }
 	$(MAKE) build
-	$(CTEST) --test-dir "$(BUILD_PATH)" -L per --output-on-failure -C "$(BUILD_TYPE)" $(CTEST_ARGS)
+	$(CTEST) --test-dir "$(BUILD_PATH)" -L per --parallel "$(CTEST_JOBS)" --output-on-failure -C "$(BUILD_TYPE)" $(CTEST_ARGS)
 
 release:
 	$(MAKE) BUILD_DIR="$(RELEASE_BUILD_DIR)" BUILD_TYPE=Release build
@@ -211,7 +213,7 @@ docs: configure
 firmware-tests: configure
 	@command -v arm-none-eabi-gcc >/dev/null 2>&1 || { \
 		echo "arm-none-eabi-gcc is required to regenerate committed firmware fixtures." >&2; exit 2; }
-	$(CMAKE) --build "$(BUILD_PATH)" --target firmware_tests --config "$(BUILD_TYPE)"
+	$(CMAKE) --build "$(BUILD_PATH)" --target firmware_tests --parallel "$(JOBS)" --config "$(BUILD_TYPE)"
 
 fixtures: firmware-tests
 
@@ -248,7 +250,7 @@ pgo-use: pgo-merge
 		IPO=ON TESTS=ON PGO_GENERATE=OFF FIL_PGO_PROFILE="$(PGO_PROFILE_PATH)" build
 
 pgo-test: pgo-use
-	$(CTEST) --test-dir "$(PGO_PATH)" --output-on-failure -C Release $(CTEST_ARGS)
+	$(CTEST) --test-dir "$(PGO_PATH)" --parallel "$(CTEST_JOBS)" --output-on-failure -C Release $(CTEST_ARGS)
 
 # Run a complete PGO cycle; validate the workload before removing prior PGO outputs.
 pgo:
@@ -280,4 +282,4 @@ help:
 	  '                Stages: pgo-generate | pgo-train | pgo-merge | pgo-use | pgo-test' \
 	  '                Set PGO_CXX/LLVM_PROFDATA to matching LLVM versions' \
 	  'Cleanup:        make clean [BUILD_DIR=...] | clean-pgo | clean-all' \
-	  'Options:        BUILD_DIR=build GENERATOR=Ninja JOBS=8 BUILD_TYPE=Release'
+	  'Options:        BUILD_DIR=build GENERATOR=Ninja JOBS=8 CTEST_JOBS=8 BUILD_TYPE=Release'
