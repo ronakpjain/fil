@@ -293,7 +293,9 @@ std::uint32_t AdcPeripheral::loadRegister(
     static_cast<void>(context);
     const std::uint32_t value = registerValue(word_offset);
     if (word_offset == dr) {
-        setRegister(isr, registerValue(isr) & ~(eoc | eos));
+        // RM0440 §21.4.23: reading ADC_DR clears EOC; EOS is cleared only
+        // by writing one to ADC_ISR.EOS (§21.4.24).
+        setRegister(isr, registerValue(isr) & ~eoc);
         setInterruptLevel(0, (registerValue(ier) & registerValue(isr) & (eoc | eos)) != 0U);
     }
     return value;
@@ -391,8 +393,15 @@ std::uint64_t AdcPeripheral::conversionCycleBudget(const std::uint32_t rank) con
         25U, 21U, 17U, 13U,
     };
     const std::uint32_t resolution = (registerValue(cfgr) >> 3U) & 0x3U;
+    // RM0440 §21.7.6: the SMPR1 SMPPLUS bit adds one ADC clock to the
+    // 2.5-cycle sample time in either SMPR bank (3.5 cycles total); it does
+    // not change the other SMPR selector encodings.
+    const std::uint32_t sample_plus =
+        sample_selector == 0U
+            ? ((registerValue(smpr1) >> 31U) & 1U) * 2U
+            : 0U;
     const std::uint64_t half_cycles =
-        sample_half_cycles[sample_selector] + conversion_half_cycles[resolution];
+        sample_half_cycles[sample_selector] + conversion_half_cycles[resolution] + sample_plus;
     return half_cycles * 500'000'000ULL;
 }
 

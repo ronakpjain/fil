@@ -3,7 +3,11 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
+#include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -822,6 +826,270 @@ TEST(PeripheralTest, GpioResetRestoresPortSpecificDebugPinModes) {
     port_a.reset();
     EXPECT_EQ(port_a.read(0, word, read_context).value(), 0xabffffffU);
 }
+
+TEST(PeripheralTest, AdcControlFlagsAndStatusClearing) {
+    fil::sim::EventLoop loop;
+    fil::stm32g4::AdcPeripheral adc("ADC1", &loop);
+    adc.setConversionDelay(10U);
+    EXPECT_TRUE(adc.write(0x08, fil::mem::AccessSize::word, (1U << 31U), write_context));
+    EXPECT_EQ(adc.read(0x08, fil::mem::AccessSize::word, read_context).value() & (1U << 31U), 0U)
+        << "ADCAL is modeled as immediate calibration completion";
+    EXPECT_TRUE(adc.write(0x08, fil::mem::AccessSize::word, 1U, write_context));
+    EXPECT_NE(adc.read(0x00, fil::mem::AccessSize::word, read_context).value() & 1U, 0U)
+        << "ADEN immediately reports ADRDY in this model";
+
+    EXPECT_TRUE(adc.write(0x04, fil::mem::AccessSize::word, (1U << 2U) | (1U << 3U), write_context));
+    EXPECT_TRUE(adc.write(0x08, fil::mem::AccessSize::word, 1U | (1U << 2U), write_context));
+    ASSERT_EQ(loop.runDueEvents(10U).events_executed, 1U);
+    EXPECT_NE(adc.read(0x00, fil::mem::AccessSize::word, read_context).value() & 0x0cU, 0U);
+    EXPECT_TRUE(adc.write(0x00, fil::mem::AccessSize::word, 1U << 3U, write_context));
+    EXPECT_EQ(adc.read(0x00, fil::mem::AccessSize::word, read_context).value() & 0x0cU, 1U << 2U)
+        << "clearing EOS leaves EOC asserted";
+    EXPECT_TRUE(adc.write(0x00, fil::mem::AccessSize::word, 1U << 2U, write_context));
+    EXPECT_EQ(adc.read(0x00, fil::mem::AccessSize::word, read_context).value() & 0x0cU, 0U)
+        << "clearing EOC leaves EOS clear";
+
+    EXPECT_TRUE(adc.write(0x08, fil::mem::AccessSize::word, 1U | (1U << 2U), write_context));
+    ASSERT_EQ(loop.runDueEvents(20U).events_executed, 1U);
+    EXPECT_NE(adc.read(0x00, fil::mem::AccessSize::word, read_context).value() & 0x0cU, 0U);
+    EXPECT_EQ(adc.read(0x40, fil::mem::AccessSize::word, read_context).value(), 0U);
+    EXPECT_EQ(adc.read(0x00, fil::mem::AccessSize::word, read_context).value() & 0x0cU, 1U << 3U)
+        << "a DR read clears EOC but not EOS; EOS requires ISR W1C";
+    EXPECT_TRUE(adc.write(0x00, fil::mem::AccessSize::word, 1U << 3U, write_context));
+    EXPECT_EQ(adc.read(0x00, fil::mem::AccessSize::word, read_context).value() & 0x0cU, 0U);
+
+    EXPECT_TRUE(adc.write(0x08, fil::mem::AccessSize::word, 1U | (1U << 2U), write_context));
+    EXPECT_TRUE(adc.write(0x08, fil::mem::AccessSize::word, 1U | (1U << 1U), write_context));
+    EXPECT_EQ(adc.read(0x08, fil::mem::AccessSize::word, read_context).value() & 7U, 0U);
+    EXPECT_EQ(adc.read(0x00, fil::mem::AccessSize::word, read_context).value() & 1U, 0U)
+        << "ADDIS clears ADEN/ADSTART and ADRDY, and cancels conversion";
+    EXPECT_EQ(loop.pending(), 0U);
+}
+
+TEST(PeripheralTest, AdcSamplingSelectorsAndResolutionTimingCoverSmprBoundary) {
+    constexpr std::array<std::uint32_t, 8> sample_half_cycles{5U, 13U, 25U, 49U, 95U, 185U, 495U, 1281U};
+    constexpr std::array<std::uint32_t, 4> conversion_half_cycles{25U, 21U, 17U, 13U};
+    for (std::uint32_t resolution = 0; resolution < 4U; ++resolution) {
+        for (std::uint32_t selector = 0; selector < 8U; ++selector) {
+            fil::sim::EventLoop loop;
+            fil::stm32g4::AdcPeripheral adc("ADC1", &loop);
+            adc.setInputClockHz(16'000'000U);
+            std::vector<fil::stm32g4::AdcSample> samples;
+            adc.setSampleCallback([&](const fil::stm32g4::AdcSample& sample) { samples.push_back(sample); });
+            const std::uint32_t exact_half_cycles = sample_half_cycles[selector] + conversion_half_cycles[resolution];
+            const std::uint32_t delay_ns = (exact_half_cycles * 500U + 15U) / 16U;
+            ASSERT_TRUE(adc.write(0x0c, fil::mem::AccessSize::word, resolution << 3U, write_context));
+            ASSERT_TRUE(adc.write(0x14, fil::mem::AccessSize::word,
+                selector << 27U, write_context)); // CH9
+            ASSERT_TRUE(adc.write(0x18, fil::mem::AccessSize::word, selector, write_context)); // CH10
+            ASSERT_TRUE(adc.write(0x30, fil::mem::AccessSize::word, 1U | (9U << 6U) | (10U << 12U), write_context));
+            ASSERT_TRUE(adc.write(0x08, fil::mem::AccessSize::word, 1U | (1U << 2U), write_context));
+            ASSERT_EQ(loop.runDueEvents(delay_ns - 1U).events_executed, 0U)
+                << "selector=" << selector << " RES=" << resolution;
+            ASSERT_EQ(loop.runDueEvents(delay_ns).events_executed, 1U)
+                << "selector=" << selector << " RES=" << resolution;
+            ASSERT_EQ(samples.size(), 1U);
+            EXPECT_EQ(samples[0].channel, 9U);
+            EXPECT_EQ(samples[0].time_ns, delay_ns);
+            ASSERT_EQ(loop.runDueEvents(delay_ns * 2U).events_executed, 1U);
+            ASSERT_EQ(samples.size(), 2U);
+            EXPECT_EQ(samples[1].channel, 10U)
+                << "validates SMPR1 channel 9 / SMPR2 channel 10 boundary";
+            EXPECT_EQ(samples[1].time_ns, delay_ns * 2U);
+        }
+    }
+}
+
+// RM0440 21.7.6: SMPPLUS affects the shortest selection in both SMPR banks.
+TEST(PeripheralTest, AdcSamplePlusAddsOneCycleToShortestSample) {
+    for (const std::uint32_t channel : {0U, 9U, 10U, 19U}) {
+        fil::sim::EventLoop loop;
+        fil::stm32g4::AdcPeripheral adc("ADC1", &loop);
+        adc.setInputClockHz(16'000'000U);
+        ASSERT_TRUE(adc.write(0x30U, fil::mem::AccessSize::word, channel << 6U, write_context));
+        ASSERT_TRUE(adc.write(0x14U, fil::mem::AccessSize::word, 1U << 31U, write_context));
+        ASSERT_TRUE(adc.write(0x08U, fil::mem::AccessSize::word, 5U, write_context));
+        EXPECT_EQ(loop.runDueEvents(999U).events_executed, 0U);
+        EXPECT_EQ(loop.runDueEvents(1'000U).events_executed, 1U)
+            << "SMPPLUS adds one sample cycle for channel " << channel;
+    }
+}
+
+TEST(PeripheralTest, AdcRegularSequenceCoversAllSixteenRanks) {
+    fil::sim::EventLoop loop;
+    fil::stm32g4::AdcPeripheral adc("ADC1", &loop);
+    adc.setConversionDelay(1U);
+    std::vector<std::uint32_t> seen;
+    std::vector<std::uint32_t> flags;
+    adc.setSampleCallback([&](const fil::stm32g4::AdcSample& sample) {
+        seen.push_back(sample.channel);
+        flags.push_back(static_cast<std::uint32_t>(adc.read(0x00, fil::mem::AccessSize::word, read_context).value()) & 0x0cU);
+    });
+    std::array<std::uint32_t, 4> sqr{};
+    sqr[0] = 15U; // L = 15 means sixteen ranks.
+    for (std::uint32_t rank = 0; rank < 16U; ++rank) {
+        const std::uint32_t channel = rank;
+        const std::uint32_t reg = rank < 4U ? 0U : rank < 9U ? 1U : rank < 14U ? 2U : 3U;
+        const std::uint32_t shift = rank < 4U ? 6U + rank * 6U
+            : rank < 9U ? (rank - 4U) * 6U
+            : rank < 14U ? (rank - 9U) * 6U : (rank - 14U) * 6U;
+        sqr[reg] |= channel << shift;
+        adc.setChannelValue(channel, static_cast<std::uint16_t>(0x100U + channel));
+    }
+    for (std::uint32_t i = 0; i < 4U; ++i)
+        ASSERT_TRUE(adc.write(0x30U + i * 4U, fil::mem::AccessSize::word, sqr[i], write_context));
+    ASSERT_TRUE(adc.write(0x08, fil::mem::AccessSize::word, 1U | (1U << 2U), write_context));
+    ASSERT_EQ(loop.runDueEvents(16U).events_executed, 16U);
+    ASSERT_EQ(seen.size(), 16U);
+    ASSERT_EQ(flags.size(), 16U);
+    for (std::uint32_t i = 0; i < 16U; ++i) {
+        EXPECT_EQ(seen[i], i);
+        EXPECT_EQ(flags[i], i == 15U ? 0x0cU : 0x04U)
+            << "EOC marks each rank; EOS only marks the end of sequence";
+    }
+    EXPECT_NE(adc.read(0x00, fil::mem::AccessSize::word, read_context).value() & (1U << 3U), 0U)
+        << "EOS occurs at final rank";
+    EXPECT_EQ(adc.read(0x40, fil::mem::AccessSize::word, read_context).value(), 0x10fU);
+}
+
+TEST(PeripheralTest, TimerForcedUpdateStatusAndOnePulseRestart) {
+    fil::sim::EventLoop loop;
+    fil::stm32g4::TimerPeripheral timer("TIM2", 1'000'000U, &loop);
+    std::uint32_t callbacks = 0;
+    timer.setUpdateCallback([&](fil::sim::SimTimeNs) { ++callbacks; });
+    ASSERT_TRUE(timer.write(0x2c, fil::mem::AccessSize::word, 9U, write_context));
+    ASSERT_TRUE(timer.write(0x28, fil::mem::AccessSize::word, 1U, write_context));
+    ASSERT_TRUE(timer.write(0x0c, fil::mem::AccessSize::word, 1U, write_context));
+    ASSERT_TRUE(timer.write(0x00, fil::mem::AccessSize::word, 1U | (1U << 3U), write_context));
+    ASSERT_EQ(loop.runDueEvents(19'999U).events_executed, 0U);
+    ASSERT_EQ(timer.read(0x24, fil::mem::AccessSize::word, read_context).value(), 9U);
+    ASSERT_EQ(loop.runDueEvents(20'000U).events_executed, 1U);
+    EXPECT_EQ(callbacks, 1U);
+    EXPECT_EQ(timer.read(0x24, fil::mem::AccessSize::word, read_context).value(), 0U);
+    EXPECT_EQ(timer.read(0x00, fil::mem::AccessSize::word, read_context).value() & 1U, 0U)
+        << "OPM clears CEN on update";
+    ASSERT_TRUE(timer.write(0x10, fil::mem::AccessSize::word, 0U, write_context));
+    EXPECT_EQ(timer.read(0x10, fil::mem::AccessSize::word, read_context).value() & 1U, 0U)
+        << "UIF uses write-zero-to-clear semantics";
+    ASSERT_TRUE(timer.write(0x14, fil::mem::AccessSize::word, 1U, write_context));
+    EXPECT_EQ(callbacks, 2U);
+    EXPECT_NE(timer.read(0x10, fil::mem::AccessSize::word, read_context).value() & 1U, 0U)
+        << "EGR.UG generates an update while stopped";
+}
+
+TEST(PeripheralTest, IwdgLockedWritesAndExactReloadDeadline) {
+    fil::sim::EventLoop loop;
+    fil::stm32g4::IwdgPeripheral watchdog(true, &loop);
+    std::uint32_t resets = 0;
+    watchdog.setResetCallback([&]() { ++resets; });
+    ASSERT_TRUE(watchdog.write(0x04, fil::mem::AccessSize::word, 0U, write_context));
+    ASSERT_TRUE(watchdog.write(0x08, fil::mem::AccessSize::word, 1U, write_context));
+    EXPECT_EQ(watchdog.read(0x08, fil::mem::AccessSize::word, read_context).value(), 0x0fffU)
+        << "PR/RLR writes are ignored until key 0x5555";
+    ASSERT_TRUE(watchdog.write(0x00, fil::mem::AccessSize::word, 0x5555U, write_context));
+    ASSERT_TRUE(watchdog.write(0x04, fil::mem::AccessSize::word, 0U, write_context));
+    ASSERT_TRUE(watchdog.write(0x08, fil::mem::AccessSize::word, 1U, write_context));
+    ASSERT_TRUE(watchdog.write(0x00, fil::mem::AccessSize::word, 0xccccU, write_context));
+    EXPECT_TRUE(watchdog.running());
+    ASSERT_EQ(loop.runDueEvents(249'999U).events_executed, 0U);
+    ASSERT_TRUE(watchdog.write(0x00, fil::mem::AccessSize::word, 0xaaaaU, write_context));
+    ASSERT_EQ(loop.runDueEvents(499'998U).events_executed, 0U);
+    EXPECT_EQ(loop.runDueEvents(499'999U).events_executed, 1U);
+    EXPECT_EQ(resets, 1U);
+}
+
+TEST(PeripheralTest, TimerPrescalerClockChangeCntWriteAndStopRestartRephase) {
+    fil::sim::EventLoop loop;
+    fil::stm32g4::TimerPeripheral timer("TIM2", 1'000'000U, &loop);
+    ASSERT_TRUE(timer.write(0x2c, fil::mem::AccessSize::word, 99U, write_context));
+    ASSERT_TRUE(timer.write(0x00, fil::mem::AccessSize::word, 1U, write_context));
+    ASSERT_EQ(loop.runDueEvents(20'000U).events_executed, 0U);
+    ASSERT_EQ(timer.read(0x24, fil::mem::AccessSize::word, read_context).value(), 20U);
+
+    ASSERT_TRUE(timer.write(0x28, fil::mem::AccessSize::word, 1U, write_context));
+    ASSERT_EQ(timer.read(0x24, fil::mem::AccessSize::word, read_context).value(), 20U)
+        << "PSC update captures CNT without resetting it";
+    ASSERT_EQ(loop.runDueEvents(30'000U).events_executed, 0U);
+    ASSERT_EQ(timer.read(0x24, fil::mem::AccessSize::word, read_context).value(), 25U);
+
+    timer.setInputClockHz(2'000'000U);
+    ASSERT_EQ(timer.read(0x24, fil::mem::AccessSize::word, read_context).value(), 25U)
+        << "clock change preserves current count";
+    ASSERT_EQ(loop.runDueEvents(40'000U).events_executed, 0U);
+    ASSERT_TRUE(timer.write(0x24, fil::mem::AccessSize::word, 10U, write_context));
+    ASSERT_EQ(timer.read(0x24, fil::mem::AccessSize::word, read_context).value(), 10U)
+        << "software CNT write is visible immediately";
+
+    ASSERT_TRUE(timer.write(0x00, fil::mem::AccessSize::word, 0U, write_context));
+    ASSERT_EQ(loop.runDueEvents(60'000U).events_executed, 0U);
+    EXPECT_EQ(timer.read(0x24, fil::mem::AccessSize::word, read_context).value(), 10U)
+        << "stopped counter holds CNT";
+    ASSERT_TRUE(timer.write(0x00, fil::mem::AccessSize::word, 1U, write_context));
+    ASSERT_EQ(loop.runDueEvents(149'999U).events_executed, 0U);
+    EXPECT_EQ(loop.runDueEvents(150'000U).events_executed, 1U)
+        << "restart schedules the remaining ARR ticks at the new PSC/clock";
+}
+
+TEST(PeripheralTest, IwdgPrescalerCodesProduceNominalTimeoutDeadlines) {
+    for (std::uint32_t code = 0; code <= 7U; ++code) {
+        fil::sim::EventLoop loop;
+        fil::stm32g4::IwdgPeripheral watchdog(true, &loop);
+        std::uint32_t resets = 0;
+        watchdog.setResetCallback([&]() { ++resets; });
+        ASSERT_TRUE(watchdog.write(0x00, fil::mem::AccessSize::word, 0x5555U, write_context));
+        ASSERT_TRUE(watchdog.write(0x04, fil::mem::AccessSize::word, code, write_context));
+        ASSERT_TRUE(watchdog.write(0x08, fil::mem::AccessSize::word, 0U, write_context));
+        ASSERT_TRUE(watchdog.write(0x00, fil::mem::AccessSize::word, 0xccccU, write_context));
+        EXPECT_EQ(watchdog.read(0x0c, fil::mem::AccessSize::word, read_context).value(), 0U)
+            << "the modeled IWDG status register reports no synchronization flags";
+        const std::uint64_t deadline_ns = 125'000U << std::min(code, 6U);
+        EXPECT_EQ(loop.runDueEvents(deadline_ns - 1U).events_executed, 0U) << "PR=" << code;
+        EXPECT_EQ(loop.runDueEvents(deadline_ns).events_executed, 1U) << "PR=" << code;
+        EXPECT_EQ(resets, 1U) << "PR=" << code;
+    }
+}
+
+TEST(PeripheralTest, WwdgCounterAndCfrPrescalerSetTimeoutDeadline) {
+    fil::sim::EventLoop loop;
+    fil::stm32g4::WwdgPeripheral watchdog(true, 16'000'000U, &loop);
+    std::uint32_t resets = 0;
+    watchdog.setResetCallback([&]() { ++resets; });
+    // T[6:0]=0x41 leaves two modeled decrement periods before underflow.
+    ASSERT_TRUE(watchdog.write(0x04, fil::mem::AccessSize::word, 1U << 7U, write_context));
+    ASSERT_TRUE(watchdog.write(0x00, fil::mem::AccessSize::word, (1U << 7U) | 0x41U, write_context));
+    ASSERT_EQ(loop.runDueEvents(1'023'999U).events_executed, 0U);
+    EXPECT_EQ(loop.runDueEvents(1'024'000U).events_executed, 1U);
+    EXPECT_EQ(resets, 1U);
+
+    fil::sim::EventLoop refresh_loop;
+    fil::stm32g4::WwdgPeripheral refreshed(true, 16'000'000U, &refresh_loop);
+    std::uint32_t refresh_resets = 0;
+    refreshed.setResetCallback([&]() { ++refresh_resets; });
+    ASSERT_TRUE(refreshed.write(0x00, fil::mem::AccessSize::word, (1U << 7U) | 0x41U, write_context));
+    ASSERT_EQ(refresh_loop.runDueEvents(100'000U).events_executed, 0U);
+    ASSERT_TRUE(refreshed.write(0x00, fil::mem::AccessSize::word, (1U << 7U) | 0x41U, write_context));
+    EXPECT_EQ(refresh_loop.runDueEvents(511'999U).events_executed, 0U)
+        << "a WDGA CR write refreshes the model timeout deadline";
+    EXPECT_EQ(refresh_loop.runDueEvents(612'000U).events_executed, 1U);
+    EXPECT_EQ(refresh_resets, 1U);
+
+    fil::sim::EventLoop stop_loop;
+    fil::stm32g4::WwdgPeripheral stopped(true, 16'000'000U, &stop_loop);
+    std::uint32_t stopped_resets = 0;
+    stopped.setResetCallback([&]() { ++stopped_resets; });
+    ASSERT_TRUE(stopped.write(0x00, fil::mem::AccessSize::word, (1U << 7U) | 0x41U, write_context));
+    ASSERT_TRUE(stopped.write(0x00, fil::mem::AccessSize::word, 0x41U, write_context));
+    EXPECT_EQ(stop_loop.runDueEvents(1'000'000U).events_executed, 0U);
+    EXPECT_EQ(stopped_resets, 0U) << "clearing WDGA cancels the scheduled timeout";
+
+    fil::sim::EventLoop disabled_loop;
+    fil::stm32g4::WwdgPeripheral no_reset(false, 16'000'000U, &disabled_loop);
+    no_reset.setResetCallback([&]() { ++resets; });
+    ASSERT_TRUE(no_reset.write(0x00, fil::mem::AccessSize::word, (1U << 7U) | 0x40U, write_context));
+    EXPECT_EQ(disabled_loop.runDueEvents(256'000U).events_executed, 1U);
+    EXPECT_EQ(resets, 1U) << "timeout requests no reset when reset option is disabled";
+}
+
 
 } // namespace
 
