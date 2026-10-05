@@ -68,6 +68,14 @@ bool onlyImmediateShape(const DecodedInstruction& d) noexcept {
         && !d.writeback && d.register_list == 0U && !d.fp_double;
 }
 
+bool onlyUnshiftedRegisterShape(const DecodedInstruction& d) noexcept {
+    return d.form == OperandForm::register_value && d.ra == 0U && d.imm == 0U
+        && d.branch_offset == 0 && d.shift_amount == 0U
+        && d.shift_type == ShiftType::lsl && d.index && d.add
+        && !d.writeback && d.register_list == 0U
+        && !d.immediate_carry_valid && !d.immediate_carry && !d.fp_double;
+}
+
 Value* stateField(IRBuilder<>& b, LLVMContext& c, Value* state, const std::size_t offset) {
     auto* byte = Type::getInt8Ty(c);
     auto* ptr = b.CreateGEP(byte, state, c64(c, offset));
@@ -144,8 +152,15 @@ bool shapeSupported(const NativeJitInstruction& i) noexcept {
             && !d.set_flags && !d.immediate_carry_valid && !d.immediate_carry;
     case InstrKind::add:
     case InstrKind::sub:
-        return onlyImmediateShape(d) && d.rd <= 12U && d.rn <= 12U
-            && !d.immediate_carry_valid && !d.immediate_carry;
+        if (d.form == OperandForm::immediate)
+            return onlyImmediateShape(d) && d.rd <= 12U && d.rn <= 12U
+                && !d.immediate_carry_valid && !d.immediate_carry;
+        return onlyUnshiftedRegisterShape(d) && d.rd <= 12U && d.rn <= 12U && d.rm <= 12U;
+    case InstrKind::and_:
+    case InstrKind::orr:
+    case InstrKind::eor:
+    case InstrKind::bic:
+        return onlyUnshiftedRegisterShape(d) && d.rd <= 12U && d.rn <= 12U && d.rm <= 12U;
     case InstrKind::cmp:
     case InstrKind::cmn:
         return onlyImmediateShape(d) && d.rn <= 12U && d.rd <= 15U && d.set_flags
@@ -302,11 +317,35 @@ std::shared_ptr<const NativeJitKernel> LlvmJit::compile(
         case InstrKind::add:
         case InstrKind::sub: {
             Value* left = readRegCached(d.rn);
-            Value* right = c32(*context, d.imm);
+            Value* right = d.form == OperandForm::register_value
+                ? readRegCached(d.rm) : c32(*context, d.imm);
             Value* result = d.kind == InstrKind::add ? b.CreateAdd(left, right) : b.CreateSub(left, right);
             writeRegCached(d.rd, result);
             if (d.set_flags) {
                 cached_xpsr = emitAddFlags(b, *context, readXpsrCached(), left, right, d.kind == InstrKind::sub);
+                dirty_xpsr = true;
+            }
+            break;
+        }
+        case InstrKind::and_:
+        case InstrKind::orr:
+        case InstrKind::eor:
+        case InstrKind::bic: {
+            Value* left = readRegCached(d.rn);
+            Value* right = readRegCached(d.rm);
+            Value* result = nullptr;
+            switch (d.kind) {
+            case InstrKind::and_: result = b.CreateAnd(left, right); break;
+            case InstrKind::orr: result = b.CreateOr(left, right); break;
+            case InstrKind::eor: result = b.CreateXor(left, right); break;
+            case InstrKind::bic: result = b.CreateAnd(left, b.CreateNot(right)); break;
+            default: break;
+            }
+            writeRegCached(d.rd, result);
+            if (d.set_flags) {
+                Value* old = readXpsrCached();
+                Value* carry = b.CreateICmpNE(b.CreateAnd(old, c32(*context, xpsr_c)), c32(*context, 0));
+                cached_xpsr = writeNzc(b, *context, old, result, carry);
                 dirty_xpsr = true;
             }
             break;

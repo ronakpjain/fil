@@ -20,14 +20,17 @@ The configure log says whether native LLVM support is enabled. Missing LLVM is n
 
 `run` and `run-network` print per-board `native_jit` counters when JIT is enabled (the default). `backend=llvm-orc` identifies the configured backend; **positive `executions` and `instructions` confirm actual native execution**, rather than merely an enabled flag. Zero counts can mean the firmware did not reach a supported hot path. `evictions` counts native LRU replacements; total `compilations` can exceed the resident capacity. `failures` and `native_jit_error` report compilation failures; execution falls back rather than changing guest behavior.
 
+Adaptive diagnostics accompany those execution counters: `policy_samples` counts matched cached/native timing windows, `promotions` and `demotions` count dispatch-policy transitions, and `compile_cost_ns` includes native compiler initialization and kernel compilation. `probe_instructions` counts shadow work used for comparisons, not guest instructions retired. `policy_mismatches` reports disagreement between the compared architectural states; a mismatching candidate must remain on the cached path.
+
 ## Initial native subset
 
 - NOP.
 - Immediate MOV, MOVW, MOVT.
 - Immediate ADD, SUB, CMP, CMN, including architectural NZCV/carry updates.
+- Unshifted register ADD/SUB and AND/ORR/EOR/BIC. Arithmetic updates NZCV when requested; logical operations update NZ while retaining C/V.
 - Unconditional B and BL as the final instruction of a block, including link-register updates and branch-to-fallthrough cases.
 
-The supported forms use ordinary integer registers r0–r12, except for explicit PC/LR effects of B/BL. SP and PC operand forms, conditional execution, memory/MMIO operations, system instructions, and floating-point operations are not lowered. They retain existing execution paths. This is a genuine but deliberately incomplete native JIT, not a full ARMv7-M translator.
+The supported forms use ordinary integer registers r0–r12, except for explicit PC/LR effects of B/BL. SP and PC operand forms, shifted register operands, ADC/SBC, conditional execution, memory/MMIO operations, system instructions, and floating-point operations are not lowered. They retain existing execution paths. This is a genuine but deliberately incomplete native JIT, not a full ARMv7-M translator.
 
 ## Safety and lifetime
 
@@ -35,13 +38,21 @@ Native kernels use the verified host `CpuState` layout and preserve unrelated fi
 
 The shared CPU front end retains fetch permissions, conditions, faults, pipeline timing, and diagnostics. Decoded-cache PC/execution-generation mismatches clear native entries, so executable writes cannot reuse stale code. Native kernels contain no memory writes, so they cannot invalidate themselves while running. For mixed blocks, the longest contiguous supported prefix is eligible for compilation when it contains at least four instructions; shorter mixed prefixes stay cached. Fully supported blocks retain their existing eligibility. The suffix uses existing cached handlers with their normal fault, MMIO, and executable-write guards. Scheduler limits can end inside either part without retiring extra instructions. Compilation does not advance simulated time or mutate guest registers.
 
-General network dispatch remains one instruction. Larger kernels run only through the existing board horizon proof or synchronized pure fixed-cost lane proof. Native generation is **not** permission to skip MMIO, scheduled events, SysTick, stop addresses, instruction budgets, or trace boundaries.
+General network dispatch remains one instruction. Larger kernels run only through existing board horizon, synchronized pure fixed-cost lane, or guarded reversible-prefix admission. Reversible native prefixes must additionally be non-memory, non-generic, and unconditional; any admitted suffix retains its cached handlers and rollback guards. Native generation is **not** permission to skip MMIO, scheduled events, SysTick, stop addresses, instruction budgets, or trace boundaries.
 
-ORC engines are initialized lazily. Cached block preparation retains its 50-probe gate, but native block compilation requires 512 actual admitted multi-instruction executions at the same cached block, then compiles on the next admission. Previews and single-instruction block limits do not warm this gate. Native single-instruction compilation requires 16,384 eligible hits at a decoded entry, then compiles on the next hit. These gates favor sustained use over startup code; they are heuristics, not an optimal profitability model.
+ORC engines are initialized lazily. Cached block preparation retains its 50-probe gate, but native block compilation requires 512 actual admitted multi-instruction executions at the same cached block, then compiles on the next admission. Previews and single-instruction block limits do not warm this gate. Native single-instruction compilation requires 16,384 eligible hits at a decoded entry, then compiles on the next hit. These gates favor sustained use over startup code; reaching a gate permits compilation, not immediate native dispatch.
 
 A CPU retains at most 32 native kernels in a dynamically updated LRU cache. Both native single-instruction and block executions refresh recency. At capacity, a hot candidate may replace the least recently used resident only after that resident has been idle for at least 16,384 eligible JIT dispatches. Otherwise the candidate stays cached and must rewarm before retrying. This admission hysteresis avoids replacing an actively used working set merely because a new candidate appears.
 
 Eviction clears matching raw entry points in both CPU caches before releasing the kernel's ORC resources. Evicted sites can compile again after rewarming. Kernel slots remain stable until replacement, and kernels keep their runtime alive. Executable-write invalidation still clears decoded/block references by generation; unreferenced resident resources can be reclaimed through subsequent LRU replacement. Capacity bounds retained kernels, not lifetime compilation count. This is not a bound on total compile time, and workloads with a changing working set can still incur compilation overhead.
+
+## Adaptive execution
+
+Cached execution remains the initial path. An eligible compiled kernel is compared with its cached implementation using sparse, bounded timing windows on copied CPU state. Comparison work must be pure: it cannot issue MMIO, mutate RAM, or advance guest time. The real instruction or prefix still retires exactly once through the selected implementation.
+
+Promotion requires repeated evidence of a meaningful execution-cost advantage and a bounded compilation-cost recovery forecast. Losing native kernels fall back to cached execution, with hysteresis and cooldown before another trial. Unsafe or mismatching candidates are rejected rather than used for guest execution. Policy state is bounded by native residency and is cleared when the corresponding kernel is replaced.
+
+Host timing influences only which equivalent implementation executes. It does not alter guest instruction counts, timing, event ordering, or scheduler admission limits. Timing noise, compilation cost, and shadow-probe overhead still matter; adaptive selection is not a guarantee of an end-to-end speedup. In particular, hot single-instruction kernels can be slower than specialized cached handlers.
 
 ## Compilation pipeline
 

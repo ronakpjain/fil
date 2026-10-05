@@ -1,6 +1,7 @@
 #include "fil/cpu/cortex_m4.hpp"
 #include "fil/cpu/decoder.hpp"
 #include "fil/cpu/jit.hpp"
+#include "fil/cpu/native_jit_policy.hpp"
 #include "fil/mem/memory_bus.hpp"
 
 #include <gtest/gtest.h>
@@ -56,6 +57,13 @@ std::uint16_t fakeFetchStall(
     return sequential ? stalls.sequential : stalls.nonsequential;
 }
 
+struct CountingFetchStalls { std::uint32_t calls{0U}; };
+std::uint16_t countingFetchStall(
+    const void* context, const std::uint32_t, const bool) {
+    ++static_cast<CountingFetchStalls*>(const_cast<void*>(context))->calls;
+    return 0U;
+}
+
 class SharedMmio final : public fil::mem::MmioDevice {
 public:
     fil::mem::MemoryResult<std::uint64_t> read(
@@ -76,6 +84,182 @@ public:
 
     std::int32_t reads{0};
 };
+
+TEST(NativeJitPolicyTest, PromotesOnlyAfterConfidentProfitableMatchedWindows) {
+    fil::cpu::NativeJitPolicy::Config config;
+    config.cooldown_windows = 0U;
+    fil::cpu::NativeJitPolicy policy(config);
+    policy.addKernelCompileCost(50000U);
+    // This modest forecast cannot yet repay the compile cost at the measured saving.
+    policy.noteReuse(10U);
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(policy.observe(10000U, 7000U, 16U),
+                  fil::cpu::NativeJitPolicy::State::cached);
+    }
+    EXPECT_EQ(policy.observe(10000U, 7000U, 16U),
+              fil::cpu::NativeJitPolicy::State::cached);
+    policy.noteReuse(1000U);
+    for (int i = 0; i < 4; ++i) {
+        policy.observe(10000U, 7000U, 16U);
+    }
+    EXPECT_EQ(policy.state(), fil::cpu::NativeJitPolicy::State::native);
+}
+
+TEST(NativeJitPolicyTest, AcceptsFastSideWhenCompetitorExceedsTimerFloor) {
+    fil::cpu::NativeJitPolicy policy;
+    EXPECT_FALSE(policy.hasTimingWindow(999U, 100U, 512U));
+    EXPECT_FALSE(policy.hasTimingWindow(2000U, 0U, 512U));
+    EXPECT_FALSE(policy.hasTimingWindow(2000U, 100U, 0U));
+    EXPECT_TRUE(policy.hasTimingWindow(2000U, 100U, 512U));
+    for (int i = 0; i < 3; ++i)
+        EXPECT_EQ(policy.observe(2000U, 100U, 512U), fil::cpu::NativeJitPolicy::State::cached);
+    EXPECT_EQ(policy.observe(2000U, 100U, 512U), fil::cpu::NativeJitPolicy::State::native);
+    // A slow native implementation supplies a measurable losing window even
+    // when its cached competitor is below the timer floor.
+    for (int i = 0; i < 4; ++i) policy.observe(100U, 2000U, 512U);
+    EXPECT_EQ(policy.state(), fil::cpu::NativeJitPolicy::State::cooldown);
+}
+
+TEST(NativeJitPolicyTest, RejectsLosersAndDemotesWithCooldownAndReprobe) {
+    fil::cpu::NativeJitPolicy::Config config;
+    config.cooldown_windows = 2U;
+    fil::cpu::NativeJitPolicy policy(config);
+    for (int i = 0; i < 4; ++i) {
+        policy.observe(12000U, 7000U, 16U);
+    }
+    ASSERT_EQ(policy.state(), fil::cpu::NativeJitPolicy::State::native);
+    for (int i = 0; i < 4; ++i) {
+        policy.observe(7000U, 10000U, 16U);
+    }
+    ASSERT_EQ(policy.state(), fil::cpu::NativeJitPolicy::State::cooldown);
+    policy.observe(12000U, 7000U, 16U);
+    policy.observe(12000U, 7000U, 16U);
+    EXPECT_EQ(policy.state(), fil::cpu::NativeJitPolicy::State::cooldown);
+    for (int i = 0; i < 4; ++i) {
+        policy.observe(12000U, 7000U, 16U);
+    }
+    EXPECT_EQ(policy.state(), fil::cpu::NativeJitPolicy::State::native);
+}
+
+TEST(JitTest, NativePolicyPromotionPreservesExactBlockBoundaryAndCpuState) {
+    if (!fil::cpu::CortexM4::nativeJitAvailable()) GTEST_SKIP();
+    constexpr std::uint32_t code_base = flash_base;
+    auto bus = basicBus();
+    ASSERT_TRUE(bus.loadBytes(code_base, halfwords({0xBF00U, 0xE7FDU})).hasValue());
+    fil::cpu::CortexM4 native(bus);
+    fil::cpu::CortexM4 reference(bus);
+    prepare(native, code_base);
+    prepare(reference, code_base);
+    const auto initial = native.state();
+    for (std::uint32_t i = 0U; i < 1200U
+        && native.jitStats().native_compilations == 0U; ++i) {
+        native.state() = initial;
+        static_cast<void>(native.tryStepJitBlock(2U));
+    }
+    ASSERT_GT(native.jitStats().native_compilations, 0U) << native.nativeJitError();
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_TRUE(native.observeNativePolicyForTesting(code_base, true,
+            500000000U, 100000000U, 16U));
+    }
+    EXPECT_EQ(native.jitStats().native_promotions, 1U);
+    native.state() = initial;
+    reference.state() = initial;
+    const auto expected0 = reference.stepFast();
+    const auto expected1 = reference.stepFast();
+    const auto actual = native.tryStepJitBlock(2U);
+    ASSERT_TRUE(actual);
+    EXPECT_EQ(actual->count, 2U);
+    EXPECT_EQ(actual->result.instructions, 2U);
+    EXPECT_EQ(actual->result.cycles, expected0.cycles + expected1.cycles);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(native.state(), reference.state()));
+    EXPECT_EQ(native.jitStats().native_instructions, 2U);
+
+    bus.setReversibleRamOnly(true);
+    bus.setAllMmioTrapping(true);
+    native.state() = initial;
+    reference.state() = initial;
+    const auto trusted_expected0 = reference.stepFast();
+    const auto trusted_expected1 = reference.stepFast();
+    const auto trusted = native.tryStepReversibleJitBlock(2U);
+    ASSERT_TRUE(trusted);
+    EXPECT_EQ(trusted->execution.count, 2U);
+    EXPECT_EQ(trusted->execution.result.cycles,
+        trusted_expected0.cycles + trusted_expected1.cycles);
+    EXPECT_EQ(trusted->instruction_cycles[0], trusted_expected0.cycles);
+    EXPECT_EQ(trusted->instruction_cycles[1], trusted_expected1.cycles);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(native.state(), reference.state()));
+    EXPECT_EQ(native.jitStats().native_instructions, 4U);
+
+    native.state() = initial;
+    reference.state() = initial;
+    CountingFetchStalls zero_fetches{};
+    fil::cpu::CortexM4::ReversibleCycleBudget zero_budget{};
+    zero_budget.remaining_cycles = 0U;
+    zero_budget.context = &zero_fetches;
+    zero_budget.fetch_stall = countingFetchStall;
+    zero_budget.total_instruction_cycles.fill(0x7777U);
+    const auto zero_stats = native.jitStats();
+    for (int i = 0; i < 2; ++i) {
+        EXPECT_FALSE(native.tryStepBudgetedReversibleJitBlock(2U, zero_budget));
+    }
+    EXPECT_EQ(zero_fetches.calls, 2U);
+    EXPECT_EQ(zero_budget.remaining_cycles, 0U);
+    EXPECT_FALSE(zero_budget.have_fetch);
+    EXPECT_EQ(zero_budget.total_instruction_cycles[0], 0x7777U);
+    EXPECT_EQ(native.jitStats().native_policy_samples, zero_stats.native_policy_samples);
+    EXPECT_EQ(native.jitStats().native_promotions, zero_stats.native_promotions);
+    EXPECT_EQ(native.jitStats().native_probe_instructions,
+        zero_stats.native_probe_instructions);
+    EXPECT_EQ(native.jitStats().native_executions, zero_stats.native_executions);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(native.state(), initial));
+
+    native.state() = initial;
+    reference.state() = initial;
+    CountingFetchStalls fetches{};
+    fil::cpu::CortexM4::ReversibleCycleBudget budget{};
+    budget.remaining_cycles = 100U;
+    budget.fetch_stall = countingFetchStall;
+    budget.context = &fetches;
+    const auto budgeted = native.tryStepBudgetedReversibleJitBlock(2U, budget);
+    ASSERT_TRUE(budgeted);
+    EXPECT_EQ(budgeted->execution.count, 2U);
+    EXPECT_EQ(fetches.calls, 2U) << "budget preflight/native commit calls each fetch callback once";
+    EXPECT_EQ(native.jitStats().native_instructions, 6U)
+        << "the certified pure prefix executes natively after one callback preflight";
+    EXPECT_EQ(budget.total_instruction_cycles[0], trusted_expected0.cycles);
+    EXPECT_EQ(budget.total_instruction_cycles[1], trusted_expected1.cycles);
+    EXPECT_EQ(budget.remaining_cycles, 100U
+        - trusted_expected0.cycles - trusted_expected1.cycles);
+    ASSERT_EQ(reference.stepFast().reason, fil::cpu::StopReason::step_complete);
+    ASSERT_EQ(reference.stepFast().reason, fil::cpu::StopReason::step_complete);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(native.state(), reference.state()));
+
+    const auto native_execs = native.jitStats().native_executions;
+    ASSERT_TRUE(native.rejectNativeForTesting(code_base, true));
+    native.state() = initial;
+    reference.state() = initial;
+    ASSERT_EQ(reference.stepFast().reason, fil::cpu::StopReason::step_complete);
+    ASSERT_EQ(reference.stepFast().reason, fil::cpu::StopReason::step_complete);
+    const auto rejected = native.tryStepJitBlock(2U);
+    ASSERT_TRUE(rejected);
+    EXPECT_EQ(rejected->count, 2U);
+    EXPECT_EQ(native.jitStats().native_executions, native_execs)
+        << "a rejected resident must never be called again";
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(native.state(), reference.state()));
+}
+
+TEST(NativeJitPolicyTest, CompileDebtAndLowConfidenceSamplesCannotPromote) {
+    fil::cpu::NativeJitPolicy policy;
+    policy.addKernelCompileCost(UINT64_MAX);
+    policy.noteReuse(1'048'576U);
+    for (int i = 0; i < 8; ++i) {
+        policy.observe(10000U, 7000U, 16U);
+    }
+    EXPECT_EQ(policy.state(), fil::cpu::NativeJitPolicy::State::cached);
+    policy.addKernelCompileCost(1U);
+    policy.observe(999U, 100U, 16U); // Below the timer-confidence floor.
+    EXPECT_EQ(policy.state(), fil::cpu::NativeJitPolicy::State::cached);
+}
 
 TEST(JitTest, DecliningStandaloneReversibleBranchRestoresEntireEntryState) {
     auto bus = basicBus();

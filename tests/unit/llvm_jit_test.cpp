@@ -10,8 +10,8 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -77,11 +77,20 @@ bool equalState(const fil::cpu::CpuState& lhs, const fil::cpu::CpuState& rhs) {
     return fil::cpu::bitwiseEqual(lhs, rhs);
 }
 
-void expectDifferentialPrefixes(LlvmJit& jit,
+bool promoteNativeForTest(fil::cpu::CortexM4& cpu, const std::uint32_t pc,
+                          const bool block, const std::uint32_t instructions) {
+    // Four confident profitable windows, with savings comfortably above the
+    // compile-debt recovery bound. Inject evidence only after compilation.
+    for (std::uint32_t window = 0; window < 4U; ++window) {
+        if (!cpu.observeNativePolicyForTesting(pc, block,
+                4'000'000'000ULL, 1'000ULL, instructions)) return false;
+    }
+    return true;
+}
+
+void expectDifferentialPrefixes(const NativeJitKernel& kernel,
                                 const std::vector<NativeJitInstruction>& program,
                                 const fil::cpu::CpuState& initial) {
-    const auto kernel = compile(jit, program);
-    ASSERT_NE(kernel, nullptr);
     fil::mem::MemoryBus bus;
     ASSERT_TRUE(bus.mapRam(entry, 256U, "llvm-prefix-oracle", true).hasValue());
     std::vector<std::uint8_t> bytes;
@@ -104,7 +113,7 @@ void expectDifferentialPrefixes(LlvmJit& jit,
     limits.push_back(std::numeric_limits<std::size_t>::max());
     for (const auto limit : limits) {
         auto actual = initial;
-        kernel->execute(actual, limit);
+        kernel.execute(actual, limit);
         fil::cpu::CortexM4 reference(bus);
         reference.state() = initial;
         const auto count = std::min(limit, program.size());
@@ -113,6 +122,14 @@ void expectDifferentialPrefixes(LlvmJit& jit,
         EXPECT_TRUE(equalState(actual, reference.state())) << "limit=" << limit;
     }
 }
+
+void expectDifferentialPrefixes(LlvmJit& jit,
+                                const std::vector<NativeJitInstruction>& program,
+                                const fil::cpu::CpuState& initial) {
+    const auto kernel = compile(jit, program);
+    ASSERT_NE(kernel, nullptr);
+    expectDifferentialPrefixes(*kernel, program, initial);
+}
 } // namespace
 
 TEST(LlvmJitTest, SupportsOnlyConservativeDecodedInstructionForms) {
@@ -120,7 +137,16 @@ TEST(LlvmJitTest, SupportsOnlyConservativeDecodedInstructionForms) {
         narrow(0xBF00U, entry), narrow(0x2001U, entry + 2U),
         narrow(0x3001U, entry + 4U), narrow(0x3801U, entry + 6U),
         narrow(0x2801U, entry + 8U),
-        wide(0xF110U, 0x0F01U, entry + 10U), // CMN r0,#1
+        narrow(0x1841U, entry + 10U), // ADD r1,r0,r1
+        narrow(0x1a5aU, entry + 12U), // SUB r2,r3,r1
+        narrow(0x4008U, entry + 14U), // ANDS r0,r1
+        narrow(0x4048U, entry + 16U), // EORS r0,r1
+        narrow(0x4308U, entry + 18U), // ORRS r0,r1
+        narrow(0x4388U, entry + 20U), // BICS r0,r1
+        wide(0xEB10U, 0x0001U, entry + 22U), // ADDS.W r0,r0,r1
+        wide(0xEBA0U, 0x0001U, entry + 26U), // SUB.W r0,r0,r1
+        wide(0xEA10U, 0x0001U, entry + 30U), // ANDS.W r0,r0,r1
+        wide(0xF110U, 0x0F01U, entry + 34U), // CMN r0,#1
         wide(0xF240U, 0x0001U, entry + 14U), // MOVW r0,#1
         wide(0xF2C0U, 0x0001U, entry + 18U), // MOVT r0,#1
     };
@@ -134,10 +160,24 @@ TEST(LlvmJitTest, SupportsOnlyConservativeDecodedInstructionForms) {
     auto memory = narrow(0x6808U, entry);
     auto it = narrow(0xBF08U, entry);
     auto bad_reg = narrow(0x4687U, entry); // MOV involving PC
+    auto adc = narrow(0x4148U, entry); // ADC r0,r1
+    auto shifted = wide(0xEB01U, 0x0042U, entry); // ADD.W with LSL #1
+    auto rrx = wide(0xEA01U, 0x0032U, entry); // AND.W with RRX
+    auto sp_operand = wide(0xEB0DU, 0x0001U, entry); // ADD.W with SP
+    auto pc_operand = wide(0xEB01U, 0x0001U, entry); // ADD.W with PC destination
+    pc_operand.decoded.rd = 15U;
+    auto non_al = narrow(0x1841U, entry);
+    non_al.decoded.condition = fil::cpu::Condition::eq;
     EXPECT_FALSE(LlvmJit::supports(conditional));
     EXPECT_FALSE(LlvmJit::supports(memory));
     EXPECT_FALSE(LlvmJit::supports(it));
     EXPECT_FALSE(LlvmJit::supports(bad_reg));
+    EXPECT_FALSE(LlvmJit::supports(adc));
+    EXPECT_FALSE(LlvmJit::supports(shifted));
+    EXPECT_FALSE(LlvmJit::supports(rrx));
+    EXPECT_FALSE(LlvmJit::supports(sp_operand));
+    EXPECT_FALSE(LlvmJit::supports(pc_operand));
+    EXPECT_FALSE(LlvmJit::supports(non_al));
 }
 
 TEST(LlvmJitTest, DifferentialArithmeticPrefixesPreserveUnrelatedState) {
@@ -259,6 +299,67 @@ TEST(LlvmJitTest, MovtAndMovwMovtCrossRegisterArithmeticFlagsMatchInterpreter) {
     expectDifferentialPrefixes(*jit, dependent_program, initial);
 }
 
+TEST(LlvmJitTest, DifferentialUnshiftedRegisterAluPrefixesMatchInterpreter) {
+    auto jit = compiler();
+    ASSERT_NE(jit, nullptr);
+    const std::vector program{
+        narrow(0x1841U, entry),       // ADDS r1,r0,r1; destination aliases Rm
+        narrow(0x1a5aU, entry + 2U),  // SUBS r2,r3,r1
+        narrow(0x4008U, entry + 4U),  // ANDS r0,r1
+        narrow(0x4051U, entry + 6U),  // EORS r1,r2; destination aliases Rn
+        narrow(0x4323U, entry + 8U),  // ORRS r3,r4
+        narrow(0x43a5U, entry + 10U), // BICS r5,r4
+        wide(0xEB19U, 0x0808U, entry + 12U), // ADDS.W r8,r9,r8
+        wide(0xEBAAU, 0x0b0aU, entry + 16U), // SUB.W r11,r10,r10 (no flags)
+        wide(0xEA1BU, 0x0c0bU, entry + 20U), // ANDS.W r12,r11,r11
+        wide(0xEA4BU, 0x080cU, entry + 24U), // ORR.W r8,r11,r12 (no flags)
+        wide(0xEA98U, 0x0908U, entry + 28U), // EORS.W r9,r8,r8
+        wide(0xEA29U, 0x090aU, entry + 32U), // BIC.W r9,r9,r10 (no flags)
+    };
+    for (const auto& instruction : program) ASSERT_TRUE(LlvmJit::supports(instruction))
+        << std::hex << instruction.decoded.raw;
+    const auto kernel = compile(*jit, program);
+    ASSERT_NE(kernel, nullptr);
+
+    constexpr std::array<std::uint32_t, 8> edges{
+        0U, 1U, 0x7fffffffU, 0x80000000U,
+        0xffffffffU, 0x55555555U, 0xaaaaaaaaU, 0xdeadbeefU};
+    for (std::size_t trial = 0; trial < edges.size(); ++trial) {
+        fil::cpu::CpuState initial{};
+        initial.r[15] = entry;
+        initial.instruction_address = entry;
+        for (std::size_t reg = 0; reg < 13U; ++reg)
+            initial.r[reg] = edges[(trial + reg * 3U) % edges.size()]
+                ^ static_cast<std::uint32_t>(trial * 0x10204081U + reg * 0x01010101U);
+        switch (trial % 4U) {
+        case 0U:
+            initial.r[0] = 0xffffffffU; initial.r[1] = 1U;
+            initial.r[3] = 0U; initial.r[8] = 0x7fffffffU; initial.r[9] = 1U;
+            initial.r[10] = 0x80000000U;
+            break;
+        case 1U:
+            initial.r[0] = 0x7fffffffU; initial.r[1] = 1U;
+            initial.r[3] = 0x80000000U; initial.r[8] = 0x80000000U;
+            initial.r[9] = 0x80000000U; initial.r[10] = 0xffffffffU;
+            break;
+        case 2U:
+            initial.r[0] = 0x80000000U; initial.r[1] = 0x80000000U;
+            initial.r[3] = 0xffffffffU; initial.r[8] = 0xffffffffU;
+            initial.r[9] = 1U; initial.r[10] = 1U;
+            break;
+        default: break;
+        }
+        initial.xpsr = fil::cpu::xpsr_t | fil::cpu::xpsr_q | fil::cpu::xpsr_ge_mask
+            | (((trial & 1U) != 0U) ? fil::cpu::xpsr_c : 0U)
+            | (((trial & 2U) != 0U) ? fil::cpu::xpsr_v : 0U);
+        initial.fpscr = 0xa5c30000U ^ static_cast<std::uint32_t>(trial * 0x12345U);
+        for (std::size_t s = 0; s < initial.s.size(); ++s)
+            initial.s[s] = std::bit_cast<float>(0x7fc00000U
+                | (static_cast<std::uint32_t>(s) << 8U) | static_cast<std::uint32_t>(trial));
+        expectDifferentialPrefixes(*kernel, program, initial);
+    }
+}
+
 TEST(LlvmJitTest, BranchPrefixesMatchInterpreterForFallthroughAndTakenTargets) {
     auto jit = compiler();
     ASSERT_NE(jit, nullptr);
@@ -364,15 +465,17 @@ TEST(LlvmJitIntegrationTest, CompiledBranchFaultOnNextDispatchMatchesInterpreter
     initial.r[13] = initial.msp;
     native.state() = initial;
     reference.state() = initial;
-    std::optional<fil::cpu::CortexM4::JitStepOutcome> branch;
-    for (std::int32_t i = 0; i < 1024 && native.jitStats().native_executions == 0U; ++i) {
+    for (std::int32_t i = 0; i < 1024 && native.jitStats().native_compilations == 0U; ++i) {
         native.state() = initial;
-        branch = native.tryStepJitBlock(2U);
+        static_cast<void>(native.tryStepJitBlock(2U));
     }
-    ASSERT_GT(native.jitStats().native_executions, 0U) << native.nativeJitError()
-        << " compilations=" << native.jitStats().native_compilations
+    ASSERT_GT(native.jitStats().native_compilations, 0U) << native.nativeJitError()
         << " failures=" << native.jitStats().native_compilation_failures
         << " block compilations=" << native.jitStats().compilations;
+    ASSERT_TRUE(promoteNativeForTest(native, ram, true, 2U));
+    native.state() = initial;
+    const auto branch = native.tryStepJitBlock(2U);
+    ASSERT_GT(native.jitStats().native_executions, 0U) << native.nativeJitError();
     ASSERT_TRUE(branch.has_value());
     ASSERT_EQ(reference.stepFast().reason, fil::cpu::StopReason::step_complete);
     ASSERT_EQ(reference.stepFast().reason, fil::cpu::StopReason::step_complete);
@@ -448,13 +551,14 @@ TEST(LlvmJitIntegrationTest, SingleInstructionNativeHotPathInvalidatesAfterExecu
     initial.instruction_address = ram;
     initial.msp = ram + 0xf0U;
     initial.r[13] = initial.msp;
-    std::optional<fil::cpu::FastStepResult> last;
-    for (std::int32_t i = 0; i < 20000 && jit.jitStats().native_executions == 0U; ++i) {
+    for (std::int32_t i = 0; i < 20000 && jit.jitStats().native_compilations == 0U; ++i) {
         jit.state() = initial;
-        last = jit.stepJitFast();
+        static_cast<void>(jit.stepJitFast());
     }
-    ASSERT_TRUE(last.has_value());
     ASSERT_GT(jit.jitStats().native_compilations, 0U) << jit.nativeJitError();
+    ASSERT_TRUE(promoteNativeForTest(jit, ram, false, 1U));
+    jit.state() = initial;
+    static_cast<void>(jit.stepJitFast());
     ASSERT_GT(jit.jitStats().native_executions, 0U) << jit.nativeJitError();
     EXPECT_EQ(jit.state().r[0], 1U);
 
@@ -471,12 +575,15 @@ TEST(LlvmJitIntegrationTest, SingleInstructionNativeHotPathInvalidatesAfterExecu
     EXPECT_EQ(actual.instruction_size, expected.instruction_size);
     EXPECT_EQ(actual.cycles, expected.cycles);
     EXPECT_TRUE(fil::cpu::bitwiseEqual(jit.state(), reference.state()));
-    for (std::int32_t i = 0; i < 20000 && jit.jitStats().native_executions == executions_before; ++i) {
+    for (std::int32_t i = 0; i < 20000 && jit.jitStats().native_compilations == compilations_before; ++i) {
         jit.state() = initial;
         static_cast<void>(jit.stepJitFast());
     }
-    EXPECT_GT(jit.jitStats().native_compilations, compilations_before)
+    ASSERT_GT(jit.jitStats().native_compilations, compilations_before)
         << "executable RAM generation change must discard stale native code";
+    ASSERT_TRUE(promoteNativeForTest(jit, ram, false, 1U));
+    jit.state() = initial;
+    static_cast<void>(jit.stepJitFast());
     EXPECT_GT(jit.jitStats().native_executions, executions_before);
     EXPECT_EQ(jit.state().r[0], 9U);
 }
@@ -507,13 +614,14 @@ TEST(LlvmJitIntegrationTest, HotCappedNativeBlockMatchesInterpreterAndTracksNati
         reference_cycles = static_cast<std::uint16_t>(reference_cycles + step.cycles);
     }
 
-    std::optional<fil::cpu::CortexM4::JitStepOutcome> result;
-    for (std::int32_t i = 0; i < 1024; ++i) {
+    for (std::int32_t i = 0; i < 1024 && cpu.jitStats().native_compilations == 0U; ++i) {
         cpu.state() = initial;
-        result = cpu.tryStepJitBlock(2U);
-        if (cpu.jitStats().native_executions != 0U) break;
+        static_cast<void>(cpu.tryStepJitBlock(2U));
     }
     ASSERT_GT(cpu.jitStats().native_compilations, 0U) << cpu.nativeJitError();
+    ASSERT_TRUE(promoteNativeForTest(cpu, ram, true, 2U));
+    cpu.state() = initial;
+    const auto result = cpu.tryStepJitBlock(2U);
     ASSERT_GT(cpu.jitStats().native_executions, 0U) << cpu.nativeJitError();
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result->count, 2U);
@@ -539,11 +647,11 @@ TEST(LlvmJitIntegrationTest, MixedBlockNativePrefixPreservesSuffixAndLimits) {
     for (const bool unsupported_first : {false, true}) {
         fil::mem::MemoryBus bus;
         ASSERT_TRUE(bus.mapRam(ram, 256U, "mixed-native", true).hasValue());
-        // Four supported ops; register ADDS (not lowered); NOP; BKPT.
+        // Four supported ops; register MULS (not lowered); NOP; BKPT.
         std::array<std::uint8_t, 14> code{0x01, 0x20, 0x01, 0x30,
-            0x00, 0xbf, 0x00, 0xbf, 0x40, 0x18, 0x00, 0xbf, 0x00, 0xbe};
+            0x00, 0xbf, 0x00, 0xbf, 0x48, 0x43, 0x00, 0xbf, 0x00, 0xbe};
         if (unsupported_first) {
-            code[0] = 0x40; code[1] = 0x18;
+            code[0] = 0x48; code[1] = 0x43;
         }
         ASSERT_TRUE(bus.loadBytes(ram, code).hasValue());
         fil::cpu::CortexM4 cpu(bus), reference(bus);
@@ -554,7 +662,9 @@ TEST(LlvmJitIntegrationTest, MixedBlockNativePrefixPreservesSuffixAndLimits) {
             cpu.state() = initial;
             static_cast<void>(cpu.tryStepJitBlock(6U));
         }
-        EXPECT_EQ(cpu.jitStats().native_compilations, unsupported_first ? 0U : 1U);
+        ASSERT_EQ(cpu.jitStats().native_compilations, unsupported_first ? 0U : 1U);
+        if (!unsupported_first)
+            ASSERT_TRUE(promoteNativeForTest(cpu, ram, true, 4U));
         for (std::size_t limit = 1; limit <= 6; ++limit) {
             cpu.state() = reference.state() = initial;
             std::uint16_t cycles = 0;
@@ -610,6 +720,10 @@ TEST(LlvmJitIntegrationTest, NativeBlockAdmissionRequiresActualMultiInstructionU
     cpu.state() = initial;
     ASSERT_TRUE(cpu.tryStepJitBlock(4U));
     EXPECT_EQ(cpu.jitStats().native_compilations, 1U);
+    EXPECT_EQ(cpu.jitStats().native_instructions, 0U);
+    ASSERT_TRUE(promoteNativeForTest(cpu, ram, true, 4U));
+    cpu.state() = initial;
+    ASSERT_TRUE(cpu.tryStepJitBlock(4U));
     EXPECT_EQ(cpu.jitStats().native_instructions, 4U);
 }
 
@@ -645,6 +759,7 @@ TEST(LlvmJitIntegrationTest, EvictedNativeBlockRewarmsWithoutStaleEntryPoint) {
     };
     for (std::int32_t i = 0; i < 600; ++i) step_block();
     ASSERT_EQ(cpu.jitStats().native_compilations, 1U);
+    ASSERT_TRUE(promoteNativeForTest(cpu, ram, true, 4U));
     for (std::size_t site = 0; site < 31; ++site) {
         const auto before = cpu.jitStats().native_compilations;
         for (std::int32_t i = 0; i < 20000 && cpu.jitStats().native_compilations == before; ++i) {
@@ -652,6 +767,9 @@ TEST(LlvmJitIntegrationTest, EvictedNativeBlockRewarmsWithoutStaleEntryPoint) {
             if (i % 100 == 0) step_block(); // Block touch must affect LRU.
         }
         ASSERT_EQ(cpu.jitStats().native_compilations, before + 1U);
+        ASSERT_TRUE(promoteNativeForTest(cpu,
+            ram + 32U + static_cast<std::uint32_t>(site * 4U), false, 1U));
+        step_single(site);
     }
     ASSERT_EQ(cpu.jitStats().native_evictions, 0U);
     auto before = cpu.jitStats();
@@ -662,12 +780,16 @@ TEST(LlvmJitIntegrationTest, EvictedNativeBlockRewarmsWithoutStaleEntryPoint) {
         step_single(31);
         if (i % 100 == 0) for (std::size_t site = 0; site < 31; ++site) step_single(site);
     }
+    ASSERT_EQ(cpu.jitStats().native_compilations, before.native_compilations + 1U);
+    ASSERT_TRUE(promoteNativeForTest(cpu, ram + 32U + 31U * 4U, false, 1U));
+    step_single(31);
     ASSERT_EQ(cpu.jitStats().native_evictions, 1U);
     before = cpu.jitStats();
     step_block();
     EXPECT_EQ(cpu.jitStats().native_instructions, before.native_instructions);
     for (std::int32_t i = 0; i < 20000 && cpu.jitStats().native_compilations == before.native_compilations; ++i) step_block();
-    EXPECT_EQ(cpu.jitStats().native_compilations, before.native_compilations + 1U);
+    ASSERT_EQ(cpu.jitStats().native_compilations, before.native_compilations + 1U);
+    ASSERT_TRUE(promoteNativeForTest(cpu, ram, true, 4U));
     EXPECT_EQ(cpu.jitStats().native_evictions, 2U);
     before = cpu.jitStats();
     step_block();
@@ -700,6 +822,9 @@ TEST(LlvmJitIntegrationTest, LruRetainsRecentKernelAndEvictedSitesRewarm) {
             if (site != 0 && warm % 100 == 0) step_site(0); // Keep anchor MRU.
         }
         ASSERT_EQ(cpu.jitStats().native_compilations, before + 1U) << "site=" << site;
+        ASSERT_TRUE(promoteNativeForTest(cpu,
+            ram + static_cast<std::uint32_t>(site * 4U), false, 1U));
+        step_site(site);
     }
     ASSERT_EQ(cpu.jitStats().native_evictions, 1U);
     auto before = cpu.jitStats();
@@ -715,7 +840,9 @@ TEST(LlvmJitIntegrationTest, LruRetainsRecentKernelAndEvictedSitesRewarm) {
         step_site(1);
         if (warm % 100 == 0) step_site(0);
     }
-    EXPECT_EQ(cpu.jitStats().native_compilations, before.native_compilations + 1U);
+    ASSERT_EQ(cpu.jitStats().native_compilations, before.native_compilations + 1U);
+    ASSERT_TRUE(promoteNativeForTest(cpu, ram + 4U, false, 1U));
+    step_site(1);
     EXPECT_EQ(cpu.jitStats().native_evictions, 2U);
 }
 #endif // FIL_HAS_LLVM_JIT

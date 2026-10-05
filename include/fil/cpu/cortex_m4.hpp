@@ -397,8 +397,22 @@ public:
         std::uint64_t native_instructions{0};
         std::uint64_t native_compilation_failures{0};
         std::uint64_t native_evictions{0};
+        std::uint64_t native_policy_samples{0};
+        std::uint64_t native_promotions{0};
+        std::uint64_t native_demotions{0};
+        std::uint64_t native_compile_cost_ns{0};
+        std::uint64_t native_startup_cost_ns{0};
+        std::uint64_t native_probe_instructions{0};
+        std::uint64_t native_policy_mismatches{0};
+        std::uint64_t native_policy_probe_cost_ns{0};
+        std::uint64_t native_policy_empty_samples{0};
     };
     [[nodiscard]] JitStats jitStats() const noexcept { return jit_stats_; }
+    /** @brief Injects a deterministic matched policy window for the current resident (tests only). */
+    [[nodiscard]] bool observeNativePolicyForTesting(
+        std::uint32_t pc, bool block, std::uint64_t cached_ns,
+        std::uint64_t native_ns, std::uint32_t instructions);
+    [[nodiscard]] bool rejectNativeForTesting(std::uint32_t pc, bool block);
     [[nodiscard]] const std::string& nativeJitError() const noexcept { return native_jit_error_; }
 
     /**
@@ -511,6 +525,8 @@ private:
         std::uint8_t native_slot{0U};
         std::uint16_t native_hits{0U};
         bool native_attempted{false};
+        std::uint8_t native_candidate_count{0U};
+        bool native_candidate_checked{false};
         std::array<DecodedInstruction, JitStepOutcome::max_block> ops{};
         std::array<std::uint32_t, JitStepOutcome::max_block> pcs{};
         std::array<std::uint8_t, JitStepOutcome::max_block> sizes{};
@@ -570,6 +586,11 @@ private:
     void touchNativeKernel(std::uint8_t slot) noexcept;
     [[nodiscard]] bool executeNativeInstruction(InstructionCacheEntry& entry);
     void prepareNativeBlock(JitBlockEntry& entry);
+    void sampleNativeSingle(InstructionCacheEntry& entry);
+    void sampleNativeBlock(JitBlockEntry& entry, std::uint8_t count);
+    void recordNativePolicySample(std::uint8_t slot, std::uint64_t cached_ns,
+                                  std::uint64_t native_ns, std::uint32_t count);
+    void rejectNativeResident(std::uint8_t slot) noexcept;
 
     [[nodiscard]] FastStepResult stepFastImpl(bool use_jit, bool fast_handler_declined = false);
     /// Shared block-execution body; prepared skips hotness/validity probing.

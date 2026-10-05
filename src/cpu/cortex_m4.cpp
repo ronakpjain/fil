@@ -2,6 +2,7 @@
 
 #include "fil/cpu/decoder.hpp"
 #include "fil/cpu/jit.hpp"
+#include "fil/cpu/native_jit_policy.hpp"
 #if FIL_HAS_LLVM_JIT
 #include "fil/cpu/llvm_jit.hpp"
 #include <cstdint>
@@ -12,18 +13,29 @@
 
 #include <algorithm>
 #include <array>
+#if !defined(__GNUC__) && !defined(__clang__)
+#include <atomic>
+#endif
 #include <bit>
 #include <cassert>
 #include <cstring>
+#include <chrono>
 #include <iomanip>
 #include <limits>
 #include <memory>
 #include <sstream>
+#include <vector>
 
 namespace fil::cpu {
 namespace {
 
 constexpr std::uint32_t xpsr_it_mask = (0x3U << 25U) | (0x3fU << 10U);
+
+[[nodiscard]] constexpr std::uint64_t saturatingCounterAdd(
+    const std::uint64_t left, const std::uint64_t right) noexcept {
+    return right > std::numeric_limits<std::uint64_t>::max() - left
+        ? std::numeric_limits<std::uint64_t>::max() : left + right;
+}
 
 [[nodiscard]] bool suppressImplicitFlagsInIt(const InstrKind kind) noexcept {
     switch (kind) {
@@ -51,6 +63,32 @@ constexpr std::uint32_t xpsr_it_mask = (0x3U << 25U) | (0x3fU << 10U);
     }
 }
 
+[[nodiscard]] bool nativePolicyInstructionShape(const DecodedInstruction& op) noexcept {
+    if (op.condition != Condition::al) return false;
+    switch (op.kind) {
+    case InstrKind::nop:
+    case InstrKind::b:
+    case InstrKind::bl:
+    case InstrKind::movw:
+    case InstrKind::movt:
+        return true;
+    case InstrKind::mov:
+        return op.form == OperandForm::immediate;
+    case InstrKind::add:
+    case InstrKind::sub:
+    case InstrKind::cmp:
+    case InstrKind::cmn:
+    case InstrKind::and_:
+    case InstrKind::orr:
+    case InstrKind::eor:
+    case InstrKind::bic:
+        return op.form != OperandForm::register_value
+            || (op.shift_type == ShiftType::lsl && op.shift_amount == 0U);
+    default:
+        return false;
+    }
+}
+
 [[nodiscard]] std::string undefinedMessage(
     const std::uint32_t pc,
     const std::uint32_t raw,
@@ -62,6 +100,21 @@ constexpr std::uint32_t xpsr_it_mask = (0x3U << 25U) | (0x3fU << 10U);
            << static_cast<std::uint32_t>(size * 8U) << "=0x" << std::hex
            << std::setw(size == 2U ? 4 : 8) << raw;
     return output.str();
+}
+
+inline void preserveBenchmarkState(const CpuState& state) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+    // Make the complete post-handler object an opaque memory input without
+    // adding runtime hashing work to the measured window.
+    __asm__ __volatile__("" : : "m"(state) : "memory");
+#else
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    const volatile auto* bytes = reinterpret_cast<const volatile unsigned char*>(&state);
+    unsigned char observed = 0U;
+    for (std::size_t i = 0U; i < sizeof(state); ++i) observed ^= bytes[i];
+    static_cast<void>(observed);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
 }
 
 inline void jitSetNz(CpuState& state, const std::uint32_t value) noexcept {
@@ -351,12 +404,15 @@ bool RunResult::succeeded() const noexcept {
 struct CortexM4::NativeState {
 #if FIL_HAS_LLVM_JIT
     std::unique_ptr<LlvmJit> compiler;
+#endif
     struct Resident {
         std::shared_ptr<const NativeJitKernel> kernel;
         std::uint64_t last_used{0};
+        NativeJitPolicy policy{};
+        std::uint32_t probe_countdown{131072U};
+        bool sampleable{false};
     };
     std::vector<Resident> kernels;
-#endif
 };
 
 CortexM4::CortexM4(mem::MemoryBus& memory) : memory_(memory) {
@@ -375,7 +431,15 @@ bool CortexM4::ensureNativeCompiler() {
 #if FIL_HAS_LLVM_JIT
     if (!native_state_) {
         native_state_ = std::make_unique<NativeState>();
+        const auto startup_start = std::chrono::steady_clock::now();
         native_state_->compiler = LlvmJit::create(native_jit_error_);
+        const auto startup_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - startup_start).count());
+        jit_stats_.native_startup_cost_ns = saturatingCounterAdd(
+            jit_stats_.native_startup_cost_ns, startup_ns);
+        jit_stats_.native_compile_cost_ns = saturatingCounterAdd(
+            jit_stats_.native_compile_cost_ns, startup_ns);
         if (!native_state_->compiler) ++jit_stats_.native_compilation_failures;
     }
     if (!native_state_->compiler) return false;
@@ -439,7 +503,15 @@ bool CortexM4::executeNativeInstruction(InstructionCacheEntry& entry) {
     ++native_clock_;
     if (state_.it_state != 0U || state_.pending_exception || state_.pending_exc_return) return false;
     if (entry.native_function) {
-        touchNativeKernel(entry.native_slot);
+        auto& resident = native_state_->kernels[entry.native_slot];
+        touchNativeKernel(entry.native_slot); // Cached re-probes count as resident reuse.
+        resident.policy.noteReuse();
+        if (resident.sampleable) {
+            if (resident.probe_countdown != 0U) --resident.probe_countdown;
+            else sampleNativeSingle(entry);
+        }
+        if (!resident.sampleable
+            || resident.policy.state() != NativeJitPolicy::State::native) return false;
         entry.native_function(&state_, 1U);
         ++jit_stats_.native_executions;
         ++jit_stats_.native_instructions;
@@ -457,8 +529,13 @@ bool CortexM4::executeNativeInstruction(InstructionCacheEntry& entry) {
         entry.native_attempted = false;
         return false;
     }
+    const auto compile_start = std::chrono::steady_clock::now();
     auto kernel = native_state_->compiler->compile(
         std::span<const NativeJitInstruction>{&instruction, 1U}, native_jit_error_);
+    const auto compile_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<
+        std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compile_start).count());
+    jit_stats_.native_compile_cost_ns = saturatingCounterAdd(
+        jit_stats_.native_compile_cost_ns, compile_ns);
     if (!kernel || !kernel->entryPoint()) {
         ++jit_stats_.native_compilation_failures;
         entry.native_supported = false;
@@ -466,26 +543,170 @@ bool CortexM4::executeNativeInstruction(InstructionCacheEntry& entry) {
     }
     entry.native_function = kernel->entryPoint();
     entry.native_slot = retainNativeKernel(std::move(kernel));
+    auto& resident = native_state_->kernels[entry.native_slot];
+    resident.policy.addKernelCompileCost(compile_ns);
+    resident.policy.noteReuse(entry.native_hits);
+    const auto fast = static_cast<JitFast>(entry.jit_fast);
+    resident.sampleable = !entry.may_trap && fast != JitFast::generic
+        && nativePolicyInstructionShape(entry.decoded);
     ++jit_stats_.native_compilations;
-    entry.native_function(&state_, 1U);
-    ++jit_stats_.native_executions;
-    ++jit_stats_.native_instructions;
-    return true;
+    // Compilation debt is considered by policy samples before native promotion.
+    // This instruction therefore takes its existing cached path unchanged.
+    return false;
 #else
     static_cast<void>(entry);
     return false;
 #endif
 }
 
+bool CortexM4::observeNativePolicyForTesting(const std::uint32_t pc,
+    const bool block, const std::uint64_t cached_ns, const std::uint64_t native_ns,
+    const std::uint32_t instructions) {
+    if (block) {
+        auto& entry = (*jit_blocks_)[jitBlockIndex(pc)];
+        if (!entry.native_function || entry.pc != pc
+            || entry.generation != memory_.executionGeneration()) return false;
+        recordNativePolicySample(entry.native_slot, cached_ns, native_ns, instructions);
+        return true;
+    }
+    auto& entry = (*instruction_cache_)[instructionCacheIndex(pc)];
+    if (!entry.native_function || entry.pc != pc
+        || entry.generation != memory_.executionGeneration()) return false;
+    recordNativePolicySample(entry.native_slot, cached_ns, native_ns, instructions);
+    return true;
+}
+
+bool CortexM4::rejectNativeForTesting(const std::uint32_t pc, const bool block) {
+    if (block) {
+        const auto& entry = (*jit_blocks_)[jitBlockIndex(pc)];
+        if (!entry.native_function || entry.pc != pc) return false;
+        rejectNativeResident(entry.native_slot);
+        return true;
+    }
+    const auto& entry = (*instruction_cache_)[instructionCacheIndex(pc)];
+    if (!entry.native_function || entry.pc != pc) return false;
+    rejectNativeResident(entry.native_slot);
+    return true;
+}
+
+void CortexM4::rejectNativeResident(const std::uint8_t slot) noexcept {
+    if (!native_state_ || slot >= native_state_->kernels.size()) return;
+    native_state_->kernels[slot].policy.reject();
+}
+
+void CortexM4::recordNativePolicySample(const std::uint8_t slot,
+    const std::uint64_t cached_ns, const std::uint64_t native_ns,
+    const std::uint32_t count) {
+    if (!native_state_ || slot >= native_state_->kernels.size()) return;
+    auto& policy = native_state_->kernels[slot].policy;
+    const auto before = policy.state();
+    const auto after = policy.observe(cached_ns, native_ns, count);
+    jit_stats_.native_policy_probe_cost_ns = saturatingCounterAdd(
+        jit_stats_.native_policy_probe_cost_ns, saturatingCounterAdd(cached_ns, native_ns));
+    if (!policy.hasTimingWindow(cached_ns, native_ns, count)) {
+        ++jit_stats_.native_policy_empty_samples;
+        return;
+    }
+    ++jit_stats_.native_policy_samples;
+    jit_stats_.native_probe_instructions = saturatingCounterAdd(
+        jit_stats_.native_probe_instructions, count);
+    if (before != NativeJitPolicy::State::native
+        && after == NativeJitPolicy::State::native) ++jit_stats_.native_promotions;
+    if (before == NativeJitPolicy::State::native
+        && after != NativeJitPolicy::State::native) ++jit_stats_.native_demotions;
+}
+
+void CortexM4::sampleNativeSingle(InstructionCacheEntry& entry) {
+    auto& resident = native_state_->kernels[entry.native_slot];
+    resident.probe_countdown = 131072U;
+    if (!entry.native_function || !resident.sampleable) return;
+    const CpuState seed = state_;
+    // Grow cheap kernels beyond timer resolution while keeping total shadow
+    // work below 1% of the steady 131,072-instruction probe cadence.
+    constexpr std::uint32_t repetitions = 512U;
+    const auto cached_start = std::chrono::steady_clock::now();
+    for (std::uint32_t i = 0U; i < repetitions; ++i) {
+        state_ = seed;
+        if (!executeJitFast(entry.decoded, static_cast<JitFast>(entry.jit_fast), entry.pc)) break;
+        preserveBenchmarkState(state_);
+    }
+    const auto cached_end = std::chrono::steady_clock::now();
+    const CpuState cached_result = state_;
+    const auto native_start = std::chrono::steady_clock::now();
+    for (std::uint32_t i = 0U; i < repetitions; ++i) {
+        state_ = seed;
+        entry.native_function(&state_, 1U);
+        preserveBenchmarkState(state_);
+    }
+    const auto native_end = std::chrono::steady_clock::now();
+    const CpuState native_result = state_;
+    state_ = seed;
+    if (!bitwiseEqual(cached_result, native_result)) {
+        ++jit_stats_.native_policy_mismatches;
+        rejectNativeResident(entry.native_slot);
+        return;
+    }
+    const auto cached_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<
+        std::chrono::nanoseconds>(cached_end - cached_start).count());
+    const auto native_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<
+        std::chrono::nanoseconds>(native_end - native_start).count());
+    recordNativePolicySample(entry.native_slot, cached_ns, native_ns, repetitions);
+}
+
+void CortexM4::sampleNativeBlock(JitBlockEntry& entry, const std::uint8_t count) {
+    auto& resident = native_state_->kernels[entry.native_slot];
+    resident.probe_countdown = 131072U;
+    if (count == 0U || count > entry.count || !entry.native_function
+        || !resident.sampleable) return;
+    const CpuState seed = state_;
+    // Keep the work window roughly constant across full and capped prefixes.
+    constexpr std::uint32_t window_instructions = 512U;
+    const std::uint32_t repetitions = (window_instructions + count - 1U) / count;
+    const auto cached_start = std::chrono::steady_clock::now();
+    for (std::uint32_t repeat = 0U; repeat < repetitions; ++repeat) {
+        state_ = seed;
+        for (std::uint8_t i = 0U; i < count; ++i) {
+            const auto pc = entry.pcs[i];
+            state_.r[15] = pc + entry.sizes[i];
+            const bool handled = executeJitFast(entry.ops[i], entry.fast[i], pc);
+            if (!handled || entry.is_terminator[i]) break;
+        }
+        state_.instruction_address = entry.pcs[count - 1U];
+        preserveBenchmarkState(state_);
+    }
+    const auto cached_end = std::chrono::steady_clock::now();
+    const CpuState cached_result = state_;
+    const auto native_start = std::chrono::steady_clock::now();
+    for (std::uint32_t repeat = 0U; repeat < repetitions; ++repeat) {
+        state_ = seed;
+        entry.native_function(&state_, count);
+        state_.instruction_address = entry.pcs[count - 1U];
+        preserveBenchmarkState(state_);
+    }
+    const auto native_end = std::chrono::steady_clock::now();
+    const CpuState native_result = state_;
+    state_ = seed;
+    if (!bitwiseEqual(cached_result, native_result)) {
+        ++jit_stats_.native_policy_mismatches;
+        rejectNativeResident(entry.native_slot);
+        return;
+    }
+    const auto cached_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<
+        std::chrono::nanoseconds>(cached_end - cached_start).count());
+    const auto native_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<
+        std::chrono::nanoseconds>(native_end - native_start).count());
+    recordNativePolicySample(entry.native_slot, cached_ns, native_ns,
+        static_cast<std::uint32_t>(count) * repetitions);
+}
+
 void CortexM4::prepareNativeBlock(JitBlockEntry& entry) {
     entry.native_attempted = true;
 #if FIL_HAS_LLVM_JIT
     std::array<NativeJitInstruction, JitStepOutcome::max_block> instructions{};
-    std::uint8_t supported_count = 0U;
-    for (; supported_count < entry.count; ++supported_count) {
-        instructions[supported_count] = {entry.ops[supported_count],
-            entry.pcs[supported_count], entry.sizes[supported_count]};
-        if (!LlvmJit::supports(instructions[supported_count])) break;
+    const std::uint8_t supported_count = entry.native_candidate_count;
+    if (!entry.native_candidate_checked || supported_count == 0U) return;
+    for (std::uint8_t i = 0U; i < supported_count; ++i) {
+        instructions[i] = {entry.ops[i], entry.pcs[i], entry.sizes[i]};
     }
     // Spend scarce native slots on multi-instruction kernels. Short mixed
     // prefixes retain cached execution; sustained hot singles use their own gate.
@@ -496,8 +717,13 @@ void CortexM4::prepareNativeBlock(JitBlockEntry& entry) {
         entry.native_attempted = false;
         return;
     }
+    const auto compile_start = std::chrono::steady_clock::now();
     auto kernel = native_state_->compiler->compile(
         std::span<const NativeJitInstruction>{instructions.data(), supported_count}, native_jit_error_);
+    const auto compile_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<
+        std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compile_start).count());
+    jit_stats_.native_compile_cost_ns = saturatingCounterAdd(
+        jit_stats_.native_compile_cost_ns, compile_ns);
     if (!kernel || !kernel->entryPoint()) {
         ++jit_stats_.native_compilation_failures;
         return;
@@ -505,6 +731,18 @@ void CortexM4::prepareNativeBlock(JitBlockEntry& entry) {
     entry.native_function = kernel->entryPoint();
     entry.native_count = supported_count;
     entry.native_slot = retainNativeKernel(std::move(kernel));
+    auto& resident = native_state_->kernels[entry.native_slot];
+    resident.policy.addKernelCompileCost(compile_ns);
+    resident.policy.noteReuse(entry.native_hits);
+    resident.sampleable = true;
+    for (std::uint8_t i = 0U; i < supported_count; ++i) {
+        if (!nativePolicyInstructionShape(entry.ops[i])
+            || entry.fast[i] == JitFast::generic || entry.is_memory[i]
+            || entry.divide_form[i]) {
+            resident.sampleable = false;
+            break;
+        }
+    }
     ++jit_stats_.native_compilations;
 #else
     static_cast<void>(entry);
@@ -535,7 +773,7 @@ FastStepResult CortexM4::stepJitFast() {
     // frame nor the generic IT/restart state. Keep those off its call stack.
     const auto pc = state_.r[15];
     auto& cache = (*instruction_cache_)[instructionCacheIndex(pc)];
-    if (!native_single_instruction_jit_enabled_ && !state_.halted && state_.thumb
+    if (!state_.halted && state_.thumb
         && (state_.xpsr & xpsr_t) != 0U && (pc & 1U) == 0U && state_.it_state == 0U
         && cache.pc == pc && cache.generation == memory_.executionGeneration()
         && static_cast<JitFast>(cache.jit_fast) != JitFast::generic) [[likely]] {
@@ -547,7 +785,15 @@ FastStepResult CortexM4::stepJitFast() {
         const auto old_instruction_address = state_.instruction_address;
         state_.instruction_address = pc;
         state_.r[15] = pc + cache.size;
-        if (!condition_passed || executeJitFast(decoded, static_cast<JitFast>(cache.jit_fast), pc)) {
+        bool handled = !condition_passed;
+        if (condition_passed && native_single_instruction_jit_enabled_
+            && (cache.native_supported || cache.native_function)) {
+            handled = executeNativeInstruction(cache);
+        }
+        if (condition_passed && !handled) {
+            handled = executeJitFast(decoded, static_cast<JitFast>(cache.jit_fast), pc);
+        }
+        if (handled) {
             if (condition_passed) ++jit_stats_.single_fast;
             FastStepResult result;
             result.instruction_address = pc;
@@ -1486,6 +1732,23 @@ bool CortexM4::prepareJitBlock(const bool allow_single) {
         return false;
     }
     fresh.valid = true;
+#if FIL_HAS_LLVM_JIT
+    fresh.native_candidate_checked = true;
+    for (std::uint8_t i = 0U; i < fresh.count; ++i) {
+        const NativeJitInstruction candidate{fresh.ops[i], fresh.pcs[i], fresh.sizes[i]};
+        if (!LlvmJit::supports(candidate)
+            || !nativePolicyInstructionShape(fresh.ops[i])
+            || fresh.fast[i] == JitFast::generic || fresh.is_memory[i]
+            || fresh.divide_form[i]) break;
+        ++fresh.native_candidate_count;
+    }
+    if (fresh.native_candidate_count == 0U
+        || (fresh.native_candidate_count < fresh.count
+            && fresh.native_candidate_count < 4U)) {
+        fresh.native_candidate_count = 0U;
+        fresh.native_attempted = true;
+    }
+#endif
     // Precompute pure-integer fast-block metadata. Control-flow kinds always
     // terminate the block, so mid-block fast ops are straight-line ALU and
     // the block's final suppress flag and base cycle sum are compile-time.
@@ -1765,10 +2028,138 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
     bool last_suppress = false;
     const auto execution_count = static_cast<std::uint8_t>(
         std::min<std::size_t>(max_instructions, slot.count));
-    // budget->total_instruction_cycles entries [0, count) are rewritten on
-    // every call before callers read them; no zero fill is needed.
+    // Only total_instruction_cycles entries [0, count) are observed by callers;
+    // preserve the unused suffix instead of zero-filling the whole array.
+    std::uint8_t first_cached = 0U;
+    std::uint8_t cached_limit = execution_count;
+#if FIL_HAS_LLVM_JIT
+    bool native_probe_sampled = false;
+    if (slot.native_function && slot.native_count != 0U) {
+        const auto count = std::min(execution_count, slot.native_count);
+        auto& resident = native_state_->kernels[slot.native_slot];
+        const bool candidate = resident.sampleable
+            && resident.policy.state() != NativeJitPolicy::State::rejected;
+        const bool sample_due = candidate && resident.probe_countdown <= count;
+        if (!budget && sample_due) {
+            sampleNativeBlock(slot, count);
+            native_probe_sampled = true;
+        }
+        if (!budget) {
+            if (candidate && resident.policy.state() == NativeJitPolicy::State::native) {
+                slot.native_function(&state_, count);
+                state_.instruction_address = slot.pcs[count - 1U];
+                for (std::uint8_t i = 0U; i < count; ++i) {
+                    timed.instruction_cycles[i] = slot.base_cycles[i];
+                    total_cycles += slot.base_cycles[i];
+                }
+                if (state_.r[15] != slot.pcs[count - 1U] + slot.sizes[count - 1U]) {
+                    timed.instruction_cycles[count - 1U] = static_cast<std::uint16_t>(
+                        timed.instruction_cycles[count - 1U] + slot.branch_penalty[count - 1U]);
+                    total_cycles += slot.branch_penalty[count - 1U];
+                }
+                first_cached = count;
+                ++jit_stats_.native_executions;
+                jit_stats_.native_instructions += count;
+            }
+        } else if (candidate && (resident.policy.state() == NativeJitPolicy::State::native
+                                  || sample_due)) {
+            ReversibleCycleBudget staged = *budget;
+            std::uint8_t planned = 0U;
+            bool stopped_on_budget = false;
+            std::uint32_t planned_cycles = 0U;
+            std::uint32_t planned_pc = state_.r[15];
+            for (; planned < count; ++planned) {
+                const auto pc = slot.pcs[planned];
+                const auto size = slot.sizes[planned];
+                const auto& op = slot.ops[planned];
+                if (planned_pc != pc || !nativePolicyInstructionShape(op)
+                    || slot.fast[planned] == JitFast::generic
+                    || slot.is_memory[planned] || slot.divide_form[planned]) break;
+                const auto base = slot.base_cycles[planned];
+                const bool sequential = staged.have_fetch && pc == staged.fetch_end;
+                const auto stall = staged.fetch_stall
+                    ? staged.fetch_stall(staged.context, pc, sequential) : 0U;
+                const auto worst = static_cast<std::uint32_t>(base)
+                    + slot.branch_penalty[planned] + stall;
+                if (worst > staged.remaining_cycles
+                    || worst > std::numeric_limits<std::uint16_t>::max()) {
+                    stopped_on_budget = true;
+                    break;
+                }
+                std::uint32_t target = pc + size;
+                if (op.kind == InstrKind::b || op.kind == InstrKind::bl) {
+                    target = static_cast<std::uint32_t>(
+                        static_cast<std::int64_t>(pc) + 4 + op.branch_offset)
+                        & ~std::uint32_t{1};
+                }
+                auto actual_cycles = base;
+                if (target != pc + size) {
+                    actual_cycles = static_cast<std::uint16_t>(
+                        actual_cycles + slot.branch_penalty[planned]);
+                }
+                const auto charged = static_cast<std::uint32_t>(actual_cycles) + stall;
+                staged.total_instruction_cycles[planned] =
+                    static_cast<std::uint16_t>(charged);
+                staged.remaining_cycles -= charged;
+                staged.have_fetch = true;
+                staged.fetch_end = pc + size;
+                timed.instruction_cycles[planned] = actual_cycles;
+                planned_cycles += actual_cycles;
+                planned_pc = target;
+                if (slot.is_terminator[planned]) {
+                    ++planned;
+                    break;
+                }
+            }
+            if (planned == 0U) {
+                ++jit_stats_.fallbacks;
+                return std::nullopt; // Callback ran once; no state/budget/reuse commit.
+            }
+            if (sample_due) {
+                sampleNativeBlock(slot, planned);
+                native_probe_sampled = true;
+            }
+            const bool use_native = resident.sampleable
+                && resident.policy.state() == NativeJitPolicy::State::native;
+            if (use_native) {
+                slot.native_function(&state_, planned);
+                state_.instruction_address = slot.pcs[planned - 1U];
+                ++jit_stats_.native_executions;
+                jit_stats_.native_instructions += planned;
+            } else {
+                // Sample rejection/demotion is resolved before guest execution.
+                // Reuse the prepared fetch charges; do not invoke the callback again.
+                for (std::uint8_t i = 0U; i < planned; ++i) {
+                    const auto pc = slot.pcs[i];
+                    state_.instruction_address = pc;
+                    state_.r[15] = pc + slot.sizes[i];
+                    const bool handled = executeJitFast(
+                        slot.ops[i], slot.fast[i], pc);
+                    assert(handled);
+                    static_cast<void>(handled);
+                }
+            }
+            total_cycles += planned_cycles;
+            *budget = staged;
+            first_cached = planned;
+            if (stopped_on_budget) cached_limit = planned;
+        }
+        if (first_cached != 0U) {
+            for (std::uint8_t i = 0U; i < first_cached; ++i) {
+                out.pcs[i] = slot.pcs[i];
+                out.sizes[i] = slot.sizes[i];
+            }
+            out.count = first_cached;
+            const auto last = static_cast<std::uint8_t>(first_cached - 1U);
+            last_pc = slot.pcs[last];
+            last_raw = slot.raws[last];
+            last_size = slot.sizes[last];
+            last_suppress = slot.suppress_obs[last];
+        }
+    }
+#endif
 
-    for (std::uint8_t i = 0U; i < execution_count; ++i) {
+    for (std::uint8_t i = first_cached; i < cached_limit; ++i) {
         const DecodedInstruction& op = slot.ops[i];
         const std::uint32_t pc = slot.pcs[i];
         if (state_.r[15] != pc) break;
@@ -1857,6 +2248,26 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
     result.instructions = out.count;
     result.cycles = static_cast<std::uint16_t>(total_cycles);
     result.suppress_loop_observation = last_suppress;
+#if FIL_HAS_LLVM_JIT
+    if (slot.native_candidate_count != 0U || slot.native_function) ++native_clock_;
+    if (out.count >= 2U && slot.native_candidate_count != 0U
+        && !slot.native_function && !slot.native_attempted
+        && slot.generation == memory_.executionGeneration()) {
+        if (slot.native_hits < native_block_compile_threshold) ++slot.native_hits;
+        else prepareNativeBlock(slot);
+    }
+    if (slot.native_function) {
+        auto& resident = native_state_->kernels[slot.native_slot];
+        touchNativeKernel(slot.native_slot);
+        const auto reused = std::min<std::uint8_t>(out.count, slot.native_count);
+        resident.policy.noteReuse(reused);
+        if (resident.sampleable && !native_probe_sampled
+            && resident.policy.state() != NativeJitPolicy::State::rejected) {
+            resident.probe_countdown = resident.probe_countdown > reused
+                ? resident.probe_countdown - reused : 0U;
+        }
+    }
+#endif
     ++jit_stats_.block_executions;
     jit_stats_.block_instructions += out.count;
     return timed;
@@ -1865,9 +2276,6 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
 std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlockImpl(
     const std::size_t max_instructions, const bool prepared, const bool fast_only,
     std::array<std::uint16_t, JitStepOutcome::max_block>* instruction_cycles) {
-#if FIL_HAS_LLVM_JIT
-    if (max_instructions != 0U && !fast_only) ++native_clock_;
-#endif
     const std::uint32_t entry_pc = state_.r[15];
     if (max_instructions == 0U) {
         if (!prepared) ++jit_stats_.fallbacks;
@@ -1907,34 +2315,47 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlockImpl(
     // Only stores can change executable generations (loads never do), so
     // load-only blocks pay a single pre-loop generation check.
     const bool check_generation_per_op = slot.has_store;
+    bool native_probe_sampled = false;
 #if FIL_HAS_LLVM_JIT
-    // Previews alone must not spend native slots. Compile only a block that
-    // is actually admitted for multi-instruction execution by the scheduler.
-    if (!fast_only && execution_count > 1U
-        && !slot.native_function && !slot.native_attempted) {
-        if (slot.native_hits < native_block_compile_threshold) ++slot.native_hits;
-        else prepareNativeBlock(slot);
-    }
-    if (!fast_only && slot.native_function && state_.it_state == 0U) {
-        // Only independently lowered, pure unconditional instructions reach
-        // this path. The scheduler still controls the allowed prefix length.
+    if (slot.native_function && state_.it_state == 0U) {
+        // Samples execute both implementations on an identical shadow state,
+        // and are triggered only by this sparse countdown (not per instruction).
         const auto native_count = std::min(execution_count, slot.native_count);
-        touchNativeKernel(slot.native_slot);
-        slot.native_function(&state_, native_count);
-        std::memcpy(out.pcs.data(), slot.pcs.data(), native_count * sizeof(std::uint32_t));
-        std::memcpy(out.sizes.data(), slot.sizes.data(), native_count * sizeof(std::uint8_t));
-        total_cycles = slot.base_prefix_cycles[native_count];
-        const auto last = static_cast<std::size_t>(native_count - 1U);
-        if (state_.r[15] != slot.pcs[last] + slot.sizes[last]) {
-            total_cycles += slot.branch_penalty[last];
+        auto& resident = native_state_->kernels[slot.native_slot];
+        const bool sample_due = resident.sampleable
+            && resident.policy.state() != NativeJitPolicy::State::rejected
+            && resident.probe_countdown <= native_count;
+        if (sample_due) {
+            sampleNativeBlock(slot, native_count);
+            native_probe_sampled = true;
         }
-        out.count = native_count;
-        last_pc = slot.pcs[last];
-        last_raw = slot.raws[last];
-        last_size = slot.sizes[last];
-        last_suppress = slot.ops[last].kind == InstrKind::bl;
-        ++jit_stats_.native_executions;
-        jit_stats_.native_instructions += native_count;
+        if (resident.sampleable
+            && resident.policy.state() == NativeJitPolicy::State::native) {
+            slot.native_function(&state_, native_count);
+            std::memcpy(out.pcs.data(), slot.pcs.data(), native_count * sizeof(std::uint32_t));
+            std::memcpy(out.sizes.data(), slot.sizes.data(), native_count * sizeof(std::uint8_t));
+            total_cycles = slot.base_prefix_cycles[native_count];
+            const auto last = static_cast<std::size_t>(native_count - 1U);
+            if (state_.r[15] != slot.pcs[last] + slot.sizes[last]) {
+                total_cycles += slot.branch_penalty[last];
+            }
+            if (instruction_cycles) {
+                for (std::uint8_t i = 0U; i < native_count; ++i) {
+                    (*instruction_cycles)[i] = static_cast<std::uint16_t>(slot.base_cycles[i]);
+                }
+                if (state_.r[15] != slot.pcs[last] + slot.sizes[last]) {
+                    (*instruction_cycles)[last] = static_cast<std::uint16_t>(
+                        (*instruction_cycles)[last] + slot.branch_penalty[last]);
+                }
+            }
+            out.count = native_count;
+            last_pc = slot.pcs[last];
+            last_raw = slot.raws[last];
+            last_size = slot.sizes[last];
+            last_suppress = slot.suppress_obs[last];
+            ++jit_stats_.native_executions;
+            jit_stats_.native_instructions += native_count;
+        }
     }
 #endif
     // Pure-integer fast block: no memory ops (no traps/generation changes),
@@ -2171,6 +2592,29 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlockImpl(
     out.result.instructions = out.count;
     out.result.cycles = static_cast<std::uint16_t>(total_cycles);
     out.result.suppress_loop_observation = last_suppress;
+#if FIL_HAS_LLVM_JIT
+    if (out.count >= 2U && slot.native_candidate_count != 0U
+        && !slot.native_function && !slot.native_attempted
+        && slot.generation == memory_.executionGeneration()) {
+        if (slot.native_hits < native_block_compile_threshold) ++slot.native_hits;
+        else prepareNativeBlock(slot);
+    }
+#endif
+    ++native_clock_;
+#if FIL_HAS_LLVM_JIT
+    if (slot.native_function) {
+        auto& resident = native_state_->kernels[slot.native_slot];
+        touchNativeKernel(slot.native_slot);
+        const auto reused = static_cast<std::uint8_t>(
+            std::min<std::uint8_t>(out.count, slot.native_count));
+        resident.policy.noteReuse(reused);
+        if (resident.sampleable && !native_probe_sampled
+            && resident.policy.state() != NativeJitPolicy::State::rejected) {
+            resident.probe_countdown = resident.probe_countdown > reused
+                ? resident.probe_countdown - reused : 0U;
+        }
+    }
+#endif
     ++jit_stats_.block_executions;
     jit_stats_.block_instructions += out.count;
     return out;

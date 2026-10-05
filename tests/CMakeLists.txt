@@ -21,6 +21,7 @@ add_executable(fil_tests
     unit/hardware_comparison_test.cpp
     unit/jit_test.cpp
     unit/llvm_jit_test.cpp
+    unit/native_fast_path_test.cpp
     unit/memory_bus_test.cpp
     unit/network_protocol_test.cpp
     unit/peripheral_test.cpp
