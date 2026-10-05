@@ -48,6 +48,16 @@ private:
     fil::test::TemporaryDirectory directory_{"fil-world-time-tests"};
 };
 
+// These scheduler vectors specify a zero-wait-state fixture, independently
+// of the device's FLASH_ACR reset value.
+bool configureZeroWaitFixture(fil::sim::World& world) {
+    for (const auto name : {"alpha", "beta", "gamma"}) {
+        auto* board = world.board(name);
+        if (board != nullptr && !board->memory().write32(0x40022000U, 0U)) return false;
+    }
+    return true;
+}
+
 fil::sim::WorldRunOptions runOptions(const fil::sim::SimTimeNs duration_ns) {
     fil::sim::WorldRunOptions options;
     options.max_instructions_per_board = 10U;
@@ -132,6 +142,8 @@ TEST(WorldTimeTest, BoardCountDoesNotScaleGlobalTime) {
     EXPECT_TRUE(one.hasValue() && three.hasValue())
         << "loads one- and three-board virtual-time worlds";
     if (!one || !three) return;
+    ASSERT_TRUE(configureZeroWaitFixture(*one.value()));
+    ASSERT_TRUE(configureZeroWaitFixture(*three.value()));
 
     const auto one_result = one.value()->run(runOptions(0U));
     const auto three_result = three.value()->run(runOptions(0U));
@@ -150,6 +162,8 @@ TEST(WorldTimeTest, BoardCountDoesNotScaleGlobalTime) {
         std::filesystem::path(FIL_SOURCE_DIR) / "tests/fixtures/elf/split_image.elf";
     standalone_config.vector_base = 0x08000000U;
     auto standalone = fil::sim::Board::load(standalone_config);
+    ASSERT_TRUE(standalone);
+    ASSERT_TRUE(standalone.value()->memory().write32(0x40022000U, 0U));
     fil::sim::BoardRunOptions standalone_options;
     standalone_options.max_instructions = 10U;
     standalone_options.duration_ns = 0U;
@@ -192,6 +206,8 @@ TEST(WorldTimeTest, TimeBudgetProgressIsIndependentOfBoardCount) {
         return;
     }
 
+    ASSERT_TRUE(configureZeroWaitFixture(*one.value()));
+    ASSERT_TRUE(configureZeroWaitFixture(*three.value()));
     const auto one_result = one.value()->run(runOptions(100U));
     const auto three_result = three.value()->run(runOptions(100U));
     EXPECT_TRUE(one_result.hasValue() && three_result.hasValue())
@@ -229,6 +245,8 @@ TEST(WorldTimeTest, ConcurrentScheduleIsByteDeterministic) {
         EXPECT_TRUE(false) << "loads repeated worlds for virtual-time determinism test";
         return;
     }
+    ASSERT_TRUE(configureZeroWaitFixture(*first.value()));
+    ASSERT_TRUE(configureZeroWaitFixture(*second.value()));
 
     auto options = runOptions(0U);
     options.trace_instructions = true;

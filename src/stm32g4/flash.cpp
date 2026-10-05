@@ -34,7 +34,8 @@ FlashPeripheral::FlashPeripheral(
     sim::EventLoop* const event_loop,
     sim::TraceRecorder* const trace
 ) : RegisterPeripheral("FLASH", 0x40, event_loop, trace) {
-    setResetValue(acr, 0x00000000U); // LATENCY=0, PRFTEN/ICEN/DCEN off.
+    // RM0440 §3.7.1 category-3 reset: 1 WS, prefetch off, I/D caches enabled.
+    setResetValue(acr, 0x00040601U);
     setResetValue(cr, lock | option_lock);
     reset();
 }

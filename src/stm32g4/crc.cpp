@@ -6,10 +6,23 @@ namespace fil::stm32g4 {
 namespace {
 
 constexpr std::uint32_t dr = 0x00;
+constexpr std::uint32_t idr = 0x04;
 constexpr std::uint32_t cr = 0x08;
 constexpr std::uint32_t init_register = 0x10;
 constexpr std::uint32_t pol_register = 0x14;
 constexpr std::uint32_t cr_reset = 1U << 0U; ///< CR RESET bit.
+
+void updateCrc(std::uint32_t& crc, const std::uint32_t polynomial,
+               const std::uint32_t data_word, const std::uint32_t byte_count) {
+    // DR subword accesses are right-aligned; process the supplied bytes MSB first.
+    for (std::uint32_t byte_index = 0U; byte_index < byte_count; ++byte_index) {
+        const std::uint32_t shift = (byte_count - 1U - byte_index) * 8U;
+        crc ^= ((data_word >> shift) & 0xffU) << 24U;
+        for (std::uint32_t bit = 0U; bit < 8U; ++bit) {
+            crc = (crc & 0x80000000U) != 0U ? (crc << 1U) ^ polynomial : (crc << 1U);
+        }
+    }
+}
 
 } // namespace
 
@@ -28,8 +41,9 @@ std::uint32_t CrcPeripheral::loadRegister(
 ) {
     static_cast<void>(context);
     if (word_offset == dr) {
-        return crc_;
+        return crc_; // REV_OUT is intentionally outside this simplified model.
     }
+    if (word_offset == idr) return registerValue(idr) & 0xffU;
     return registerValue(word_offset);
 }
 
@@ -42,13 +56,20 @@ void CrcPeripheral::storeRegister(
 ) {
     static_cast<void>(context);
     if (word_offset == dr) {
-        update(value);
+        // RM0440 16.3.3: subword accesses feed only their right-aligned byte(s).
+        const std::uint32_t byte_count = write_mask == 0x000000ffU ? 1U
+            : write_mask == 0x0000ffffU ? 2U : 4U;
+        if (byte_count == 4U) update(value);
+        else updateCrc(crc_, poly_, value, byte_count);
+    } else if (word_offset == idr) {
+        setRegister(idr, value & 0xffU);
     } else if (word_offset == cr) {
         if ((value & write_mask & cr_reset) != 0U) {
             crc_ = init_;
         }
     } else if (word_offset == init_register) {
         init_ = value;
+        crc_ = value;
     } else if (word_offset == pol_register) {
         poly_ = value;
     }
@@ -62,18 +83,7 @@ void CrcPeripheral::onReset() {
 }
 
 void CrcPeripheral::update(const std::uint32_t data_word) {
-    // CRC-32/MPEG-2 word-wise update: process the four bytes most-significant
-    // byte first with no bit reflection and no final XOR.
-    for (std::uint32_t byte_index = 0U; byte_index < 4U; ++byte_index) {
-        const std::uint32_t data_byte =
-            (data_word >> (24U - byte_index * 8U)) & 0xffU;
-        crc_ ^= data_byte << 24U;
-        for (std::uint32_t bit = 0U; bit < 8U; ++bit) {
-            crc_ = (crc_ & 0x80000000U) != 0U
-                ? (crc_ << 1U) ^ poly_
-                : (crc_ << 1U);
-        }
-    }
+    updateCrc(crc_, poly_, data_word, 4U);
 }
 
 } // namespace fil::stm32g4

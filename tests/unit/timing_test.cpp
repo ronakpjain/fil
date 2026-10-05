@@ -6,7 +6,6 @@
 
 #include <gtest/gtest.h>
 
-#include <bit>
 #include <cstdint>
 #include <filesystem>
 
@@ -72,12 +71,13 @@ TEST(RealTimingTest, TakenBranchPenaltyMatchesRefillModel) {
     EXPECT_EQ(fil::cpu::takenBranchPenalty(fil::cpu::InstrKind::cbnz), 1U);
 }
 
-TEST(RealTimingTest, FlashAcrResetsToZeroWaitStates) {
+// RM0440 3.7.1: FLASH_ACR reset is 0x00040601 (LATENCY=1, caches enabled).
+TEST(RealTimingTest, FlashResetEnablesCachesAndOneWaitState) {
     fil::stm32g4::FlashPeripheral flash;
-    EXPECT_EQ(flash.waitStates(), 0U);
+    EXPECT_EQ(flash.waitStates(), 1U);
     EXPECT_FALSE(flash.prefetchEnabled());
-    EXPECT_FALSE(flash.instructionCacheEnabled());
-    EXPECT_EQ(flash.fetchStallCycles(0x08000000U, false), 0U);
+    EXPECT_TRUE(flash.instructionCacheEnabled());
+    EXPECT_EQ(flash.fetchStallCycles(0x08000000U, false), 1U);
 }
 
 TEST(RealTimingTest, FlashWaitStateTableMatchesDatasheet) {
@@ -129,6 +129,7 @@ TEST(RealTimingTest, SplitImageCostsFiveCyclesForThreeInstructions) {
     config.vector_base = 0x08000000U;
     auto loaded = fil::sim::Board::load(config, true);
     ASSERT_TRUE(loaded.hasValue());
+    ASSERT_TRUE(loaded.value()->memory().write32(0x40022000U, 0U));
     fil::sim::BoardRunOptions options;
     options.max_instructions = 10U;
     options.duration_ns = 0U;

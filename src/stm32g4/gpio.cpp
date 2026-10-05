@@ -18,8 +18,10 @@ GpioPeripheral::GpioPeripheral(
     std::string name,
     sim::EventLoop* const event_loop,
     sim::TraceRecorder* const trace
-) : RegisterPeripheral(std::move(name), 0x2c, event_loop, trace) {
-    setResetValue(moder, 0xffffffffU);
+) : RegisterPeripheral(name, 0x2c, event_loop, trace) {
+    const std::uint32_t reset_moder = name == "GPIOA" ? 0xabffffffU
+        : name == "GPIOB" ? 0xfffffebfU : 0xffffffffU;
+    setResetValue(moder, reset_moder);
     reset();
 }
 

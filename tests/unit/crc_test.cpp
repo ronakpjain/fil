@@ -164,5 +164,32 @@ TEST(CrcIntegrationTest, RoutesThroughStm32G4) {
             .hasValue());
 }
 
+// RM0440 §16.3.3, §16.4.2, §16.4.4: DR accepts right-aligned subwords;
+// INIT writes reload DR and IDR is independent storage, unaffected by RESET.
+TEST(CrcPeripheralTest, SubwordInputsInitReloadAndIdrSemantics) {
+    fil::stm32g4::CrcPeripheral byte_input, halfword_input, word_input;
+    constexpr auto byte = fil::mem::AccessSize::byte;
+    constexpr auto half = fil::mem::AccessSize::halfword;
+    constexpr auto word = fil::mem::AccessSize::word;
+    ASSERT_TRUE(byte_input.write(crc_init, word, 0xffffffffU, write_context));
+    ASSERT_TRUE(byte_input.write(crc_dr, byte, 0x31U, write_context));
+    ASSERT_TRUE(byte_input.write(crc_dr, byte, 0x32U, write_context));
+    ASSERT_TRUE(byte_input.write(crc_dr, byte, 0x33U, write_context));
+    ASSERT_TRUE(byte_input.write(crc_dr, byte, 0x34U, write_context));
+    ASSERT_TRUE(halfword_input.write(crc_init, word, 0xffffffffU, write_context));
+    ASSERT_TRUE(halfword_input.write(crc_dr, half, 0x3132U, write_context));
+    ASSERT_TRUE(halfword_input.write(crc_dr, half, 0x3334U, write_context));
+    ASSERT_TRUE(word_input.write(crc_init, word, 0xffffffffU, write_context));
+    ASSERT_TRUE(word_input.write(crc_dr, word, 0x31323334U, write_context));
+    EXPECT_EQ(byte_input.crc(), halfword_input.crc());
+    EXPECT_EQ(byte_input.crc(), word_input.crc());
+
+    ASSERT_TRUE(byte_input.write(crc_init, word, 0x12345678U, write_context));
+    EXPECT_EQ(byte_input.read(crc_dr, word, read_context).value(), 0x12345678U);
+    ASSERT_TRUE(byte_input.write(4, word, 0xabcdef01U, write_context));
+    ASSERT_TRUE(byte_input.write(crc_cr, word, 1U, write_context));
+    EXPECT_EQ(byte_input.read(4, word, read_context).value(), 1U);
+    EXPECT_EQ(byte_input.read(crc_dr, word, read_context).value(), 0x12345678U);
+}
 
 } // namespace

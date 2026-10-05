@@ -611,6 +611,8 @@ TEST(PeripheralTest, DecimatesContinuousAdcScansWithoutDriftingSchedule) {
         << "kept scan zero materializes on schedule";
     const auto first = adc.read(0x40, fil::mem::AccessSize::word, read_context);
     EXPECT_TRUE(first && first.value() == 1U) << "DR holds scan zero value";
+    // DR acknowledges EOC only; EOS requires its explicit W1C acknowledgement.
+    ASSERT_TRUE(adc.write(0U, fil::mem::AccessSize::word, 1U << 3U, write_context));
     EXPECT_TRUE(loop.runDueEvents(19'999).events_executed == 0)
         << "skipped scans enqueue no per-conversion events";
     EXPECT_TRUE(loop.runDueEvents(20'000).events_executed == 1 && interrupts == 1)
@@ -693,6 +695,132 @@ TEST(PeripheralTest, DecimationFactorZeroMeansOne) {
     fil::stm32g4::AdcPeripheral adc;
     adc.setDecimation(0);
     EXPECT_TRUE(adc.decimation() == 1U) << "zero decimation clamps to exact mode";
+}
+
+// RM0440 §7.4.1: ON is software controlled; RDY is read-only hardware status.
+TEST(PeripheralTest, RccReadyFlagsMirrorEnableAndHonorAbsentHse) {
+    fil::stm32g4::RccPeripheral present(true), absent(false);
+    constexpr auto word = fil::mem::AccessSize::word;
+    ASSERT_TRUE(present.write(0, word, (1U << 8U) | (1U << 16U) | (1U << 24U), write_context));
+    auto cr = present.read(0, word, read_context);
+    ASSERT_TRUE(cr);
+    EXPECT_EQ(cr.value() & ((1U << 8U) | (1U << 10U) | (1U << 16U) | (1U << 17U) |
+                            (1U << 24U) | (1U << 25U)),
+              (1U << 8U) | (1U << 10U) | (1U << 16U) | (1U << 17U) |
+                  (1U << 24U) | (1U << 25U));
+    ASSERT_TRUE(present.write(0, word, 0, write_context));
+    cr = present.read(0, word, read_context);
+    ASSERT_TRUE(cr);
+    EXPECT_EQ(cr.value() & ((1U << 10U) | (1U << 17U) | (1U << 25U)), 0U);
+    ASSERT_TRUE(absent.write(0, word, 1U << 16U, write_context));
+    cr = absent.read(0, word, read_context);
+    ASSERT_TRUE(cr);
+    EXPECT_EQ(cr.value() & (1U << 16U), 1U << 16U);
+    EXPECT_EQ(cr.value() & (1U << 17U), 0U);
+}
+
+// RM0440 §7.4.27–29: ON is writable; LSERDY/LSIRDY/HSI48RDY are status fields.
+TEST(PeripheralTest, RccLowSpeedAndRecoveryOscillatorsMirrorOnAndHardwareReady) {
+    fil::stm32g4::RccPeripheral rcc;
+    constexpr auto word = fil::mem::AccessSize::word;
+    ASSERT_TRUE(rcc.write(0x90, word, 1U, write_context));
+    ASSERT_TRUE(rcc.write(0x94, word, 1U, write_context));
+    ASSERT_TRUE(rcc.write(0x98, word, 1U, write_context));
+    EXPECT_EQ(rcc.read(0x90, word, read_context).value() & 3U, 3U);
+    EXPECT_EQ(rcc.read(0x94, word, read_context).value() & 3U, 3U);
+    EXPECT_EQ(rcc.read(0x98, word, read_context).value() & 3U, 3U);
+    // Writing RDY alone cannot keep it high when its matching ON control is zero.
+    ASSERT_TRUE(rcc.write(0x90, word, 2U, write_context));
+    ASSERT_TRUE(rcc.write(0x94, word, 2U, write_context));
+    ASSERT_TRUE(rcc.write(0x98, word, 2U, write_context));
+    EXPECT_EQ(rcc.read(0x90, word, read_context).value() & 3U, 0U);
+    EXPECT_EQ(rcc.read(0x94, word, read_context).value() & 3U, 0U);
+    EXPECT_EQ(rcc.read(0x98, word, read_context).value() & 3U, 0U);
+    ASSERT_TRUE(rcc.write(0x90, word, 1U, write_context));
+    EXPECT_EQ(rcc.read(0x90, word, read_context).value() & 3U, 3U);
+}
+
+// RM0440 §7.2.4, §7.4.3–4: actual SW encodings are HSI16/HSE/PLL for 01/10/11.
+TEST(PeripheralTest, RccSysclkPllCalculationIsExplicitlyPermissive) {
+    fil::stm32g4::RccPeripheral rcc(true, 8'000'000U);
+    constexpr auto word = fil::mem::AccessSize::word;
+    EXPECT_EQ(rcc.systemClockHz(), 16'000'000U);
+    ASSERT_TRUE(rcc.write(0x0c, word, 3U | (20U << 8U) | (1U << 25U), write_context));
+    ASSERT_TRUE(rcc.write(0, word, 1U << 24U, write_context)); // PLLON; model makes PLLRDY immediate.
+    ASSERT_TRUE(rcc.write(0x08, word, 3U, write_context));
+    EXPECT_EQ(rcc.systemClockHz(), 40'000'000U); // HSE(8 MHz) * N(20) / R(4).
+    ASSERT_TRUE(rcc.write(0x08, word, 2U, write_context));
+    EXPECT_EQ(rcc.systemClockHz(), 8'000'000U);
+    ASSERT_TRUE(rcc.write(0x08, word, 1U, write_context));
+    EXPECT_EQ(rcc.systemClockHz(), 16'000'000U);
+
+    fil::stm32g4::RccPeripheral no_hse(false, 8'000'000U);
+    ASSERT_TRUE(no_hse.write(0x08, word, 2U, write_context));
+    EXPECT_EQ(no_hse.systemClockHz(), 16'000'000U); // permissive fallback, not RM ready-switch behavior.
+}
+
+// RM0440 §7.4.6–7: CICR write-one-to-clear corresponding CIFR flags.
+TEST(PeripheralTest, RccCicrClearsOnlyWrittenFlagsAndResetRestoresStartup) {
+    fil::stm32g4::RccPeripheral rcc;
+    constexpr auto word = fil::mem::AccessSize::word;
+    ASSERT_TRUE(rcc.write(0x1c, word, 0x3fU, write_context));
+    ASSERT_TRUE(rcc.write(0x20, word, 1U << 3U, write_context));
+    auto flags = rcc.read(0x1c, word, read_context);
+    ASSERT_TRUE(flags);
+    EXPECT_EQ(flags.value(), 0x37U);
+    rcc.reset();
+    EXPECT_EQ(rcc.read(0x1c, word, read_context).value(), 0U);
+    EXPECT_EQ(rcc.read(0, word, read_context).value() & ((1U << 8U) | (1U << 10U)),
+              (1U << 8U) | (1U << 10U));
+}
+
+// RM0440 §6.4.1, §6.4.9, §6.4.22: reset VOS=01, VOSF read-only, CR5.R1MODE.
+TEST(PeripheralTest, PwrResetVoltageRangeAndBoostFieldAreStable) {
+    fil::stm32g4::PwrPeripheral pwr;
+    constexpr auto word = fil::mem::AccessSize::word;
+    EXPECT_EQ(pwr.read(0, word, read_context).value() & (3U << 9U), 1U << 9U);
+    EXPECT_EQ(pwr.read(0x14, word, read_context).value() & (1U << 10U), 0U);
+    ASSERT_TRUE(pwr.write(0, word, 2U << 9U, write_context));
+    EXPECT_EQ(pwr.read(0, word, read_context).value() & (3U << 9U), 2U << 9U);
+    EXPECT_EQ(pwr.read(0x14, word, read_context).value() & (1U << 10U), 0U);
+    ASSERT_TRUE(pwr.write(0x80, word, 0U, write_context));
+    EXPECT_EQ(pwr.read(0x80, word, read_context).value() & (1U << 8U), 0U);
+    pwr.reset();
+    EXPECT_EQ(pwr.read(0, word, read_context).value(), 1U << 9U);
+    EXPECT_EQ(pwr.read(0x80, word, read_context).value(), 1U << 8U);
+    // VOSF is deliberately simplified to always complete immediately; no regulator delay modeled.
+}
+
+// RM0440 §9.3.5, §9.4.5–7, §9.4.11: set wins simultaneous BSRR set/reset.
+TEST(PeripheralTest, GpioBsrrPriorityBrrSubwordAndExternalRelease) {
+    fil::stm32g4::GpioPeripheral gpio("GPIOC");
+    constexpr auto word = fil::mem::AccessSize::word;
+    constexpr auto half = fil::mem::AccessSize::halfword;
+    constexpr auto byte = fil::mem::AccessSize::byte;
+    ASSERT_TRUE(gpio.write(0x14, half, 0U, write_context));
+    ASSERT_TRUE(gpio.write(0x18, word, (1U << 2U) | (1U << (16U + 2U)) | (1U << 4U), write_context));
+    EXPECT_EQ(gpio.read(0x14, word, read_context).value(), (1U << 2U) | (1U << 4U));
+    ASSERT_TRUE(gpio.write(0x28, byte, 1U << 4U, write_context));
+    EXPECT_EQ(gpio.read(0x14, word, read_context).value(), 1U << 2U);
+    EXPECT_EQ(gpio.read(0x18, word, read_context).value(), 0U);
+    ASSERT_TRUE(gpio.write(0, word, 1U << 2U, write_context)); // pin 1 output
+    ASSERT_TRUE(gpio.write(0x14, word, 1U << 1U, write_context));
+    gpio.setInput(1, false);
+    EXPECT_EQ(gpio.read(0x10, word, read_context).value() & (1U << 1U), 0U);
+    gpio.releaseInput(1);
+    EXPECT_EQ(gpio.read(0x10, word, read_context).value() & (1U << 1U), 1U << 1U);
+    EXPECT_EQ(gpio.read(0x10, word, read_context).value() & 0xffff0000U, 0U);
+}
+
+// RM0440 §9.4.1: GPIOA=ABFFFFFF, GPIOB=FFFFFEBF, ports C–G=FFFFFFFF.
+TEST(PeripheralTest, GpioResetRestoresPortSpecificDebugPinModes) {
+    fil::stm32g4::GpioPeripheral port_a("GPIOA"), port_b("GPIOB"), port_c("GPIOC");
+    constexpr auto word = fil::mem::AccessSize::word;
+    EXPECT_EQ(port_a.read(0, word, read_context).value(), 0xabffffffU);
+    EXPECT_EQ(port_b.read(0, word, read_context).value(), 0xfffffebfU);
+    EXPECT_EQ(port_c.read(0, word, read_context).value(), 0xffffffffU);
+    port_a.reset();
+    EXPECT_EQ(port_a.read(0, word, read_context).value(), 0xabffffffU);
 }
 
 } // namespace

@@ -198,4 +198,85 @@ TEST(FlashIntegrationTest, RoutesEraseThroughStm32G4) {
         << "integrated erase clears the mapped flash page";
 }
 
+// RM0440 §3.7.1: LATENCY[2:0], PRFTEN/ICEN/DCEN, ICRST/DCRST.
+TEST(FlashPeripheralTest, AcrMasksWritesAndClearsCacheResetPulses) {
+    fil::stm32g4::FlashPeripheral flash;
+    constexpr auto word = fil::mem::AccessSize::word;
+    constexpr auto byte = fil::mem::AccessSize::byte;
+    EXPECT_EQ(flash.read(0, word, read_context).value(), 0x00040601U);
+    ASSERT_TRUE(flash.write(0, word, 0xffffffffU, write_context));
+    auto acr = flash.read(0, word, read_context);
+    ASSERT_TRUE(acr);
+    EXPECT_EQ(acr.value(), 0x00040707U);
+    EXPECT_EQ(flash.waitStates(), 7U);
+    EXPECT_TRUE(flash.prefetchEnabled());
+    EXPECT_TRUE(flash.instructionCacheEnabled());
+    ASSERT_TRUE(flash.write(0, byte, 3U, write_context)); // byte lane update retains cache enables.
+    EXPECT_EQ(flash.read(0, word, read_context).value(), 0x00040703U);
+    ASSERT_TRUE(flash.write(0, word, 0U, write_context));
+    EXPECT_EQ(flash.read(0, word, read_context).value(), 0x00040000U);
+    EXPECT_GT(flash.acrGeneration(), 1U); // effective ACR changes invalidate timing generations
+}
+
+// RM0440 §3.5.5, §3.7.3–3.7.4: key sequences unlock CR and option lock.
+TEST(FlashPeripheralTest, KeySequencesUnlockAndRelockControlAndOptionLock) {
+    fil::stm32g4::FlashPeripheral flash;
+    constexpr auto word = fil::mem::AccessSize::word;
+    constexpr std::uint32_t lock_bits = (1U << 31U) | (1U << 30U);
+    ASSERT_EQ(flash.read(0x14, word, read_context).value() & lock_bits, lock_bits);
+    EXPECT_EQ(flash.read(0x08, word, read_context).value(), 0U);
+    EXPECT_EQ(flash.read(0x0c, word, read_context).value(), 0U);
+    ASSERT_TRUE(flash.write(0x08, word, 0x1234U, write_context));
+    ASSERT_TRUE(flash.write(0x08, word, 0xcdef89abU, write_context));
+    EXPECT_EQ(flash.read(0x14, word, read_context).value() & lock_bits, lock_bits);
+    ASSERT_TRUE(flash.write(0x08, word, 0x45670123U, write_context));
+    ASSERT_TRUE(flash.write(0x08, word, 0xcdef89abU, write_context));
+    EXPECT_EQ(flash.read(0x14, word, read_context).value() & lock_bits, 1U << 30U);
+    ASSERT_TRUE(flash.write(0x0c, word, 0x08192a3bU, write_context));
+    ASSERT_TRUE(flash.write(0x0c, word, 0x4c5d6e7fU, write_context));
+    EXPECT_EQ(flash.read(0x14, word, read_context).value() & lock_bits, 0U);
+    ASSERT_TRUE(flash.write(0x14, word, (1U << 31U) | 1U, write_context));
+    EXPECT_NE(flash.read(0x14, word, read_context).value() & (1U << 31U), 0U);
+}
+
+// RM0440 §3.5.6, §3.7.5–6: erase selects PNB/BKER; EOP is cleared by writing one.
+TEST(FlashPeripheralTest, StatusW1cAndPageEraseMapsBankAndPage) {
+    fil::stm32g4::FlashPeripheral flash;
+    constexpr auto word = fil::mem::AccessSize::word;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> erased;
+    flash.setEraseGeometry(0x08000000U, 2048U, 128U * 1024U);
+    flash.setPageEraseCallback([&](std::uint32_t base, std::uint32_t size) {
+        erased.emplace_back(base, size);
+        return fil::Result<void>{};
+    });
+    ASSERT_TRUE(flash.write(0x08, word, 0x45670123U, write_context));
+    ASSERT_TRUE(flash.write(0x08, word, 0xcdef89abU, write_context));
+    constexpr std::uint32_t per = 1U << 1U, start = 1U << 16U, bker = 1U << 11U;
+    ASSERT_TRUE(flash.write(0x14, word, per | start | (3U << 3U) | bker, write_context));
+    EXPECT_EQ(erased, (std::vector<std::pair<std::uint32_t, std::uint32_t>>{
+                          {0x08000000U + 128U * 1024U + 3U * 2048U, 2048U}}));
+    EXPECT_EQ(flash.read(0x10, word, read_context).value() & 1U, 1U);
+    ASSERT_TRUE(flash.write(0x10, word, 1U, write_context));
+    EXPECT_EQ(flash.read(0x10, word, read_context).value() & 1U, 0U);
+}
+
+// RM0440 §3.5.6 and §3.7.5–6: failed operation must not be represented as EOP success;
+// LOCK prevents CR writes, including byte-lane writes.
+TEST(FlashPeripheralTest, EraseFailureClearsBusyWithoutReportingEopAndLockedPartialCrWriteIsIgnored) {
+    fil::stm32g4::FlashPeripheral flash;
+    constexpr auto word = fil::mem::AccessSize::word;
+    constexpr auto byte = fil::mem::AccessSize::byte;
+    flash.setPageEraseCallback([](std::uint32_t, std::uint32_t) {
+        return fil::Error{fil::ErrorCategory::runtime, "backing erase failed", {}};
+    });
+    ASSERT_TRUE(flash.write(0x08, word, 0x45670123U, write_context));
+    ASSERT_TRUE(flash.write(0x08, word, 0xcdef89abU, write_context));
+    ASSERT_TRUE(flash.write(0x14, word, (1U << 1U) | (1U << 16U), write_context));
+    EXPECT_EQ(flash.read(0x10, word, read_context).value() & ((1U << 16U) | 1U), 0U);
+    ASSERT_TRUE(flash.write(0x14, word, 1U << 31U, write_context));
+    const auto locked_before = flash.read(0x14, word, read_context).value();
+    ASSERT_TRUE(flash.write(0x14, byte, 0U, write_context));
+    EXPECT_EQ(flash.read(0x14, word, read_context).value(), locked_before);
+}
+
 } // namespace
