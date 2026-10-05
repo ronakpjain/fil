@@ -305,7 +305,7 @@ std::uint32_t SystemControl::readWord(const std::uint32_t offset) {
     }
     if (offset == 0xe014U) return systick_load_;
     if (offset == 0xe018U) return systick_value_;
-    if (offset == 0xe01cU) return 0;
+    if (offset == 0xe01cU) return 0x3e8U; // STM32G4 SysTick calibration, RM0440 14.2.
     if (offset >= 0xe100U && offset < 0xe120U) return nvic_enable_[(offset - 0xe100U) / 4U];
     if (offset >= 0xe180U && offset < 0xe1a0U) return nvic_enable_[(offset - 0xe180U) / 4U];
     if (offset >= 0xe200U && offset < 0xe220U) return nvic_pending_[(offset - 0xe200U) / 4U];

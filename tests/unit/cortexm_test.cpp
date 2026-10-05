@@ -6,6 +6,34 @@
 
 namespace {
 
+// RM0440 section 14.2 specifies the STM32G4 read-only calibration literal.
+TEST(CortexMTest, ReportsReadOnlySysTickCalibrationValue) {
+    fil::cortexm::SystemControl system;
+    constexpr auto word = fil::mem::AccessSize::word;
+    auto calibration = system.read(0xe01cU, word, {});
+    ASSERT_TRUE(calibration);
+    EXPECT_EQ(calibration.value(), 0x3e8U);
+    ASSERT_TRUE(system.write(0xe01cU, word, 0xffffffffU, {}));
+    calibration = system.read(0xe01cU, word, {});
+    ASSERT_TRUE(calibration);
+    EXPECT_EQ(calibration.value(), 0x3e8U);
+}
+
+// RM0440 section 14.1 specifies four implemented priority bits (16 levels).
+TEST(CortexMTest, AllDeviceInterruptPrioritiesImplementExactlyFourBits) {
+    fil::cortexm::SystemControl system;
+    for (std::uint32_t irq = 0U; irq < 102U; ++irq) {
+        for (const std::uint32_t value : {0U, 0x0fU, 0x10U, 0x7fU, 0xa5U, 0xffU}) {
+            SCOPED_TRACE(irq);
+            SCOPED_TRACE(value);
+            ASSERT_TRUE(system.write(0xe400U + irq, fil::mem::AccessSize::byte, value, {}));
+            const auto priority = system.read(0xe400U + irq, fil::mem::AccessSize::byte, {});
+            ASSERT_TRUE(priority);
+            EXPECT_EQ(priority.value(), value & 0xf0U);
+        }
+    }
+}
+
 TEST(CortexMTest, ModelsSysTick) {
     fil::cortexm::SystemControl system;
     EXPECT_TRUE(system.write(0xe014U, fil::mem::AccessSize::word, 3U, {}).hasValue())
@@ -161,6 +189,123 @@ TEST(CortexMTest, ModelsNvicAndScb) {
         << "writes keyed AIRCR reset request";
     EXPECT_TRUE(system.consumeResetRequest() && !system.consumeResetRequest())
         << "consumes reset request once";
+}
+
+// RM0440 14.1 delegates these architectural registers to PM0214. These
+// tests pin the modeled contract; they are not a substitute for that audit.
+TEST(CortexMTest, SetsAndClearsInterruptEnablePendingAndActiveBits) {
+    fil::cortexm::SystemControl system;
+    constexpr auto word = fil::mem::AccessSize::word;
+    ASSERT_TRUE(system.write(0xe100U, word, 1U << 17U, {}));
+    ASSERT_TRUE(system.write(0xef00U, word, 17U, {}));
+    EXPECT_EQ(system.nextPending(0U, 0U, 0U), 33U);
+    ASSERT_TRUE(system.write(0xe280U, word, 1U << 17U, {}));
+    EXPECT_FALSE(system.nextPending(0U, 0U, 0U));
+    ASSERT_TRUE(system.write(0xe200U, word, 1U << 17U, {}));
+    system.enter(33U);
+    EXPECT_EQ(system.read(0xe300U, word, {}).value(), 1U << 17U);
+    EXPECT_EQ(system.read(0xe200U, word, {}).value(), 0U);
+    system.leave(33U);
+    EXPECT_EQ(system.read(0xe300U, word, {}).value(), 0U);
+    ASSERT_TRUE(system.write(0xe180U, word, 1U << 17U, {}));
+    EXPECT_EQ(system.read(0xe100U, word, {}).value(), 0U);
+}
+
+TEST(CortexMTest, SetsAndClearsSystemExceptionPendingBits) {
+    fil::cortexm::SystemControl system;
+    constexpr auto word = fil::mem::AccessSize::word;
+    ASSERT_TRUE(system.write(0xed04U, word, (1U << 28U) | (1U << 26U), {}));
+    EXPECT_EQ(system.nextPending(0U, 0U, 0U), 14U);
+    const auto status = system.read(0xed04U, word, {});
+    ASSERT_TRUE(status);
+    EXPECT_EQ((status.value() >> 12U) & 0x1ffU, 14U);
+    ASSERT_TRUE(system.write(0xed04U, word, 1U << 27U, {}));
+    EXPECT_EQ(system.nextPending(0U, 0U, 0U), 15U);
+    ASSERT_TRUE(system.write(0xed04U, word, 1U << 25U, {}));
+    EXPECT_FALSE(system.nextPending(0U, 0U, 0U));
+}
+
+TEST(CortexMTest, MasksSystemHandlerPriorityBytesAndPreservesNeighborLanes) {
+    fil::cortexm::SystemControl system;
+    constexpr auto word = fil::mem::AccessSize::word;
+    ASSERT_TRUE(system.write(0xed18U, word, 0xabcdef12U, {}));
+    EXPECT_EQ(system.read(0xed18U, word, {}).value(), 0xa0c0e010U);
+    ASSERT_TRUE(system.write(0xed19U, fil::mem::AccessSize::byte, 0x35U, {}));
+    EXPECT_EQ(system.read(0xed18U, word, {}).value(), 0xa0c03010U);
+    EXPECT_EQ(system.priority(5U), 0x30U);
+}
+
+TEST(CortexMTest, RequiresAircrKeyAndAlignsVectorTableBase) {
+    fil::cortexm::SystemControl system;
+    constexpr auto word = fil::mem::AccessSize::word;
+    ASSERT_TRUE(system.write(0xed0cU, word, 0x12340004U, {}));
+    EXPECT_FALSE(system.resetRequested());
+    ASSERT_TRUE(system.write(0xed0cU, word, 0x05fa0304U, {}));
+    EXPECT_TRUE(system.consumeResetRequest());
+    EXPECT_FALSE(system.consumeResetRequest());
+    EXPECT_EQ(system.read(0xed0cU, word, {}).value(), 0xfa050300U);
+    ASSERT_TRUE(system.write(0xed08U, word, 0x080081ffU, {}));
+    EXPECT_EQ(system.vectorBase(), 0x08008180U);
+}
+
+TEST(CortexMTest, CycleCounterAdvancesOnlyWhenEnabledAndWraps) {
+    fil::cortexm::SystemControl system;
+    constexpr auto word = fil::mem::AccessSize::word;
+    ASSERT_TRUE(system.write(0x1004U, word, 0xfffffffeU, {}));
+    system.advanceCycles(10U);
+    EXPECT_EQ(system.read(0x1004U, word, {}).value(), 0xfffffffeU);
+    ASSERT_TRUE(system.write(0x1000U, word, 1U, {}));
+    system.advanceCycles(3U);
+    EXPECT_EQ(system.read(0x1004U, word, {}).value(), 1U);
+    ASSERT_TRUE(system.write(0x1000U, word, 0U, {}));
+    system.advanceCycles(100U);
+    EXPECT_EQ(system.read(0x1004U, word, {}).value(), 1U);
+}
+
+TEST(CortexMTest, StoresSystemControlLanesAndResetsThem) {
+    fil::cortexm::SystemControl system;
+    constexpr auto word = fil::mem::AccessSize::word;
+    for (const auto offset : {0xed10U, 0xed14U, 0xed24U, 0xed34U, 0xed38U,
+                              0xed88U, 0xedfcU, 0xef34U}) {
+        ASSERT_TRUE(system.write(offset, word, 0x12345678U, {}));
+        ASSERT_TRUE(system.write(offset + 2U, fil::mem::AccessSize::halfword, 0xabcdU, {}));
+        EXPECT_EQ(system.read(offset, word, {}).value(), 0xabcd5678U);
+    }
+    EXPECT_FALSE(system.fpuEnabled());
+    ASSERT_TRUE(system.write(0xed88U, word, 0x00f00000U, {}));
+    EXPECT_TRUE(system.fpuEnabled());
+    system.reset(0x08008000U);
+    EXPECT_EQ(system.ccr(), 1U << 9U);
+    EXPECT_EQ(system.vectorBase(), 0x08008000U);
+    EXPECT_EQ(system.fpccr(), 0U);
+    EXPECT_FALSE(system.fpuEnabled());
+    EXPECT_EQ(system.read(0xed00U, word, {}).value(), 0x410fc241U);
+    ASSERT_TRUE(system.write(0xed00U, word, 0U, {}));
+    EXPECT_EQ(system.read(0xed00U, word, {}).value(), 0x410fc241U);
+}
+
+TEST(CortexMTest, RejectsCrossRegisterSystemAccesses) {
+    fil::cortexm::SystemControl system;
+    EXPECT_FALSE(system.read(0xe013U, fil::mem::AccessSize::halfword, {}));
+    EXPECT_FALSE(system.write(0xe013U, fil::mem::AccessSize::halfword, 0U, {}));
+    EXPECT_FALSE(system.read(0x100000U, fil::mem::AccessSize::word, {}));
+    EXPECT_FALSE(system.write(0x100000U, fil::mem::AccessSize::word, 0U, {}));
+}
+
+TEST(CortexMTest, MasksSysTickReloadAndClearsCountFlagOnCurrentWrite) {
+    fil::cortexm::SystemControl system;
+    constexpr auto word = fil::mem::AccessSize::word;
+    ASSERT_TRUE(system.write(0xe014U, word, 0xff000003U, {}));
+    EXPECT_EQ(system.read(0xe014U, word, {}).value(), 3U);
+    ASSERT_TRUE(system.write(0xe010U, word, 1U, {}));
+    system.advanceCycles(4U);
+    EXPECT_FALSE(system.nextPending(0U, 0U, 0U));
+    ASSERT_TRUE(system.write(0xe018U, word, 0xffffffffU, {}));
+    EXPECT_EQ(system.read(0xe018U, word, {}).value(), 0U);
+    EXPECT_EQ(system.read(0xe010U, word, {}).value() & (1U << 16U), 0U);
+    ASSERT_TRUE(system.write(0xe010U, word, 0U, {}));
+    system.advanceCycles(10U);
+    EXPECT_EQ(system.read(0xe018U, word, {}).value(), 0U);
 }
 
 } // namespace

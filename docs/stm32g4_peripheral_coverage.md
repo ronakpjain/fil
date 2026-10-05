@@ -2,6 +2,34 @@
 
 The STM32G4 layer is a deterministic register-level model for startup, RTOS scheduling, and device-facing firmware tests. It preserves little-endian byte/halfword/word register accesses and implements selected side effects. It is not a complete STM32G474 electrical, timing, or register-accuracy model.
 
+## Evidence and scope
+
+The reference is **RM0440**, the STM32G4 reference manual, rather than an
+analog/electrical device datasheet. Citations below identify a numbered section
+and, where relevant, its register/field. They are stable across local Markdown
+line wrapping; no external firmware checkout is needed to run the tests.
+
+A named test is evidence only for the assertions it makes, not the entire cited
+section. The matrices distinguish **conformant subset**, **simplified model
+contract**, and **unsupported** behavior. Simulation-only hooks and optimization
+invariants are not hardware-conformance evidence. Generic register storage does
+not imply implementation of the feature associated with that register.
+
+This audit covers peripheral and system-window side effects. Instruction-set
+coverage is separate: see [Thumb instruction coverage](thumb_instruction_coverage.md).
+RM0440 delegates most Cortex-M register and exception semantics to PM0214; those
+semantics are not labeled RM0440-verified without an actual specification check.
+
+Check that the matrix names real tests and numbered manual sections with:
+
+```bash
+bash tools/check_peripheral_coverage.sh
+bash tools/check_peripheral_coverage.sh --manual-dir /path/to/STM32G4_RM0440_chapters
+```
+
+The checker validates reference integrity, not assertion completeness or hardware
+accuracy. Run the tests as described in [Testing](testing.md).
+
 ## Routed map
 
 | Device | Address or instances | Current level |
@@ -60,7 +88,29 @@ acknowledged or disabled. Software-pended interrupts remain independently latche
 
 Unit tests cover SysTick wrap, COUNTFLAG, NVIC enable/masking/priority, BASEPRI_MAX,
 PendSV, CPACR, AIRCR, basic/extended exception entry and return, preservation of
-re-pended nested interrupts, peripheral IRQ acknowledgment, shared IRQs, and reset/teardown. MPU, ITM/SWO, breakpoint/watchpoint comparators, debug transport, lazy FP stacking, and automatic fault escalation are not modeled.
+re-pended nested interrupts, peripheral IRQ acknowledgment, shared IRQs, and reset/teardown. MPU, ITM/SWO, breakpoint/watchpoint comparators, debug transport, and automatic fault escalation are not modeled. Lazy FP preservation has model tests but is not independently checked against PM0214 here.
+
+### System-window evidence
+
+RM0440 §14.1 specifies 102 device IRQs and four priority bits; RM0440 §14.2
+specifies the SysTick calibration literal. RM0440 §14.3, Table 100, is the
+peripheral-to-NVIC routing authority. Remaining architectural register details
+are delegated to PM0214 by RM0440 §14.1 and are **not independently
+reference-verified here**.
+
+| Behavior | Reference / scope | Named test evidence | Fidelity / limitation |
+|---|---|---|---|
+| SysTick CALIB reads `0x3e8` and ignores writes | RM0440 §14.2 | `CortexMTest.ReportsReadOnlySysTickCalibrationValue` | Conformant device-specific literal. |
+| All 102 device IRQ priority bytes expose only bits 7:4 | RM0440 §14.1 | `CortexMTest.AllDeviceInterruptPrioritiesImplementExactlyFourBits`; `CortexMTest.ModelsNvicAndScb` | Conformant priority width. The generic NVIC exposes 240 IRQ slots, more than this device implements. |
+| SysTick wrap at LOAD+1 cycles, interrupt pending, COUNTFLAG read-to-clear | RM0440 §14.1 delegates register semantics to PM0214 | `CortexMTest.ModelsSysTick`; `CortexMTest.MasksSysTickReloadAndClearsCountFlagOnCurrentWrite` | Tested model contract, not full SysTick conformance; alternate clock selection is not modeled. |
+| Enable/pending/active state, pulse latching and level re-pending | RM0440 §14.1 delegates to PM0214 | `CortexMTest.ModelsNvicAndScb`; `CortexMTest.SetsAndClearsInterruptEnablePendingAndActiveBits`; `CortexMTest.SamplesInterruptLevelsWithoutInventingPendingEdges`; `CortexMTest.ResetClearsInterruptLevelsAndPendingSummary` | Tested model contract; 240 generic IRQ slots. |
+| Masking, priority arbitration, active-handler preemption and selection-cache invalidation | RM0440 §14.1 priority width; PM0214 required for full arbitration proof | `CortexMTest.BasepriArbitrationUsesOnlyImplementedPriorityBits`; `CortexMTest.TakablePendingCacheTracksMasksPrioritiesAndLifecycle`; `CortexMTest.ModelsNvicAndScb` | Tested model contract; AIRCR priority grouping is not modeled. |
+| PendSV, CPACR FPU-enable state and keyed AIRCR reset-request consumption | RM0440 §14.1 delegates to PM0214 | `CortexMTest.ModelsNvicAndScb`; `CortexMTest.SetsAndClearsSystemExceptionPendingBits`; `CortexMTest.RequiresAircrKeyAndAlignsVectorTableBase` | Tested model contract, not automatic reset/restart. |
+| SHPR four-bit priorities and byte-lane preservation | RM0440 §14.1 priority width; PM0214 for register layout | `CortexMTest.MasksSystemHandlerPriorityBytesAndPreservesNeighborLanes` | Tested model contract. |
+| DWT cycle count enable and 32-bit wrap | RM0440 §47.2 delegates core debug details to architecture documentation | `CortexMTest.CycleCounterAdvancesOnlyWhenEnabledAndWraps` | Model contract; DEMCR.TRCENA does not gate counting. |
+| SCB/CoreDebug/FPCCR register storage, lane merging, reset, CPUID read-only literal and access bounds | RM0440 §14.1 delegates to PM0214 | `CortexMTest.StoresSystemControlLanesAndResetsThem`; `CortexMTest.RejectsCrossRegisterSystemAccesses` | Storage/model contract, not a claim of all register bits' reset/access accuracy. CFSR/HFSR have no modeled fault-generation path; clearing initially-zero status does not prove fault conformance. |
+| Basic/extended frames, thread stack selection, nested return and lazy floating-point preservation | RM0440 §14.1 delegates to PM0214 | `ExceptionTest.StacksAndReturnsBasicFrame`; `ExceptionTest.StacksAndReturnsExtendedFloatingPointFrame`; `ExceptionTest.RestoresThreadStackSelectionFromExcReturn`; `ExceptionTest.NestedReturnPreservesRependedOuterInterrupt`; `ExceptionTest.DefersFloatingPointStackingUntilHandlerTouch`; `ExceptionTest.NestedEntryFallsBackToEagerStacking` | Architectural model tests; no RM0440 proof of cycle-accurate exception entry/return. |
+| ADC5, FDCAN, TIM, USART and EXTI interrupt routing/shared-source OR | RM0440 §14.3, Table 100 | `Stm32G4Test.Adc5RoutesItsDmaRequestAndDedicatedInterrupt`; `Stm32G4Test.FdcanInterruptLineRoutingAndDisableUpdateNvicLevels`; `Stm32G4Test.SharedTimerIrqRemainsAssertedUntilAllSourcesClear`; `Stm32G4Test.UsartInterruptStopsRependingAfterReceiveConsumed`; `Stm32G4Test.ExtiSharedLinesOrIntoSingleIrq` | Tested routed subset, not every entry of Table 100. |
 
 ## Virtual CAN and multi-board world
 
