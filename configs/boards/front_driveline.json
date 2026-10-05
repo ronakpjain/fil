@@ -2,7 +2,7 @@
   "schema_version": 1,
   "name": "front_driveline",
   "mcu": "../mcus/stm32g474retx.json",
-  "elf": "../../../../PER/Projects/monorepo/firmware/output/front_driveline/front_driveline.elf",
+  "elf": "../../../../PER/monorepo/firmware/output/front_driveline/front_driveline.elf",
   "vector_base": "0x08008000",
   "can": {"FDCAN2": {"bus": "vcan"}}
 }
