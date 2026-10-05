@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -65,16 +66,52 @@ namespace {
 constexpr std::uint32_t entry = 0x08000000U;
 
 std::vector<NativeJitInstruction> arithmeticProgram() {
-    return {narrow(0x2001U, entry),       // MOVS r0,#1
-            narrow(0x3001U, entry + 2U),   // ADDS r0,#1
-            narrow(0x3801U, entry + 4U),   // SUBS r0,#1
-            narrow(0x2801U, entry + 6U),   // CMP r0,#1
-            narrow(0xBF00U, entry + 8U),    // NOP
-            narrow(0xE7FFU, entry + 10U)}; // B to its fallthrough
+    return {narrow(0x3001U, entry),       // ADDS r0,#1
+            narrow(0x3801U, entry + 2U),   // SUBS r0,#1
+            narrow(0x2801U, entry + 4U),   // CMP r0,#1
+            narrow(0xBF00U, entry + 6U),   // NOP
+            narrow(0xE7FFU, entry + 8U)};  // B to its fallthrough
 }
 
 bool equalState(const fil::cpu::CpuState& lhs, const fil::cpu::CpuState& rhs) {
     return fil::cpu::bitwiseEqual(lhs, rhs);
+}
+
+void expectDifferentialPrefixes(LlvmJit& jit,
+                                const std::vector<NativeJitInstruction>& program,
+                                const fil::cpu::CpuState& initial) {
+    const auto kernel = compile(jit, program);
+    ASSERT_NE(kernel, nullptr);
+    fil::mem::MemoryBus bus;
+    ASSERT_TRUE(bus.mapRam(entry, 256U, "llvm-prefix-oracle", true).hasValue());
+    std::vector<std::uint8_t> bytes;
+    for (const auto& instruction : program) {
+        const auto first = instruction.size == 4U
+            ? static_cast<std::uint16_t>(instruction.decoded.raw >> 16U)
+            : static_cast<std::uint16_t>(instruction.decoded.raw);
+        bytes.push_back(static_cast<std::uint8_t>(first));
+        bytes.push_back(static_cast<std::uint8_t>(first >> 8U));
+        if (instruction.size == 4U) {
+            const auto second = static_cast<std::uint16_t>(instruction.decoded.raw);
+            bytes.push_back(static_cast<std::uint8_t>(second));
+            bytes.push_back(static_cast<std::uint8_t>(second >> 8U));
+        }
+    }
+    ASSERT_TRUE(bus.loadBytes(entry, bytes).hasValue());
+    std::vector<std::size_t> limits;
+    for (std::size_t limit = 0; limit <= program.size(); ++limit) limits.push_back(limit);
+    limits.push_back(program.size() + 2U);
+    limits.push_back(std::numeric_limits<std::size_t>::max());
+    for (const auto limit : limits) {
+        auto actual = initial;
+        kernel->execute(actual, limit);
+        fil::cpu::CortexM4 reference(bus);
+        reference.state() = initial;
+        const auto count = std::min(limit, program.size());
+        for (std::size_t i = 0; i < count; ++i)
+            ASSERT_EQ(reference.stepFast().reason, fil::cpu::StopReason::step_complete);
+        EXPECT_TRUE(equalState(actual, reference.state())) << "limit=" << limit;
+    }
 }
 } // namespace
 
@@ -117,7 +154,7 @@ TEST(LlvmJitTest, DifferentialArithmeticPrefixesPreserveUnrelatedState) {
         fil::cpu::CpuState initial{};
         initial.r[15] = entry;
         initial.instruction_address = entry;
-        initial.xpsr = fil::cpu::xpsr_t
+        initial.xpsr = fil::cpu::xpsr_t | fil::cpu::xpsr_q | 0x000a0000U
             | (((trial & 1U) != 0U) ? fil::cpu::xpsr_c : 0U)
             | (((trial & 2U) != 0U) ? fil::cpu::xpsr_v : 0U);
         initial.fpscr = 0xa5c30000U ^ static_cast<std::uint32_t>(trial);
@@ -134,7 +171,7 @@ TEST(LlvmJitTest, DifferentialArithmeticPrefixesPreserveUnrelatedState) {
         initial.control = 2U;
         initial.primask = 3U;
 
-        for (std::size_t limit = 0; limit <= program.size(); ++limit) {
+        for (std::size_t limit = 0; limit <= program.size() + 2U; ++limit) {
             auto actual = initial;
             kernel->execute(actual, limit);
             fil::mem::MemoryBus bus;
@@ -155,13 +192,71 @@ TEST(LlvmJitTest, DifferentialArithmeticPrefixesPreserveUnrelatedState) {
             ASSERT_TRUE(bus.loadBytes(entry, bytes).hasValue());
             fil::cpu::CortexM4 reference(bus);
             reference.state() = initial;
-            for (std::size_t i = 0; i < limit; ++i) {
+            for (std::size_t i = 0; i < std::min(limit, program.size()); ++i) {
                 ASSERT_EQ(reference.stepFast().reason, fil::cpu::StopReason::step_complete);
             }
             EXPECT_TRUE(equalState(actual, reference.state()))
                 << "trial=" << trial << " limit=" << limit;
         }
     }
+}
+
+TEST(LlvmJitTest, CachedNzcvFlowsAcrossNarrowAndModifiedImmediateMovs) {
+    auto jit = compiler();
+    ASSERT_NE(jit, nullptr);
+    const auto narrow_program = std::vector{
+        narrow(0x3001U, entry),       // ADDS r0,#1: 0x7fffffff -> N=1,V=1,C=0
+        narrow(0x215aU, entry + 2U),  // MOVS r1,#0x5a preserves cached C and V
+    };
+    for (const auto& instruction : narrow_program) ASSERT_TRUE(LlvmJit::supports(instruction));
+    fil::cpu::CpuState initial{};
+    initial.r[15] = entry;
+    initial.instruction_address = entry;
+    initial.r[0] = 0x7fffffffU;
+    initial.xpsr = fil::cpu::xpsr_t | fil::cpu::xpsr_q | 0x000a0000U;
+    initial.fpscr = 0xdecafbadU;
+    initial.s[3] = std::bit_cast<float>(0x7fc12345U);
+    expectDifferentialPrefixes(*jit, narrow_program, initial);
+
+    const auto modified_program = std::vector{
+        narrow(0x3001U, entry),
+        wide(0xF05FU, 0x4200U, entry + 2U), // MOVS.W r2,#0x80000000; explicit C=1
+    };
+    for (const auto& instruction : modified_program) ASSERT_TRUE(LlvmJit::supports(instruction));
+    ASSERT_TRUE(modified_program[1].decoded.immediate_carry_valid);
+    ASSERT_TRUE(modified_program[1].decoded.immediate_carry);
+    expectDifferentialPrefixes(*jit, modified_program, initial);
+}
+
+TEST(LlvmJitTest, MovtAndMovwMovtCrossRegisterArithmeticFlagsMatchInterpreter) {
+    auto jit = compiler();
+    ASSERT_NE(jit, nullptr);
+    fil::cpu::CpuState initial{};
+    initial.r[15] = entry;
+    initial.instruction_address = entry;
+    initial.r[0] = 0xabcd5678U;
+    initial.r[1] = 0x87654321U;
+    initial.xpsr = fil::cpu::xpsr_t | fil::cpu::xpsr_q | fil::cpu::xpsr_ge_mask;
+    initial.fpscr = 0x13579bdfU;
+    for (std::size_t i = 0; i < initial.s.size(); ++i)
+        initial.s[i] = std::bit_cast<float>(0x7fc00000U | static_cast<std::uint32_t>(i));
+
+    const auto standalone_movt = std::vector{
+        wide(0xF2C1U, 0x2234U, entry), // MOVT r2,#0x1234; retain r2's nonzero low half
+    };
+    ASSERT_TRUE(LlvmJit::supports(standalone_movt.front()));
+    initial.r[2] = 0x89abcdefU;
+    expectDifferentialPrefixes(*jit, standalone_movt, initial);
+
+    initial.r[2] = 0x2468ace0U;
+    const auto dependent_program = std::vector{
+        wide(0xF245U, 0x6078U, entry),       // MOVW r0,#0x5678
+        wide(0xF2C1U, 0x0234U, entry + 4U),  // MOVT r0,#0x1234
+        wide(0xF100U, 0x0101U, entry + 8U),  // ADD.W r1,r0,#1 (non-flag-setting)
+        wide(0xF111U, 0x0F01U, entry + 12U), // CMN r1,#1 updates flags
+    };
+    for (const auto& instruction : dependent_program) ASSERT_TRUE(LlvmJit::supports(instruction));
+    expectDifferentialPrefixes(*jit, dependent_program, initial);
 }
 
 TEST(LlvmJitTest, BranchPrefixesMatchInterpreterForFallthroughAndTakenTargets) {
@@ -193,7 +288,7 @@ TEST(LlvmJitTest, BranchPrefixesMatchInterpreterForFallthroughAndTakenTargets) {
             }
         }
         ASSERT_TRUE(bus.loadBytes(entry, bytes).hasValue());
-        for (const std::size_t limit : std::array<std::size_t, 3>{0U, 1U, program.size()}) {
+        for (const std::size_t limit : std::array<std::size_t, 4>{0U, 1U, program.size(), program.size() + 2U}) {
             fil::cpu::CpuState initial{};
             initial.r[15] = entry;
             initial.instruction_address = entry;
@@ -203,7 +298,7 @@ TEST(LlvmJitTest, BranchPrefixesMatchInterpreterForFallthroughAndTakenTargets) {
             kernel->execute(actual, limit);
             fil::cpu::CortexM4 reference(bus);
             reference.state() = initial;
-            for (std::size_t i = 0; i < limit; ++i) {
+            for (std::size_t i = 0; i < std::min(limit, program.size()); ++i) {
                 ASSERT_EQ(reference.stepFast().reason, fil::cpu::StopReason::step_complete);
             }
             EXPECT_TRUE(equalState(actual, reference.state()))

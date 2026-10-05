@@ -20,6 +20,7 @@
 #include <type_traits>
 #include <llvm/Support/TargetSelect.h>
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -86,29 +87,27 @@ void storeReg(IRBuilder<>& b, LLVMContext& c, Value* state, std::uint8_t reg, Va
     storeField(b, c, state, offsetof(CpuState, r) + sizeof(std::uint32_t) * reg, value);
 }
 
-void writeNzcv(IRBuilder<>& b, LLVMContext& c, Value* state, Value* result,
-               Value* carry, Value* overflow) {
-    Value* old = loadField(b, c, state, offsetof(CpuState, xpsr));
+Value* writeNzcv(IRBuilder<>& b, LLVMContext& c, Value* old, Value* result,
+                 Value* carry, Value* overflow) {
     Value* retained = b.CreateAnd(old, c32(c, ~flag_mask));
     Value* n = b.CreateAnd(result, c32(c, xpsr_n));
     Value* z = b.CreateZExt(b.CreateICmpEQ(result, c32(c, 0)), Type::getInt32Ty(c));
     z = b.CreateShl(z, c32(c, 30));
     Value* cb = b.CreateShl(b.CreateZExt(carry, Type::getInt32Ty(c)), c32(c, 29));
     Value* vb = b.CreateShl(b.CreateZExt(overflow, Type::getInt32Ty(c)), c32(c, 28));
-    storeField(b, c, state, offsetof(CpuState, xpsr), b.CreateOr(retained, b.CreateOr(n, b.CreateOr(z, b.CreateOr(cb, vb)))));
+    return b.CreateOr(retained, b.CreateOr(n, b.CreateOr(z, b.CreateOr(cb, vb))));
 }
 
-void writeNzc(IRBuilder<>& b, LLVMContext& c, Value* state, Value* result, Value* carry) {
-    Value* old = loadField(b, c, state, offsetof(CpuState, xpsr));
+Value* writeNzc(IRBuilder<>& b, LLVMContext& c, Value* old, Value* result, Value* carry) {
     Value* retained = b.CreateAnd(old, c32(c, ~(xpsr_n | xpsr_z | xpsr_c)));
     Value* n = b.CreateAnd(result, c32(c, xpsr_n));
     Value* z = b.CreateShl(b.CreateZExt(b.CreateICmpEQ(result, c32(c, 0)), Type::getInt32Ty(c)), c32(c, 30));
     Value* cb = b.CreateShl(b.CreateZExt(carry, Type::getInt32Ty(c)), c32(c, 29));
-    storeField(b, c, state, offsetof(CpuState, xpsr), b.CreateOr(retained, b.CreateOr(n, b.CreateOr(z, cb))));
+    return b.CreateOr(retained, b.CreateOr(n, b.CreateOr(z, cb)));
 }
 
-void emitAddFlags(IRBuilder<>& b, LLVMContext& c, Value* state, Value* left, Value* right,
-                  bool subtract) {
+Value* emitAddFlags(IRBuilder<>& b, LLVMContext& c, Value* old, Value* left, Value* right,
+                    bool subtract) {
     Value* y = subtract ? b.CreateNot(right) : right;
     Value* sum64 = b.CreateAdd(b.CreateZExt(left, Type::getInt64Ty(c)),
                                b.CreateZExt(y, Type::getInt64Ty(c)));
@@ -124,7 +123,7 @@ void emitAddFlags(IRBuilder<>& b, LLVMContext& c, Value* state, Value* left, Val
         ovbits = b.CreateAnd(ovbits, c32(c, 0x80000000U));
     }
     Value* overflow = b.CreateICmpNE(ovbits, c32(c, 0));
-    writeNzcv(b, c, state, result, carry, overflow);
+    return writeNzcv(b, c, old, result, carry, overflow);
 }
 
 bool shapeSupported(const NativeJitInstruction& i) noexcept {
@@ -270,58 +269,116 @@ std::shared_ptr<const NativeJitKernel> LlvmJit::compile(
     IRBuilder<> b(*context);
     auto* entry = BasicBlock::Create(*context, "entry", fn);
     b.SetInsertPoint(entry);
-    for (std::size_t i = 0; i < instructions.size(); ++i) {
-        auto* run = BasicBlock::Create(*context, "op" + std::to_string(i), fn);
-        auto* next = BasicBlock::Create(*context, "next" + std::to_string(i), fn);
-        b.CreateCondBr(b.CreateICmpUGT(maximum, c64(*context, i)), run, next);
-        b.SetInsertPoint(run);
+    const auto emitInstruction = [&](const std::size_t i, auto&& readRegCached,
+                                     auto&& writeRegCached, auto&& readXpsrCached,
+                                     Value*& cached_xpsr, bool& dirty_xpsr,
+                                     Value*& cached_instruction_address,
+                                     bool& dirty_instruction_address) {
         const auto& item = instructions[i];
         const auto& d = item.decoded;
-        storeField(b, *context, state, offsetof(CpuState, instruction_address), c32(*context, item.pc));
-        storeReg(b, *context, state, 15U, c32(*context, item.pc + item.size));
+        cached_instruction_address = c32(*context, item.pc);
+        dirty_instruction_address = true;
+        writeRegCached(15U, c32(*context, item.pc + item.size));
         switch (d.kind) {
         case InstrKind::nop: break;
         case InstrKind::mov: {
             Value* value = c32(*context, d.imm);
-            storeReg(b, *context, state, d.rd, value);
+            writeRegCached(d.rd, value);
             if (d.set_flags) {
                 Value* carry = d.immediate_carry_valid
                     ? llvm::ConstantInt::get(Type::getInt1Ty(*context), d.immediate_carry)
-                    : b.CreateICmpNE(b.CreateAnd(loadField(b, *context, state, offsetof(CpuState, xpsr)), c32(*context, xpsr_c)), c32(*context, 0));
-                writeNzc(b, *context, state, value, carry);
+                    : b.CreateICmpNE(b.CreateAnd(readXpsrCached(), c32(*context, xpsr_c)), c32(*context, 0));
+                cached_xpsr = writeNzc(b, *context, readXpsrCached(), value, carry);
+                dirty_xpsr = true;
             }
             break;
         }
-        case InstrKind::movw: storeReg(b, *context, state, d.rd, c32(*context, d.imm)); break;
+        case InstrKind::movw: writeRegCached(d.rd, c32(*context, d.imm)); break;
         case InstrKind::movt: {
-            Value* old = loadReg(b, *context, state, d.rd);
-            storeReg(b, *context, state, d.rd, b.CreateOr(b.CreateAnd(old, c32(*context, 0xffffU)), c32(*context, d.imm << 16U)));
+            Value* old = readRegCached(d.rd);
+            writeRegCached(d.rd, b.CreateOr(b.CreateAnd(old, c32(*context, 0xffffU)), c32(*context, d.imm << 16U)));
             break;
         }
         case InstrKind::add:
         case InstrKind::sub: {
-            Value* left = loadReg(b, *context, state, d.rn);
+            Value* left = readRegCached(d.rn);
             Value* right = c32(*context, d.imm);
             Value* result = d.kind == InstrKind::add ? b.CreateAdd(left, right) : b.CreateSub(left, right);
-            storeReg(b, *context, state, d.rd, result);
-            if (d.set_flags) emitAddFlags(b, *context, state, left, right, d.kind == InstrKind::sub);
+            writeRegCached(d.rd, result);
+            if (d.set_flags) {
+                cached_xpsr = emitAddFlags(b, *context, readXpsrCached(), left, right, d.kind == InstrKind::sub);
+                dirty_xpsr = true;
+            }
             break;
         }
         case InstrKind::cmp:
-        case InstrKind::cmn: emitAddFlags(b, *context, state, loadReg(b, *context, state, d.rn), c32(*context, d.imm), d.kind == InstrKind::cmp); break;
+        case InstrKind::cmn:
+            cached_xpsr = emitAddFlags(b, *context, readXpsrCached(), readRegCached(d.rn), c32(*context, d.imm), d.kind == InstrKind::cmp);
+            dirty_xpsr = true;
+            break;
         case InstrKind::b:
         case InstrKind::bl: {
-            if (d.kind == InstrKind::bl) storeReg(b, *context, state, 14U, c32(*context, (item.pc + item.size) | 1U));
+            if (d.kind == InstrKind::bl) writeRegCached(14U, c32(*context, (item.pc + item.size) | 1U));
             const std::uint32_t target = static_cast<std::uint32_t>(static_cast<std::int64_t>(item.pc) + 4 + d.branch_offset) & ~1U;
-            storeReg(b, *context, state, 15U, c32(*context, target));
+            writeRegCached(15U, c32(*context, target));
             break;
         }
         default: break;
         }
-        b.CreateBr(next);
-        b.SetInsertPoint(next);
-    }
-    b.CreateRetVoid();
+    };
+
+    const auto emitPath = [&](const bool bounded) {
+        std::array<Value*, 16> registers{};
+        std::array<bool, 16> dirty_registers{};
+        Value* cached_xpsr = nullptr;
+        bool dirty_xpsr = false;
+        Value* cached_instruction_address = nullptr;
+        bool dirty_instruction_address = false;
+        const auto readRegCached = [&](const std::uint8_t reg) -> Value* {
+            if (registers[reg] == nullptr) registers[reg] = loadReg(b, *context, state, reg);
+            return registers[reg];
+        };
+        const auto writeRegCached = [&](const std::uint8_t reg, Value* value) {
+            registers[reg] = value;
+            dirty_registers[reg] = true;
+        };
+        const auto readXpsrCached = [&]() -> Value* {
+            if (cached_xpsr == nullptr) cached_xpsr = loadField(b, *context, state, offsetof(CpuState, xpsr));
+            return cached_xpsr;
+        };
+        const auto commitPrefix = [&]() {
+            for (std::size_t reg = 0; reg < registers.size(); ++reg)
+                if (dirty_registers[reg]) storeReg(b, *context, state, static_cast<std::uint8_t>(reg), registers[reg]);
+            if (dirty_xpsr) storeField(b, *context, state, offsetof(CpuState, xpsr), cached_xpsr);
+            if (dirty_instruction_address)
+                storeField(b, *context, state, offsetof(CpuState, instruction_address), cached_instruction_address);
+        };
+
+        for (std::size_t i = 0; i < instructions.size(); ++i) {
+            if (bounded) {
+                auto* execute = BasicBlock::Create(*context, "bounded_op" + std::to_string(i), fn);
+                auto* limit_exit = BasicBlock::Create(*context, "limit" + std::to_string(i), fn);
+                b.CreateCondBr(b.CreateICmpUGT(maximum, c64(*context, i)), execute, limit_exit);
+                b.SetInsertPoint(limit_exit);
+                commitPrefix();
+                b.CreateRetVoid();
+                b.SetInsertPoint(execute);
+            }
+            emitInstruction(i, readRegCached, writeRegCached, readXpsrCached,
+                            cached_xpsr, dirty_xpsr, cached_instruction_address,
+                            dirty_instruction_address);
+        }
+        commitPrefix();
+        b.CreateRetVoid();
+    };
+
+    auto* full_kernel = BasicBlock::Create(*context, "full_kernel", fn);
+    auto* bounded_prefix = BasicBlock::Create(*context, "bounded_prefix", fn);
+    b.CreateCondBr(b.CreateICmpUGE(maximum, c64(*context, instructions.size())), full_kernel, bounded_prefix);
+    b.SetInsertPoint(full_kernel);
+    emitPath(false);
+    b.SetInsertPoint(bounded_prefix);
+    emitPath(true);
     std::string verifier;
     if (!verifyModule(*module, verifier)) {
         error = "LLVM module verification failed before optimization: " + verifier;
