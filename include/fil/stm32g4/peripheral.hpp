@@ -214,7 +214,13 @@ public:
     );
 
     [[nodiscard]] std::uint64_t systemClockHz() const noexcept { return system_clock_hz_; }
+    [[nodiscard]] std::uint64_t hclkHz() const noexcept { return hclk_hz_; }
     void setClockChangedCallback(std::function<void(std::uint64_t)> callback);
+    /** Reports HCLK and independently gated ADC12/ADC345 kernel clocks. */
+    void setAdcClockChangedCallback(
+        std::function<void(std::uint64_t, std::uint64_t, std::uint64_t, bool, bool, bool)> callback
+    );
+    void setAdcResetChangedCallback(std::function<void(bool, bool)> callback);
 
 protected:
     void storeRegister(
@@ -229,12 +235,24 @@ protected:
 private:
     void updateClockReadyBits();
     void updateSystemClock();
+    void updateAdcClocks(bool force_callback = false);
+    void updateAdcResets();
     [[nodiscard]] std::uint64_t pllClockHz() const noexcept;
+    [[nodiscard]] std::uint64_t hclkClockHz() const noexcept;
+    [[nodiscard]] std::uint64_t adcKernelClockHz(std::uint32_t selector) const noexcept;
 
     bool hse_present_{true};
     std::uint64_t hse_hz_{8000000};
     std::uint64_t system_clock_hz_{16000000};
+    std::uint64_t hclk_hz_{16000000};
+    std::uint64_t adc12_clock_hz_{0};
+    std::uint64_t adc345_clock_hz_{0};
+    bool adc12_enabled_{false};
+    bool adc345_enabled_{false};
+    bool hpre_div1_allowed_{true};
     std::function<void(std::uint64_t)> clock_changed_;
+    std::function<void(std::uint64_t, std::uint64_t, std::uint64_t, bool, bool, bool)> adc_clock_changed_;
+    std::function<void(bool, bool)> adc_reset_changed_;
 };
 
 /** @brief STM32G4 FLASH control-register model with key-based lock state. */
@@ -588,7 +606,11 @@ public:
     explicit AdcCommonPeripheral(std::string name, std::vector<AdcPeripheral*> members,
                                  sim::EventLoop* event_loop = nullptr,
                                  sim::TraceRecorder* trace = nullptr);
+    /** Legacy standalone helper: uses the supplied rate for both HCLK and async kernel. */
     void setSystemClockHz(std::uint64_t frequency_hz);
+    void setClockInputs(std::uint64_t hclk_hz, std::uint64_t async_kernel_hz,
+                        bool clock_enabled = true, bool hclk_div1_allowed = true);
+    void setGroupReset(bool asserted);
 
 protected:
     void storeRegister(std::uint32_t word_offset, std::uint32_t previous,
@@ -599,7 +621,11 @@ protected:
 private:
     void updateMemberClocks();
     std::vector<AdcPeripheral*> members_;
-    std::uint64_t system_clock_hz_{16000000U};
+    std::uint64_t hclk_hz_{16000000U};
+    std::uint64_t async_kernel_hz_{16000000U};
+    bool clock_enabled_{true};
+    bool hclk_div1_allowed_{true};
+    bool reset_asserted_{false};
 };
 
 /** @brief ADC conversion result with selected channel metadata. */
@@ -657,6 +683,7 @@ public:
     }
     [[nodiscard]] std::uint32_t decimation() const noexcept { return decimation_; }
     void setInputClockHz(std::uint64_t frequency_hz);
+    void setResetHeld(bool asserted);
     /** @brief Enables timestamped sample history; disabling it permits lazy continuous conversion. */
     void setSampleHistoryEnabled(bool enabled);
     [[nodiscard]] bool sampleHistoryEnabled() const noexcept { return sample_history_enabled_; }
@@ -710,6 +737,7 @@ private:
     void armNextConversion(sim::SimTimeNs completion_time);
     void scheduleConversionEvent();
     void cancelConversion() noexcept;
+    [[nodiscard]] std::uint64_t conversionCycleBudget(std::uint32_t rank) const noexcept;
 
     std::array<std::uint16_t, 20> channel_values_{};
     std::array<bool, 20> channel_overrides_{};
@@ -731,6 +759,9 @@ private:
     bool skip_scan_{false};
     sim::ScheduledEvent conversion_event_;
     std::optional<sim::SimTimeNs> next_conversion_ns_;
+    std::uint64_t suspended_conversion_cycles_{0U};
+    sim::SimTimeNs suspended_override_ns_{0U};
+    bool reset_held_{false};
     bool skipped_scan_event_{false};
     std::uint32_t skipped_scan_count_{0U};
     bool sample_history_enabled_{true};

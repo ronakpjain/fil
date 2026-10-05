@@ -2,6 +2,7 @@ find_package(GTest CONFIG REQUIRED)
 
 add_executable(fil_tests
     unit/alu_test.cpp
+    unit/adc_clock_test.cpp
     unit/board_test.cpp
     unit/can_bus_test.cpp
     unit/can_end_to_end_test.cpp

@@ -11,6 +11,19 @@
 
 namespace {
 
+// DMA/locality tests need an explicitly selected and enabled ADC kernel clock.
+auto createAdcMcu(fil::sim::EventLoop& events, fil::sim::TraceRecorder& trace,
+                  fil::cortexm::SystemControl& system) {
+    auto mcu = fil::stm32g4::Stm32G4::create(events, trace, system, true);
+    if (mcu) {
+        EXPECT_TRUE(mcu.value()->router().write(0x2104cU, fil::mem::AccessSize::word,
+                                               (1U << 13U) | (1U << 14U), {}));
+        EXPECT_TRUE(mcu.value()->router().write(0x21088U, fil::mem::AccessSize::word,
+                                               (2U << 28U) | (2U << 30U), {}));
+    }
+    return mcu;
+}
+
 TEST(Stm32G4Test, AdcCommonCkmodeClocksSeparateGroupsAndHonorsPartialCcrWrites) {
     fil::sim::EventLoop events;
     fil::sim::TraceRecorder trace;
@@ -67,7 +80,7 @@ TEST(Stm32G4Test, AdcCommonCkmodeClocksSeparateGroupsAndHonorsPartialCcrWrites) 
     ASSERT_TRUE(switched_adc.write(0x08U, word, 1U, {}));
     ASSERT_TRUE(switched_adc.write(0x08U, word, 1U | (1U << 2U), {}));
     ASSERT_EQ(switched_events.advanceBy(100U).events_executed, 0U);
-    ASSERT_TRUE(switched_common.write(0x0aU, half, 1U, {}));
+    switched_adc.setInputClockHz(170'000'000U); // RCC input changes may occur while active.
     EXPECT_EQ(switched_events.nextScheduledTime(), 164U);
     ASSERT_EQ(switched_events.runDueEvents(164U).events_executed, 1U);
     EXPECT_EQ(switched_events.now(), 164U);
@@ -84,7 +97,7 @@ TEST(Stm32G4Test, AdcCommonCkmodeClocksSeparateGroupsAndHonorsPartialCcrWrites) 
     ASSERT_TRUE(lazy_adc.write(0x08U, word, 1U, {}));
     ASSERT_TRUE(lazy_adc.write(0x08U, word, 1U | (1U << 2U), {}));
     ASSERT_EQ(lazy_events.advanceBy(40U).events_executed, 0U);
-    ASSERT_TRUE(lazy_common.write(0x0aU, half, 2U, {})); // HCLK/2, retaining lazy deadline.
+    lazy_adc.setInputClockHz(85'000'000U); // Retain the lazy deadline on an input-clock change.
     lazy_adc.setSampleHistoryEnabled(true);
     EXPECT_EQ(lazy_events.nextScheduledTime(), 138U);
     ASSERT_EQ(lazy_events.runDueEvents(138U).events_executed, 1U);
@@ -105,7 +118,7 @@ TEST(Stm32G4Test, AdcCommonCkmodeClocksSeparateGroupsAndHonorsPartialCcrWrites) 
     ASSERT_TRUE(gap_adc.write(0x08U, word, 1U | (1U << 2U), {}));
     ASSERT_EQ(gap_events.runDueEvents(89U).events_executed, 1U);
     ASSERT_TRUE(gap_events.advanceBy(11U).events_executed == 0U);
-    ASSERT_TRUE(gap_common.write(0x0aU, half, 2U, {}));
+    gap_adc.setInputClockHz(85'000'000U);
     EXPECT_EQ(gap_events.nextScheduledTime(), 256U);
     ASSERT_EQ(gap_events.runDueEvents(256U).events_executed, 1U);
     EXPECT_EQ(gap_adc.samples().size(), 1U) << "the gap landing remains suppressed";
@@ -129,6 +142,7 @@ TEST(Stm32G4Test, AdcCommonClockTracksRccPllChanges) {
         (1U << 16U) | (1U << 24U), {}));
     ASSERT_TRUE(mcu.value()->router().write(0x21008U, word, 3U, {}));
     ASSERT_EQ(mcu.value()->rcc().systemClockHz(), 170'000'000U);
+    ASSERT_TRUE(mcu.value()->router().write(0x2104cU, word, 1U << 13U, {}));
     auto* adc = mcu.value()->adc("ADC1");
     ASSERT_NE(adc, nullptr);
     ASSERT_TRUE(mcu.value()->router().write(0x1000030aU, half, 3U, {}));
@@ -145,7 +159,7 @@ TEST(Stm32G4Test, Adc5RoutesItsDmaRequestAndDedicatedInterrupt) {
     fil::sim::TraceRecorder trace;
     trace.setEnabled(false);
     fil::cortexm::SystemControl system;
-    auto mcu = fil::stm32g4::Stm32G4::create(events, trace, system, true);
+    auto mcu = createAdcMcu(events, trace, system);
     ASSERT_TRUE(mcu);
     fil::mem::MemoryBus memory;
     ASSERT_TRUE(memory.mapRam(0x20000000U, 0x1000U, "ram"));
@@ -182,7 +196,7 @@ TEST(Stm32G4Test, CertifiesOnlyTrustedAdcEventsAndRechecksPendingHooks) {
     fil::sim::TraceRecorder trace;
     trace.setEnabled(false);
     fil::cortexm::SystemControl system;
-    auto mcu = fil::stm32g4::Stm32G4::create(events, trace, system, true);
+    auto mcu = createAdcMcu(events, trace, system);
     ASSERT_TRUE(mcu);
     fil::mem::MemoryBus memory;
     ASSERT_TRUE(memory.mapRam(0x20000000U, 0x1000U, "ram"));
@@ -232,7 +246,7 @@ TEST(Stm32G4Test, PublicAdcHookChangesForceGlobalDispatch) {
         fil::sim::TraceRecorder trace;
         trace.setEnabled(false);
         fil::cortexm::SystemControl system;
-        auto mcu = fil::stm32g4::Stm32G4::create(events, trace, system, true);
+        auto mcu = createAdcMcu(events, trace, system);
         ASSERT_TRUE(mcu);
         fil::mem::MemoryBus memory;
         ASSERT_TRUE(memory.mapRam(0x20000000U, 0x1000U, "ram"));
@@ -281,7 +295,7 @@ TEST(Stm32G4Test, ObservationBarrierRechecksAfterProviderReplacement) {
     fil::sim::TraceRecorder trace;
     trace.setEnabled(false);
     fil::cortexm::SystemControl system;
-    auto mcu = fil::stm32g4::Stm32G4::create(events, trace, system, true);
+    auto mcu = createAdcMcu(events, trace, system);
     ASSERT_TRUE(mcu);
     fil::mem::MemoryBus memory;
     ASSERT_TRUE(memory.mapRam(0x20000000U, 0x1000U, "ram"));
@@ -328,7 +342,7 @@ TEST(Stm32G4Test, ReplacingAttachedMemoryBusInvalidatesAdcDmaLocality) {
     fil::sim::TraceRecorder trace;
     trace.setEnabled(false);
     fil::cortexm::SystemControl system;
-    auto mcu = fil::stm32g4::Stm32G4::create(events, trace, system, true);
+    auto mcu = createAdcMcu(events, trace, system);
     ASSERT_TRUE(mcu);
     fil::mem::MemoryBus trusted_router;
     ASSERT_TRUE(trusted_router.mapRam(0x20000000U, 0x1000U, "trusted-ram"));
@@ -375,7 +389,7 @@ TEST(Stm32G4Test, PartiallyConsumedAdcDmaRechecksNextDestinationRange) {
     fil::sim::TraceRecorder trace;
     trace.setEnabled(false);
     fil::cortexm::SystemControl system;
-    auto mcu = fil::stm32g4::Stm32G4::create(events, trace, system, true);
+    auto mcu = createAdcMcu(events, trace, system);
     ASSERT_TRUE(mcu);
     fil::mem::MemoryBus memory;
     ASSERT_TRUE(memory.mapRam(0x20000000U, 0x1000U, "ram"));

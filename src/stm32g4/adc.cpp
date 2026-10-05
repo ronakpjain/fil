@@ -1,7 +1,6 @@
 #include "fil/stm32g4/peripheral.hpp"
 
 #include <algorithm>
-#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -52,7 +51,28 @@ AdcCommonPeripheral::AdcCommonPeripheral(
 }
 
 void AdcCommonPeripheral::setSystemClockHz(const std::uint64_t frequency_hz) {
-    system_clock_hz_ = std::max<std::uint64_t>(frequency_hz, 1U);
+    // Legacy standalone helper keeps the prior test-facing behavior explicitly.
+    setClockInputs(frequency_hz, frequency_hz);
+}
+
+void AdcCommonPeripheral::setClockInputs(
+    const std::uint64_t hclk_hz, const std::uint64_t async_kernel_hz,
+    const bool clock_enabled, const bool hclk_div1_allowed
+) {
+    hclk_hz_ = hclk_hz;
+    async_kernel_hz_ = async_kernel_hz;
+    clock_enabled_ = clock_enabled;
+    hclk_div1_allowed_ = hclk_div1_allowed;
+    updateMemberClocks();
+}
+
+void AdcCommonPeripheral::setGroupReset(const bool asserted) {
+    if (reset_asserted_ == asserted) return;
+    reset_asserted_ = asserted;
+    if (asserted) RegisterPeripheral::reset();
+    for (AdcPeripheral* member : members_) {
+        if (member != nullptr) member->setResetHeld(asserted);
+    }
     updateMemberClocks();
 }
 
@@ -61,23 +81,40 @@ void AdcCommonPeripheral::storeRegister(
     const std::uint32_t value, const std::uint32_t write_mask,
     const mem::AccessContext& context
 ) {
-    static_cast<void>(previous);
-    static_cast<void>(value);
     static_cast<void>(write_mask);
     static_cast<void>(context);
-    if (word_offset == 0x08U) updateMemberClocks(); // ADC_CCR.CKMODE
+    if (reset_asserted_) {
+        setRegister(word_offset, previous);
+        return;
+    }
+    if (word_offset != 0x08U) return;
+    constexpr std::uint32_t clock_fields = (3U << 16U) | (0x0fU << 18U);
+    constexpr std::uint32_t active = (1U << 0U) | (1U << 1U) | (1U << 2U)
+        | (1U << 3U) | (1U << 4U) | (1U << 31U);
+    const bool member_enabled = std::any_of(members_.begin(), members_.end(),
+        [](const AdcPeripheral* member) {
+            return member != nullptr && (member->peekRegister(0x08U) & active) != 0U;
+        });
+    if (member_enabled) {
+        setRegister(word_offset, (value & ~clock_fields) | (previous & clock_fields));
+    }
+    updateMemberClocks();
 }
 
 void AdcCommonPeripheral::onReset() { updateMemberClocks(); }
 
 void AdcCommonPeripheral::updateMemberClocks() {
-    const std::uint32_t mode = (registerValue(0x08U) >> 16U) & 0x3U;
-    // CKMODE 00 selects the asynchronous ADC kernel clock. RCC ADC12SEL /
-    // ADC345SEL and PLLP/HSI source rates are not yet modeled; use SYSCLK as
-    // the explicit deterministic fallback. Synchronous modes are modeled as
-    // HCLK / {1,2,4}; RCC.HPRE is not modeled, so HCLK currently equals SYSCLK.
-    const std::uint64_t divisor = mode == 2U ? 2U : mode == 3U ? 4U : 1U;
-    const std::uint64_t clock = system_clock_hz_ / divisor;
+    const std::uint32_t ccr = registerValue(0x08U);
+    const std::uint32_t mode = (ccr >> 16U) & 0x3U;
+    static constexpr std::uint16_t async_dividers[16]{1,2,4,6,8,10,12,16,32,64,128,256,0,0,0,0};
+    const std::uint32_t presc = (ccr >> 18U) & 0x0fU;
+    const std::uint64_t async_clock = presc < 12U
+        ? async_kernel_hz_ / async_dividers[presc] : 0U;
+    const std::uint64_t synchronous_clock = mode == 1U
+        ? (hclk_div1_allowed_ ? hclk_hz_ : 0U)
+        : mode == 2U ? hclk_hz_ / 2U : mode == 3U ? hclk_hz_ / 4U : async_clock;
+    const std::uint64_t clock = reset_asserted_ ? 0U : mode == 0U ? async_clock
+        : clock_enabled_ ? synchronous_clock : 0U;
     for (AdcPeripheral* member : members_) {
         if (member != nullptr) member->setInputClockHz(clock);
     }
@@ -159,16 +196,54 @@ void AdcPeripheral::setInterruptCallback(InterruptCallback callback) {
     refreshConversionScheduling();
 }
 
+void AdcPeripheral::setResetHeld(const bool asserted) {
+    if (reset_held_ == asserted) return;
+    reset_held_ = asserted;
+    if (asserted) RegisterPeripheral::reset();
+}
+
 void AdcPeripheral::setInputClockHz(const std::uint64_t frequency_hz) {
-    const std::uint64_t next_hz = std::max<std::uint64_t>(frequency_hz, 1U);
+    const std::uint64_t next_hz = frequency_hz;
     if (next_hz == input_clock_hz_) return;
 
     synchronizeLazyConversions();
+    if (next_hz == 0U) {
+        if (next_conversion_ns_) {
+            const sim::SimTimeNs now = currentTime();
+            const sim::SimTimeNs remaining_ns = *next_conversion_ns_ > now
+                ? *next_conversion_ns_ - now : 0U;
+            if (conversion_delay_override_ns_ != 0U) {
+                suspended_override_ns_ = remaining_ns;
+            } else {
+                if (remaining_ns > std::numeric_limits<std::uint64_t>::max() / input_clock_hz_) {
+                    throw std::overflow_error("ADC suspended-cycle count overflow");
+                }
+                suspended_conversion_cycles_ = remaining_ns * input_clock_hz_;
+            }
+        }
+        conversion_event_.cancel();
+        next_conversion_ns_.reset();
+        input_clock_hz_ = 0U;
+        return;
+    }
     const std::uint64_t previous_hz = input_clock_hz_;
     const sim::SimTimeNs now = currentTime();
     const bool event_pending = conversion_event_.pending();
     std::optional<sim::SimTimeNs> rescheduled_time;
-    if (next_conversion_ns_ && conversion_delay_override_ns_ == 0U) {
+    if (suspended_override_ns_ != 0U) {
+        if (suspended_override_ns_ > std::numeric_limits<sim::SimTimeNs>::max() - now)
+            throw std::overflow_error("ADC conversion time overflow during override resume");
+        rescheduled_time = now + suspended_override_ns_;
+        suspended_override_ns_ = 0U;
+    } else if (suspended_conversion_cycles_ != 0U) {
+        sim::SimTimeNs delay = suspended_conversion_cycles_ / next_hz;
+        if (suspended_conversion_cycles_ % next_hz != 0U) ++delay;
+        delay = std::max<sim::SimTimeNs>(delay, 1U);
+        if (delay > std::numeric_limits<sim::SimTimeNs>::max() - now)
+            throw std::overflow_error("ADC conversion time overflow during clock resume");
+        rescheduled_time = now + delay;
+        suspended_conversion_cycles_ = 0U;
+    } else if (next_conversion_ns_ && conversion_delay_override_ns_ == 0U) {
         const sim::SimTimeNs remaining_ns = *next_conversion_ns_ > now
             ? *next_conversion_ns_ - now : 0U;
         // Integer checked arithmetic avoids an out-of-range float-to-time cast.
@@ -195,7 +270,12 @@ void AdcPeripheral::setInputClockHz(const std::uint64_t frequency_hz) {
     if (event_pending) conversion_event_.cancel();
     input_clock_hz_ = next_hz;
     if (rescheduled_time) next_conversion_ns_ = *rescheduled_time;
-    if (event_pending) refreshConversionScheduling();
+    if (!next_conversion_ns_ && (registerValue(cr) & adstart) != 0U) {
+        const sim::SimTimeNs delay = conversionDelayForRank(sequence_rank_);
+        if (delay <= std::numeric_limits<sim::SimTimeNs>::max() - now)
+            next_conversion_ns_ = now + delay;
+    }
+    if (event_pending || rescheduled_time || next_conversion_ns_) refreshConversionScheduling();
 }
 
 void AdcPeripheral::setSampleHistoryEnabled(const bool enabled) {
@@ -227,6 +307,10 @@ void AdcPeripheral::storeRegister(
     const mem::AccessContext& context
 ) {
     static_cast<void>(context);
+    if (reset_held_) {
+        setRegister(word_offset, previous);
+        return;
+    }
     if (word_offset == isr) {
         setRegister(isr, previous & ~(value & write_mask));
         setInterruptLevel(0, (registerValue(ier) & registerValue(isr) & (eoc | eos)) != 0U);
@@ -265,6 +349,7 @@ void AdcPeripheral::storeRegister(
 
 void AdcPeripheral::onReset() {
     cancelConversion();
+    samples_.clear();
     sequence_rank_ = 0U;
     scan_index_ = 0U;
     skip_scan_ = false;
@@ -293,8 +378,7 @@ std::uint32_t AdcPeripheral::channelForRank(const std::uint32_t rank) const noex
     return channel < channel_values_.size() ? channel : 0U;
 }
 
-sim::SimTimeNs AdcPeripheral::conversionDelayForRank(const std::uint32_t rank) const noexcept {
-    if (conversion_delay_override_ns_ != 0U) return conversion_delay_override_ns_;
+std::uint64_t AdcPeripheral::conversionCycleBudget(const std::uint32_t rank) const noexcept {
     const std::uint32_t channel = channelForRank(rank);
     const std::uint32_t sample_register = channel <= 9U ? smpr1 : smpr2;
     const std::uint32_t sample_shift = 3U * (channel <= 9U ? channel : channel - 10U);
@@ -309,13 +393,14 @@ sim::SimTimeNs AdcPeripheral::conversionDelayForRank(const std::uint32_t rank) c
     const std::uint32_t resolution = (registerValue(cfgr) >> 3U) & 0x3U;
     const std::uint64_t half_cycles =
         sample_half_cycles[sample_selector] + conversion_half_cycles[resolution];
-    const std::uint64_t denominator = 2U * std::max<std::uint64_t>(input_clock_hz_, 1U);
-    if (half_cycles > std::numeric_limits<std::uint64_t>::max() / 1'000'000'000ULL) {
-        return std::numeric_limits<sim::SimTimeNs>::max();
-    }
-    return std::max<sim::SimTimeNs>(
-        (half_cycles * 1'000'000'000ULL + denominator - 1U) / denominator, 1U
-    );
+    return half_cycles * 500'000'000ULL;
+}
+
+sim::SimTimeNs AdcPeripheral::conversionDelayForRank(const std::uint32_t rank) const noexcept {
+    if (conversion_delay_override_ns_ != 0U) return conversion_delay_override_ns_;
+    if (input_clock_hz_ == 0U) return std::numeric_limits<sim::SimTimeNs>::max();
+    const std::uint64_t budget = conversionCycleBudget(rank);
+    return std::max<sim::SimTimeNs>((budget + input_clock_hz_ - 1U) / input_clock_hz_, 1U);
 }
 
 bool AdcPeripheral::continuousMode() const noexcept {
@@ -343,6 +428,11 @@ void AdcPeripheral::startConversion() {
     sequence_rank_ = 0U;
     scan_index_ = 0U;
     skip_scan_ = false;
+    if (input_clock_hz_ == 0U) {
+        if (conversion_delay_override_ns_ != 0U) suspended_override_ns_ = conversion_delay_override_ns_;
+        else suspended_conversion_cycles_ = conversionCycleBudget(sequence_rank_);
+        return;
+    }
     if (eventLoop() == nullptr) {
         materializeConversion(currentTime(), true);
         setRegister(cr, registerValue(cr) & ~adstart);
@@ -374,6 +464,7 @@ void AdcPeripheral::completeConversion() {
         return;
     }
 
+    if (input_clock_hz_ == 0U) return;
     if ((registerValue(cr) & adstart) != 0U) {
         const sim::SimTimeNs delay = conversionDelayForRank(sequence_rank_);
         if (delay > std::numeric_limits<sim::SimTimeNs>::max() - currentTime()) {
@@ -399,6 +490,7 @@ void AdcPeripheral::beginNextScan() {
         setRegister(cr, registerValue(cr) & ~adstart);
         return;
     }
+    if (input_clock_hz_ == 0U) return;
     // Jump the whole decimated gap in one event: scans scan_index_ .. the
     // next kept scan are unobservable while skipped, so their internal
     // event granularity collapses. The span repeats the live scan period;
@@ -533,6 +625,8 @@ void AdcPeripheral::scheduleConversionEvent() {
 
 void AdcPeripheral::cancelConversion() noexcept {
     conversion_event_.cancel();
+    suspended_conversion_cycles_ = 0U;
+    suspended_override_ns_ = 0U;
     next_conversion_ns_.reset();
     skipped_scan_event_ = false;
     skipped_scan_count_ = 0U;

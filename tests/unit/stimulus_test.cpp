@@ -307,6 +307,8 @@ TEST(StimulusTest, SchedulesCanGpioAdcAndUsartInputs) {
         return std::uint16_t{123U};
     });
     adc->setConversionDelay(5'000U);
+    ASSERT_TRUE(board->memory().write32(0x4002104cU, 1U << 13U));
+    ASSERT_TRUE(board->memory().write32(0x40021088U, 2U << 28U));
 
     const auto result = world.value()->eventLoop().runDueEvents(9'000'000U);
     EXPECT_EQ(result.events_executed, 7U);

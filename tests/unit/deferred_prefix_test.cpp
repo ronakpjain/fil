@@ -69,6 +69,8 @@ void configureLocalAdc(fil::sim::World& world, const fil::sim::EventOwner owner)
     ASSERT_NE(adc, nullptr);
     adc->setConversionDelay(100U);
     adc->setChannelValue(0U, 321U);
+    ASSERT_TRUE(board.memory().write32(0x4002104cU, 1U << 13U));
+    ASSERT_TRUE(board.memory().write32(0x40021088U, 2U << 28U));
     ASSERT_TRUE(board.memory().write32(0x40020800U, 5U));
     ASSERT_TRUE(board.memory().write32(0x4002000cU, 4U));
     ASSERT_TRUE(board.memory().write32(0x40020010U, 0x50000040U));

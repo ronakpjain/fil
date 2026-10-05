@@ -255,7 +255,17 @@ void Stm32G4::wireInterrupts() {
     dma2_.setEnableCallback(dma_enable_trigger);
     rcc_.setClockChangedCallback([this](const std::uint64_t frequency) {
         for (auto& timer : timers_) timer->setInputClockHz(frequency);
-        for (auto& common : adc_common_) common->setSystemClockHz(frequency);
+    });
+    rcc_.setAdcClockChangedCallback(
+        [this](const std::uint64_t hclk, const std::uint64_t adc12, const std::uint64_t adc345,
+               const bool adc12_enabled, const bool adc345_enabled, const bool hpre_div1) {
+            adc_common_[0]->setClockInputs(hclk, adc12, adc12_enabled, hpre_div1);
+            adc_common_[1]->setClockInputs(hclk, adc345, adc345_enabled, hpre_div1);
+        }
+    );
+    rcc_.setAdcResetChangedCallback([this](const bool adc12_reset, const bool adc345_reset) {
+        adc_common_[0]->setGroupReset(adc12_reset);
+        adc_common_[1]->setGroupReset(adc345_reset);
     });
     iwdg_.setResetCallback([this] { reset_requested_ = true; });
     wwdg_.setResetCallback([this] { reset_requested_ = true; });

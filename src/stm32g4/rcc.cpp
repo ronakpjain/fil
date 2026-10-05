@@ -10,6 +10,9 @@ namespace {
 constexpr std::uint32_t cr = 0x00;
 constexpr std::uint32_t cfgr = 0x08;
 constexpr std::uint32_t pllcfgr = 0x0c;
+constexpr std::uint32_t ahb2rstr = 0x2c;
+constexpr std::uint32_t ahb2enr = 0x4c;
+constexpr std::uint32_t ccipr = 0x88;
 constexpr std::uint32_t cifr = 0x1c;
 constexpr std::uint32_t cicr = 0x20;
 constexpr std::uint32_t bdcr = 0x90;
@@ -44,6 +47,23 @@ void RccPeripheral::setClockChangedCallback(std::function<void(std::uint64_t)> c
     clock_changed_ = std::move(callback);
 }
 
+void RccPeripheral::setAdcClockChangedCallback(
+    std::function<void(std::uint64_t, std::uint64_t, std::uint64_t, bool, bool, bool)> callback
+) {
+    adc_clock_changed_ = std::move(callback);
+    if (adc_clock_changed_) {
+        const std::uint32_t ahb2 = registerValue(ahb2enr);
+        adc_clock_changed_(hclk_hz_, adc12_clock_hz_, adc345_clock_hz_,
+            (ahb2 & (1U << 13U)) != 0U, (ahb2 & (1U << 14U)) != 0U,
+            ((registerValue(cfgr) >> 4U) & 0x0fU) < 8U);
+    }
+}
+
+void RccPeripheral::setAdcResetChangedCallback(std::function<void(bool, bool)> callback) {
+    adc_reset_changed_ = std::move(callback);
+    if (adc_reset_changed_) updateAdcResets();
+}
+
 void RccPeripheral::storeRegister(
     const std::uint32_t word_offset,
     const std::uint32_t previous,
@@ -68,12 +88,22 @@ void RccPeripheral::storeRegister(
     if (word_offset == cr || word_offset == cfgr || word_offset == pllcfgr) {
         updateSystemClock();
     }
+    if (word_offset == cr || word_offset == cfgr || word_offset == pllcfgr
+        || word_offset == ccipr || word_offset == ahb2enr) {
+        updateAdcClocks();
+    }
+    if (word_offset == ahb2rstr) updateAdcResets();
 }
 
 void RccPeripheral::onReset() {
     const std::uint64_t previous_clock = system_clock_hz_;
     system_clock_hz_ = 16000000;
+    hclk_hz_ = 16000000;
+    adc12_clock_hz_ = 0U;
+    adc345_clock_hz_ = 0U;
     updateClockReadyBits();
+    updateAdcClocks(true);
+    updateAdcResets();
     if (previous_clock != system_clock_hz_ && clock_changed_) {
         traceEvent("clock_change", {{"frequency_hz", std::to_string(system_clock_hz_)}});
         clock_changed_(system_clock_hz_);
@@ -120,6 +150,65 @@ std::uint64_t RccPeripheral::pllClockHz() const noexcept {
     const std::uint64_t multiplier_n = std::max<std::uint64_t>((config >> 8U) & 0x7fU, 1U);
     const std::uint64_t divider_r = 2U * (((config >> 25U) & 0x3U) + 1U);
     return (source_hz / divider_m) * multiplier_n / divider_r;
+}
+
+std::uint64_t RccPeripheral::hclkClockHz() const noexcept {
+    const std::uint32_t hpre = (registerValue(cfgr) >> 4U) & 0x0fU;
+    static constexpr std::uint16_t divisors[16]{1,1,1,1,1,1,1,1,2,4,8,16,64,128,256,512};
+    return system_clock_hz_ / divisors[hpre];
+}
+
+std::uint64_t RccPeripheral::adcKernelClockHz(const std::uint32_t selector) const noexcept {
+    if (selector == 0U || selector == 3U) return 0U;
+    if (selector == 2U) return system_clock_hz_;
+    const std::uint32_t config = registerValue(pllcfgr);
+    const std::uint32_t source_selector = config & 0x3U;
+    const std::uint32_t oscillator_state = registerValue(cr);
+    if ((config & (1U << 16U)) == 0U
+        || (oscillator_state & (pllon | pllrdy)) != (pllon | pllrdy)) return 0U;
+    std::uint64_t source_hz = 0U;
+    if (source_selector == 2U && (oscillator_state & hsirdy) != 0U) source_hz = 16000000U;
+    if (source_selector == 3U && (oscillator_state & hserdy) != 0U) source_hz = hse_hz_;
+    if (source_hz == 0U) return 0U;
+    const std::uint64_t divider_m = ((config >> 4U) & 0x0fU) + 1U;
+    const std::uint64_t multiplier_n = std::max<std::uint64_t>((config >> 8U) & 0x7fU, 1U);
+    std::uint64_t p_divider = (config >> 27U) & 0x1fU;
+    if (p_divider == 1U) return 0U;
+    if (p_divider == 0U) p_divider = (config & (1U << 17U)) != 0U ? 17U : 7U;
+    return (source_hz * multiplier_n) / (divider_m * p_divider);
+}
+
+void RccPeripheral::updateAdcClocks(const bool force_callback) {
+    const std::uint64_t previous_hclk = hclk_hz_;
+    hclk_hz_ = hclkClockHz();
+    const std::uint32_t ccipr_value = registerValue(ccipr);
+    const std::uint32_t ahb2_value = registerValue(ahb2enr);
+    const bool adc12_enabled = (ahb2_value & (1U << 13U)) != 0U;
+    const bool adc345_enabled = (ahb2_value & (1U << 14U)) != 0U;
+    const bool hpre_div1_allowed = ((registerValue(cfgr) >> 4U) & 0x0fU) < 8U;
+    // AHB2ENR gates the bus-interface clock. The asynchronous conversion
+    // kernel is a separate clock domain (RM0440 21.4.3, Figure 83).
+    const std::uint64_t adc12 = adcKernelClockHz((ccipr_value >> 28U) & 0x3U);
+    const std::uint64_t adc345 = adcKernelClockHz((ccipr_value >> 30U) & 0x3U);
+    if (!force_callback && previous_hclk == hclk_hz_
+        && adc12 == adc12_clock_hz_ && adc345 == adc345_clock_hz_
+        && adc12_enabled == adc12_enabled_ && adc345_enabled == adc345_enabled_
+        && hpre_div1_allowed == hpre_div1_allowed_) return;
+    adc12_clock_hz_ = adc12;
+    adc345_clock_hz_ = adc345;
+    adc12_enabled_ = adc12_enabled;
+    adc345_enabled_ = adc345_enabled;
+    hpre_div1_allowed_ = hpre_div1_allowed;
+    if (adc_clock_changed_) {
+        adc_clock_changed_(hclk_hz_, adc12_clock_hz_, adc345_clock_hz_,
+            adc12_enabled_, adc345_enabled_, hpre_div1_allowed_);
+    }
+}
+
+void RccPeripheral::updateAdcResets() {
+    if (!adc_reset_changed_) return;
+    const std::uint32_t resets = registerValue(ahb2rstr);
+    adc_reset_changed_((resets & (1U << 13U)) != 0U, (resets & (1U << 14U)) != 0U);
 }
 
 void RccPeripheral::updateSystemClock() {
