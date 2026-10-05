@@ -13,6 +13,28 @@ namespace {
 constexpr fil::mem::AccessContext read_context{fil::mem::AccessType::data_read, 0};
 constexpr fil::mem::AccessContext write_context{fil::mem::AccessType::data_write, 0};
 
+TEST(PeripheralTest, MergesRegisterByteLanesAndRejectsOutOfBlockWrites) {
+    fil::stm32g4::RegisterPeripheral registers("register-contract", 8U);
+    constexpr auto word = fil::mem::AccessSize::word;
+    ASSERT_TRUE(registers.write(0U, word, 0x11223344U, write_context));
+    ASSERT_TRUE(registers.write(4U, word, 0x55667788U, write_context));
+    ASSERT_TRUE(registers.write(1U, fil::mem::AccessSize::byte, 0xabU, write_context));
+    ASSERT_TRUE(registers.write(2U, fil::mem::AccessSize::halfword, 0xcdefU, write_context));
+    EXPECT_EQ(registers.peekRegister(0U), 0xcdefab44U);
+    // The generic backing supports cross-register lanes; individual device
+    // access restrictions need their own tests rather than inheriting this rule.
+    ASSERT_TRUE(registers.write(3U, fil::mem::AccessSize::halfword, 0x9876U, write_context));
+    EXPECT_EQ(registers.peekRegister(0U), 0x76efab44U);
+    EXPECT_EQ(registers.peekRegister(4U), 0x55667798U);
+    EXPECT_EQ(registers.read(3U, fil::mem::AccessSize::halfword, read_context).value(), 0x9876U);
+    EXPECT_FALSE(registers.write(7U, word, 0U, write_context));
+    EXPECT_FALSE(registers.read(8U, word, read_context));
+    EXPECT_EQ(registers.peekRegister(4U), 0x55667798U);
+    registers.reset();
+    EXPECT_EQ(registers.peekRegister(0U), 0U);
+    EXPECT_EQ(registers.peekRegister(4U), 0U);
+}
+
 TEST(PeripheralTest, StoresRegistersAndUnknownMmio) {
     fil::stm32g4::PwrPeripheral pwr;
     EXPECT_TRUE(pwr.write(0, fil::mem::AccessSize::word, 0x11223344U, write_context).hasValue())

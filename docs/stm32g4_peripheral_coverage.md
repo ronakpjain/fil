@@ -52,6 +52,15 @@ accuracy. Run the tests as described in [Testing](testing.md).
 
 Within a modeled register block, registers without a special hook generally retain written values. An address outside all routed blocks is handled by the top-level MMIO policy: lenient mode returns zero and counts the address, while `--strict-mmio` faults.
 
+### Shared MMIO model contracts
+
+`PeripheralTest.MergesRegisterByteLanesAndRejectsOutOfBlockWrites` checks the
+shared little-endian register backing, byte/halfword lane merging, reset, and
+out-of-block rejection without mutation. Cross-register accesses supported by
+that backing are **not** proof that a particular hardware register permits them.
+`PeripheralTest.StoresRegistersAndUnknownMmio` checks lenient sparse storage and
+strict unknown-MMIO failure; these are simulator policies, not RM0440 features.
+
 ## Implemented device behavior
 
 | Device | Implemented and tested semantics | Intentional simplifications or gaps |
