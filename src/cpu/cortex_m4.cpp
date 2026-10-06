@@ -1617,6 +1617,52 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::tryStepReversibleJitBlock
     return timed;
 }
 
+bool CortexM4::peekReversibleBlockHeadDeclines(
+    const ReversibleCycleBudget& budget) noexcept {
+    if (!prepareJitBlock(true)) return true;
+    const std::uint32_t entry_pc = state_.r[15];
+    const auto& slot = (*jit_blocks_)[jitBlockIndex(entry_pc)];
+    if (!slot.valid || slot.pc != entry_pc
+        || slot.generation != memory_.executionGeneration()
+        || state_.halted || !state_.thumb || (state_.xpsr & xpsr_t) == 0U
+        || (entry_pc & 1U) != 0U || inItBlock(state_.it_state)
+        || state_.pending_exception || state_.pending_exc_return) {
+        return true;
+    }
+    if (slot.count == 0U) return true;
+    const DecodedInstruction& op = slot.ops[0];
+    const JitFast fast = slot.fast[0];
+    if (fast == JitFast::generic) return true;
+    const bool condition_passed = op.condition == Condition::al
+        || conditionPasses(op.condition, state_.xpsr);
+    const std::uint16_t cycles = condition_passed
+        ? (slot.divide_form[0]
+            ? divideCycles(state_.readRegister(op.rm)) : slot.base_cycles[0])
+        : 1U;
+    const bool sequential_fetch = budget.have_fetch && slot.pcs[0] == budget.fetch_end;
+    const std::uint16_t fetch_stall = budget.fetch_stall
+        ? budget.fetch_stall(budget.context, slot.pcs[0], sequential_fetch) : 0U;
+    const std::uint32_t worst_cycles = static_cast<std::uint32_t>(cycles)
+        + (condition_passed ? slot.branch_penalty[0] : 0U) + fetch_stall;
+    if (worst_cycles > budget.remaining_cycles
+        || worst_cycles > std::numeric_limits<std::uint16_t>::max()) {
+        return true;
+    }
+    // Only forms whose effective address is a pure register+immediate sum can
+    // be predicted exactly; anything else stays optimistic (a real attempt may
+    // still decline and roll back as before).
+    const std::uint32_t address = state_.r[op.rn] + op.imm;
+    switch (fast) {
+    case JitFast::ldr_word_gpr:
+        return !memory_.isBackedRange(address, 4U, false);
+    case JitFast::str_word_gpr:
+        return !memory_.isBackedRange(address, 4U, true)
+            || (memory_.reversibleRamOnly() && !memory_.isReversibleRamTarget(address));
+    default:
+        return false;
+    }
+}
+
 std::optional<CortexM4::TimedJitStepOutcome> CortexM4::tryStepBudgetedReversibleJitBlock(
     const std::size_t max_instructions, ReversibleCycleBudget& budget) {
     if (max_instructions == 0U || !memory_.reversibleRamOnly()

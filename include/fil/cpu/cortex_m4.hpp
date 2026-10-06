@@ -323,6 +323,20 @@ public:
         std::size_t max_instructions, ReversibleCycleBudget& budget);
 
     /**
+     * @brief Predicts, without executing or mutating state, whether a trusted
+     * reversible block attempt at the current PC would execute no instruction.
+     *
+     * Replicates the entry checks and head-operation admission cost of
+     * executeTrustedReversibleJitBlock, including the runtime fast-path
+     * declines of register-indirect word load/store whose effective address
+     * cannot be served by the backed-memory fast path (MMIO, faults, or, for
+     * stores, the reversible-RAM restriction). Callers use it to skip
+     * reversible admission setup that would otherwise roll back unchanged.
+     */
+    [[nodiscard]] bool peekReversibleBlockHeadDeclines(
+        const ReversibleCycleBudget& budget) noexcept;
+
+    /**
      * @brief Previews a ready block prefix without executing it.
      *
      * Returns nullopt for unavailable blocks, zero-length requests, or when

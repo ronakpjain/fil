@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <span>
 #include <string>
@@ -313,6 +314,14 @@ public:
      */
     [[nodiscard]] bool isBackedRange(
         std::uint32_t address, std::uint32_t size, bool is_store) const noexcept;
+    /**
+     * @brief Non-mutating reversible-RAM store-target check.
+     *
+     * True only when the target is non-executable RAM, matching the
+     * reversible_ram_only_ restriction applied by tryFastWrite32. Used by
+     * admission peeks; performs no journal, footprint, or generation effect.
+     */
+    [[nodiscard]] bool isReversibleRamTarget(std::uint32_t address) const noexcept;
     /**
      * @brief Width-generic backed-memory-only access without fault allocation.
      *
