@@ -240,8 +240,10 @@ public:
         FastStepResult result{};
         // Per-instruction PCs/sizes for host fetch-stall accounting.
         static constexpr std::size_t max_block = 16U;
-        std::array<std::uint32_t, max_block> pcs{};
-        std::array<std::uint8_t, max_block> sizes{};
+        // Only elements [0, count) are ever written or read; leaving these
+        // uninitialized skips per-call zeroing in the hot block executor.
+        std::array<std::uint32_t, max_block> pcs;
+        std::array<std::uint8_t, max_block> sizes;
         std::uint8_t count{0};
         /// True when no executed op touched memory (ACR stable mid-block).
         bool memory_free{true};
@@ -262,7 +264,7 @@ public:
     /** @brief Fast-handler-only execution with exact per-committed-op pipeline costs. */
     struct TimedJitStepOutcome {
         JitStepOutcome execution{};
-        std::array<std::uint16_t, JitStepOutcome::max_block> instruction_cycles{};
+        std::array<std::uint16_t, JitStepOutcome::max_block> instruction_cycles;
     };
 
     /**

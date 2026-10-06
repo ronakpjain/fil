@@ -1756,7 +1756,7 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
         return std::nullopt;
     }
 
-    TimedJitStepOutcome timed{};
+    TimedJitStepOutcome timed;  // arrays are uninitialized; only [0, count) is used
     auto& out = timed.execution;
     std::uint32_t total_cycles = 0U;
     std::uint32_t last_pc = entry_pc;
@@ -1765,7 +1765,8 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
     bool last_suppress = false;
     const auto execution_count = static_cast<std::uint8_t>(
         std::min<std::size_t>(max_instructions, slot.count));
-    if (budget) budget->total_instruction_cycles.fill(0U);
+    // budget->total_instruction_cycles entries [0, count) are rewritten on
+    // every call before callers read them; no zero fill is needed.
 
     for (std::uint8_t i = 0U; i < execution_count; ++i) {
         const DecodedInstruction& op = slot.ops[i];
