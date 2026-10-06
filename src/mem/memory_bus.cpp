@@ -745,6 +745,12 @@ bool MemoryBus::tryFastReadWords(
     return true;
 }
 
+bool MemoryBus::isReversibleRamTarget(const std::uint32_t address) const noexcept {
+    const Region* region = find(address);
+    return region != nullptr && region->info.kind == RegionKind::ram
+        && !region->info.executable;
+}
+
 bool MemoryBus::tryFastWriteWords(
     const std::uint32_t address,
     const std::uint32_t count,
@@ -845,6 +851,12 @@ void MemoryBus::addAccessFootprint(
     const std::uint32_t address, const std::uint32_t width
 ) const noexcept {
     if (!read_footprint_tracking_ || width == 0U) return;
+    // Dominant case: an aligned access within one word marks only that
+    // word, skipping the span loop and 64-bit end arithmetic.
+    if ((address & 3U) == 0U && width <= 4U) {
+        addReadFootprint(read_footprint_, address);
+        return;
+    }
     const std::uint32_t first_word = address & ~std::uint32_t{3U};
     const std::uint64_t end = static_cast<std::uint64_t>(address) + width;
     for (std::uint64_t word = first_word; word < end; word += 4U) {
