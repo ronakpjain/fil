@@ -59,6 +59,8 @@ public:
         EventOwner owner{shared_event_owner};
         SimTimeNs time_ns{0};
         std::uint64_t event_generation{0};
+        /// Opaque snapshot of the owner's pending events (EventLoop-owned).
+        std::shared_ptr<const void> captured_events;
     };
 
     /** @brief RAII scope inherited by events scheduled within one board lane. */

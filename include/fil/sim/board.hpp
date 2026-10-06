@@ -283,11 +283,16 @@ public:
         SimTimeNs deadline_ns,
         bool enable_loop_batching = true,
         bool trap_all_mmio = false,
-        bool enable_jit = true
+        bool enable_jit = true,
+        std::uint64_t max_mutation_distance = 0U,
+        std::uint64_t mutation_base = 0U
     );
 
     /** @brief Captures reversible CPU, RAM, system, scheduler, and lane-clock state. */
     [[nodiscard]] TransactionCheckpointPtr captureTransaction(EventOwner owner) const;
+    /** @brief Backed-mutation sequence captured with a transaction checkpoint. */
+    [[nodiscard]] std::uint64_t transactionMutationSequence(
+        const TransactionCheckpointPtr& checkpoint) const noexcept;
 
     /** @brief Restores a checkpoint when no MMIO or owner event escaped the slice. */
     [[nodiscard]] bool restoreTransaction(const TransactionCheckpointPtr& checkpoint);

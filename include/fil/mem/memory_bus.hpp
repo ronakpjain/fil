@@ -505,6 +505,18 @@ private:
     mutable std::uint64_t side_effect_generation_{1};
     mutable std::uint64_t mmio_generation_{1};
     std::uint64_t mutation_sequence_{0};
+
+public:
+    /** @brief Monotone backed-mutation sequence, for journal-capacity guards. */
+    [[nodiscard]] std::uint64_t mutationSequence() const noexcept {
+        return mutation_sequence_;
+    }
+    /** @brief Journal capacity, for restore-window guards. */
+    [[nodiscard]] static constexpr std::size_t mutationJournalCapacity() noexcept {
+        return mutation_journal_capacity;
+    }
+
+private:
     std::uint64_t journal_generation_{1};
     std::uint64_t restoration_generation_{0};
     bool write_journal_tracking_{true};

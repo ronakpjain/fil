@@ -1215,9 +1215,13 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                     );
                 }
                 const auto run_slice = [&](const std::size_t index) {
+                    // Bound the slice's mutation distance so a failed epoch can
+                    // always roll back; partial slices simply do not commit.
                     slices[index] = boards_[index]->board->runWorkerSlice(
                         static_cast<EventOwner>(index), slice_instructions,
-                        slice_deadline, false, true, options.enable_jit
+                        slice_deadline, false, true, options.enable_jit,
+                        mem::MemoryBus::mutationJournalCapacity() - 16U,
+                        boards_[index]->board->transactionMutationSequence(checkpoints[index])
                     );
                 };
                 if (worker_pool) worker_pool->run(run_slice);
@@ -1238,6 +1242,17 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                 }
 
                 if (commit) {
+                    // Fire each lane's owner events for the committed span
+                    // (the slice deferred them; see runWorkerSlice). They must
+                    // run before the shared frontier advances.
+                    for (std::size_t index = 0; index < boards_.size(); ++index) {
+                        const auto local = event_loop_.runOwnedEvents(
+                            static_cast<EventOwner>(index), committed_time
+                        );
+                        output.event_callbacks = saturatingAdd(
+                            output.event_callbacks, local.events_executed
+                        );
+                    }
                     const auto events = event_loop_.runDueEvents(committed_time);
                     output.event_callbacks = saturatingAdd(
                         output.event_callbacks, events.events_executed

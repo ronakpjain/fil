@@ -1831,6 +1831,11 @@ Board::TransactionCheckpointPtr Board::captureTransaction(
     return checkpoint;
 }
 
+std::uint64_t Board::transactionMutationSequence(
+    const TransactionCheckpointPtr& checkpoint) const noexcept {
+    return checkpoint ? checkpoint->memory_checkpoint.mutation_sequence : 0U;
+}
+
 bool Board::restoreTransaction(const TransactionCheckpointPtr& checkpoint) {
     if (!checkpoint || !memory_.canRestoreSideEffects(checkpoint->memory_checkpoint)
         || !event_loop_->canRestoreOwnerCheckpoint(checkpoint->event_checkpoint)) {
@@ -1866,7 +1871,9 @@ BoardRunResult Board::runWorkerSlice(
     const SimTimeNs deadline_ns,
     const bool enable_loop_batching,
     const bool trap_all_mmio,
-    const bool enable_jit
+    const bool enable_jit,
+    const std::uint64_t max_mutation_distance,
+    const std::uint64_t mutation_base
 ) {
     BoardRunResult aggregate;
     aggregate.reason = BoardStopReason::instruction_budget;
@@ -1882,7 +1889,11 @@ BoardRunResult Board::runWorkerSlice(
         memory_.setAllMmioTrapping(previous_all_trapping);
     };
     const auto finish = [&]() {
-        if (trap_all_mmio) {
+        // Transactional slices (trap_all_mmio) do not fire owner events here:
+        // event callbacks mutate peripheral state that no transaction
+        // checkpoint captures, so the World fires them only after deciding to
+        // commit the epoch. Rolled-back epochs leave the events pending.
+        if (!trap_all_mmio) {
             static_cast<void>(event_loop_->runOwnedEvents(owner, local_now));
         }
         restore_trapping();
@@ -1892,6 +1903,15 @@ BoardRunResult Board::runWorkerSlice(
     };
 
     while (aggregate.instructions < instruction_budget) {
+        // Stop before the mutation journal could outgrow its restore window:
+        // a slice whose distance from its checkpoint exceeds the journal
+        // capacity could never be rolled back if the epoch does not commit.
+        if (max_mutation_distance != 0U
+            && memory_.mutationSequence() - mutation_base > max_mutation_distance) {
+            aggregate.reason = BoardStopReason::time_budget;
+            aggregate.message = "worker slice mutation journal bound reached";
+            break;
+        }
         const SimTimeNs now = trap_all_mmio ? local_now : event_loop_->now(owner);
         if (now >= deadline_ns) {
             aggregate.reason = BoardStopReason::time_budget;
