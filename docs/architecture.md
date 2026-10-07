@@ -8,10 +8,11 @@ task names, or source paths.
 ## Architecture diagrams
 
 Open the [editable architecture atlas](diagrams/fil-architecture.drawio.png) in
-draw.io to browse twelve pages. The PNG previews the first page; all twelve
-pages are embedded as editable, uncompressed draw.io XML.
+draw.io to pan and zoom around one large canvas containing twelve detailed
+sections in a three-column layout. The PNG previews the complete canvas, with
+editable, uncompressed draw.io XML embedded inside it.
 
-| Page | Focus |
+| Section | Focus |
 | --- | --- |
 | 1–4 | System overview, board internals, deterministic networking, performance overview |
 | 5 | Configuration, ELF loading, memory materialization and reset validation |
