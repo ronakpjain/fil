@@ -8,9 +8,20 @@ task names, or source paths.
 ## Architecture diagrams
 
 Open the [editable architecture atlas](diagrams/fil-architecture.drawio.png) in
-draw.io to browse four pages: system overview, board internals, deterministic
-networking, and guarded performance optimizations. The PNG previews the first
-page; all four pages are embedded as editable, uncompressed draw.io XML.
+draw.io to browse twelve pages. The PNG previews the first page; all twelve
+pages are embedded as editable, uncompressed draw.io XML.
+
+| Page | Focus |
+| --- | --- |
+| 1–4 | System overview, board internals, deterministic networking, performance overview |
+| 5 | Configuration, ELF loading, memory materialization and reset validation |
+| 6 | Address resolution, access permissions, MMIO dispatch and mutation tracking |
+| 7 | Instruction cache, fetch/decode, specialized handlers and retirement |
+| 8 | Pending exception selection, stack frames, nesting and EXC_RETURN |
+| 9 | Native JIT compilation, residency, matched timing windows and adaptive dispatch |
+| 10 | Network time frontiers, lane ordering, admission limits and observation barriers |
+| 11 | Reversible RAM capsules, period certificates, rollback and materialization cuts |
+| 12 | ADC conversion events, DMA transfers, interrupts and FDCAN delivery |
 
 ## Components
 
