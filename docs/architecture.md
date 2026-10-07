@@ -5,6 +5,13 @@ inputs. Behavior comes from ELF contents, configuration, architectural state, an
 modeled register accesses. The emulator does not dispatch on application symbols,
 task names, or source paths.
 
+## Architecture diagrams
+
+Open the [editable architecture atlas](diagrams/fil-architecture.drawio.png) in
+draw.io to browse four pages: system overview, board internals, deterministic
+networking, and guarded performance optimizations. The PNG previews the first
+page; all four pages are embedded as editable, uncompressed draw.io XML.
+
 ## Components
 
 ```text
