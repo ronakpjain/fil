@@ -383,7 +383,6 @@ bool CortexM4::ensureMicroJit() {
 void CortexM4::prepareMicroBlock(JitBlockEntry& entry) {
     entry.micro_attempted = true;
     entry.micro_prefix_count = 0U;
-    if (!micro_jit_enabled_) return;
     if (!MicroJit::hostSupported() || entry.count < 2U) return;
     // Leading FilIR-lowerable run: unconditional control flow only
     // terminates a slot, so the run naturally satisfies the terminal rule.

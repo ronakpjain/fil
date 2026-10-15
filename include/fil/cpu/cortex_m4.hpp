@@ -197,10 +197,6 @@ public:
     /** @brief Executes one cached, specialized instruction or interprets exactly one step. */
     [[nodiscard]] FastStepResult stepJitFast();
 
-    /** @brief Enables the bespoke stencil JIT (default on where supported). */
-    void setMicroJitEnabled(bool enabled) noexcept {
-        micro_jit_enabled_ = enabled;
-    }
     [[nodiscard]] const std::string& microJitError() const noexcept { return micro_jit_error_; }
 
     /** @brief Gets the diagnostic captured by the most recent failed fast step. */
@@ -544,7 +540,6 @@ private:
     static constexpr std::uint16_t jit_compile_threshold = 50U;
     std::unique_ptr<MicroJit> micro_jit_;
     std::string micro_jit_error_;
-    bool micro_jit_enabled_{true};
     [[nodiscard]] bool ensureMicroJit();
     void prepareMicroBlock(JitBlockEntry& entry);
     // Total cycle overcharge when failed conditional branches in a retired

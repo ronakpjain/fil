@@ -20,6 +20,7 @@ add_executable(fil_tests
     unit/hard_float_firmware_test.cpp
     unit/hardware_comparison_test.cpp
     unit/jit_test.cpp
+    unit/block_fast_path_test.cpp
     unit/micro_jit_test.cpp
     unit/micro_jit_ir_test.cpp
     unit/memory_bus_test.cpp
