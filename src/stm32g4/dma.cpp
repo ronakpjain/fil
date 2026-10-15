@@ -25,6 +25,13 @@ std::uint32_t transferWidth(const std::uint32_t selector) noexcept {
     return selector <= 2U ? (1U << selector) : 4U;
 }
 
+mem::BusFault missingMemoryFault(
+    const std::string_view device, const std::uint32_t address, const mem::AccessType access_type
+) {
+    return {mem::BusFaultReason::device_error, address, mem::AccessSize::byte,
+            {access_type, 0}, std::string{device}, "DMA has no attached memory bus"};
+}
+
 } // namespace
 
 DmaPeripheral::DmaPeripheral(
@@ -220,14 +227,7 @@ mem::MemoryResult<std::uint64_t> DmaPeripheral::readMemory(
     const std::uint32_t width
 ) {
     if (memory_ == nullptr) {
-        return mem::BusFault{
-            mem::BusFaultReason::device_error,
-            address,
-            mem::AccessSize::byte,
-            {mem::AccessType::data_read, 0},
-            std::string{name()},
-            "DMA has no attached memory bus",
-        };
+        return missingMemoryFault(name(), address, mem::AccessType::data_read);
     }
     if (width == 1U) {
         auto result = memory_->read8(address);
@@ -250,14 +250,7 @@ mem::MemoryResult<std::uint64_t> DmaPeripheral::writeMemory(
     const std::uint64_t value
 ) {
     if (memory_ == nullptr) {
-        return mem::BusFault{
-            mem::BusFaultReason::device_error,
-            address,
-            mem::AccessSize::byte,
-            {mem::AccessType::data_write, 0},
-            std::string{name()},
-            "DMA has no attached memory bus",
-        };
+        return missingMemoryFault(name(), address, mem::AccessType::data_write);
     }
     if (width == 1U) {
         return memory_->write8(address, static_cast<std::uint8_t>(value));
