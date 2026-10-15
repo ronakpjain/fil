@@ -750,6 +750,16 @@ void CortexM4::prepareNativeBlock(JitBlockEntry& entry) {
 #endif
 }
 
+std::uint32_t CortexM4::microFailedAdjust(
+    const JitBlockEntry& slot, const std::uint8_t retired,
+    const std::uint32_t failed_mask) noexcept {
+    std::uint32_t adjust = 0U;
+    for (std::uint8_t i = 0U; i < retired; ++i) {
+        if (((failed_mask >> i) & 1U) != 0U) adjust += slot.base_cycles[i] - 1U;
+    }
+    return adjust;
+}
+
 bool CortexM4::ensureMicroJit() {
     if (micro_jit_) return true;
     if (!MicroJit::hostSupported()) {
@@ -2118,25 +2128,25 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
                         stopped_on_budget = true;
                         break;
                     }
+                    // Track the planned PC for continuity/termination only.
+                    // Taken refills are never precomputed: the post-execution
+                    // discontinuity check below charges the actual outcome,
+                    // whether the branch was planned, truncated, or terminal.
                     std::uint32_t target = pc + size;
-                    if (op.kind == InstrKind::b || op.kind == InstrKind::bl) {
+                    if ((op.kind == InstrKind::b && op.condition == Condition::al)
+                        || op.kind == InstrKind::bl) {
                         target = static_cast<std::uint32_t>(
                             static_cast<std::int64_t>(pc) + 4 + op.branch_offset)
                             & ~std::uint32_t{1};
                     }
-                    auto actual_cycles = base;
-                    if (target != pc + size) {
-                        actual_cycles = static_cast<std::uint16_t>(
-                            actual_cycles + slot.branch_penalty[planned]);
-                    }
-                    const auto charged = static_cast<std::uint32_t>(actual_cycles) + stall;
+                    const auto charged = static_cast<std::uint32_t>(base) + stall;
                     staged.total_instruction_cycles[planned] =
                         static_cast<std::uint16_t>(charged);
                     staged.remaining_cycles -= charged;
                     staged.have_fetch = true;
                     staged.fetch_end = pc + size;
-                    timed.instruction_cycles[planned] = actual_cycles;
-                    planned_cycles += actual_cycles;
+                    timed.instruction_cycles[planned] = base;
+                    planned_cycles += base;
                     planned_pc = target;
                     if (slot.is_terminator[planned]) {
                         ++planned;
@@ -2147,12 +2157,28 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
                     ++jit_stats_.fallbacks;
                     return std::nullopt; // Callback ran once; no commit.
                 }
-                const std::size_t retired = slot.micro_function(&state_, planned);
+                const std::uint64_t outcome = slot.micro_function(&state_, planned);
+                const std::size_t retired = static_cast<std::size_t>(outcome & 0xffffffffU);
+                const auto failed = static_cast<std::uint32_t>(outcome >> 32U);
                 if (retired == 0U || retired > planned) {
                     ++jit_stats_.fallbacks;
                     return std::nullopt;
                 }
                 const auto retired_u8 = static_cast<std::uint8_t>(retired);
+                if (failed != 0U) {
+                    // Failed conditional branches retire for 1 cycle, not the
+                    // planned base cost. Correct the planned charges in place
+                    // (fetch callbacks ran once; adjust arithmetically).
+                    for (std::uint8_t j = 0U; j < retired_u8; ++j) {
+                        if (((failed >> j) & 1U) == 0U) continue;
+                        const std::uint32_t over = slot.base_cycles[j] - 1U;
+                        timed.instruction_cycles[j] = 1U;
+                        staged.total_instruction_cycles[j] = static_cast<std::uint16_t>(
+                            staged.total_instruction_cycles[j] - over);
+                        staged.remaining_cycles += over;
+                        planned_cycles -= over;
+                    }
+                }
                 if (retired_u8 < planned) {
                     // Conditional taken: give back over-planned tail charges
                     // (callbacks ran once during planning; adjust arithmetically).
@@ -2163,6 +2189,14 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
                     for (std::uint8_t j = 0U; j < retired_u8; ++j) {
                         planned_cycles += timed.instruction_cycles[j];
                     }
+                    staged.fetch_end =
+                        slot.pcs[retired_u8 - 1U] + slot.sizes[retired_u8 - 1U];
+                    staged.have_fetch = true;
+                }
+                // Uniform taken refill: planning never precomputes it, so any
+                // PC discontinuity (terminal, truncated-taken, or coincidental
+                // fallthrough-target) charges the refill exactly once.
+                {
                     const auto last = static_cast<std::size_t>(retired_u8 - 1U);
                     if (state_.r[15] != slot.pcs[last] + slot.sizes[last]) {
                         timed.instruction_cycles[last] = static_cast<std::uint16_t>(
@@ -2172,8 +2206,6 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
                         staged.remaining_cycles -= slot.branch_penalty[last];
                         planned_cycles += slot.branch_penalty[last];
                     }
-                    staged.fetch_end = slot.pcs[last] + slot.sizes[last];
-                    staged.have_fetch = true;
                 }
                 state_.instruction_address = slot.pcs[retired_u8 - 1U];
                 total_cycles += planned_cycles;
@@ -2183,13 +2215,17 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
                 ++jit_stats_.micro_executions;
                 jit_stats_.micro_instructions += retired_u8;
             } else {
-                const std::size_t retired = slot.micro_function(&state_, micro_limit);
+                const std::uint64_t outcome = slot.micro_function(&state_, micro_limit);
+                const std::size_t retired = static_cast<std::size_t>(outcome & 0xffffffffU);
+                const auto failed = static_cast<std::uint32_t>(outcome >> 32U);
                 if (retired != 0U && retired <= micro_limit) {
                     const auto retired_u8 = static_cast<std::uint8_t>(retired);
                     state_.instruction_address = slot.pcs[retired_u8 - 1U];
                     for (std::uint8_t i = 0U; i < retired_u8; ++i) {
-                        timed.instruction_cycles[i] = slot.base_cycles[i];
-                        total_cycles += slot.base_cycles[i];
+                        const std::uint16_t charge = ((failed >> i) & 1U) != 0U
+                            ? std::uint16_t{1U} : slot.base_cycles[i];
+                        timed.instruction_cycles[i] = charge;
+                        total_cycles += charge;
                     }
                     const auto last = static_cast<std::size_t>(retired_u8 - 1U);
                     if (state_.r[15] != slot.pcs[last] + slot.sizes[last]) {
@@ -2542,7 +2578,9 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlockImpl(
         const std::uint8_t micro_limit = static_cast<std::uint8_t>(std::min<std::size_t>(
             std::min<std::size_t>(max_instructions, slot.count), slot.micro_prefix_count));
         if (micro_limit != 0U) {
-            const std::size_t retired = slot.micro_function(&state_, micro_limit);
+            const std::uint64_t outcome = slot.micro_function(&state_, micro_limit);
+            const std::size_t retired = static_cast<std::size_t>(outcome & 0xffffffffU);
+            const auto failed = static_cast<std::uint32_t>(outcome >> 32U);
             // The kernel reports its exact retired prefix: scheduler limits
             // via prefix exits, data-dependent conditional takes via stubs.
             // A taken branch lands r15 off the sequential PCs, so the slow
@@ -2556,13 +2594,17 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlockImpl(
                 out.count = retired_u8;
                 const auto last = static_cast<std::size_t>(retired_u8 - 1U);
                 state_.instruction_address = slot.pcs[last];
-                std::uint32_t total = slot.base_prefix_cycles[retired_u8];
+                // Failed conditional branches retire for 1 cycle, not base.
+                const std::uint32_t failed_adjust = microFailedAdjust(slot, retired_u8, failed);
+                std::uint32_t total = slot.base_prefix_cycles[retired_u8] - failed_adjust;
                 if (state_.r[15] != slot.pcs[last] + slot.sizes[last]) {
                     total += slot.branch_penalty[last];
                 }
                 if (instruction_cycles) {
                     for (std::uint8_t i = 0U; i < retired_u8; ++i) {
-                        (*instruction_cycles)[i] = static_cast<std::uint16_t>(slot.base_cycles[i]);
+                        (*instruction_cycles)[i] = ((failed >> i) & 1U) != 0U
+                            ? std::uint16_t{1U}
+                            : static_cast<std::uint16_t>(slot.base_cycles[i]);
                     }
                     if (state_.r[15] != slot.pcs[last] + slot.sizes[last]) {
                         (*instruction_cycles)[last] = static_cast<std::uint16_t>(

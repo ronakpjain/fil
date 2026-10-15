@@ -187,29 +187,45 @@ public:
     void movRet(std::uint32_t count) {
         emit(0xD2800000U | ((count & 0xffffU) << 5U)); // movz x0, #count
     }
+    // Combines the retired count with the failed-branch mask (x16[63:48])
+    // into the x0 return value. x1 holds the mask after the epilogue below.
+    void movRetMasked(std::uint32_t count) {
+        movRet(count);
+        bfi64(0U, 1U, 32U, 16U); // x0[47:32] = failed mask
+    }
+    // Marks op i as a failed conditional branch in x16[63:48].
+    // ORR-imm with a single high bit (N=1 size-64 pattern, R=(64-p)%64).
+    void markFailed(std::uint32_t op_index) {
+        const std::uint32_t bit = 48U + op_index;
+        const std::uint32_t r = (64U - bit) & 63U;
+        emit(0xB2400000U | ((r & 63U) << 16U) | (0U << 10U) | (16U << 5U) | 16U);
+    }
     // Evaluates a guest condition from the host flags without disturbing
     // them (mrs/ubfm/eor/cbz only) and jumps to `taken` when it passes.
     // Returns false for NV (rejected at lowering; defensive). Uses w1/x17.
-    bool emitCondTaken(Condition cond, std::size_t taken, std::string& error) {
+    // The fallthrough (failed) path records op_index in the x16 mask.
+    bool emitCondTaken(Condition cond, std::uint32_t op_index,
+                       std::size_t taken, std::string& error) {
         mrsNzcv(17U);
         const auto flag = [&](std::uint32_t bit) { ubfm(17U, 17U, bit, bit); };
         switch (cond) {
-        case Condition::eq: flag(30U); cbnzW(17U, taken); return true;
-        case Condition::ne: flag(30U); cbzW(17U, taken); return true;
-        case Condition::cs: flag(29U); cbnzW(17U, taken); return true;
-        case Condition::cc: flag(29U); cbzW(17U, taken); return true;
-        case Condition::mi: flag(31U); cbnzW(17U, taken); return true;
-        case Condition::pl: flag(31U); cbzW(17U, taken); return true;
-        case Condition::vs: flag(28U); cbnzW(17U, taken); return true;
-        case Condition::vc: flag(28U); cbzW(17U, taken); return true;
+        case Condition::eq: flag(30U); cbnzW(17U, taken); markFailed(op_index); return true;
+        case Condition::ne: flag(30U); cbzW(17U, taken); markFailed(op_index); return true;
+        case Condition::cs: flag(29U); cbnzW(17U, taken); markFailed(op_index); return true;
+        case Condition::cc: flag(29U); cbzW(17U, taken); markFailed(op_index); return true;
+        case Condition::mi: flag(31U); cbnzW(17U, taken); markFailed(op_index); return true;
+        case Condition::pl: flag(31U); cbzW(17U, taken); markFailed(op_index); return true;
+        case Condition::vs: flag(28U); cbnzW(17U, taken); markFailed(op_index); return true;
+        case Condition::vc: flag(28U); cbzW(17U, taken); markFailed(op_index); return true;
         case Condition::hi: { // C && !Z
             flag(29U);
             const auto done = makeLabel();
             cbzW(17U, done);
             mrsNzcv(17U);
             flag(30U);
-            cbnzW(17U, taken);
+            cbzW(17U, taken);
             bindLabel(done);
+            markFailed(op_index);
             return true;
         }
         case Condition::ls: // !C || Z
@@ -218,6 +234,7 @@ public:
             mrsNzcv(17U);
             flag(30U);
             cbnzW(17U, taken);
+            markFailed(op_index);
             return true;
         case Condition::ge: // N == V
         case Condition::lt: { // N != V
@@ -226,6 +243,7 @@ public:
             logicReg(3U, 1U, 1U, 17U); // eor w1, w1, w17 (no flags)
             if (cond == Condition::ge) cbzW(1U, taken);
             else cbnzW(1U, taken);
+            markFailed(op_index);
             return true;
         }
         case Condition::gt: { // !Z && N == V
@@ -238,6 +256,7 @@ public:
             logicReg(3U, 1U, 1U, 17U);
             cbzW(1U, taken);
             bindLabel(done);
+            markFailed(op_index);
             return true;
         }
         case Condition::le: // Z || N != V
@@ -248,6 +267,7 @@ public:
             flag(28U);
             logicReg(3U, 1U, 1U, 17U);
             cbnzW(1U, taken);
+            markFailed(op_index);
             return true;
         case Condition::al: b(taken); return true;
         case Condition::nv:
@@ -751,6 +771,7 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
     const auto emitEpilogue = [&](std::uint32_t pc_value, std::uint32_t ia_value,
                                   bool link) {
         if (link && have_lr) e.movImm(15U, lr_value);
+        e.lsr64(1U, 16U, 48U); // failed-branch mask -> x1 before merge
         e.mrsNzcv(17U);
         e.logicReg(2U, 16U, 16U, 17U); // orr w16, w16, w17
         e.strW(16U, xpsr_off);
@@ -786,7 +807,7 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
     for (std::size_t i = 0; i < block.ops.size(); ++i) {
         const auto& op = block.ops[i];
         if (op.op == MicroOp::b_cond) {
-            if (!e.emitCondTaken(op.condition, taken_labels[i], error)) return nullptr;
+            if (!e.emitCondTaken(op.condition, static_cast<std::uint32_t>(i), taken_labels[i], error)) return nullptr;
         } else if (op.op == MicroOp::cbz) {
             e.cbzW(hostReg(op.rn), taken_labels[i]); // taken when zero
         } else if (op.op == MicroOp::cbnz) {
@@ -800,21 +821,21 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
         }
     }
     emitEpilogue(final_pc, last_pc, true);
-    e.movRet(static_cast<std::uint32_t>(block.ops.size()));
+    e.movRetMasked(static_cast<std::uint32_t>(block.ops.size()));
     const std::size_t end_label = e.makeLabel();
     e.b(end_label);
     for (std::size_t i = 1U; i < block.ops.size(); ++i) {
         e.bindLabel(exit_labels[i]);
         // Retired ops [0, i): next PC is pcs[i], last address pcs[i-1].
         emitEpilogue(block.ops[i].pc, block.ops[i - 1U].pc, false);
-        e.movRet(static_cast<std::uint32_t>(i));
+        e.movRetMasked(static_cast<std::uint32_t>(i));
         e.ret();
     }
     for (std::size_t i = 0; i < block.ops.size(); ++i) {
         if (!has_taken[i]) continue;
         e.bindLabel(taken_labels[i]);
         emitEpilogue(taken_targets[i], block.ops[i].pc, false);
-        e.movRet(static_cast<std::uint32_t>(i + 1U));
+        e.movRetMasked(static_cast<std::uint32_t>(i + 1U));
         e.ret();
     }
     e.bindLabel(done_label);

@@ -92,7 +92,7 @@ bool runMicro(const std::vector<std::uint16_t>& code, const CpuState& initial,
     final_out.r[15] = kFlash;
     final_out.thumb = true;
     final_out.halted = false;
-    const std::size_t retired = fn(&final_out, block.ops.size());
+    const std::size_t retired = static_cast<std::size_t>(fn(&final_out, block.ops.size()) & 0xffffffffU);
     EXPECT_EQ(retired, block.ops.size());
     return true;
 }
@@ -252,8 +252,11 @@ TEST(MicroJitEmitterTest, ConditionalBranchTakenAndFallthrough) {
         micro_out.r[15] = kFlash;
         micro_out.thumb = true;
         micro_out.halted = false;
-        const std::size_t retired = fn(&micro_out, block.ops.size());
+        const std::uint64_t outcome = fn(&micro_out, block.ops.size());
+        const std::size_t retired = static_cast<std::size_t>(outcome & 0xffffffffU);
+        const auto failed = static_cast<std::uint32_t>(outcome >> 32U);
         EXPECT_EQ(retired, take ? 3U : 5U);
+        EXPECT_EQ(failed, take ? 0U : (1U << 2U));
         expectSameState(ref_out, micro_out);
         if (::testing::Test::HasFailure()) {
             ADD_FAILURE() << "taken=" << take;
@@ -313,8 +316,74 @@ TEST(MicroJitEmitterTest, CbzCbnz) {
         micro_out.r[15] = kFlash;
         micro_out.thumb = true;
         micro_out.halted = false;
-        EXPECT_EQ(fn(&micro_out, block.ops.size()), take ? 1U : 4U);
+        EXPECT_EQ(static_cast<std::size_t>(fn(&micro_out, block.ops.size()) & 0xffffffffU), take ? 1U : 4U);
         expectSameState(ref_out, micro_out);
+    }
+}
+
+TEST(MicroJitEmitterTest, AllConditionsMatchInterpreterAndReportFailed) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no micro-jit emitter on this host";
+    // nop; b<cond> +2 (skip one nop when taken); nop; nop.
+    for (std::uint32_t cond = 0U; cond <= 13U; ++cond) {
+        const std::uint16_t branch =
+            static_cast<std::uint16_t>(0xD000U | (cond << 8U) | 0x01U); // +4
+        const std::vector<std::uint16_t> code{0xBF00U, branch, 0xBF00U, 0xBF00U, 0xBF00U};
+        for (std::uint32_t flags = 0U; flags < 16U; ++flags) {
+            Fixture f;
+            for (std::size_t i = 0; i < code.size(); ++i) {
+                std::array<std::uint8_t, 2> by{
+                    static_cast<std::uint8_t>(code[i]), static_cast<std::uint8_t>(code[i] >> 8U)};
+                ASSERT_TRUE(
+                    f.bus.loadBytes(kFlash + static_cast<std::uint32_t>(2U * i), by).hasValue());
+            }
+            CpuState initial;
+            initial.xpsr = (1U << 24U) | 0x000F0000U | (flags << 28U);
+            initial.r[13] = kRam + 2048U;
+            // Reference: step until PC diverges from sequential.
+            f.cpu.state() = initial;
+            f.cpu.state().r[15] = kFlash;
+            f.cpu.state().thumb = true;
+            f.cpu.state().halted = false;
+            int ref_steps = 0;
+            for (int i = 0; i < 5; ++i) {
+                ASSERT_EQ(f.cpu.stepFast().reason, fil::cpu::StopReason::step_complete);
+                ++ref_steps;
+                if (f.cpu.state().r[15] != kFlash + 2U * static_cast<std::uint32_t>(i + 1U)) break;
+            }
+            const CpuState ref_out = f.cpu.state();
+            // Micro side.
+            std::vector<MicroSource> sources;
+            std::uint32_t pc = kFlash;
+            for (const auto half : code) {
+                auto decoded = fil::cpu::decode16(half);
+                ASSERT_TRUE(decoded.has_value());
+                sources.push_back(MicroSource{*decoded, pc, 2U});
+                pc += 2U;
+            }
+            MicroBlock block;
+            ASSERT_TRUE(fil::cpu::buildMicroBlock({sources.data(), sources.size()}, block).ok);
+            std::string error;
+            auto jit = MicroJit::create(error);
+            ASSERT_TRUE(jit) << error;
+            MicroFunction fn = jit->compile(block, error);
+            ASSERT_TRUE(fn) << error;
+            CpuState micro_out = initial;
+            micro_out.r[15] = kFlash;
+            micro_out.thumb = true;
+            micro_out.halted = false;
+            const std::uint64_t outcome = fn(&micro_out, block.ops.size());
+            const std::size_t retired = static_cast<std::size_t>(outcome & 0xffffffffU);
+            const auto failed = static_cast<std::uint32_t>(outcome >> 32U);
+            EXPECT_EQ(retired, static_cast<std::size_t>(ref_steps));
+            const bool took = (retired == 2U);
+            EXPECT_EQ(failed, took ? 0U : (1U << 1U))
+                << "cond=" << cond << " flags=" << flags;
+            expectSameState(ref_out, micro_out);
+            if (::testing::Test::HasFailure()) {
+                ADD_FAILURE() << "cond=" << cond << " flags=" << flags;
+                return;
+            }
+        }
     }
 }
 

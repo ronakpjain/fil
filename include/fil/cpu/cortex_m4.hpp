@@ -606,6 +606,10 @@ private:
     bool micro_jit_enabled_{true};
     [[nodiscard]] bool ensureMicroJit();
     void prepareMicroBlock(JitBlockEntry& entry);
+    // Total cycle overcharge when failed conditional branches in a retired
+    // micro prefix were planned at base cost (each retires for 1 cycle).
+    [[nodiscard]] static std::uint32_t microFailedAdjust(
+        const JitBlockEntry& slot, std::uint8_t retired, std::uint32_t failed_mask) noexcept;
     [[nodiscard]] bool ensureNativeCompiler();
     [[nodiscard]] std::uint8_t retainNativeKernel(std::shared_ptr<const NativeJitKernel> kernel);
     void touchNativeKernel(std::uint8_t slot) noexcept;
