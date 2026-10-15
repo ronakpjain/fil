@@ -47,8 +47,8 @@ and candidate runs. Compare against native kernels disabled as well as the
 current implementation. Report compilation counts separately from throughput;
 retired-instruction coverage is not a measure of host-time benefit. Profile the
 surrounding execution and scheduler paths when kernels cover only a small share
-of the workload. Resolve capsule replay correctness before relying on sustained
-capsule-enabled throughput measurements.
+of the workload. Preserve capsule replay correctness through differential
+validation before relying on sustained capsule-enabled throughput measurements.
 
 ## Candidate extensions
 

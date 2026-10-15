@@ -351,6 +351,38 @@ TEST(JitTest, ReversibleTimedBlockReturnsCommittedPrefixOnDecline) {
         << "reversible store restriction refuses executable RAM writes";
 }
 
+TEST(JitTest, BudgetedReversibleFailedConditionalCannotOverrunNativePrefix) {
+    auto bus = basicBus();
+    // nop; bne +0 (failed with Z set); movs r0,#1; movs r1,#2
+    // A failed conditional updates the native stencil's failed-branch mask.
+    // The two-instruction request must stop before either MOV.
+    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({
+        0xBF00U, 0xD100U, 0x2001U, 0x2102U, 0xBF00U
+    })).hasValue());
+    bus.setReversibleRamOnly(true);
+    bus.setAllMmioTrapping(true);
+    fil::cpu::CortexM4 cpu(bus);
+    prepare(cpu);
+    cpu.state().xpsr |= fil::cpu::xpsr_z; // BNE is not taken.
+    for (std::uint32_t i = 0U; i < 70U; ++i) {
+        static_cast<void>(cpu.prepareJitBlock());
+    }
+
+    fil::cpu::CortexM4::ReversibleCycleBudget budget{};
+    budget.remaining_cycles = 100U;
+    const auto result = cpu.tryStepBudgetedReversibleJitBlock(2U, budget);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->execution.count, 2U);
+    EXPECT_EQ(result->execution.pcs[0], flash_base);
+    EXPECT_EQ(result->execution.pcs[1], flash_base + 2U);
+    EXPECT_EQ(cpu.state().r[15], flash_base + 4U);
+    EXPECT_EQ(cpu.state().instruction_address, flash_base + 2U);
+    EXPECT_EQ(cpu.state().r[0], 0U);
+    EXPECT_EQ(cpu.state().r[1], 0U);
+    EXPECT_EQ(budget.total_instruction_cycles[0] + budget.total_instruction_cycles[1],
+              result->execution.result.cycles);
+}
+
 TEST(JitTest, BudgetedReversiblePrefixDebitsExactCommittedCosts) {
     auto bus = basicBus();
     ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({

@@ -1725,10 +1725,12 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
                     ++jit_stats_.fallbacks;
                     return std::nullopt; // Callback ran once; no commit.
                 }
+                const CpuState before_micro = state_;
                 const std::uint64_t outcome = slot.micro_function(&state_, planned);
                 const std::size_t retired = static_cast<std::size_t>(outcome & 0xffffffffU);
                 const auto failed = static_cast<std::uint32_t>(outcome >> 32U);
                 if (retired == 0U || retired > planned) {
+                    state_ = before_micro;
                     ++jit_stats_.fallbacks;
                     return std::nullopt;
                 }
@@ -1783,6 +1785,7 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
                 ++jit_stats_.micro_executions;
                 jit_stats_.micro_instructions += retired_u8;
             } else {
+                const CpuState before_micro = state_;
                 const std::uint64_t outcome = slot.micro_function(&state_, micro_limit);
                 const std::size_t retired = static_cast<std::size_t>(outcome & 0xffffffffU);
                 const auto failed = static_cast<std::uint32_t>(outcome >> 32U);
@@ -1804,6 +1807,8 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
                     first_cached = retired_u8;
                     ++jit_stats_.micro_executions;
                     jit_stats_.micro_instructions += retired_u8;
+                } else {
+                    state_ = before_micro;
                 }
             }
         }
@@ -1966,6 +1971,7 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlockImpl(
         const std::uint8_t micro_limit = static_cast<std::uint8_t>(std::min<std::size_t>(
             std::min<std::size_t>(max_instructions, slot.count), slot.micro_prefix_count));
         if (micro_limit != 0U) {
+            const CpuState before_micro = state_;
             const std::uint64_t outcome = slot.micro_function(&state_, micro_limit);
             const std::size_t retired = static_cast<std::size_t>(outcome & 0xffffffffU);
             const auto failed = static_cast<std::uint32_t>(outcome >> 32U);
@@ -2006,6 +2012,11 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlockImpl(
                 total_cycles = total;
                 ++jit_stats_.micro_executions;
                 jit_stats_.micro_instructions += retired_u8;
+            } else {
+                // A native prefix that reports an impossible retirement count
+                // has already written its speculative CPU state. Discard it and
+                // let the checked cached loop below execute the bounded prefix.
+                state_ = before_micro;
             }
         }
     }

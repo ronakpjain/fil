@@ -131,6 +131,48 @@ bool configureSysTickIdleLoop(
         && board->memory().write32(0xe000e010U, 3U).hasValue();
 }
 
+TEST(WorldTimeTest, CapsuleFailedConditionalPreservesInstructionBudgetCuts) {
+    TempWorldTimeConfigs files;
+    const auto alpha = files.writeBoard("alpha.json", "alpha");
+    // CMP; failed BEQ; five independent increments; B back to CMP. The
+    // terminal instruction budget cuts a warmed kernel after the failed B.
+    const std::vector<std::uint8_t> code{
+        0x00U, 0x28U, 0x00U, 0xd0U, 0x01U, 0x31U, 0x01U, 0x32U,
+        0x01U, 0x33U, 0x01U, 0x34U, 0x01U, 0x35U, 0xf7U, 0xe7U,
+    };
+    for (const std::uint64_t tail : {1U, 2U, 3U, 4U, 5U, 6U, 7U}) {
+        SCOPED_TRACE(tail);
+        auto exact = fil::sim::World::load(files.network({alpha}));
+        auto capsules = fil::sim::World::load(files.network({alpha}));
+        ASSERT_TRUE(exact && capsules);
+        for (auto* world : {exact.value().get(), capsules.value().get()}) {
+            ASSERT_TRUE(configureZeroWaitFixture(*world));
+            auto& board = *world->board("alpha");
+            const auto start = board.cpu().state().r[15];
+            ASSERT_TRUE(board.memory().loadBytes(start, code));
+            board.cpu().state().r[0] = 1U; // BEQ never taken.
+        }
+        auto options = runOptions(1'000'000U);
+        options.max_instructions_per_board = 2'000U + tail;
+        options.enable_ram_capsules = false;
+        const auto reference = exact.value()->run(options);
+        options.enable_ram_capsules = true;
+        const auto actual = capsules.value()->run(options);
+        ASSERT_TRUE(reference && actual);
+        EXPECT_GT(actual.value().deferred_prefixes, 0U);
+#if defined(FIL_ENABLE_MICRO_JIT) && FIL_ENABLE_MICRO_JIT
+        if (fil::cpu::MicroJit::hostSupported())
+            EXPECT_GT(capsules.value()->board("alpha")->cpu().jitStats().micro_executions, 0U);
+#endif
+        EXPECT_EQ(actual.value().instructions, reference.value().instructions);
+        EXPECT_EQ(actual.value().cycles, reference.value().cycles);
+        EXPECT_EQ(actual.value().end_time_ns, reference.value().end_time_ns);
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(capsules.value()->board("alpha")->cpu().state(),
+                                         exact.value()->board("alpha")->cpu().state()));
+        EXPECT_EQ(capsules.value()->trace().jsonLines(), exact.value()->trace().jsonLines());
+    }
+}
+
 TEST(WorldTimeTest, BoardCountDoesNotScaleGlobalTime) {
     TempWorldTimeConfigs files;
     const auto alpha = files.writeBoard("alpha.json", "alpha");

@@ -15,6 +15,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -248,6 +249,52 @@ TEST(MicroJitEmitterTest, PrefixExitsCommitPrecisely) {
     fn(&untouched, 0U);
     EXPECT_EQ(untouched.r[0], 0U);
     EXPECT_EQ(untouched.r[15], kFlash);
+}
+
+TEST(MicroJitEmitterTest, FailedConditionalBranchesDoNotCorruptPrefixLimit) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no micro-jit emitter on this host";
+    // nop; bne +0; bne +0; movs r0,#1; movs r1,#2; movs r2,#3.
+    // Z is set, so both BNEs fail and set adjacent failed-mask bits.
+    const auto sources = decodeProgram({
+        0xBF00U, 0xD100U, 0xD100U, 0x2001U, 0x2102U, 0x2203U
+    });
+    ASSERT_EQ(sources.size(), 6U);
+    MicroBlock block;
+    ASSERT_TRUE(fil::cpu::buildMicroBlock({sources.data(), sources.size()}, block).ok);
+    std::string error;
+    auto jit = MicroJit::create(error);
+    ASSERT_TRUE(jit) << error;
+    const auto fn = jit->compile(block, error);
+    ASSERT_TRUE(fn) << error;
+
+    for (const std::size_t limit : std::array<std::size_t, 9>{
+            0U, 1U, 2U, 3U, 4U, 5U, 6U, 16U,
+            std::numeric_limits<std::size_t>::max()}) {
+        CpuState initial;
+        initial.r[15] = kFlash;
+        initial.xpsr = fil::cpu::xpsr_t | fil::cpu::xpsr_z
+            | fil::cpu::xpsr_n | fil::cpu::xpsr_c;
+        CpuState expected = initial;
+        const std::size_t retired_expected = std::min(limit, block.ops.size());
+        // Execute the reference on its own fixture at the same program.
+        Fixture reference;
+        loadProgram(reference, {0xBF00U, 0xD100U, 0xD100U, 0x2001U, 0x2102U, 0x2203U});
+        reference.cpu.state() = initial;
+        for (std::size_t i = 0U; i < retired_expected; ++i) {
+            ASSERT_EQ(reference.cpu.stepFast().reason, fil::cpu::StopReason::step_complete);
+        }
+        expected = reference.cpu.state();
+
+        CpuState actual = initial;
+        const std::uint64_t outcome = fn(&actual, limit);
+        const auto retired = static_cast<std::size_t>(outcome & 0xffffffffU);
+        const auto failed = static_cast<std::uint32_t>(outcome >> 32U);
+        EXPECT_EQ(retired, retired_expected) << "limit=" << limit;
+        const std::uint32_t expected_failed = (retired_expected > 1U ? 1U << 1U : 0U)
+            | (retired_expected > 2U ? 1U << 2U : 0U);
+        EXPECT_EQ(failed, expected_failed) << "limit=" << limit;
+        expectSameState(expected, actual);
+    }
 }
 
 TEST(MicroJitEmitterTest, PrefixBeforeBlPreservesLrAndBlWritesLink) {

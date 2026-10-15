@@ -145,8 +145,12 @@ may represent up to 4096 instructions while remaining bounded by events,
 SysTick, deadlines, and cycle-result capacity. Observation barriers select the
 exact started prefix and restore its certified phase; all peripheral callbacks
 still execute in their original order. See [Performance](performance.md) for
-eligibility and benchmark controls. Capsule replay is not yet verified cycle-exact on
-real firmware; see the known issue there.
+eligibility and benchmark controls. Native prefix limits and failed-conditional
+masks occupy disjoint fields, so conditional outcomes cannot extend the admitted
+instruction frontier. Impossible native retirement counts restore CPU state before
+fallback. Regression tests and real-firmware comparisons against capsules-disabled
+execution cover prefix cuts, timing, and observable traces; this is validation of
+tested paths, not a proof for arbitrary firmware.
 
 ### Loop batching
 

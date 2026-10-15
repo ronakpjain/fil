@@ -156,19 +156,27 @@ public:
     void cmpImm(std::uint32_t rn, std::uint32_t imm) {
         emit(0x71000000U | ((imm & 0xfffU) << 10U) | ((rn & 31U) << 5U) | 31U);
     }
-    // Stash the scheduler limit (x1) in the high half of x16; the low half
-    // keeps retained xPSR bits. Flag sequences freely clobber w1/x1, so the
-    // limit cannot live there across ops. W-ops on w16 leave high32 intact
-    // only if untouched: stash AFTER clearTopNibble, read via limitCheck.
+    void cmp64(std::uint32_t rn, std::uint32_t rm) {
+        emit(0xEB00001FU | ((rm & 31U) << 16U) | ((rn & 31U) << 5U)); // subs xzr, rn, rm
+    }
+    // The native block has at most 16 ops. Clamp the size_t scheduler limit
+    // to that bound before placing it in the 16-bit x16[47:32] field.
+    // Failed-branch flags occupy x16[63:48], so the fields never overlap.
+    void clampMax(std::uint32_t block_max) {
+        movImm(17U, block_max);
+        cmp64(1U, 17U);
+        csel(1U, 1U, 17U, 3U); // LO: keep requested max, otherwise block_max
+    }
     void stashMax() {
-        emit(0xB3400000U | (32U << 16U) | (31U << 10U) | (1U << 5U) | 16U); // bfi x16, x1, #32, #32
+        bfi64(16U, 1U, 32U, 16U);
     }
     // Compare stashed max against `count` (clobbers x17, preserves flags).
-    // Exit (unsigned wrap) iff max < count: sub leaves the top bit set
-    // exactly when max-count wraps, and plain sub/lsr/cbnz touch no flags.
+    // Exit iff max < count. Mask to the dedicated 16-bit limit field so the
+    // failed-branch mask in x16[63:48] cannot affect the scheduler.
     void checkMax(std::uint32_t count, std::size_t exit_label) {
-        lsr64(17U, 16U, 32U); // max -> x17
-        sub64Imm(17U, 17U, count); // wraps iff max < count
+        lsr64(17U, 16U, 32U);
+        ubfm(17U, 17U, 0U, 15U);
+        sub64Imm(17U, 17U, count);
         lsr64(17U, 17U, 63U); // wrap bit -> bit0
         cbnzX17(exit_label);
     }
@@ -851,8 +859,12 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
         if ((mask & (1U << 13U)) != 0U) transferOne(13U);
     };
 
+    // Clamp size_t max to the bounded block length before it is packed into
+    // the 16-bit limit field; this also preserves max==0 and max>=block size.
+    // Do this before loading guest NZCV because CMP changes host flags.
+    e.clampMax(static_cast<std::uint32_t>(block.ops.size()));
     // Prologue: seed host flags from guest xPSR and load only touched
-    // registers. x1 carries the scheduler prefix limit.
+    // registers. x1 carries the clamped scheduler prefix limit.
     e.ldrW(16U, xpsr_off);
     e.msrNzcv(16U);
     e.clearTopNibble(16U); // retained xPSR bits (~N/Z/C/V)
