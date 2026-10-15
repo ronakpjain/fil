@@ -71,6 +71,8 @@ On macOS, prefix the LLVM tools with `xcrun`. Coverage percentages are diagnosti
 not a release gate; prioritize deterministic behavior and boundary cases over tests
 that only execute lines.
 
+Known coverage residual: after the native backend was removed, unit tests execute every reachable statement text in the reversible micro-JIT block path except two statements that are unreachable through the public caller. Some sites of that path (`CortexM4::tryStepJitBlockImpl` and `CortexM4::executeTrustedReversibleJitBlock`) run only in the firmware acceptance runs, not in unit tests, and about ten last-instruction bookkeeping sites never run in those runs. Check changes to these sites against the firmware acceptance outputs.
+
 ## Physical hardware comparison
 
 The hermetic suite exercises the ST-Link orchestration through a fake OpenOCD
