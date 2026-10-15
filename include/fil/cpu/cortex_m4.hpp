@@ -378,6 +378,8 @@ public:
         std::size_t max_instructions, JitBlockPreview& preview_out);
     [[nodiscard]] bool prepareAndPeekExactJitBlock(
         std::size_t max_instructions, JitBlockPreview& preview_out);
+    [[nodiscard]] bool prepareAndPeekJitBlock(
+        std::size_t max_instructions, JitBlockPreview& preview_out, bool extended);
 
     /**
      * @brief Whether a compiled JIT block covers the current PC.

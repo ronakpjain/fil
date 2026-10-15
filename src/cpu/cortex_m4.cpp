@@ -2885,6 +2885,16 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlockImpl(
 
 bool CortexM4::prepareAndPeekJitBlock(
     const std::size_t max_instructions, JitBlockPreview& preview_out) {
+    return prepareAndPeekJitBlock(max_instructions, preview_out, true);
+}
+
+bool CortexM4::prepareAndPeekExactJitBlock(
+    const std::size_t max_instructions, JitBlockPreview& preview_out) {
+    return prepareAndPeekJitBlock(max_instructions, preview_out, false);
+}
+
+bool CortexM4::prepareAndPeekJitBlock(
+    const std::size_t max_instructions, JitBlockPreview& preview_out, const bool extended) {
     if (max_instructions == 0U || !prepareJitBlock()) return false;
     // prepareJitBlock validated architecture state and slot readiness; a
     // single lookup serves the preview fill (no second readiness probe).
@@ -2893,34 +2903,9 @@ bool CortexM4::prepareAndPeekJitBlock(
     if (!slot.valid || slot.pc != entry_pc
         || slot.generation != memory_.executionGeneration()) return false;
     const std::size_t count = std::min<std::size_t>(max_instructions, slot.count);
-    const std::size_t safe_count = std::min(count,
-        static_cast<std::size_t>(slot.preview_extended_count));
-    if (safe_count == 0U || slot.decline_streak >= 2U) return false;
-    std::memcpy(preview_out.pcs.data(), slot.pcs.data(),
-        safe_count * sizeof(preview_out.pcs[0]));
-    std::memcpy(preview_out.sizes.data(), slot.sizes.data(),
-        safe_count * sizeof(preview_out.sizes[0]));
-    std::memcpy(preview_out.instruction_cycles.data(), slot.preview_cycles.data(),
-        safe_count * sizeof(preview_out.instruction_cycles[0]));
-    preview_out.max_cycles = slot.preview_prefix_cycles[safe_count];
-    preview_out.exact_cycle_prefix_count = static_cast<std::uint8_t>(
-        std::min<std::size_t>(safe_count, slot.preview_exact_prefix));
-    preview_out.cycles_exact = slot.preview_exact_prefix >= safe_count;
-    preview_out.count = static_cast<std::uint8_t>(safe_count);
-    return true;
-}
-
-bool CortexM4::prepareAndPeekExactJitBlock(
-    const std::size_t max_instructions, JitBlockPreview& preview_out) {
-    if (max_instructions == 0U || !prepareJitBlock()) return false;
-    const std::uint32_t entry_pc = state_.r[15];
-    const auto& slot = (*jit_blocks_)[jitBlockIndex(entry_pc)];
-    if (!slot.valid || slot.pc != entry_pc
-        || slot.generation != memory_.executionGeneration()) return false;
-    const std::size_t count = std::min<std::size_t>(max_instructions, slot.count);
-    const std::size_t safe_count = std::min(count,
-        static_cast<std::size_t>(slot.preview_count));
-    if (safe_count == 0U) return false;
+    const std::size_t available = extended ? slot.preview_extended_count : slot.preview_count;
+    const std::size_t safe_count = std::min(count, static_cast<std::size_t>(available));
+    if (safe_count == 0U || (extended && slot.decline_streak >= 2U)) return false;
     std::memcpy(preview_out.pcs.data(), slot.pcs.data(),
         safe_count * sizeof(preview_out.pcs[0]));
     std::memcpy(preview_out.sizes.data(), slot.sizes.data(),
