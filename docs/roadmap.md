@@ -20,6 +20,36 @@ This roadmap lists deliberate gaps; it is not a release schedule.
    matrix in an environment where the firmware artifacts and ARM tools are
    available.
 
+## Micro-JIT framework optimization priorities
+
+Optimize the profitability and overhead of existing kernels before expanding
+instruction coverage. More eligible blocks can increase compilation and dispatch
+cost without improving firmware throughput.
+
+1. **Profitability-based admission.** Start with cached handlers and require
+   demonstrated reuse before native compilation. Consider prefix length and
+   expected dispatch savings, not eligibility alone.
+2. **Cheaper kernel boundaries.** Eliminate unnecessary flag transfers and use
+   exit-specific register-write masks. Preserve untouched registers, later-written
+   destinations, and LR across every partial-prefix and taken-branch exit.
+3. **Cheaper prefix checks.** Investigate flag-preserving instruction-limit checks
+   or a full-block fast route, accounting for extra code size and compilation cost.
+4. **Less surrounding bookkeeping.** Profile cycle-budget admission and result
+   materialization; reuse prepared metadata where exact event and timing contracts
+   allow it.
+5. **Indexed compilation-cache lookup, if profiling warrants it.** Use a
+   fingerprint to narrow candidates while retaining exact semantic comparison.
+   Avoid optimizing lookup ahead of larger execution costs.
+
+Validate each change independently on representative real firmware, including
+startup and compilation, with fixed fidelity settings and alternating baseline
+and candidate runs. Compare against native kernels disabled as well as the
+current implementation. Report compilation counts separately from throughput;
+retired-instruction coverage is not a measure of host-time benefit. Profile the
+surrounding execution and scheduler paths when kernels cover only a small share
+of the workload. Resolve capsule replay correctness before relying on sustained
+capsule-enabled throughput measurements.
+
 ## Candidate extensions
 
 - Cortex-M event-latch behavior for `WFI`, `WFE`, and `SEV`;
