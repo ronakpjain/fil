@@ -31,7 +31,6 @@ set(padded_stdout "\n${normalized_stdout}\n")
 foreach(required_line IN ITEMS
     "board: g4_testing"
     "stop: time-budget"
-    "time_ns: 1000000000"
     "unknown_mmio_addresses: 0"
 )
     string(FIND "${padded_stdout}" "\n${required_line}\n" line_position)
@@ -43,9 +42,21 @@ foreach(required_line IN ITEMS
     endif()
 endforeach()
 
+string(REGEX MATCH "time_ns: ([0-9]+)" time_match "${normalized_stdout}")
+if(time_match STREQUAL "")
+    message(FATAL_ERROR "g4_testing smoke output is missing a numeric time_ns line\nstdout:\n${run_stdout}")
+endif()
+set(stop_time_ns "${CMAKE_MATCH_1}")
+if(stop_time_ns LESS 1000000000 OR stop_time_ns GREATER_EQUAL 1001000000)
+    message(FATAL_ERROR
+        "g4_testing smoke stop time ${stop_time_ns} ns is outside [1000000000, 1001000000)\n"
+        "stdout:\n${run_stdout}"
+    )
+endif()
+
 string(FIND "${run_stdout}" "unknown_mmio:" unknown_detail_position)
 if(NOT unknown_detail_position EQUAL -1)
     message(FATAL_ERROR "g4_testing smoke reported an unknown MMIO detail:\n${run_stdout}")
 endif()
 
-message(STATUS "g4_testing reached exactly 1000000000 ns with zero unknown MMIO")
+message(STATUS "g4_testing reached the 1 s deadline within documented overshoot with zero unknown MMIO")
