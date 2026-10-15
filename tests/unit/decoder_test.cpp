@@ -65,6 +65,16 @@ TEST(DecoderTest, DecodesRepresentativeThirtyTwoBitFamilies) {
     EXPECT_TRUE(ldr && ldr->rn == 1U && ldr->rd == 0U && ldr->imm == 32U)
         << "normalizes LDR.W operands";
 
+    const auto rrx = fil::cpu::decode32(0xea4fU, 0x0031U);
+    EXPECT_TRUE(rrx && rrx->shift_type == fil::cpu::ShiftType::rrx)
+        << "decodes an immediate RRX operand";
+    const auto bic = fil::cpu::decode32(0xea21U, 0x0002U);
+    EXPECT_TRUE(bic && bic->kind == fil::cpu::InstrKind::bic)
+        << "decodes BIC register data processing";
+    const auto eor = fil::cpu::decode32(0xea81U, 0x0002U);
+    EXPECT_TRUE(eor && eor->kind == fil::cpu::InstrKind::eor)
+        << "decodes EOR register data processing";
+
     const auto literal_up = fil::cpu::decode32(0xf8dfU, 0x0010U);
     const auto literal_down = fil::cpu::decode32(0xf85fU, 0x0010U);
     EXPECT_TRUE(literal_up && literal_up->form == fil::cpu::OperandForm::literal && literal_up->add)

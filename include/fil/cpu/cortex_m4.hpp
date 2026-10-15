@@ -29,8 +29,6 @@ class SystemControl;
 
 namespace fil::cpu {
 
-class NativeJitKernel;
-
 inline constexpr std::uint32_t xpsr_n = 1U << 31U;
 inline constexpr std::uint32_t xpsr_z = 1U << 30U;
 inline constexpr std::uint32_t xpsr_c = 1U << 29U;
@@ -177,9 +175,6 @@ public:
     CortexM4(const CortexM4&) = delete;
     CortexM4& operator=(const CortexM4&) = delete;
 
-    /** Whether this build includes the LLVM host-machine-code backend. */
-    [[nodiscard]] static bool nativeJitAvailable() noexcept;
-
     /** @brief Gets mutable architectural state for inspection or setup. */
     [[nodiscard]] CpuState& state() noexcept { return state_; }
     /** @brief Gets immutable architectural state. */
@@ -202,21 +197,7 @@ public:
     /** @brief Executes one cached, specialized instruction or interprets exactly one step. */
     [[nodiscard]] FastStepResult stepJitFast();
 
-    /**
-     * @brief Enables LLVM-compiled one-instruction kernels for direct CPU stepping.
-     *
-     * Multi-instruction native blocks remain independently available. The
-     * multi-board runner disables single kernels by default because measured
-     * real-firmware runs did not recover their dispatch/codegen overhead.
-     */
-    void setNativeSingleInstructionJitEnabled(bool enabled) noexcept {
-        native_single_instruction_jit_enabled_ = enabled;
-    }
-
-    /** @brief Enables the bespoke stencil JIT (default on where supported).
-     *
-     *  Native-policy tests disable it to exercise the LLVM backend in
-     *  isolation; production and benchmarks keep the default. */
+    /** @brief Enables the bespoke stencil JIT (default on where supported). */
     void setMicroJitEnabled(bool enabled) noexcept {
         micro_jit_enabled_ = enabled;
     }
@@ -404,20 +385,6 @@ public:
         std::uint64_t block_generic{0};
         /// Fast-handler declines on the single-step path (MMIO/faults).
         std::uint64_t single_decline{0};
-        std::uint64_t native_compilations{0};
-        std::uint64_t native_executions{0};
-        std::uint64_t native_instructions{0};
-        std::uint64_t native_compilation_failures{0};
-        std::uint64_t native_evictions{0};
-        std::uint64_t native_policy_samples{0};
-        std::uint64_t native_promotions{0};
-        std::uint64_t native_demotions{0};
-        std::uint64_t native_compile_cost_ns{0};
-        std::uint64_t native_startup_cost_ns{0};
-        std::uint64_t native_probe_instructions{0};
-        std::uint64_t native_policy_mismatches{0};
-        std::uint64_t native_policy_probe_cost_ns{0};
-        std::uint64_t native_policy_empty_samples{0};
         std::uint64_t micro_compilations{0};
         std::uint64_t micro_executions{0};
         std::uint64_t micro_instructions{0};
@@ -425,13 +392,6 @@ public:
         std::uint64_t micro_compile_cost_ns{0};
     };
     [[nodiscard]] JitStats jitStats() const noexcept { return jit_stats_; }
-    /** @brief Injects a deterministic matched policy window for the current resident (tests only). */
-    [[nodiscard]] bool observeNativePolicyForTesting(
-        std::uint32_t pc, bool block, std::uint64_t cached_ns,
-        std::uint64_t native_ns, std::uint32_t instructions);
-    [[nodiscard]] bool rejectNativeForTesting(std::uint32_t pc, bool block);
-    [[nodiscard]] const std::string& nativeJitError() const noexcept { return native_jit_error_; }
-
     /**
      * @brief Provides FPCCR (ASPEN) reads for automatic CONTROL.FPCA maintenance.
      * May remain unset (unit tests); FP ownership tracking then assumes ASPEN.
@@ -439,7 +399,6 @@ public:
     void setSystemControl(const cortexm::SystemControl* system) noexcept { system_ = system; }
 
 private:
-    using NativeFunction = void (*)(CpuState*, std::size_t);
     struct InstructionCacheEntry {
         std::uint64_t generation{0};
         std::uint32_t pc{0};
@@ -459,11 +418,6 @@ private:
         /// True when execution may report synchronization_required (memory).
         /// Lets the stepper skip its restart copy for pure ALU/branch ops.
         bool may_trap{false};
-        bool native_supported{false};
-        NativeFunction native_function{nullptr};
-        std::uint8_t native_slot{0U};
-        std::uint16_t native_hits{0U};
-        bool native_attempted{false};
     };
 
     static constexpr std::size_t instruction_cache_entries = 65536U;
@@ -537,13 +491,6 @@ private:
         std::uint8_t count{0};
         bool valid{false};
         bool attempted{false};
-        NativeFunction native_function{nullptr};
-        std::uint8_t native_count{0}; ///< Pure supported prefix; suffix uses cached handlers.
-        std::uint8_t native_slot{0U};
-        std::uint16_t native_hits{0U};
-        bool native_attempted{false};
-        std::uint8_t native_candidate_count{0U};
-        bool native_candidate_checked{false};
         /// Bespoke stencil kernel for the leading FilIR prefix (count in
         /// micro_prefix_count); the suffix keeps existing handlers.
         MicroFunction micro_function{nullptr};
@@ -595,14 +542,6 @@ private:
     std::array<std::uint16_t, jit_block_entries> jit_hot_{};
     JitStats jit_stats_{};
     static constexpr std::uint16_t jit_compile_threshold = 50U;
-    static constexpr std::uint16_t native_compile_threshold = 16384U;
-    static constexpr std::uint16_t native_block_compile_threshold = 512U;
-    static constexpr std::size_t max_native_kernels = 32U;
-    struct NativeState;
-    std::unique_ptr<NativeState> native_state_;
-    std::uint64_t native_clock_{0}; ///< Native candidates/block execution, not simulated time.
-    bool native_single_instruction_jit_enabled_{true};
-    std::string native_jit_error_;
     std::unique_ptr<MicroJit> micro_jit_;
     std::string micro_jit_error_;
     bool micro_jit_enabled_{true};
@@ -612,16 +551,6 @@ private:
     // micro prefix were planned at base cost (each retires for 1 cycle).
     [[nodiscard]] static std::uint32_t microFailedAdjust(
         const JitBlockEntry& slot, std::uint8_t retired, std::uint32_t failed_mask) noexcept;
-    [[nodiscard]] bool ensureNativeCompiler();
-    [[nodiscard]] std::uint8_t retainNativeKernel(std::shared_ptr<const NativeJitKernel> kernel);
-    void touchNativeKernel(std::uint8_t slot) noexcept;
-    [[nodiscard]] bool executeNativeInstruction(InstructionCacheEntry& entry);
-    void prepareNativeBlock(JitBlockEntry& entry);
-    void sampleNativeSingle(InstructionCacheEntry& entry);
-    void sampleNativeBlock(JitBlockEntry& entry, std::uint8_t count);
-    void recordNativePolicySample(std::uint8_t slot, std::uint64_t cached_ns,
-                                  std::uint64_t native_ns, std::uint32_t count);
-    void rejectNativeResident(std::uint8_t slot) noexcept;
 
     [[nodiscard]] FastStepResult stepFastImpl(bool use_jit, bool fast_handler_declined = false);
     /// Shared block-execution body; prepared skips hotness/validity probing.

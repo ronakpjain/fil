@@ -1,7 +1,7 @@
 #pragma once
 
 /** @file micro_jit.hpp
- *  @brief Bespoke FilIR stencil JIT: host machine code without LLVM.
+ *  @brief Bespoke FilIR stencil JIT: host machine code.
  *
  *  MicroJit compiles a FilIR MicroBlock (straight-line unconditional
  *  integer ops, terminal B/BL) into a single straight-line AArch64

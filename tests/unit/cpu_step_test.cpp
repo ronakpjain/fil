@@ -130,6 +130,18 @@ TEST(CpuStepTest, StrdStoresRepeatedSourceRegisterTwice) {
     EXPECT_EQ(second.value(), 0x12345678U);
 }
 
+TEST(CpuStepTest, ExecutesMovtAndPreservesLowHalfword) {
+    auto bus = basicBus();
+    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0xf2c1U, 0x2034U})).hasValue());
+    fil::cpu::CortexM4 cpu(bus);
+    prepare(cpu);
+    cpu.state().r[0] = 0x00001c0cU;
+    const auto result = cpu.stepFast();
+    EXPECT_EQ(result.reason, fil::cpu::StopReason::step_complete);
+    EXPECT_EQ(result.raw, 0xf2c12034U);
+    EXPECT_EQ(cpu.state().r[0], 0x12341c0cU);
+}
+
 TEST(CpuStepTest, ComparesCpuStateByStoredRepresentation) {
     fil::cpu::CpuState left;
     left.s[0] = std::bit_cast<float>(0x7fc00001U);
@@ -568,6 +580,7 @@ TEST(CpuStepTest, ExecutesRealWideAluMultiplyAndBitfieldEncodings) {
     EXPECT_TRUE(cpu.step().reason == fil::cpu::StopReason::step_complete)
         << "executes ADDW plain immediate";
     EXPECT_TRUE(cpu.state().r[2] == 0x1c0cU) << "ADDW reconstructs all twelve immediate bits";
+
 }
 
 TEST(CpuStepTest, ExecutesExtendDoublewordAndVfpContextTransfers) {

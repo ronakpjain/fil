@@ -257,7 +257,6 @@ TEST(DeferredPrefixTest, WarmIdleCallPeriodEveryCutMatchesExactCpuMemoryAndTimer
         options.max_instructions = 13U;
         for (auto* board : {exact.value().get(), speculative.value().get()}) {
             board->cpu().state().r[3] = 1U;
-            board->cpu().setNativeSingleInstructionJitEnabled(false);
             ASSERT_TRUE(board->memory().write32(0x20000040U, 0U));
             ASSERT_TRUE(board->memory().write32(0x20000044U, 1U));
             ASSERT_TRUE(board->memory().write32(0xe0001000U, 1U));
@@ -339,7 +338,6 @@ TEST(DeferredPrefixTest, IdempotentPeriodAdmissionReusesRotatedPhasesWithoutExec
     warm.max_instructions = 13U;
     for (auto* board : {exact.value().get(), cached.value().get()}) {
         board->cpu().state().r[3] = 1U;
-        board->cpu().setNativeSingleInstructionJitEnabled(false);
         ASSERT_TRUE(board->memory().write32(0x20000040U, 0U));
         ASSERT_TRUE(board->memory().write32(0x20000044U, 1U));
         ASSERT_TRUE(board->memory().write32(0xe0001000U, 1U));
@@ -405,7 +403,6 @@ TEST(DeferredPrefixTest, RestorationInvalidatesImmutablePeriodAdmission) {
         0x1bU,0x68U, 0x00U,0x2bU, 0xfaU,0xd1U, 0x08U,0xbdU,
         0x40U,0x00U,0x00U,0x20U, 0x44U,0x00U,0x00U,0x20U};
     board.value()->cpu().state().r[3] = 1U;
-    board.value()->cpu().setNativeSingleInstructionJitEnabled(false);
     ASSERT_TRUE(board.value()->memory().write32(0x20000040U, 0U));
     ASSERT_TRUE(board.value()->memory().write32(0x20000044U, 1U));
     ASSERT_TRUE(board.value()->memory().write32(0xe0001000U, 1U));
@@ -448,7 +445,6 @@ TEST(DeferredPrefixTest, ReversibleRamEveryCutMatchesExactCpuMemoryAndTimers) {
         constexpr std::uint32_t ram = 0x20000040U;
         for (auto* board : {exact.value().get(), speculative.value().get()}) {
             board->cpu().state().r[1] = ram;
-            board->cpu().setNativeSingleInstructionJitEnabled(false);
             ASSERT_TRUE(board->memory().write32(0xe0001000U, 1U)); // DWT cycle counter
             installCode(*board, code);
         }
@@ -545,7 +541,7 @@ TEST(DeferredPrefixTest, FailureTruncatesOtherCapsulesBeforeDraining) {
     }
 }
 
-TEST(DeferredPrefixTest, NativeDisabledSingleStepPreservesDivideLatency) {
+TEST(DeferredPrefixTest, SingleStepPreservesDivideLatency) {
     for (const std::uint32_t divisor : {0U, 1U, 2U, 8U, 0x80U, 0xffffffffU}) {
         auto exact = fil::sim::Board::load(fil::test::fixtureBoardConfig());
         auto jit = fil::sim::Board::load(fil::test::fixtureBoardConfig());
@@ -556,7 +552,6 @@ TEST(DeferredPrefixTest, NativeDisabledSingleStepPreservesDivideLatency) {
             ASSERT_TRUE(board->memory().loadBytes(board->cpu().state().r[15], code));
             board->cpu().state().r[2] = divisor;
             board->cpu().state().r[3] = 1234567U;
-            board->cpu().setNativeSingleInstructionJitEnabled(false);
         }
         const auto expected = exact.value()->cpu().stepFast();
         const auto actual = jit.value()->cpu().stepJitFast();

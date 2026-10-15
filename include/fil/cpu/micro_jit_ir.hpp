@@ -1,16 +1,16 @@
 #pragma once
 
 /** @file micro_jit_ir.hpp
- *  @brief Bespoke FilIR: tiny guest IR for the LLVM-free micro-JIT.
+ *  @brief Bespoke FilIR: tiny guest IR for the micro-JIT.
  *
- *  FilIR replaces LLVM IR for straight-line Cortex-M integer kernels.
+ *  FilIR is a tiny guest IR for straight-line Cortex-M integer kernels.
  *  One DecodedInstruction lowers to exactly one MicroInst (no optimizer,
  *  no modules, no linker). The stencil emitter (phase 2) memcpy's one
  *  host template per MicroInst; this header + micro_jit_ir.cpp own
  *  lowering, validation, cost model, and a reference interpreter used
  *  for differential testing against the existing executor.
  *
- *  Scope mirrors the proven LLVM subset plus shifted register forms:
+ *  Scope includes the admitted integer forms plus shifted register forms:
  *  NOP, MOV/MOVW/MOVT immediate, ADD/SUB/CMP/CMN immediate, unshifted
  *  AND/ORR/EOR/BIC and ADD/SUB, shifted ADD/SUB, LSL/LSR/ASR/ROR/RRX,
  *  and a terminal unconditional B/BL. Everything else (memory/MMIO,
@@ -79,7 +79,7 @@ struct MicroInst {
     std::uint8_t size{0};
 };
 
-/** Already-decoded guest instruction with address/width (LLVM-free alias). */
+/** Already-decoded guest instruction with address/width. */
 struct MicroSource {
     DecodedInstruction decoded{};
     std::uint32_t pc{0};

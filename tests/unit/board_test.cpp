@@ -67,7 +67,6 @@ bool warmIdempotentPeriodCache(fil::sim::Board& board) {
         0x1bU,0x68U, 0x00U,0x2bU, 0xfaU,0xd1U, 0x08U,0xbdU,
         0x40U,0x00U,0x00U,0x20U, 0x44U,0x00U,0x00U,0x20U};
     board.cpu().state().r[3] = 1U;
-    board.cpu().setNativeSingleInstructionJitEnabled(false);
     if (!board.memory().write32(0x40022000U, 0U) // Pin the period-cache fixture's fetch cost.
         || !board.memory().write32(0x20000040U, 0U)
         || !board.memory().write32(0x20000044U, 1U)
@@ -125,7 +124,6 @@ bool installBranchingReversibleProgram(fil::sim::Board& board) {
     }
     board.cpu().state() = initial;
     board.cpu().state().r[0] = 0U;
-    board.cpu().setNativeSingleInstructionJitEnabled(false);
     return true;
 }
 
