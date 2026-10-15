@@ -93,9 +93,6 @@ public:
     /** @brief Gets recognized `.ARM.attributes` values. @return ARM attributes. */
     [[nodiscard]] const ArmAttributes& armAttributes() const noexcept { return attributes_; }
 
-    /** @brief Gets the immutable original ELF bytes. @return View into image-owned storage. */
-    [[nodiscard]] std::span<const std::uint8_t> fileBytes() const noexcept { return file_bytes_; }
-
     /**
      * @brief Reads bytes by physical/load address, never runtime address.
      * @param address First physical address to read.
@@ -116,7 +113,6 @@ public:
 private:
     friend Result<ElfImage> load(const std::filesystem::path&, std::optional<std::uint32_t>);
 
-    std::filesystem::path path_;
     std::vector<std::uint8_t> file_bytes_;
     std::vector<ElfLoadSegment> segments_;
     std::vector<ElfSymbol> symbols_;

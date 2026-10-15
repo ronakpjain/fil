@@ -559,7 +559,6 @@ Result<ElfImage> load(
     }
 
     ElfImage image;
-    image.path_ = path;
     image.file_bytes_ = std::move(bytes).value();
     image.entry_point_ = entry.value();
     image.flags_ = flags.value();
