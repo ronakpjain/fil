@@ -2,6 +2,7 @@
 
 #include "fil/cpu/decoder.hpp"
 #include "fil/cpu/jit.hpp"
+#include "fil/cpu/micro_jit_ir.hpp"
 #include "fil/cpu/native_jit_policy.hpp"
 #if FIL_HAS_LLVM_JIT
 #include "fil/cpu/llvm_jit.hpp"
@@ -747,6 +748,41 @@ void CortexM4::prepareNativeBlock(JitBlockEntry& entry) {
 #else
     static_cast<void>(entry);
 #endif
+}
+
+bool CortexM4::ensureMicroJit() {
+    if (micro_jit_) return true;
+    if (!MicroJit::hostSupported()) {
+        micro_jit_error_ = "micro-jit unsupported on this host";
+        return false;
+    }
+    micro_jit_ = MicroJit::create(micro_jit_error_);
+    return micro_jit_ != nullptr;
+}
+
+void CortexM4::prepareMicroBlock(JitBlockEntry& entry) {
+    entry.micro_attempted = true;
+    if (!micro_jit_enabled_) return;
+    if (!MicroJit::hostSupported() || entry.count < 2U) return;
+    std::array<MicroSource, JitStepOutcome::max_block> sources{};
+    for (std::uint8_t i = 0U; i < entry.count; ++i) {
+        sources[i] = {entry.ops[i], entry.pcs[i], entry.sizes[i]};
+    }
+    MicroBlock block;
+    if (!buildMicroBlock({sources.data(), entry.count}, block).ok) return;
+    if (!ensureMicroJit()) return;
+    const auto compile_start = std::chrono::steady_clock::now();
+    MicroFunction fn = micro_jit_->compile(block, micro_jit_error_);
+    const auto compile_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<
+        std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compile_start).count());
+    jit_stats_.micro_compile_cost_ns = saturatingCounterAdd(
+        jit_stats_.micro_compile_cost_ns, compile_ns);
+    if (!fn) {
+        ++jit_stats_.micro_compilation_failures;
+        return;
+    }
+    entry.micro_function = fn;
+    ++jit_stats_.micro_compilations;
 }
 
 bool CortexM4::reset(const elf::ElfImage& image) noexcept {
@@ -1782,6 +1818,12 @@ bool CortexM4::prepareJitBlock(const bool allow_single) {
     fresh.has_memory = has_memory;
     fresh.has_store = has_store;
     fresh.fast_base_cycles = base_sum;
+    // Bespoke stencil kernels cover pure-integer all-fast blocks wholesale.
+    // Prepare already gates on sustained use (jit_compile_threshold), so no
+    // extra hotness counter is needed: stencil emission costs microseconds.
+    if (fresh.all_fast && !fresh.has_memory && fresh.count >= 2U) {
+        prepareMicroBlock(fresh);
+    }
     // Precompute the peek preview: leading prefix cycles with divide at
     // modeled maximum, branch penalties, and exactness flags.
     // Handler-covered loads/stores (including multi-word and PC-loading
@@ -2358,6 +2400,33 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlockImpl(
         }
     }
 #endif
+    // Bespoke stencil kernel: one call retires the whole block. Full-count
+    // execution only (capped prefixes keep the paths below); reversible
+    // capsules keep checked handlers so rollback retains checkpoints.
+    // Subsumes the cached fast loop and any native kernel for this slot.
+    if (!fast_only && out.count == 0U && slot.micro_function
+        && max_instructions >= slot.count && state_.it_state == 0U) {
+        slot.micro_function(&state_);
+        const std::uint8_t last = static_cast<std::uint8_t>(slot.count - 1U);
+        for (std::uint8_t i = 0U; i < slot.count; ++i) {
+            out.pcs[i] = slot.pcs[i];
+            out.sizes[i] = slot.sizes[i];
+        }
+        out.count = slot.count;
+        state_.instruction_address = slot.pcs[last];
+        std::uint32_t total = slot.fast_base_cycles;
+        if (state_.r[15] != slot.pcs[last] + slot.sizes[last]) {
+            total += slot.branch_penalty[last];
+        }
+        last_pc = slot.pcs[last];
+        last_raw = slot.raws[last];
+        last_size = slot.sizes[last];
+        last_suppress = slot.fast_last_suppress;
+        total_cycles = total;
+        ++jit_stats_.micro_executions;
+        jit_stats_.micro_instructions += slot.count;
+        goto commit_block;
+    }
     // Pure-integer fast block: no memory ops (no traps/generation changes),
     // no generic ops (no conditions/faults), IT/pending checked at prepare.
     // Control flow always terminates the block, so mid-block PCs are
@@ -2595,6 +2664,7 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlockImpl(
 #if FIL_HAS_LLVM_JIT
     if (out.count >= 2U && slot.native_candidate_count != 0U
         && !slot.native_function && !slot.native_attempted
+        && !slot.micro_function
         && slot.generation == memory_.executionGeneration()) {
         if (slot.native_hits < native_block_compile_threshold) ++slot.native_hits;
         else prepareNativeBlock(slot);

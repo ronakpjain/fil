@@ -631,6 +631,11 @@ void printNativeJitStats(std::ostream& out, const cpu::CortexM4& cpu, const std:
         << " probe_cost_ns=" << stats.native_policy_probe_cost_ns
         << " empty_samples=" << stats.native_policy_empty_samples
         << " policy_mismatches=" << stats.native_policy_mismatches
+        << " micro_compilations=" << stats.micro_compilations
+        << " micro_executions=" << stats.micro_executions
+        << " micro_instructions=" << stats.micro_instructions
+        << " micro_failures=" << stats.micro_compilation_failures
+        << " micro_compile_cost_ns=" << stats.micro_compile_cost_ns
         << " block_executions=" << stats.block_executions
         << " block_instructions=" << stats.block_instructions
         << " block_compilations=" << stats.compilations

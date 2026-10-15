@@ -5,6 +5,7 @@
  */
 
 #include "fil/cpu/instruction.hpp"
+#include "fil/cpu/micro_jit.hpp"
 #include "fil/mem/address.hpp"
 
 #include <array>
@@ -212,6 +213,14 @@ public:
         native_single_instruction_jit_enabled_ = enabled;
     }
 
+    /** @brief Enables the bespoke stencil JIT (default on where supported).
+     *
+     *  Native-policy tests disable it to exercise the LLVM backend in
+     *  isolation; production and benchmarks keep the default. */
+    void setMicroJitEnabled(bool enabled) noexcept {
+        micro_jit_enabled_ = enabled;
+    }
+
     /** @brief Gets the diagnostic captured by the most recent failed fast step. */
     [[nodiscard]] const DiagnosticSnapshot& lastDiagnostic() const noexcept {
         return last_diagnostic_;
@@ -406,6 +415,11 @@ public:
         std::uint64_t native_policy_mismatches{0};
         std::uint64_t native_policy_probe_cost_ns{0};
         std::uint64_t native_policy_empty_samples{0};
+        std::uint64_t micro_compilations{0};
+        std::uint64_t micro_executions{0};
+        std::uint64_t micro_instructions{0};
+        std::uint64_t micro_compilation_failures{0};
+        std::uint64_t micro_compile_cost_ns{0};
     };
     [[nodiscard]] JitStats jitStats() const noexcept { return jit_stats_; }
     /** @brief Injects a deterministic matched policy window for the current resident (tests only). */
@@ -527,6 +541,9 @@ private:
         bool native_attempted{false};
         std::uint8_t native_candidate_count{0U};
         bool native_candidate_checked{false};
+        /// Bespoke stencil kernel for the whole block (full-count only).
+        MicroFunction micro_function{nullptr};
+        bool micro_attempted{false};
         std::array<DecodedInstruction, JitStepOutcome::max_block> ops{};
         std::array<std::uint32_t, JitStepOutcome::max_block> pcs{};
         std::array<std::uint8_t, JitStepOutcome::max_block> sizes{};
@@ -581,6 +598,12 @@ private:
     std::uint64_t native_clock_{0}; ///< Native candidates/block execution, not simulated time.
     bool native_single_instruction_jit_enabled_{true};
     std::string native_jit_error_;
+    std::unique_ptr<MicroJit> micro_jit_;
+    std::string micro_jit_error_;
+    bool micro_jit_enabled_{true};
+    [[nodiscard]] bool ensureMicroJit();
+    void prepareMicroBlock(JitBlockEntry& entry);
+    [[nodiscard]] const std::string& microJitError() const noexcept { return micro_jit_error_; }
     [[nodiscard]] bool ensureNativeCompiler();
     [[nodiscard]] std::uint8_t retainNativeKernel(std::shared_ptr<const NativeJitKernel> kernel);
     void touchNativeKernel(std::uint8_t slot) noexcept;

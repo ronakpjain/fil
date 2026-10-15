@@ -105,6 +105,7 @@ TEST(NativeFastPathTest, PureArithmeticMatchesCappedReferencesAndBranchBoundary)
                 .hasValue());
         ASSERT_TRUE(bus.write32(ram_base, 0xDEADBEEFU).hasValue());
         fil::cpu::CortexM4 cpu(bus);
+        cpu.setMicroJitEnabled(false); // exercises the LLVM backend in isolation
         fil::cpu::CortexM4 reference(bus);
         prepare(cpu);
         prepare(reference);

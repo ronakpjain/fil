@@ -527,8 +527,12 @@ struct MicroJit::Impl {
 MicroJit::~MicroJit() = default;
 
 bool MicroJit::hostSupported() noexcept {
+#if defined(FIL_ENABLE_MICRO_JIT) && FIL_ENABLE_MICRO_JIT
 #ifdef FIL_MICRO_JIT_AARCH64
     return true;
+#else
+    return false;
+#endif
 #else
     return false;
 #endif

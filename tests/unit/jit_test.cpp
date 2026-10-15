@@ -147,6 +147,7 @@ TEST(JitTest, NativePolicyPromotionPreservesExactBlockBoundaryAndCpuState) {
     auto bus = basicBus();
     ASSERT_TRUE(bus.loadBytes(code_base, halfwords({0xBF00U, 0xE7FDU})).hasValue());
     fil::cpu::CortexM4 native(bus);
+    native.setMicroJitEnabled(false); // exercises the LLVM backend in isolation
     fil::cpu::CortexM4 reference(bus);
     prepare(native, code_base);
     prepare(reference, code_base);

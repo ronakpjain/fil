@@ -457,6 +457,7 @@ TEST(LlvmJitIntegrationTest, CompiledBranchFaultOnNextDispatchMatchesInterpreter
     ASSERT_TRUE(native_bus.loadBytes(ram, code).hasValue());
     ASSERT_TRUE(reference_bus.loadBytes(ram, code).hasValue());
     fil::cpu::CortexM4 native(native_bus);
+    native.setMicroJitEnabled(false); // exercises the LLVM backend in isolation
     fil::cpu::CortexM4 reference(reference_bus);
     fil::cpu::CpuState initial{};
     initial.r[15] = ram;
@@ -505,6 +506,7 @@ TEST(LlvmJitIntegrationTest, CompiledBranchReportsExactCyclesAndFallthroughState
     ASSERT_TRUE(native_bus.loadBytes(ram, code).hasValue());
     ASSERT_TRUE(reference_bus.loadBytes(ram, code).hasValue());
     fil::cpu::CortexM4 native(native_bus);
+    native.setMicroJitEnabled(false); // exercises the LLVM backend in isolation
     fil::cpu::CortexM4 reference(reference_bus);
     fil::cpu::CpuState initial{};
     initial.r[15] = ram;
@@ -597,6 +599,7 @@ TEST(LlvmJitIntegrationTest, HotCappedNativeBlockMatchesInterpreterAndTracksNati
                                             0x00U, 0xBEU}; // BKPT ends lookahead
     ASSERT_TRUE(bus.loadBytes(ram, code).hasValue());
     fil::cpu::CortexM4 cpu(bus);
+    cpu.setMicroJitEnabled(false); // exercises the LLVM backend in isolation
     fil::cpu::CpuState initial{};
     initial.r[15] = ram;
     initial.instruction_address = ram;
@@ -702,6 +705,7 @@ TEST(LlvmJitIntegrationTest, NativeBlockAdmissionRequiresActualMultiInstructionU
         0, 0xbf, 0, 0xbf, 0, 0xbe};
     ASSERT_TRUE(bus.loadBytes(ram, code).hasValue());
     fil::cpu::CortexM4 cpu(bus);
+    cpu.setMicroJitEnabled(false); // exercises the LLVM backend in isolation
     fil::cpu::CpuState initial{};
     initial.r[15] = ram;
     cpu.state() = initial;
@@ -742,6 +746,7 @@ TEST(LlvmJitIntegrationTest, EvictedNativeBlockRewarmsWithoutStaleEntryPoint) {
     }
     ASSERT_TRUE(bus.loadBytes(ram, code).hasValue());
     fil::cpu::CortexM4 cpu(bus);
+    cpu.setMicroJitEnabled(false); // exercises the LLVM backend in isolation
     const auto step_single = [&](std::size_t site) {
         cpu.state() = fil::cpu::CpuState{};
         cpu.state().r[15] = ram + 32U + static_cast<std::uint32_t>(site * 4U);
