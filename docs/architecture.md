@@ -145,7 +145,8 @@ may represent up to 4096 instructions while remaining bounded by events,
 SysTick, deadlines, and cycle-result capacity. Observation barriers select the
 exact started prefix and restore its certified phase; all peripheral callbacks
 still execute in their original order. See [Performance](performance.md) for
-eligibility and benchmark controls.
+eligibility and benchmark controls. Capsule replay is not yet verified cycle-exact on
+real firmware; see the known issue there.
 
 ### Loop batching
 
