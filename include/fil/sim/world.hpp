@@ -41,7 +41,6 @@ struct WorldRunOptions {
     std::uint64_t spin_threshold{1'000'000}; ///< Logical loop instructions required before stopping.
     bool enable_loop_batching{false}; ///< Alternative proven-loop scheduler; disables RAM capsules.
     bool enable_jit{true}; ///< Cached hot-path compilation; preserves lane boundaries.
-    bool enable_native_single_jit{false}; ///< Opt-in LLVM single-instruction kernels (off by default).
     bool enable_transactional_slices{false}; ///< Execute experimental reversible lane epochs.
     bool enable_deferred_prefixes{false}; ///< Experimental interruptible pure prefixes; requires JIT.
     bool enable_ram_capsules{true}; ///< Guarded reversible RAM prefixes; incompatible modes fall back automatically.
