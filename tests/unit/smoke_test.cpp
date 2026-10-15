@@ -145,11 +145,10 @@ TEST(SmokeTest, HonorsRunStopControls) {
         fil::cli::run(allowed_args, allowed_out, allowed_err) == fil::cli::ExitCode::success)
         << "--allow-breakpoint explicitly accepts a firmware BKPT";
     EXPECT_TRUE(allowed_err.str().empty()) << "an explicitly accepted BKPT has no error diagnostic";
-    EXPECT_NE(allowed_out.str().find(" policy_samples="), std::string::npos);
-    EXPECT_NE(allowed_out.str().find(" promotions="), std::string::npos);
-    EXPECT_NE(allowed_out.str().find(" demotions="), std::string::npos);
-    EXPECT_NE(allowed_out.str().find(" compile_cost_ns="), std::string::npos);
-    EXPECT_NE(allowed_out.str().find(" policy_mismatches=0"), std::string::npos);
+    EXPECT_NE(allowed_out.str().find("jit: board="), std::string::npos);
+    EXPECT_NE(allowed_out.str().find(" micro_compilations="), std::string::npos);
+    EXPECT_NE(allowed_out.str().find(" block_executions="), std::string::npos);
+    EXPECT_NE(allowed_out.str().find(" single_fast="), std::string::npos);
 
     const std::string_view symbol_args[]{"run", config_text, "--stop-at-symbol", "Reset_Handler"};
     std::ostringstream symbol_out;

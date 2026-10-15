@@ -621,24 +621,9 @@ ExitCode disassembleWindowCommand(
     return ExitCode::success;
 }
 
-void printNativeJitStats(std::ostream& out, const cpu::CortexM4& cpu, const std::string_view name) {
+void printJitStats(std::ostream& out, const cpu::CortexM4& cpu, const std::string_view name) {
     const auto stats = cpu.jitStats();
-    out << "native_jit: board=" << name
-        << " backend=" << (cpu::CortexM4::nativeJitAvailable() ? "llvm-orc" : "unavailable")
-        << " compilations=" << stats.native_compilations
-        << " executions=" << stats.native_executions
-        << " instructions=" << stats.native_instructions
-        << " failures=" << stats.native_compilation_failures
-        << " evictions=" << stats.native_evictions
-        << " policy_samples=" << stats.native_policy_samples
-        << " promotions=" << stats.native_promotions
-        << " demotions=" << stats.native_demotions
-        << " compile_cost_ns=" << stats.native_compile_cost_ns
-        << " startup_cost_ns=" << stats.native_startup_cost_ns
-        << " probe_instructions=" << stats.native_probe_instructions
-        << " probe_cost_ns=" << stats.native_policy_probe_cost_ns
-        << " empty_samples=" << stats.native_policy_empty_samples
-        << " policy_mismatches=" << stats.native_policy_mismatches
+    out << "jit: board=" << name
         << " micro_compilations=" << stats.micro_compilations
         << " micro_executions=" << stats.micro_executions
         << " micro_instructions=" << stats.micro_instructions
@@ -652,7 +637,6 @@ void printNativeJitStats(std::ostream& out, const cpu::CortexM4& cpu, const std:
         << " single_generic=" << stats.single_generic
         << " block_generic=" << stats.block_generic
         << " single_decline=" << stats.single_decline << '\n';
-    if (!cpu.nativeJitError().empty()) out << "native_jit_error: " << cpu.nativeJitError() << '\n';
 }
 
 ExitCode runBoardCommand(
@@ -789,7 +773,7 @@ ExitCode runBoardCommand(
             << " reads=" << access.reads << " writes=" << access.writes << '\n';
     }
 
-    if (enable_jit) printNativeJitStats(out, board.value()->cpu(), board_config.value().name);
+    if (enable_jit) printJitStats(out, board.value()->cpu(), board_config.value().name);
     if (trace_path) {
         std::ofstream trace(*trace_path, std::ios::binary | std::ios::trunc);
         if (!trace) {
@@ -1276,7 +1260,7 @@ ExitCode runNetworkCommand(
                 << " admitted_instructions=" << board.memoized_instructions << '\n';
         }
         if (sim::Board* instance = world.value()->board(board.name)) {
-            if (enable_jit) printNativeJitStats(out, instance->cpu(), board.name);
+            if (enable_jit) printJitStats(out, instance->cpu(), board.name);
             const auto unknown = instance->peripherals().router().unknownAccesses();
             for (const auto& access : unknown) {
                 out << "  unknown_mmio: 0x" << std::hex << access.address << std::dec
