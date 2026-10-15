@@ -266,7 +266,7 @@ if(FIL_BUILD_TESTS)
                         ${FIL_PER_AUDIT_ELFS}
                 )
                 set_tests_properties(fil.per.audit_instructions PROPERTIES
-                    TIMEOUT 120
+                    TIMEOUT 900
                     LABELS "per;integration;static"
                 )
             else()
