@@ -88,6 +88,7 @@ resolve_path() {
 reports_json='[]'
 total_instructions=0
 total_decoded=0
+total_undefined=0
 for elf in "${elfs[@]}"; do
   [[ -f $elf ]] || fail "ELF does not exist: $elf"
   if ! run_checked "$objdump" -d "$elf"; then exit 1; fi
@@ -116,7 +117,7 @@ for elf in "${elfs[@]}"; do
   duplicate=$(printf '%s\n' "${addresses[@]}" | LC_ALL=C sort | uniq -d | head -n 1)
   [[ -z $duplicate ]] || fail "objdump emitted duplicate instruction address 0x$duplicate for $elf"
 
-  chunks=0; decoded=0; failures=()
+  chunks=0; decoded=0; undefined=0; failures=()
   start=0; count=${#addresses[@]}
   while ((start < count)); do
     end=$((start + 1))
@@ -147,6 +148,14 @@ for elf in "${elfs[@]}"; do
       actual_mnemonic=${fields[k]}
       if [[ $got != "$expected" ]]; then failures+=("0x$expected: fil advanced to 0x$got"); continue; fi
       if [[ $actual_encoding != "${encodings[idx]}" ]]; then failures+=("0x$got: raw encoding differs: objdump ${encodings[idx]}, fil $actual_encoding"); continue; fi
+      if [[ ${mnemonics[idx],,} == udf ]]; then
+        if [[ ${encodings[idx],,} != deff || $actual_mnemonic != unsupported ]]; then
+          failures+=("0x$got: udf (${encodings[idx]}) was not rejected by FIL as an undefined instruction")
+        else
+          ((undefined+=1))
+        fi
+        continue
+      fi
       if [[ $actual_mnemonic == unsupported ]]; then failures+=("0x$got: unsupported objdump mnemonic ${mnemonics[idx]} (${encodings[idx]})"); continue; fi
       ((decoded+=1))
     done
@@ -165,13 +174,13 @@ for elf in "${elfs[@]}"; do
   fi
   sha=${sha%% *}
   base=${elf##*/}; name=${base%.*}
-  printf '%s: %d objdump instructions decoded, 0 unsupported, 0 address/width mismatches\n' "$name" "$decoded"
+  printf '%s: %d instructions decoded, %d undefined encodings rejected, 0 unsupported, 0 address/width mismatches\n' "$name" "$decoded" "$undefined"
   if [[ -n $report ]]; then
     resolved=$(resolve_path "$elf") || fail "could not resolve ELF path: $elf"
-    item=$(jq -n --arg name "$name" --arg path "$resolved" --arg sha "$sha" --argjson objdump "$count" --argjson decoded "$decoded" --argjson chunks "$chunks" '{name:$name,path:$path,sha256:$sha,objdump_instructions:$objdump,decoded_instructions:$decoded,contiguous_chunks:$chunks,unsupported:0,address_or_width_mismatches:0}') || fail "could not construct report"
+    item=$(jq -n --arg name "$name" --arg path "$resolved" --arg sha "$sha" --argjson objdump "$count" --argjson decoded "$decoded" --argjson undefined "$undefined" --argjson chunks "$chunks" '{name:$name,path:$path,sha256:$sha,objdump_instructions:$objdump,decoded_instructions:$decoded,undefined_encodings_rejected:$undefined,contiguous_chunks:$chunks,unsupported:0,address_or_width_mismatches:0}') || fail "could not construct report"
     reports_json=$(jq --argjson item "$item" '. + [$item]' <<<"$reports_json") || fail "could not construct report"
   fi
-  total_instructions=$((total_instructions + count)); total_decoded=$((total_decoded + decoded))
+  total_instructions=$((total_instructions + count)); total_decoded=$((total_decoded + decoded)); total_undefined=$((total_undefined + undefined))
 done
 if ! run_checked "$fil" --version; then exit 1; fi
 fil_version=$(printf '%s' "$RUN_OUTPUT" | sed -e 's/[[:space:]]*$//')
@@ -180,6 +189,6 @@ objdump_version=${RUN_OUTPUT%%$'\n'*}
 if [[ -n $report ]]; then
   parent=${report%/*}; [[ $parent != "$report" ]] || parent=.
   mkdir -p -- "$parent" || fail "could not create report directory: $parent"
-  jq -n --arg fv "$fil_version" --arg ov "$objdump_version" --argjson count "${#elfs[@]}" --argjson total "$total_instructions" --argjson decoded "$total_decoded" --argjson elfs "$reports_json" '{schema_version:1,fil_version:$fv,objdump_version:$ov,elf_count:$count,total_objdump_instructions:$total,total_decoded_instructions:$decoded,unsupported:0,address_or_width_mismatches:0,elfs:$elfs}' >"$report" || fail "could not write JSON report: $report"
+  jq -n --arg fv "$fil_version" --arg ov "$objdump_version" --argjson count "${#elfs[@]}" --argjson total "$total_instructions" --argjson decoded "$total_decoded" --argjson undefined "$total_undefined" --argjson elfs "$reports_json" '{schema_version:1,fil_version:$fv,objdump_version:$ov,elf_count:$count,total_objdump_instructions:$total,total_decoded_instructions:$decoded,total_undefined_encodings_rejected:$undefined,unsupported:0,address_or_width_mismatches:0,elfs:$elfs}' >"$report" || fail "could not write JSON report: $report"
 fi
-printf 'total: %d instructions across %d ELFs\n' "$total_decoded" "${#elfs[@]}"
+printf 'total: %d supported instructions decoded, %d undefined encodings rejected across %d ELFs\n' "$total_decoded" "$total_undefined" "${#elfs[@]}"
