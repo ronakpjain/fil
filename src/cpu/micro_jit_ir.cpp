@@ -49,53 +49,6 @@ void writeOp(MicroCpu& cpu, std::uint8_t reg, std::uint32_t value) noexcept {
 
 } // namespace
 
-const char* toString(MicroOp op) noexcept {
-    switch (op) {
-    case MicroOp::nop: return "nop";
-    case MicroOp::mov_imm: return "mov_imm";
-    case MicroOp::movw: return "movw";
-    case MicroOp::movt: return "movt";
-    case MicroOp::add_imm: return "add_imm";
-    case MicroOp::sub_imm: return "sub_imm";
-    case MicroOp::cmp_imm: return "cmp_imm";
-    case MicroOp::cmn_imm: return "cmn_imm";
-    case MicroOp::add_reg: return "add_reg";
-    case MicroOp::sub_reg: return "sub_reg";
-    case MicroOp::and_reg: return "and_reg";
-    case MicroOp::orr_reg: return "orr_reg";
-    case MicroOp::eor_reg: return "eor_reg";
-    case MicroOp::bic_reg: return "bic_reg";
-    case MicroOp::add_shift: return "add_shift";
-    case MicroOp::sub_shift: return "sub_shift";
-    case MicroOp::lsl: return "lsl";
-    case MicroOp::lsr: return "lsr";
-    case MicroOp::asr: return "asr";
-    case MicroOp::ror: return "ror";
-    case MicroOp::rrx: return "rrx";
-    case MicroOp::b: return "b";
-    case MicroOp::bl: return "bl";
-    case MicroOp::b_cond: return "b_cond";
-    case MicroOp::cbz: return "cbz";
-    case MicroOp::cbnz: return "cbnz";
-    }
-    return "unknown";
-}
-
-const char* toString(MicroLowerReason reason) noexcept {
-    switch (reason) {
-    case MicroLowerReason::ok: return "ok";
-    case MicroLowerReason::bad_condition: return "bad_condition";
-    case MicroLowerReason::bad_size: return "bad_size";
-    case MicroLowerReason::bad_pc: return "bad_pc";
-    case MicroLowerReason::unsupported_kind: return "unsupported_kind";
-    case MicroLowerReason::bad_shape: return "bad_shape";
-    case MicroLowerReason::bad_register: return "bad_register";
-    case MicroLowerReason::bad_immediate: return "bad_immediate";
-    case MicroLowerReason::branch_not_terminal: return "branch_not_terminal";
-    }
-    return "unknown";
-}
-
 MicroLowerResult tryLowerMicroInst(const MicroSource& source, MicroInst& out) noexcept {
     const auto& d = source.decoded;
     MicroInst inst;

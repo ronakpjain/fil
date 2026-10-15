@@ -77,7 +77,6 @@ TEST(MicroJitIrTest, FlagsMatchAddWithCarry) {
     MicroBlock block;
     ASSERT_TRUE(fil::cpu::buildMicroBlock({sources.data(), sources.size()}, block).ok);
     EXPECT_GE(fil::cpu::microBlockCost(block), 1U);
-    EXPECT_STREQ(fil::cpu::toString(MicroOp::add_imm), "add_imm");
 }
 
 } // namespace

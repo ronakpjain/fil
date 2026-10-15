@@ -95,7 +95,6 @@ enum class MicroLowerReason : std::uint8_t {
     unsupported_kind,
     bad_shape,
     bad_register,
-    bad_immediate,
     branch_not_terminal,
 };
 
@@ -134,7 +133,5 @@ struct MicroCpu {
 /** Reference interpreter: executes up to max_instructions, returns retired count. */
 std::size_t interpretMicroBlock(const MicroBlock& block, MicroCpu& cpu, std::size_t max_instructions) noexcept;
 
-[[nodiscard]] const char* toString(MicroOp op) noexcept;
-[[nodiscard]] const char* toString(MicroLowerReason reason) noexcept;
 
 } // namespace fil::cpu
