@@ -39,6 +39,32 @@ Error runtimeError(std::string message) {
 
 } // namespace
 
+bool Board::appendReversibleChunk(
+    ReversibleRamPrefix::ReversibleExecution& aggregate,
+    const cpu::CortexM4::TimedJitStepOutcome& chunk) {
+    const auto count = chunk.execution.count;
+    if (count == 0U || count > cpu::CortexM4::JitStepOutcome::max_block
+        || static_cast<std::size_t>(aggregate.count) + count
+            > ReversibleRamPrefix::max_instructions) return false;
+    if (aggregate.count == 0U) aggregate.result = chunk.execution.result;
+    else {
+        aggregate.result.instruction_address = chunk.execution.result.instruction_address;
+        aggregate.result.raw = chunk.execution.result.raw;
+        aggregate.result.instruction_size = chunk.execution.result.instruction_size;
+        aggregate.result.suppress_loop_observation =
+            chunk.execution.result.suppress_loop_observation;
+    }
+    for (std::uint8_t i = 0U; i < count; ++i) {
+        const std::size_t destination = aggregate.count++;
+        aggregate.pcs[destination] = chunk.execution.pcs[i];
+        aggregate.sizes[destination] = chunk.execution.sizes[i];
+        aggregate.instruction_cycles[destination] = chunk.instruction_cycles[i];
+    }
+    aggregate.result.instructions = aggregate.count;
+    aggregate.result.reason = cpu::StopReason::step_complete;
+    return true;
+}
+
 struct Board::IdempotentPeriodCertificate {
     static constexpr std::size_t max_instructions = 32U;
     std::uint8_t count{0U};
@@ -746,29 +772,6 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
         prefix.entry_state.restore(cpu_->state());
         memory_.restoreReadFootprint(prefix.entry_read_footprint);
     };
-    const auto append_chunk = [](ReversibleRamPrefix::ReversibleExecution& aggregate,
-                                 const cpu::CortexM4::TimedJitStepOutcome& chunk) {
-        const auto n = chunk.execution.count;
-        if (n == 0U || n > cpu::CortexM4::JitStepOutcome::max_block
-            || static_cast<std::size_t>(aggregate.count) + n
-                > ReversibleRamPrefix::max_instructions) return false;
-        if (aggregate.count == 0U) aggregate.result = chunk.execution.result;
-        else {
-            aggregate.result.instruction_address = chunk.execution.result.instruction_address;
-            aggregate.result.raw = chunk.execution.result.raw;
-            aggregate.result.instruction_size = chunk.execution.result.instruction_size;
-            aggregate.result.suppress_loop_observation = chunk.execution.result.suppress_loop_observation;
-        }
-        for (std::uint8_t i = 0U; i < n; ++i) {
-            const std::size_t dst = aggregate.count++;
-            aggregate.pcs[dst] = chunk.execution.pcs[i];
-            aggregate.sizes[dst] = chunk.execution.sizes[i];
-            aggregate.instruction_cycles[dst] = chunk.instruction_cycles[i];
-        }
-        aggregate.result.instructions = aggregate.count;
-        aggregate.result.reason = cpu::StopReason::step_complete;
-        return true;
-    };
 
     // MMIO is trapped and every admitted store is non-executable RAM, so
     // clock/flash timing inputs cannot change during this speculative span.
@@ -1022,7 +1025,7 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
             auto chunk = cpu_->tryStepBudgetedReversibleJitBlock(request, budget);
             if (!chunk || chunk->execution.count == 0U) break;
             const std::uint8_t chunk_count = chunk->execution.count;
-            if (!append_chunk(speculative, *chunk)) break;
+            if (!appendReversibleChunk(speculative, *chunk)) break;
             for (std::uint8_t i = 0U; i < chunk_count; ++i) {
                 cycles += budget.total_instruction_cycles[i];
                 if ((systick && cycles >= *systick)) {
@@ -1121,7 +1124,8 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
                 static_cast<std::size_t>(prefix.count - replayed.count),
                 cpu::CortexM4::JitStepOutcome::max_block);
             auto chunk = cpu_->tryStepReversibleJitBlock(request);
-            if (!chunk || chunk->execution.count == 0U || !append_chunk(replayed, *chunk)) {
+            if (!chunk || chunk->execution.count == 0U
+                || !appendReversibleChunk(replayed, *chunk)) {
                 throw std::logic_error("reversible RAM admission replay made no progress");
             }
             if (chunk->execution.result.reason != cpu::StopReason::step_complete
@@ -1356,36 +1360,13 @@ Board::ConcurrentStepResult Board::materializeReversibleRamPrefix(
     prefix.entry_state.restore(cpu_->state());
     memory_.restoreReadFootprint(prefix.entry_read_footprint);
     ReversibleRamPrefix::ReversibleExecution replayed{};
-    const auto append_chunk = [](ReversibleRamPrefix::ReversibleExecution& aggregate,
-                                 const cpu::CortexM4::TimedJitStepOutcome& chunk) {
-        const auto n = chunk.execution.count;
-        if (n == 0U || n > cpu::CortexM4::JitStepOutcome::max_block
-            || static_cast<std::size_t>(aggregate.count) + n
-                > ReversibleRamPrefix::max_instructions) return false;
-        if (aggregate.count == 0U) aggregate.result = chunk.execution.result;
-        else {
-            aggregate.result.instruction_address = chunk.execution.result.instruction_address;
-            aggregate.result.raw = chunk.execution.result.raw;
-            aggregate.result.instruction_size = chunk.execution.result.instruction_size;
-            aggregate.result.suppress_loop_observation = chunk.execution.result.suppress_loop_observation;
-        }
-        for (std::uint8_t i = 0U; i < n; ++i) {
-            const std::size_t dst = aggregate.count++;
-            aggregate.pcs[dst] = chunk.execution.pcs[i];
-            aggregate.sizes[dst] = chunk.execution.sizes[i];
-            aggregate.instruction_cycles[dst] = chunk.instruction_cycles[i];
-        }
-        aggregate.result.instructions = aggregate.count;
-        aggregate.result.reason = cpu::StopReason::step_complete;
-        return true;
-    };
     {
         ReversibleMemoryGuard guard(memory_);
         while (replayed.count < count) {
             const std::size_t request = std::min<std::size_t>(
                 count - replayed.count, cpu::CortexM4::JitStepOutcome::max_block);
             auto chunk = cpu_->tryStepReversibleJitBlock(request);
-            if (!chunk || !append_chunk(replayed, *chunk)) {
+            if (!chunk || !appendReversibleChunk(replayed, *chunk)) {
                 throw std::logic_error("reversible RAM interrupted replay differs");
             }
             if (chunk->execution.result.reason != cpu::StopReason::step_complete

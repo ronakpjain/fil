@@ -289,6 +289,10 @@ public:
 private:
     friend class World;
 
+    [[nodiscard]] static bool appendReversibleChunk(
+        ReversibleRamPrefix::ReversibleExecution& aggregate,
+        const cpu::CortexM4::TimedJitStepOutcome& chunk);
+
     struct BoundaryStop {
         BoardStopReason reason{BoardStopReason::host_error};
         std::string message;
