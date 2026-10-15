@@ -10,7 +10,7 @@ endforeach()
 file(REMOVE "${TRACE_FILE}")
 execute_process(
     COMMAND "${FIL_EXECUTABLE}" run-network "${NETWORK_CONFIG}"
-        --duration-ms 10
+        --duration-ms 20
         --max-instructions 1000000
         --quantum 512
         --strict-mmio
@@ -51,9 +51,9 @@ if(time_match STREQUAL "")
     message(FATAL_ERROR "network smoke output is missing a numeric time_ns line\nstdout:\n${run_stdout}")
 endif()
 set(stop_time_ns "${CMAKE_MATCH_1}")
-if(stop_time_ns LESS 10000000 OR stop_time_ns GREATER_EQUAL 11000000)
+if(stop_time_ns LESS 20000000 OR stop_time_ns GREATER_EQUAL 21000000)
     message(FATAL_ERROR
-        "network smoke stop time ${stop_time_ns} ns is outside [10000000, 11000000)\n"
+        "network smoke stop time ${stop_time_ns} ns is outside [20000000, 21000000)\n"
         "stdout:\n${run_stdout}"
     )
 endif()
@@ -91,4 +91,4 @@ if(firmware_can_rx STREQUAL "")
     message(FATAL_ERROR "network trace contains no shared-bus can_rx record")
 endif()
 
-message(STATUS "six-board PER network stopped within documented deadline overshoot with real CAN TX/RX")
+message(STATUS "six-board PER network ran 20 ms with real CAN TX/RX")

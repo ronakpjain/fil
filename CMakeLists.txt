@@ -295,14 +295,14 @@ if(FIL_BUILD_TESTS)
             set(per_network_config "${FIL_PER_GENERATED_CONFIG_DIR}/per_vehicle.json")
             file(WRITE "${per_network_config}" "${per_network_json}")
             add_test(
-                NAME fil.per.run_network_10ms
+                NAME fil.per.run_network_20ms
                 COMMAND ${CMAKE_COMMAND}
                     "-DFIL_EXECUTABLE=$<TARGET_FILE:fil>"
                     "-DNETWORK_CONFIG=${per_network_config}"
                     "-DTRACE_FILE=${CMAKE_CURRENT_BINARY_DIR}/per-network-smoke.jsonl"
                     -P "${PROJECT_SOURCE_DIR}/tests/cmake/run_per_network_smoke.cmake"
             )
-            set_tests_properties(fil.per.run_network_10ms PROPERTIES
+            set_tests_properties(fil.per.run_network_20ms PROPERTIES
                 TIMEOUT 60
                 LABELS "per;integration"
             )
