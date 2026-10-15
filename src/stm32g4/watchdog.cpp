@@ -4,7 +4,6 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
-#include <utility>
 
 namespace fil::stm32g4 {
 namespace {
@@ -28,12 +27,6 @@ IwdgPeripheral::IwdgPeripheral(
     setResetValue(0x08, 0x0fffU);
     setResetValue(0x10, 0x0fffU);
     reset();
-}
-
-IwdgPeripheral::~IwdgPeripheral() = default;
-
-void IwdgPeripheral::setResetCallback(ResetCallback callback) {
-    reset_callback_ = std::move(callback);
 }
 
 void IwdgPeripheral::setResetEnabled(const bool enabled) {
@@ -112,10 +105,6 @@ void IwdgPeripheral::reload() {
     }));
 }
 
-void IwdgPeripheral::cancelTimeout() noexcept {
-    timeout_event_.cancel();
-}
-
 WwdgPeripheral::WwdgPeripheral(
     const bool reset_enabled,
     const std::uint64_t peripheral_clock_hz,
@@ -128,12 +117,6 @@ WwdgPeripheral::WwdgPeripheral(
     setResetValue(0x00, 0x7fU);
     setResetValue(0x04, 0x7fU);
     reset();
-}
-
-WwdgPeripheral::~WwdgPeripheral() = default;
-
-void WwdgPeripheral::setResetCallback(ResetCallback callback) {
-    reset_callback_ = std::move(callback);
 }
 
 void WwdgPeripheral::setResetEnabled(const bool enabled) {
@@ -187,10 +170,6 @@ void WwdgPeripheral::reload() {
             reset_callback_();
         }
     }));
-}
-
-void WwdgPeripheral::cancelTimeout() noexcept {
-    timeout_event_.cancel();
 }
 
 } // namespace fil::stm32g4

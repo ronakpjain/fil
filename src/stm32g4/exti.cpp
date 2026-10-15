@@ -48,14 +48,6 @@ ExtiPeripheral::ExtiPeripheral(
     reset();
 }
 
-std::uint32_t ExtiPeripheral::loadRegister(
-    const std::uint32_t word_offset,
-    const mem::AccessContext& context
-) {
-    static_cast<void>(context);
-    return registerValue(word_offset);
-}
-
 void ExtiPeripheral::storeRegister(
     const std::uint32_t word_offset,
     const std::uint32_t previous,

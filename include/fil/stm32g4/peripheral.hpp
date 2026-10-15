@@ -177,7 +177,6 @@ public:
     void setStrict(bool strict) noexcept { strict_ = strict; }
     [[nodiscard]] bool strict() const noexcept { return strict_; }
     [[nodiscard]] const std::vector<PeripheralAccess>& accesses() const noexcept { return accesses_; }
-    /** @brief Qualifies future trace sources as `prefix.device`; empty restores the device name. */
     void setTraceSourcePrefix(std::string_view prefix);
     void clear();
 
@@ -479,7 +478,6 @@ public:
     void setRxProvider(RxProvider provider);
     void setInterruptCallback(InterruptCallback callback);
     void setDmaRequestCallback(DmaRequestCallback callback);
-    /** @brief Suppresses DMA request callbacks during DMA burst transfers. */
     void setDmaSuppress(bool suppress) noexcept { dma_suppress_ = suppress; }
     [[nodiscard]] bool dmaTxEnabled() const noexcept { return (peekRegister(0x08) & (1U << 7U)) != 0U; }
     [[nodiscard]] bool dmaRxEnabled() const noexcept { return (peekRegister(0x08) & (1U << 6U)) != 0U; }
@@ -763,7 +761,6 @@ public:
     void setInterruptCallback(InterruptCallback callback);
     void setDmaRequestCallback(DmaRequestCallback callback);
     void setEcho(bool enabled) noexcept { echo_ = enabled; }
-    /** @brief Suppresses DMA request callbacks during DMA burst transfers. */
     void setDmaSuppress(bool suppress) noexcept { dma_suppress_ = suppress; }
     [[nodiscard]] bool hasRxData() const noexcept { return !receive_bytes_.empty(); }
     [[nodiscard]] const std::vector<SpiTransfer>& transferLog() const noexcept { return transfers_; }
@@ -904,9 +901,9 @@ public:
         sim::EventLoop* event_loop = nullptr,
         sim::TraceRecorder* trace = nullptr
     );
-    ~IwdgPeripheral() override;
+    ~IwdgPeripheral() override = default;
 
-    void setResetCallback(ResetCallback callback);
+    void setResetCallback(ResetCallback callback) { reset_callback_ = std::move(callback); }
     void setResetEnabled(bool enabled);
     [[nodiscard]] bool running() const noexcept { return running_; }
 
@@ -926,7 +923,7 @@ protected:
 
 private:
     void reload();
-    void cancelTimeout() noexcept;
+    void cancelTimeout() noexcept { timeout_event_.cancel(); }
 
     bool reset_enabled_{false};
     bool running_{false};
@@ -946,9 +943,9 @@ public:
         sim::EventLoop* event_loop = nullptr,
         sim::TraceRecorder* trace = nullptr
     );
-    ~WwdgPeripheral() override;
+    ~WwdgPeripheral() override = default;
 
-    void setResetCallback(ResetCallback callback);
+    void setResetCallback(ResetCallback callback) { reset_callback_ = std::move(callback); }
     void setResetEnabled(bool enabled);
 
 protected:
@@ -963,7 +960,7 @@ protected:
 
 private:
     void reload();
-    void cancelTimeout() noexcept;
+    void cancelTimeout() noexcept { timeout_event_.cancel(); }
 
     bool reset_enabled_{false};
     std::uint64_t peripheral_clock_hz_{16000000};
@@ -999,10 +996,6 @@ public:
     void notifyGpioEdge(std::uint32_t port, std::uint32_t pin, bool high);
 
 protected:
-    [[nodiscard]] std::uint32_t loadRegister(
-        std::uint32_t word_offset,
-        const mem::AccessContext& context
-    ) override;
     void storeRegister(
         std::uint32_t word_offset,
         std::uint32_t previous,
