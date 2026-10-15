@@ -1,5 +1,4 @@
 #include "fil/common/error.hpp"
-#include "fil/common/log.hpp"
 #include "fil/common/numeric.hpp"
 #include "fil/config/config.hpp"
 #include "../fixture_support.hpp"
@@ -8,7 +7,6 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
-#include <sstream>
 #include <string>
 #include <string_view>
 
@@ -183,15 +181,6 @@ TEST(ConfigTest, RejectsMalformedConfigs) {
     EXPECT_TRUE(
         !duplicate && duplicate.error().source.has_value() && duplicate.error().source->line == 1)
         << "parse errors contain source locations";
-}
-
-/// @brief Verifies logger severity filtering.
-TEST(ConfigTest, LoggingHonorsMinimumLevel) {
-    std::ostringstream output;
-    fil::Logger logger(output, fil::LogLevel::warning);
-    logger.log(fil::LogLevel::info, "hidden");
-    logger.log(fil::LogLevel::error, "visible");
-    EXPECT_TRUE(output.str() == "[error] visible\n") << "logger filters and formats messages";
 }
 
 } // namespace

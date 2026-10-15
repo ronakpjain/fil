@@ -50,7 +50,6 @@ public:
     [[nodiscard]] Result<void> append(std::span<const std::uint8_t> bytes);
     [[nodiscard]] Result<std::optional<Frame>> next();
     [[nodiscard]] Result<void> finish() const;
-    [[nodiscard]] std::size_t bufferedBytes() const noexcept { return bytes_.size(); }
 
 private:
     std::vector<std::uint8_t> bytes_;

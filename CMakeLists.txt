@@ -100,7 +100,6 @@ add_library(fil_core STATIC
     src/cli/network_protocol.cpp
     src/common/error.cpp
     src/common/format.cpp
-    src/common/log.cpp
     src/config/config.cpp
     src/cpu/cortex_m4.cpp
     src/cpu/decoder.cpp
