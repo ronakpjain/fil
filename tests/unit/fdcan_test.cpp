@@ -253,49 +253,48 @@ TEST(FdcanTest, FdcanExtendedRangeFilterAndNonmatchReject) {
     EXPECT_FALSE(can.receiveFrame(frame, 2U));
 }
 
-TEST(FdcanTest, FdcanStandardDualIdAndMaskFiltersAcceptOnlyMatches) {
-    struct Case { std::uint32_t type; std::uint32_t first; std::uint32_t second; std::uint32_t accept; std::uint32_t reject; };
+TEST(FdcanTest, DualIdAndMaskFiltersAcceptOnlyMatchingIdentifiers) {
+    struct Case {
+        bool extended;
+        std::uint32_t type;
+        std::uint32_t first;
+        std::uint32_t second;
+        std::uint32_t accept;
+        std::uint32_t reject;
+    };
     constexpr std::array cases{
-        Case{1U, 0x123U, 0x456U, 0x456U, 0x124U}, // dual ID
-        Case{2U, 0x520U, 0x7f0U, 0x52aU, 0x531U}, // classic mask
+        Case{false, 1U, 0x123U, 0x456U, 0x456U, 0x124U}, // standard dual ID
+        Case{false, 2U, 0x520U, 0x7f0U, 0x52aU, 0x531U}, // standard classic mask
+        Case{true, 1U, 0x123456U, 0x234567U, 0x234567U, 0x123457U}, // extended dual ID
+        Case{true, 2U, 0x1234500U, 0x1fffff00U, 0x12345a5U, 0x12344a5U}, // extended mask
     };
     for (const Case entry : cases) {
+        SCOPED_TRACE(entry.extended ? "extended" : "standard");
+        SCOPED_TRACE(entry.type);
         fil::stm32g4::FdcanMessageRam ram;
         fil::stm32g4::FdcanPeripheral can(1U, ram);
         ASSERT_TRUE(can.write(fil::stm32g4::FdcanPeripheral::cccrOffset, fil::mem::AccessSize::word, 0U, write_context));
-        const std::uint32_t filter = (entry.type << 30U) | (1U << 27U) |
-            (entry.first << 16U) | entry.second;
-        ram.storeWord(0U, fil::stm32g4::FdcanMessageRam::standardFilterOffset, filter);
+        const std::uint32_t offset = entry.extended
+            ? fil::stm32g4::FdcanMessageRam::extendedFilterOffset
+            : fil::stm32g4::FdcanMessageRam::standardFilterOffset;
+        if (entry.extended) {
+            ram.storeWord(0U, offset, (1U << 29U) | entry.first);
+            ram.storeWord(0U, offset + 4U, (entry.type << 30U) | entry.second);
+        } else {
+            ram.storeWord(0U, offset, (entry.type << 30U) | (1U << 27U) |
+                          (entry.first << 16U) | entry.second);
+        }
+        const std::uint32_t filter_config = entry.extended
+            ? (1U << 24U) | (1U << 2U)
+            : (1U << 16U) | (1U << 4U);
         ASSERT_TRUE(can.write(fil::stm32g4::FdcanPeripheral::rxgfcOffset, fil::mem::AccessSize::word,
-                              (1U << 16U) | (1U << 4U), write_context));
+                              filter_config, write_context));
         fil::devices::CanFrame frame;
-        frame.id = entry.accept; frame.dlc = 0U;
-        EXPECT_TRUE(can.receiveFrame(frame, 1U)) << "standard filter type=" << entry.type;
+        frame.extended = entry.extended;
+        frame.id = entry.accept;
+        EXPECT_TRUE(can.receiveFrame(frame, 1U)) << "filter type=" << entry.type;
         frame.id = entry.reject;
-        EXPECT_FALSE(can.receiveFrame(frame, 2U)) << "standard filter type=" << entry.type;
-    }
-}
-
-TEST(FdcanTest, FdcanExtendedDualIdAndMaskFiltersAcceptOnlyMatches) {
-    struct Case { std::uint32_t type; std::uint32_t first; std::uint32_t second; std::uint32_t accept; std::uint32_t reject; };
-    constexpr std::array cases{
-        Case{1U, 0x123456U, 0x234567U, 0x234567U, 0x123457U},
-        Case{2U, 0x1234500U, 0x1fffff00U, 0x12345a5U, 0x12344a5U},
-    };
-    for (const Case entry : cases) {
-        fil::stm32g4::FdcanMessageRam ram;
-        fil::stm32g4::FdcanPeripheral can(1U, ram);
-        ASSERT_TRUE(can.write(fil::stm32g4::FdcanPeripheral::cccrOffset, fil::mem::AccessSize::word, 0U, write_context));
-        const std::uint32_t offset = fil::stm32g4::FdcanMessageRam::extendedFilterOffset;
-        ram.storeWord(0U, offset, (1U << 29U) | entry.first);
-        ram.storeWord(0U, offset + 4U, (entry.type << 30U) | entry.second);
-        ASSERT_TRUE(can.write(fil::stm32g4::FdcanPeripheral::rxgfcOffset, fil::mem::AccessSize::word,
-                              (1U << 24U) | (1U << 2U), write_context));
-        fil::devices::CanFrame frame;
-        frame.extended = true; frame.id = entry.accept;
-        EXPECT_TRUE(can.receiveFrame(frame, 1U)) << "extended filter type=" << entry.type;
-        frame.id = entry.reject;
-        EXPECT_FALSE(can.receiveFrame(frame, 2U)) << "extended filter type=" << entry.type;
+        EXPECT_FALSE(can.receiveFrame(frame, 2U)) << "filter type=" << entry.type;
     }
 }
 
