@@ -77,7 +77,71 @@ public:
     std::int32_t reads{0};
 };
 
- TEST(JitTest, DecliningStandaloneReversibleBranchRestoresEntireEntryState) {
+TEST(JitTest, CachedBlocksMatchInterpreterAcrossMicroPrefixCuts) {
+    for (const bool unsupported_first : {false, true}) {
+        auto bus = basicBus();
+        std::array<std::uint16_t, 7> code{
+            0x2001U, 0x3001U, 0xBF00U, 0xBF00U, 0x4348U, 0xBF00U, 0xBE00U};
+        if (unsupported_first) code[0] = 0x4348U;
+        ASSERT_TRUE(bus.loadBytes(flash_base, halfwords(
+            {code[0], code[1], code[2], code[3], code[4], code[5], code[6]})).hasValue());
+        fil::cpu::CortexM4 cpu(bus), reference(bus);
+        prepare(cpu); prepare(reference);
+        cpu.state().r[1] = reference.state().r[1] = 7U;
+        const auto initial = cpu.state();
+        for (unsigned i = 0; i < 100U; ++i) {
+            cpu.state() = initial;
+            static_cast<void>(cpu.tryStepJitBlock(6U));
+        }
+        for (std::size_t cap = 1; cap <= 6U; ++cap) {
+            cpu.state() = reference.state() = initial;
+            std::uint32_t cycles = 0U;
+            for (std::size_t i = 0; i < cap; ++i) {
+                const auto step = reference.stepFast();
+                ASSERT_EQ(step.reason, fil::cpu::StopReason::step_complete);
+                cycles += step.cycles;
+            }
+            const auto block = cpu.tryStepJitBlock(cap);
+            ASSERT_TRUE(block);
+            EXPECT_EQ(block->count, cap);
+            EXPECT_EQ(block->result.cycles, cycles);
+            EXPECT_EQ(block->result.instruction_address, reference.state().instruction_address);
+            EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()));
+            for (std::size_t i = 0; i < cap; ++i)
+                EXPECT_EQ(block->pcs[i], flash_base + 2U * i);
+        }
+    }
+}
+
+TEST(JitTest, CachedBranchMatchesInterpreterCyclesAndNextFetchFault) {
+    constexpr std::uint32_t ram = 0x20000000U;
+    fil::mem::MemoryBus bus, oracle;
+    ASSERT_TRUE(bus.mapRam(ram, 256U, "jit-branch", true).hasValue());
+    ASSERT_TRUE(oracle.mapRam(ram, 256U, "jit-branch-oracle", true).hasValue());
+    const std::array<std::uint8_t, 4> code{0x00U, 0xBFU, 0x7DU, 0xE0U};
+    ASSERT_TRUE(bus.loadBytes(ram, code).hasValue());
+    ASSERT_TRUE(oracle.loadBytes(ram, code).hasValue());
+    fil::cpu::CortexM4 cpu(bus), reference(oracle);
+    prepare(cpu, ram); prepare(reference, ram);
+    const auto initial = cpu.state();
+    for (unsigned i = 0; i < 100U; ++i) {
+        cpu.state() = initial;
+        static_cast<void>(cpu.tryStepJitBlock(2U));
+    }
+    cpu.state() = reference.state() = initial;
+    const auto expected0 = reference.stepFast(), expected1 = reference.stepFast();
+    const auto block = cpu.tryStepJitBlock(2U);
+    ASSERT_TRUE(block);
+    EXPECT_EQ(block->result.cycles, expected0.cycles + expected1.cycles);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()));
+    const auto expected_fault = reference.stepFast();
+    const auto actual_fault = cpu.stepJitFast();
+    EXPECT_EQ(actual_fault.reason, expected_fault.reason);
+    EXPECT_EQ(actual_fault.cycles, expected_fault.cycles);
+    EXPECT_EQ(cpu.lastDiagnostic().message, reference.lastDiagnostic().message);
+}
+
+TEST(JitTest, DecliningStandaloneReversibleBranchRestoresEntireEntryState) {
     auto bus = basicBus();
     ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0x4700U})));
     fil::cpu::CortexM4 cpu(bus);
