@@ -140,7 +140,6 @@ private:
     std::uint64_t interrupt_level_callback_generation_{0U};
 };
 
-/** @brief One observed access handled by a lenient unknown MMIO device. */
 struct PeripheralAccess {
     sim::SimTimeNs time_ns{0};
     bool write{false};
@@ -203,7 +202,6 @@ private:
     std::vector<PeripheralAccess> accesses_;
 };
 
-/** @brief STM32G4 reset-and-clock-control startup model. */
 class RccPeripheral final : public RegisterPeripheral {
 public:
     explicit RccPeripheral(
@@ -255,7 +253,6 @@ private:
     std::function<void(bool, bool)> adc_reset_changed_;
 };
 
-/** @brief STM32G4 FLASH control-register model with key-based lock state. */
 class FlashPeripheral final : public RegisterPeripheral {
 public:
     /**
@@ -269,12 +266,8 @@ public:
     explicit FlashPeripheral(sim::EventLoop* event_loop = nullptr, sim::TraceRecorder* trace = nullptr);
 
     /**
-     * @brief FLASH_ACR wait states programmed in LATENCY[2:0].
-     *
-     * This is the firmware-programmed value, not the HCLK-required value:
-     * overclocked firmware (HCLK above the LATENCY table) still pays the
-     * programmed stall, matching silicon behavior. See
-     * docs/real_timing_audit.md for the DS12288 table.
+     * @brief Programmed FLASH_ACR.LATENCY, even when below the HCLK requirement.
+     * See docs/real_timing_audit.md for the DS12288 table.
      */
     [[nodiscard]] std::uint32_t waitStates() const noexcept { return acr_ & 0x7U; }
     [[nodiscard]] bool prefetchEnabled() const noexcept { return (acr_ & (1U << 8U)) != 0U; }
@@ -282,13 +275,10 @@ public:
         return (acr_ & (1U << 9U)) != 0U;
     }
     [[nodiscard]] std::uint32_t flashAcr() const noexcept { return acr_; }
-    /** @brief Generation bumped on LATENCY/PRFTEN/ICEN/DCEN changes. */
+    /** @brief Generation for timing-proof invalidation on ACR changes. */
     [[nodiscard]] std::uint64_t acrGeneration() const noexcept { return acr_generation_; }
 
-    /**
-     * @brief HCLK wait-state requirement per the DS12288 Range-1 table:
-     * 0 WS to 30 MHz, 1 to 60, 2 to 90, 3 to 120, 4 to 170.
-     */
+    /** @brief DS12288 Range-1 HCLK wait-state table. */
     [[nodiscard]] static std::uint32_t requiredWaitStates(std::uint64_t hclk_hz) noexcept {
         if (hclk_hz <= 30'000'000U) return 0U;
         if (hclk_hz <= 60'000'000U) return 1U;
@@ -297,19 +287,15 @@ public:
         return 4U;
     }
 
-    /** @brief True for flash bank bytes and the 0x00000000 boot alias. */
+    /** @brief True for flash bank bytes and the boot alias. */
     [[nodiscard]] bool isFlashAddress(std::uint32_t address) const noexcept {
         if (address >= flash_base_ && address < flash_base_ + bank_size_) return true;
         return address < bank_size_;
     }
 
     /**
-     * @brief Simplified ART fetch stall for one instruction fetch.
-     *
-     * SRAM/ROM fetches pay 0. Sequential flash fetches with prefetch or
-     * instruction cache enabled hit the ART buffer and pay 0; all other
-     * flash fetches (taken branches, prefetch/cache disabled) pay the full
-     * programmed LATENCY. Data-cache state is intentionally out of scope.
+     * @brief Simplified ART fetch stall: sequential cached/prefetched flash hits cost 0;
+     * other flash fetches pay LATENCY. SRAM/ROM and data-cache effects are out of scope.
      */
     [[nodiscard]] std::uint32_t fetchStallCycles(
         std::uint32_t pc, bool sequential
@@ -380,13 +366,8 @@ protected:
 };
 
 /**
- * @brief STM32G4 CRC computation unit with CRC-32/MPEG-2 word-wise updates.
- *
- * Implements the default G4 configuration used by the PER bootloader: 32-bit
- * data words processed most-significant-byte first, polynomial 0x04C11DB7,
- * initial value 0xFFFFFFFF, and no reflection or final XOR. Writing DR feeds a
- * word into the running CRC; reading DR returns the current result. CR RESET
- * (bit 0) reloads the INIT register value.
+ * @brief CRC-32/MPEG-2 unit: MSB-first 32-bit updates, configurable POL/INIT,
+ * no reflection or final XOR. CR.RESET reloads INIT.
  */
 class CrcPeripheral final : public RegisterPeripheral {
 public:
@@ -421,7 +402,6 @@ private:
     std::uint32_t poly_{0x04c11db7U};
 };
 
-/** @brief One deterministic GPIO output transition. */
 struct GpioTransition {
     sim::SimTimeNs time_ns{0};
     std::uint32_t pin{0};
@@ -473,7 +453,6 @@ private:
     std::vector<GpioTransition> transitions_;
 };
 
-/** @brief Timestamped byte emitted by a USART. */
 struct UsartTxByte {
     sim::SimTimeNs time_ns{0};
     std::uint8_t value{0};
@@ -542,7 +521,6 @@ private:
     sim::ScheduledEvent idle_event_;
 };
 
-/** @brief STM32G4 timer update event record. */
 struct TimerUpdate {
     sim::SimTimeNs time_ns{0};
     std::uint32_t count_before_update{0};
@@ -628,7 +606,6 @@ private:
     bool reset_asserted_{false};
 };
 
-/** @brief ADC conversion result with selected channel metadata. */
 struct AdcSample {
     sim::SimTimeNs time_ns{0};
     std::uint32_t channel{0};
@@ -669,14 +646,9 @@ public:
     /** Overrides register-derived conversion timing, primarily for focused tests. */
     void setConversionDelay(sim::SimTimeNs delay_ns) noexcept { conversion_delay_override_ns_ = delay_ns; }
     /**
-     * @brief Keeps one of every N continuous-mode scans, skipping the rest.
-     *
-     * The conversion schedule keeps advancing on time (no clock drift), but
-     * skipped scans do not touch DR/ISR, raise EOC/EOS, fire DMA or
-     * interrupt callbacks, or append sample history/trace records. DR holds
-     * the last kept value, so firmware observes sample data coarsened to
-     * one scan per N periods. Single-shot conversions are never skipped.
-     * Factor 1 (default) preserves current behavior exactly.
+     * @brief Keep every Nth continuous scan; skipped scans preserve timing but
+     * suppress DR/ISR, DMA, interrupt, history, and trace effects. Single shots
+     * are never skipped; factor 1 preserves normal behavior.
      */
     void setDecimation(std::uint32_t factor) noexcept {
         decimation_ = factor == 0U ? 1U : factor;
@@ -720,16 +692,7 @@ private:
     void completeSkippedScans(std::uint32_t skipped);
     /** @brief Arms the next scan after a boundary, jumping skipped scans. */
     void beginNextScan();
-    /**
-     * @brief Arms one event spanning count whole skipped scans.
-     *
-     * The span repeats the live single-scan period, so ADC timing rewrites
-     * during a gap take effect at the next kept scan at the latest.
-     * Unobservable while skipped by construction (no DR/ISR/DMA/trace side
-     * effects), the internal rank granularity is invisible, making the
-     * collapse exact except for the documented decimation staleness. Falls
-     * back to per-rank arming when the span cannot be represented.
-     */
+    /** @brief Arms an unobservable skipped-scan span, or falls back to per-rank events. */
     void armSkippedScans(std::uint32_t count);
     void materializeConversion(sim::SimTimeNs completion_time, bool observable);
     void synchronizeLazyConversions();
@@ -768,7 +731,6 @@ private:
     std::vector<AdcSample> samples_;
 };
 
-/** @brief One complete SPI frame transaction. */
 struct SpiTransfer {
     sim::SimTimeNs time_ns{0};
     std::vector<std::uint8_t> transmitted;
@@ -835,7 +797,6 @@ private:
     std::vector<SpiTransfer> transfers_;
 };
 
-/** @brief One serviced DMA peripheral request. */
 struct DmaTransfer {
     sim::SimTimeNs time_ns{0};
     std::uint32_t channel{0};
@@ -1058,7 +1019,6 @@ private:
     const SyscfgPeripheral* syscfg_{nullptr};
 };
 
-/** @brief Compatibility name matching the STM32 TIM abbreviation. */
 using TimPeripheral = TimerPeripheral;
 
 } // namespace fil::stm32g4
