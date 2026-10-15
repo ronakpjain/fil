@@ -147,9 +147,6 @@ public:
     /** @brief Earliest owner event or globally observed event time. */
     [[nodiscard]] std::optional<SimTimeNs> nextObservationTime(EventOwner owner);
 
-    /** @brief Enables locking for concurrent owner-lane access. Set before workers start. */
-    void setConcurrentAccess(bool enabled) noexcept;
-
     /** @brief Changes zero-delay livelock protection; zero disables callbacks. */
     void setMaximumSameTimeEvents(std::size_t maximum) noexcept;
 

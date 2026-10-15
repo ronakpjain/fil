@@ -1,17 +1,13 @@
 #include "fil/sim/event_loop.hpp"
 #include "fil/sim/trace.hpp"
-#include "fil/sim/worker_pool.hpp"
 
 #include <gtest/gtest.h>
 
-#include <array>
-#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -262,79 +258,6 @@ TEST(EventLoopTest, DenseAndSparseQueuesPreserveCancellationAndClear) {
         EXPECT_EQ(loop.runOwnedEvents(owner, 20U).events_executed, 0U);
         EXPECT_EQ(calls, 0U);
     }
-}
-
-TEST(EventLoopTest, ReusesPersistentLaneWorkers) {
-    fil::sim::LaneWorkerPool workers(4U);
-    std::array<std::atomic<std::uint32_t>, 4> calls{};
-    const auto task = [&](const std::size_t lane) {
-        calls[lane].fetch_add(1U, std::memory_order_relaxed);
-    };
-    workers.run(task);
-    workers.run(task);
-    bool exact = workers.size() == 4U;
-    for (const auto& count : calls) {
-        exact = exact && count.load(std::memory_order_relaxed) == 2U;
-    }
-    EXPECT_TRUE(exact) << "persistent worker pool executes every lane once per epoch";
-}
-
-TEST(EventLoopTest, ValidatesWorkerPoolFailuresAndRecovery) {
-    bool rejected_zero_lanes = false;
-    try {
-        fil::sim::LaneWorkerPool invalid(0U);
-    } catch (const std::invalid_argument&) {
-        rejected_zero_lanes = true;
-    }
-    EXPECT_TRUE(rejected_zero_lanes) << "worker pool rejects an empty lane set";
-
-    fil::sim::LaneWorkerPool workers(2U);
-    bool rejected_empty_task = false;
-    try {
-        workers.run({});
-    } catch (const std::invalid_argument&) {
-        rejected_empty_task = true;
-    }
-    EXPECT_TRUE(rejected_empty_task) << "worker pool rejects an empty task";
-
-    bool propagated = false;
-    try {
-        workers.run([](const std::size_t lane) {
-            if (lane == 1U) throw std::runtime_error("lane failed");
-        });
-    } catch (const std::runtime_error&) {
-        propagated = true;
-    }
-    std::atomic<std::uint32_t> recovered{0U};
-    workers.run([&](std::size_t) {
-        recovered.fetch_add(1U, std::memory_order_relaxed);
-    });
-    EXPECT_TRUE(propagated && recovered.load(std::memory_order_relaxed) == 2U)
-        << "worker pool propagates failures and remains reusable";
-}
-
-TEST(EventLoopTest, SupportsConcurrentOwnerLanes) {
-    fil::sim::EventLoop loop;
-    loop.setConcurrentAccess(true);
-    std::atomic<std::uint32_t> calls{0U};
-    const auto worker = [&](const fil::sim::EventOwner owner) {
-        auto scope = loop.useOwner(owner);
-        for (std::uint32_t index = 0U; index < 100U; ++index) {
-            static_cast<void>(loop.scheduleAt(0U, [&]() {
-                calls.fetch_add(1U, std::memory_order_relaxed);
-            }));
-        }
-        const auto result = loop.runOwnedEvents(owner, 0U);
-        EXPECT_TRUE(result.events_executed == 100U)
-            << "worker drains its concurrently scheduled owner queue";
-    };
-    std::thread first(worker, 1U);
-    std::thread second(worker, 2U);
-    first.join();
-    second.join();
-    EXPECT_TRUE(
-        calls.load(std::memory_order_relaxed) == 200U && loop.pending() == 0U && loop.now() == 0U)
-        << "concurrent owner lanes preserve exactly-once callback execution";
 }
 
 TEST(EventLoopTest, CancelsAndRejectsInvalidTime) {

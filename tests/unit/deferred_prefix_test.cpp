@@ -432,11 +432,6 @@ TEST(DeferredPrefixTest, RestorationInvalidatesImmutablePeriodAdmission) {
     const auto after_rewind = board.value()->prepareReversibleRamPrefix(12U);
     ASSERT_TRUE(after_rewind);
     EXPECT_EQ(after_rewind->memoized_count, 0U);
-    const auto transaction = board.value()->captureTransaction(fil::sim::shared_event_owner);
-    ASSERT_TRUE(board.value()->restoreTransaction(transaction));
-    const auto after_transaction_restore = board.value()->prepareReversibleRamPrefix(12U);
-    ASSERT_TRUE(after_transaction_restore);
-    EXPECT_EQ(after_transaction_restore->memoized_count, 0U);
     ASSERT_TRUE(board.value()->reset());
     EXPECT_THROW(static_cast<void>(board.value()->materializeReversibleRamPrefix(*certificate, 1U)),
                  std::logic_error);
@@ -607,7 +602,6 @@ TEST(DeferredPrefixTest, SynchronousCanAtHiddenCompletionPreservesBoardOrder) {
         options.enable_loop_batching = false;
         const auto expected = reference.value()->run(options);
         options.enable_jit = true;
-        options.enable_deferred_prefixes = true;
         const auto actual = candidate.value()->run(options);
         ASSERT_TRUE(expected);
         ASSERT_TRUE(actual);

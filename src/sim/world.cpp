@@ -4,7 +4,6 @@
 #include "fil/devices/can_bus.hpp"
 #include "fil/stm32g4/fdcan.hpp"
 #include "fil/stm32g4/stm32g4.hpp"
-#include "fil/sim/worker_pool.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -42,13 +41,6 @@ std::pair<SimTimeNs, std::uint64_t> smallNetworkFrontier(const SimTimeNs* times)
     }
     return {next, mask};
 }
-
-struct ConcurrentEventGuard {
-    EventLoop* loop{nullptr};
-    ~ConcurrentEventGuard() {
-        if (loop != nullptr) loop->setConcurrentAccess(false);
-    }
-};
 
 void initializeSnapshot(WorldBoardRunResult& output, const Board& board, const SimTimeNs now) {
     output.name = board.config().name;
@@ -266,8 +258,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
         // into invalid combinations. Their exact paths retain full fidelity.
         effective.enable_ram_capsules = effective.enable_ram_capsules
             && effective.enable_jit && !effective.enable_loop_batching
-            && !effective.enable_deferred_prefixes && !effective.trace_instructions
-            && !effective.detect_spin && !effective.enable_transactional_slices;
+            && !effective.trace_instructions && !effective.detect_spin;
         return effective;
     }();
     if (options.instruction_quantum == 0U) {
@@ -277,12 +268,11 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
         return argumentError("world spin threshold must be nonzero when spin detection is enabled");
     }
 
-    if ((options.enable_deferred_prefixes || options.enable_ram_capsules)
-        && (!options.enable_jit || options.trace_instructions || options.detect_spin
-            || options.enable_transactional_slices)) {
-        return argumentError("deferred prefixes require JIT without instruction tracing, spin detection, or transactional slices");
+    if (options.enable_ram_capsules
+        && (!options.enable_jit || options.trace_instructions || options.detect_spin)) {
+        return argumentError("RAM capsules require JIT without instruction tracing or spin detection");
     }
-    const bool deferred_enabled = options.enable_deferred_prefixes || options.enable_ram_capsules;
+    const bool deferred_enabled = options.enable_ram_capsules;
 
     WorldRunResult output;
     output.start_time_ns = event_loop_.now();
@@ -291,7 +281,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
 
     const bool exact_single_fast_path = boards_.size() <= 64U && !options.enable_loop_batching
         && !options.detect_spin && !options.trace_instructions
-        && !options.enable_transactional_slices && !deferred_enabled;
+        && !deferred_enabled;
     struct SchedulerState {
         bool runnable{true};
         bool in_flight{false};
@@ -327,14 +317,6 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
         best_block_limits.assign(boards_.size(), 1U);
         burst_block_costs.resize(boards_.size());
         burst_prefix_indices.assign(boards_.size(), 0U);
-    }
-    std::unique_ptr<LaneWorkerPool> worker_pool;
-    ConcurrentEventGuard concurrent_guard;
-    if (options.enable_transactional_slices && boards_.size() > 1U
-        && !trace_.enabled() && !options.trace_instructions && !options.detect_spin) {
-        event_loop_.setConcurrentAccess(true);
-        concurrent_guard.loop = &event_loop_;
-        worker_pool = std::make_unique<LaneWorkerPool>(boards_.size());
     }
     for (std::size_t index = 0; index < boards_.size(); ++index) {
         initializeSnapshot(output.boards[index], *boards_[index]->board, output.start_time_ns);
@@ -512,7 +494,6 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
     bool board_failed = false;
     bool stop_requested = false;
     SimTimeNs dispatch_time = output.start_time_ns;
-    std::uint64_t transaction_backoff = 0U;
 
     if (exact_single_fast_path) {
         // This scheduler never consumes loop proofs or reversible epochs.
@@ -906,8 +887,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
             }
         }
 
-        bool burst_eligible = !deferred_enabled && !options.enable_transactional_slices
-            && !options.trace_instructions && !options.detect_spin
+        bool burst_eligible = !deferred_enabled && !options.trace_instructions && !options.detect_spin
             && !stop_requested && !time_exhausted && !states.empty();
         bool all_lanes_proven = !states.empty();
         for (std::size_t index = 0; index < states.size(); ++index) {
@@ -1178,116 +1158,6 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                 }
             }
             if (completed_rounds != 0U) continue;
-        }
-
-        if (transaction_backoff != 0U) --transaction_backoff;
-        if (options.enable_transactional_slices && transaction_backoff == 0U
-            && !trace_.enabled() && !options.trace_instructions && !options.detect_spin
-            && !stop_requested && !time_exhausted) {
-            constexpr std::uint64_t slice_instructions = 256U;
-            bool eligible = !states.empty();
-            for (std::size_t index = 0; index < states.size() && eligible; ++index) {
-                eligible = states[index].runnable && !states[index].in_flight
-                    && states[index].ready_time_ns == now
-                    && output.boards[index].result.instructions + slice_instructions
-                        <= options.max_instructions_per_board;
-            }
-
-            std::optional<SimTimeNs> event_horizon = event_loop_.nextScheduledTime();
-            SimTimeNs slice_deadline = deadline == 0U
-                ? std::numeric_limits<SimTimeNs>::max() : deadline;
-            if (event_horizon && *event_horizon <= slice_deadline) {
-                slice_deadline = *event_horizon == 0U ? 0U : *event_horizon - 1U;
-            }
-            eligible = eligible && slice_deadline > now;
-
-            if (eligible) {
-                ++output.transactional_attempts;
-                std::vector<Board::TransactionCheckpointPtr> checkpoints;
-                std::vector<BoardRunResult> slices(boards_.size());
-                checkpoints.reserve(boards_.size());
-                for (std::size_t index = 0; index < boards_.size(); ++index) {
-                    checkpoints.push_back(
-                        boards_[index]->board->captureTransaction(
-                            static_cast<EventOwner>(index)
-                        )
-                    );
-                }
-                const auto run_slice = [&](const std::size_t index) {
-                    // Bound the slice's mutation distance so a failed epoch can
-                    // always roll back; partial slices simply do not commit.
-                    slices[index] = boards_[index]->board->runWorkerSlice(
-                        static_cast<EventOwner>(index), slice_instructions,
-                        slice_deadline, false, true, options.enable_jit,
-                        mem::MemoryBus::mutationJournalCapacity() - 16U,
-                        boards_[index]->board->transactionMutationSequence(checkpoints[index])
-                    );
-                };
-                if (worker_pool) worker_pool->run(run_slice);
-                else {
-                    for (std::size_t index = 0; index < boards_.size(); ++index) {
-                        run_slice(index);
-                    }
-                }
-
-                const SimTimeNs committed_time = slices.front().time_ns;
-                bool commit = committed_time > now && committed_time <= slice_deadline;
-                if (event_horizon && committed_time >= *event_horizon) commit = false;
-                for (const BoardRunResult& slice : slices) {
-                    commit = commit
-                        && slice.reason == BoardStopReason::instruction_budget
-                        && slice.instructions == slice_instructions
-                        && slice.time_ns == committed_time;
-                }
-
-                if (commit) {
-                    // Fire each lane's owner events for the committed span
-                    // (the slice deferred them; see runWorkerSlice). They must
-                    // run before the shared frontier advances.
-                    for (std::size_t index = 0; index < boards_.size(); ++index) {
-                        const auto local = event_loop_.runOwnedEvents(
-                            static_cast<EventOwner>(index), committed_time
-                        );
-                        output.event_callbacks = saturatingAdd(
-                            output.event_callbacks, local.events_executed
-                        );
-                    }
-                    const auto events = event_loop_.runDueEvents(committed_time);
-                    output.event_callbacks = saturatingAdd(
-                        output.event_callbacks, events.events_executed
-                    );
-                    for (std::size_t index = 0; index < boards_.size(); ++index) {
-                        accumulate(output.boards[index], slices[index]);
-                        states[index].ready_time_ns = committed_time;
-                        states[index].proven_loop.reset();
-                        states[index].inside_proven_loop = false;
-                    }
-                    output.dispatches = saturatingAdd(
-                        output.dispatches, static_cast<std::uint64_t>(boards_.size())
-                    );
-                    output.exact_dispatches = saturatingAdd(
-                        output.exact_dispatches,
-                        slice_instructions * static_cast<std::uint64_t>(boards_.size())
-                    );
-                    output.transactional_instructions = saturatingAdd(
-                        output.transactional_instructions,
-                        slice_instructions * static_cast<std::uint64_t>(boards_.size())
-                    );
-                    ++output.transactional_commits;
-                    ++output.rounds;
-                    continue;
-                }
-
-                for (std::size_t index = 0; index < boards_.size(); ++index) {
-                    if (!boards_[index]->board->restoreTransaction(checkpoints[index])) {
-                        return runtimeError(
-                            "transactional worker slice for board '"
-                            + boards_[index]->name + "' escaped reversible state"
-                        );
-                    }
-                }
-                transaction_backoff = 4096U;
-            }
         }
 
         bool dispatched = false;

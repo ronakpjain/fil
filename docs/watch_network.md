@@ -91,8 +91,7 @@ error and ignored without stopping the simulation.
 | `--lenient-mmio` | Use lenient MMIO handling; this is the default. |
 | `--control-stdin` | Accepted compatibility marker; standard input is always monitored. |
 
-See [CLI options](options.md) for the command reference and defaults. Experimental transactional and deferred scheduler implementations
-remain internal APIs, not CLI modes. JIT and eligible guarded RAM capsules are
+See [CLI options](options.md) for the command reference and defaults. JIT and eligible guarded RAM capsules are
 automatic; network loop batching remains off. Capsule guards preserve event and
 observation ordering; custom callbacks and unsupported DMA paths remain barriers.
 Tracing and spin diagnostics safely disable capsules rather than failing because

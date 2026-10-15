@@ -77,7 +77,6 @@ class Board {
     struct IdempotentPeriodCertificate;
     struct RamNeutralTransitionCertificate;
 public:
-    struct TransactionCheckpoint;
 
     /**
      * @brief Admission certificate for deferred execution of a pure CPU prefix.
@@ -215,7 +214,6 @@ public:
         cpu::FastStepResult cpu_result;
         SimTimeNs elapsed_ns{0};
     };
-    using TransactionCheckpointPtr = std::shared_ptr<const TransactionCheckpoint>;
 
     /** @brief Loads config references, ELF, MCU map, CPU, and peripherals. */
     [[nodiscard]] static Result<std::unique_ptr<Board>> load(
@@ -275,27 +273,6 @@ public:
     /** @brief Commits the started prefix, restoring/replaying an interrupted suffix. */
     [[nodiscard]] ConcurrentStepResult materializeReversibleRamPrefix(
         const ReversibleRamPrefix& prefix, std::size_t count);
-
-    /** @brief Runs one lane using only owner-local events until shared synchronization. */
-    [[nodiscard]] BoardRunResult runWorkerSlice(
-        EventOwner owner,
-        std::uint64_t instruction_budget,
-        SimTimeNs deadline_ns,
-        bool enable_loop_batching = true,
-        bool trap_all_mmio = false,
-        bool enable_jit = true,
-        std::uint64_t max_mutation_distance = 0U,
-        std::uint64_t mutation_base = 0U
-    );
-
-    /** @brief Captures reversible CPU, RAM, system, scheduler, and lane-clock state. */
-    [[nodiscard]] TransactionCheckpointPtr captureTransaction(EventOwner owner) const;
-    /** @brief Backed-mutation sequence captured with a transaction checkpoint. */
-    [[nodiscard]] std::uint64_t transactionMutationSequence(
-        const TransactionCheckpointPtr& checkpoint) const noexcept;
-
-    /** @brief Restores a checkpoint when no MMIO or owner event escaped the slice. */
-    [[nodiscard]] bool restoreTransaction(const TransactionCheckpointPtr& checkpoint);
 
     [[nodiscard]] cpu::CortexM4& cpu() noexcept { return *cpu_; }
     [[nodiscard]] const cpu::CortexM4& cpu() const noexcept { return *cpu_; }

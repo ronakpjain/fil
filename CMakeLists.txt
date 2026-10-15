@@ -120,7 +120,6 @@ add_library(fil_core STATIC
     src/sim/board.cpp
     src/sim/trace.cpp
     src/sim/stimulus.cpp
-    src/sim/worker_pool.cpp
     src/sim/world.cpp
     src/stm32g4/adc.cpp
     src/stm32g4/crc.cpp

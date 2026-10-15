@@ -129,23 +129,9 @@ Every callback belongs to one board lane or to the shared domain. Ownership is
 inherited by nested scheduling. Per-owner queues and clocks provide local horizons
 without changing the global timestamp/sequence order.
 
-This ownership supports conservative independent execution:
-
-- board-local callbacks invalidate only their lane's lookahead;
-- shared callbacks invalidate every lane;
-- shared MMIO yields before device dispatch so the coordinator can restart the
-  instruction once in deterministic order;
-- `Board::runWorkerSlice()` services only one owner's callbacks and stops at shared
-  synchronization; and
-- a transaction captures CPU, system, RAM journal, event-clock, fractional-time,
-  and loop-proof state for rollback.
-
-Persistent lane workers may run reversible slices concurrently. An epoch commits
-only when every board reaches the same MMIO-free boundary before the next event;
-otherwise all checkpoints are restored and exact frontier scheduling resumes.
-Tracing disables transactional epochs because speculative trace records cannot be
-retracted. Transactional and deferred scheduler implementations remain internal
-APIs and are not exposed as CLI modes.
+This ownership supports conservative independent execution: board-local callbacks
+invalidate only their lane's lookahead, while shared callbacks and shared MMIO
+synchronize lanes in deterministic order.
 
 ### Guarded RAM periods
 

@@ -12,10 +12,6 @@
 #include <vector>
 
 namespace fil::sim {
-namespace {
-thread_local EventOwner active_event_owner = shared_event_owner;
-}
-
 struct EventLoop::Impl {
     struct Event {
         SimTimeNs at{0};
@@ -49,7 +45,6 @@ struct EventLoop::Impl {
     std::uint64_t next_sequence{0};
     std::size_t maximum_same_time_events{100000};
     mutable std::recursive_mutex mutex;
-    bool concurrent_access{false};
     EventOwner serial_active_owner{shared_event_owner};
     Queue events;
     Queue globally_observed_events;
@@ -61,20 +56,16 @@ struct EventLoop::Impl {
     std::unordered_map<EventOwner, std::uint64_t> owner_generation;
 
     struct Lock {
-        explicit Lock(Impl& impl)
-            : lock(impl.mutex, std::defer_lock) {
-            if (impl.concurrent_access) lock.lock();
-        }
+        explicit Lock(Impl& impl) : lock(impl.mutex) {}
         std::unique_lock<std::recursive_mutex> lock;
     };
 
     [[nodiscard]] EventOwner currentOwner() const noexcept {
-        return concurrent_access ? active_event_owner : serial_active_owner;
+        return serial_active_owner;
     }
 
     void setCurrentOwner(const EventOwner owner) noexcept {
-        if (concurrent_access) active_event_owner = owner;
-        else serial_active_owner = owner;
+        serial_active_owner = owner;
     }
 
     [[nodiscard]] SimTimeNs timeFor(const EventOwner owner) const noexcept {
@@ -367,7 +358,7 @@ EventLoop::OwnerCheckpoint EventLoop::ownerCheckpoint(
     Impl::Lock lock(*impl_);
     const auto generation = impl_->owner_generation.find(owner);
     // Snapshot the owner's live events so a rollback can undo scheduling and
-    // retirement performed by a transactional worker slice.
+    // retirement performed after the checkpoint.
     std::vector<Impl::EventPtr> snapshot;
     if (const auto* queue = impl_->ownerQueue(owner)) {
         for (const auto& event : queue->container()) {
@@ -482,11 +473,6 @@ std::optional<SimTimeNs> EventLoop::nextObservationTime(const EventOwner owner) 
         if (!result || global_time < *result) result = global_time;
     }
     return result;
-}
-
-void EventLoop::setConcurrentAccess(const bool enabled) noexcept {
-    std::lock_guard lock(impl_->mutex);
-    impl_->concurrent_access = enabled;
 }
 
 void EventLoop::setMaximumSameTimeEvents(const std::size_t maximum) noexcept {

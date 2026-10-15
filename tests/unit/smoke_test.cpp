@@ -27,7 +27,6 @@ TEST(SmokeTest, HelpIsSuccessful) {
     EXPECT_EQ(out.str().find("--no-loop-batching"), std::string::npos);
     EXPECT_EQ(out.str().find("--no-ram-capsules"), std::string::npos);
     EXPECT_NE(out.str().find("--adc-decimation"), std::string::npos);
-    EXPECT_EQ(out.str().find("--transactional-slices"), std::string::npos);
     EXPECT_EQ(out.str().find("--deferred-prefixes"), std::string::npos);
     EXPECT_NE(out.str().find("trades fidelity for speed"), std::string::npos);
     EXPECT_EQ(out.str().find("--jit"), std::string::npos);
@@ -51,7 +50,7 @@ TEST(SmokeTest, ExecutionSlowdownSwitchesAreRejected) {
     for (const std::string_view command : {"run", "run-network", "watch-network", "serve-network"}) {
         for (const std::string_view option : {
                  "--no-jit", "--no-ram-capsules", "--no-loop-batching",
-                 "--transactional-slices", "--no-transactional-slices", "--deferred-prefixes"}) {
+                 "--deferred-prefixes"}) {
             if (command == "run" && option == "--no-ram-capsules") continue;
             std::vector<std::string_view> args{command, "missing-jit-config.json", option};
             if (command == "serve-network") {

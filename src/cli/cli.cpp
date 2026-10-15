@@ -1243,10 +1243,6 @@ ExitCode runNetworkCommand(
         << "loop_batches: " << result.value().loop_batches << '\n'
         << "batched_instructions: " << result.value().batched_instructions << '\n'
         << "event_callbacks: " << result.value().event_callbacks << '\n'
-        << "transactional_attempts: " << result.value().transactional_attempts << '\n'
-        << "transactional_commits: " << result.value().transactional_commits << '\n'
-        << "transactional_instructions: "
-        << result.value().transactional_instructions << '\n'
         << "lockstep_bursts: " << result.value().lockstep_bursts << '\n';
     if (enable_ram_capsules) {
         out << "deferred_prefixes: " << result.value().deferred_prefixes << '\n'

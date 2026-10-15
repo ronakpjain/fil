@@ -41,8 +41,6 @@ struct WorldRunOptions {
     std::uint64_t spin_threshold{1'000'000}; ///< Logical loop instructions required before stopping.
     bool enable_loop_batching{false}; ///< Alternative proven-loop scheduler; disables RAM capsules.
     bool enable_jit{true}; ///< Cached hot-path compilation; preserves lane boundaries.
-    bool enable_transactional_slices{false}; ///< Execute experimental reversible lane epochs.
-    bool enable_deferred_prefixes{false}; ///< Experimental interruptible pure prefixes; requires JIT.
     bool enable_ram_capsules{true}; ///< Guarded reversible RAM prefixes; incompatible modes fall back automatically.
     bool stop_on_board_failure{true}; ///< Stop immediately instead of finishing other boards.
     std::uint32_t adc_decimation{1}; ///< Keep 1 of N continuous ADC scans on every board.
@@ -70,9 +68,6 @@ struct WorldRunResult {
     std::uint64_t loop_batches{0}; ///< Proven-loop batches applied without interpretation.
     std::uint64_t batched_instructions{0}; ///< Logical instructions represented by loop batches.
     std::uint64_t event_callbacks{0}; ///< Shared event callbacks executed during the run.
-    std::uint64_t transactional_attempts{0}; ///< Reversible multi-lane epochs attempted.
-    std::uint64_t transactional_commits{0}; ///< MMIO-free epochs committed without rollback.
-    std::uint64_t transactional_instructions{0}; ///< Instructions committed by lane epochs.
     std::uint64_t lockstep_bursts{0}; ///< Tight exact multi-board dispatch loops entered.
     std::uint64_t deferred_prefixes{0}; ///< Certified pure prefixes admitted without eager execution.
     std::uint64_t deferred_instructions{0}; ///< Instructions evaluated by deferred materialization.
