@@ -8,24 +8,37 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <span>
 
 namespace {
 
+bool setupExceptionTest(
+    fil::mem::MemoryBus& memory,
+    fil::cpu::CpuState& state,
+    const std::uint32_t vector_address,
+    const std::span<const std::uint8_t> handlers
+) {
+    if (!memory.mapRom(0x08000000U, 0x200U, "flash") ||
+        !memory.mapRam(0x20000000U, 0x1000U, "ram") ||
+        !memory.loadBytes(vector_address, handlers)) {
+        return false;
+    }
+    state.msp = state.r[13] = 0x20001000U;
+    state.r[15] = 0x08000080U;
+    state.xpsr = fil::cpu::xpsr_t;
+    return true;
+}
+
 TEST(ExceptionTest, StacksAndReturnsBasicFrame) {
     fil::mem::MemoryBus memory;
-    EXPECT_TRUE(memory.mapRom(0x08000000U, 0x200U, "flash").hasValue()) << "maps exception vectors";
-    EXPECT_TRUE(memory.mapRam(0x20000000U, 0x1000U, "ram").hasValue()) << "maps exception stack";
     const std::array<std::uint8_t, 4> handler{0x01U, 0x01U, 0x00U, 0x08U};
-    EXPECT_TRUE(memory.loadBytes(0x0800002cU, handler).hasValue()) << "loads SVC vector";
     fil::cortexm::SystemControl system(0x08000000U);
-    fil::cortexm::ExceptionController exceptions(memory, system);
     fil::cpu::CpuState state;
-    state.msp = 0x20001000U;
-    state.r[13] = state.msp;
-    state.r[15] = 0x08000080U;
+    ASSERT_TRUE(setupExceptionTest(memory, state, 0x0800002cU, handler));
+    fil::cortexm::ExceptionController exceptions(memory, system);
     state.r[0] = 0x12345678U;
     state.r[14] = 0x08000041U;
-    state.xpsr = fil::cpu::xpsr_t | fil::cpu::xpsr_z;
+    state.xpsr |= fil::cpu::xpsr_z;
 
     auto entered = exceptions.enter(state, 11U);
     EXPECT_TRUE(entered.hasValue()) << "enters SVC exception";
@@ -46,18 +59,13 @@ TEST(ExceptionTest, StacksAndReturnsBasicFrame) {
 
 TEST(ExceptionTest, NestedReturnPreservesRependedOuterInterrupt) {
     fil::mem::MemoryBus memory;
-    ASSERT_TRUE(memory.mapRom(0x08000000U, 0x200U, "flash"));
-    ASSERT_TRUE(memory.mapRam(0x20000000U, 0x1000U, "ram"));
     const std::array<std::uint8_t, 8> handlers{
         0x01U, 0x01U, 0x00U, 0x08U, 0x21U, 0x01U, 0x00U, 0x08U,
     };
-    ASSERT_TRUE(memory.loadBytes(0x08000040U, handlers));
     fil::cortexm::SystemControl system;
-    fil::cortexm::ExceptionController exceptions(memory, system);
     fil::cpu::CpuState state;
-    state.msp = state.r[13] = 0x20001000U;
-    state.r[15] = 0x08000080U;
-    state.xpsr = fil::cpu::xpsr_t;
+    ASSERT_TRUE(setupExceptionTest(memory, state, 0x08000040U, handlers));
+    fil::cortexm::ExceptionController exceptions(memory, system);
     ASSERT_TRUE(system.write(0xe100U, fil::mem::AccessSize::word, 3U, {}));
     ASSERT_TRUE(system.write(0xe400U, fil::mem::AccessSize::word, 0x4080U, {}));
 
@@ -93,19 +101,11 @@ TEST(ExceptionTest, NestedReturnPreservesRependedOuterInterrupt) {
 
 TEST(ExceptionTest, StacksAndReturnsExtendedFloatingPointFrame) {
     fil::mem::MemoryBus memory;
-    EXPECT_TRUE(memory.mapRom(0x08000000U, 0x200U, "fp-flash").hasValue())
-        << "maps FP exception vectors";
-    EXPECT_TRUE(memory.mapRam(0x20000000U, 0x1000U, "fp-ram").hasValue())
-        << "maps FP exception stack";
     const std::array<std::uint8_t, 4> handler{0x01U, 0x01U, 0x00U, 0x08U};
-    EXPECT_TRUE(memory.loadBytes(0x0800003cU, handler).hasValue()) << "loads SysTick vector";
     fil::cortexm::SystemControl system(0x08000000U);
-    fil::cortexm::ExceptionController exceptions(memory, system);
     fil::cpu::CpuState state;
-    state.msp = 0x20001000U;
-    state.r[13] = state.msp;
-    state.r[15] = 0x08000080U;
-    state.xpsr = fil::cpu::xpsr_t;
+    ASSERT_TRUE(setupExceptionTest(memory, state, 0x0800003cU, handler));
+    fil::cortexm::ExceptionController exceptions(memory, system);
     state.control = 4U;
     state.s[0] = 1.5F;
     state.s[15] = -2.25F;
@@ -138,20 +138,13 @@ TEST(ExceptionTest, StacksAndReturnsExtendedFloatingPointFrame) {
 
 TEST(ExceptionTest, RestoresThreadStackSelectionFromExcReturn) {
     fil::mem::MemoryBus memory;
-    EXPECT_TRUE(memory.mapRom(0x08000000U, 0x200U, "psp-flash").hasValue())
-        << "maps PSP exception vectors";
-    EXPECT_TRUE(memory.mapRam(0x20000000U, 0x1000U, "psp-ram").hasValue())
-        << "maps PSP exception stack";
     const std::array<std::uint8_t, 4> handler{0x01U, 0x01U, 0x00U, 0x08U};
-    EXPECT_TRUE(memory.loadBytes(0x0800002cU, handler).hasValue()) << "loads PSP SVC vector";
     fil::cortexm::SystemControl system(0x08000000U);
-    fil::cortexm::ExceptionController exceptions(memory, system);
     fil::cpu::CpuState state;
-    state.msp = 0x20001000U;
+    ASSERT_TRUE(setupExceptionTest(memory, state, 0x0800002cU, handler));
+    fil::cortexm::ExceptionController exceptions(memory, system);
     state.psp = 0x20000f00U;
     state.r[13] = state.psp;
-    state.r[15] = 0x08000080U;
-    state.xpsr = fil::cpu::xpsr_t;
     state.control = 2U;
 
     EXPECT_TRUE(exceptions.enter(state, 11U).hasValue()) << "enters SVC from PSP thread mode";
@@ -164,19 +157,11 @@ TEST(ExceptionTest, RestoresThreadStackSelectionFromExcReturn) {
 
 TEST(ExceptionTest, DefersFloatingPointStackingUntilHandlerTouch) {
     fil::mem::MemoryBus memory;
-    EXPECT_TRUE(memory.mapRom(0x08000000U, 0x200U, "lazy-flash").hasValue())
-        << "maps lazy exception vectors";
-    EXPECT_TRUE(memory.mapRam(0x20000000U, 0x1000U, "lazy-ram").hasValue())
-        << "maps lazy exception stack";
     const std::array<std::uint8_t, 4> handler{0x01U, 0x01U, 0x00U, 0x08U};
-    EXPECT_TRUE(memory.loadBytes(0x0800003cU, handler).hasValue()) << "loads SysTick vector";
     fil::cortexm::SystemControl system(0x08000000U);
-    fil::cortexm::ExceptionController exceptions(memory, system);
     fil::cpu::CpuState state;
-    state.msp = 0x20001000U;
-    state.r[13] = state.msp;
-    state.r[15] = 0x08000080U;
-    state.xpsr = fil::cpu::xpsr_t;
+    ASSERT_TRUE(setupExceptionTest(memory, state, 0x0800003cU, handler));
+    fil::cortexm::ExceptionController exceptions(memory, system);
     state.control = 4U;
     state.s[0] = 1.5F;
     state.s[15] = -2.25F;
@@ -213,21 +198,14 @@ TEST(ExceptionTest, DefersFloatingPointStackingUntilHandlerTouch) {
 
 TEST(ExceptionTest, NestedEntryFallsBackToEagerStacking) {
     fil::mem::MemoryBus memory;
-    EXPECT_TRUE(memory.mapRom(0x08000000U, 0x200U, "nest-flash").hasValue())
-        << "maps nested exception vectors";
-    EXPECT_TRUE(memory.mapRam(0x20000000U, 0x1000U, "nest-ram").hasValue())
-        << "maps nested exception stack";
-    const std::array<std::uint8_t, 4> handler{0x01U, 0x01U, 0x00U, 0x08U};
-    EXPECT_TRUE(memory.loadBytes(0x0800003cU, handler).hasValue()) << "loads SysTick vector";
-    EXPECT_TRUE(memory.loadBytes(0x08000038U, handler).hasValue()) << "loads PendSV vector";
+    const std::array<std::uint8_t, 8> handlers{
+        0x01U, 0x01U, 0x00U, 0x08U, 0x01U, 0x01U, 0x00U, 0x08U,
+    };
     fil::cortexm::SystemControl system(0x08000000U);
+    fil::cpu::CpuState state;
+    ASSERT_TRUE(setupExceptionTest(memory, state, 0x08000038U, handlers));
     system.setFpccr(0xc0000000U);
     fil::cortexm::ExceptionController exceptions(memory, system);
-    fil::cpu::CpuState state;
-    state.msp = 0x20001000U;
-    state.r[13] = state.msp;
-    state.r[15] = 0x08000080U;
-    state.xpsr = fil::cpu::xpsr_t;
     state.control = 4U;
     state.s[0] = 1.5F;
     state.fpscr = 0x01000000U;
