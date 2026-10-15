@@ -191,12 +191,6 @@ TEST(EventLoopTest, InsertionPrunesGloballyRetiredOwnerCallbacks) {
 }
 
 TEST(EventLoopTest, AdvancesOneOwnerIndependently) {
-    fil::sim::EventLoop rewindable;
-    const auto checkpoint = rewindable.ownerCheckpoint(4U);
-    static_cast<void>(rewindable.runOwnedEvents(4U, 10U));
-    EXPECT_TRUE(rewindable.restoreOwnerCheckpoint(checkpoint) && rewindable.now(4U) == 0U)
-        << "untouched owner queues permit transactional clock rewind";
-
     fil::sim::EventLoop loop;
     std::vector<std::uint32_t> calls;
     {
@@ -209,31 +203,24 @@ TEST(EventLoopTest, AdvancesOneOwnerIndependently) {
     }
     static_cast<void>(loop.scheduleAt(7U, [&]() { calls.push_back(3U); }));
 
-    const auto event_checkpoint = loop.ownerCheckpoint(1U);
     const auto local = loop.runOwnedEvents(1U, 7U);
     EXPECT_TRUE(local.events_executed == 1U && calls == std::vector<std::uint32_t>{1U})
         << "owner-local execution drains only the selected lane";
     EXPECT_TRUE(loop.now() == 0U && loop.now(1U) == 7U && loop.pending() == 2U)
         << "owner-local execution leaves the shared clock and other lanes untouched";
-    EXPECT_TRUE(!loop.restoreOwnerCheckpoint(event_checkpoint))
-        << "executed owner callbacks reject unsafe clock-only rollback";
-
     const auto remaining = loop.runDueEvents(7U);
     EXPECT_TRUE((remaining.events_executed == 2U &&
                  calls == std::vector<std::uint32_t>{1U, 2U, 3U} && loop.pending() == 0U))
         << "global execution skips an owner event already committed locally";
 }
 
-TEST(EventLoopTest, DenseAndSparseOwnerClocksPreserveRewindAndSharedClamp) {
+TEST(EventLoopTest, DenseAndSparseOwnerClocksPreserveSharedClamp) {
     for (const fil::sim::EventOwner owner : {0U, 63U, 64U, 1000U}) {
         fil::sim::EventLoop loop;
-        const auto initial = loop.ownerCheckpoint(owner);
         static_cast<void>(loop.runOwnedEvents(owner, 20U));
         EXPECT_EQ(loop.now(owner), 20U);
-        EXPECT_TRUE(loop.restoreOwnerCheckpoint(initial));
-        EXPECT_EQ(loop.now(owner), 0U);
         static_cast<void>(loop.runDueEvents(10U));
-        EXPECT_EQ(loop.now(owner), 10U);
+        EXPECT_EQ(loop.now(owner), 20U);
         static_cast<void>(loop.runOwnedEvents(owner, 30U));
         EXPECT_EQ(loop.now(owner), 30U);
         EXPECT_EQ(loop.now(), 10U);

@@ -25,10 +25,6 @@ Error argumentError(std::string message) {
     return Error{ErrorCategory::invalid_argument, std::move(message), std::nullopt};
 }
 
-Error runtimeError(std::string message) {
-    return Error{ErrorCategory::runtime, std::move(message), std::nullopt};
-}
-
 // Small networks use a fixed-width timestamp reduction. Padding with the
 // inactive sentinel permits unrolled/vectorized selection without changing
 // equal-time board ordering; the caller masks out inactive lanes.

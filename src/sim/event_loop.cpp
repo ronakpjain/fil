@@ -7,7 +7,6 @@
 #include <queue>
 #include <stdexcept>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -33,12 +32,7 @@ struct EventLoop::Impl {
         }
     };
 
-    using QueueBase = std::priority_queue<EventPtr, std::vector<EventPtr>, Later>;
-
-    /// Exposes the underlying container so checkpoints can enumerate it.
-    struct Queue : QueueBase {
-        const std::vector<EventPtr>& container() const { return this->c; }
-    };
+    using Queue = std::priority_queue<EventPtr, std::vector<EventPtr>, Later>;
 
     SimTimeNs shared_now{0};
     EventId next_id{1};
@@ -53,7 +47,6 @@ struct EventLoop::Impl {
     ObservationBarrier scheduler_observation_barrier;
     std::unordered_map<EventId, EventPtr> live_events;
     std::unordered_map<EventOwner, SimTimeNs> owner_now;
-    std::unordered_map<EventOwner, std::uint64_t> owner_generation;
 
     struct Lock {
         explicit Lock(Impl& impl) : lock(impl.mutex) {}
@@ -106,7 +99,6 @@ struct EventLoop::Impl {
         event->live = false;
         live_events.erase(event->id);
         discardDeadFront(globally_observed_events);
-        ++owner_generation[event->owner];
     }
 
     void markOwner(EventRunResult& result, const EventOwner owner) const noexcept {
@@ -136,7 +128,6 @@ struct EventLoop::Impl {
         discardDeadFront(owner_queue);
         owner_queue.push(event);
         live_events.emplace(id, event);
-        ++owner_generation[owner];
         return id;
     }
 
@@ -241,7 +232,6 @@ bool EventLoop::cancel(const EventId id) noexcept {
     if (found == impl_->live_events.end()) return false;
     found->second->live = false;
     Impl::discardDeadFront(impl_->globally_observed_events);
-    ++impl_->owner_generation[found->second->owner];
     impl_->live_events.erase(found);
     return true;
 }
@@ -339,7 +329,6 @@ void EventLoop::clear() noexcept {
     impl_->globally_observed_events = {};
     impl_->owner_events.clear();
     impl_->live_events.clear();
-    impl_->owner_generation.clear();
 }
 
 SimTimeNs EventLoop::now() const noexcept {
@@ -350,80 +339,6 @@ SimTimeNs EventLoop::now() const noexcept {
 SimTimeNs EventLoop::now(const EventOwner owner) const noexcept {
     Impl::Lock lock(*impl_);
     return impl_->timeFor(owner);
-}
-
-EventLoop::OwnerCheckpoint EventLoop::ownerCheckpoint(
-    const EventOwner owner
-) const noexcept {
-    Impl::Lock lock(*impl_);
-    const auto generation = impl_->owner_generation.find(owner);
-    // Snapshot the owner's live events so a rollback can undo scheduling and
-    // retirement performed after the checkpoint.
-    std::vector<Impl::EventPtr> snapshot;
-    if (const auto* queue = impl_->ownerQueue(owner)) {
-        for (const auto& event : queue->container()) {
-            if (event->live) snapshot.push_back(event);
-        }
-    }
-    return OwnerCheckpoint{
-        owner,
-        impl_->timeFor(owner),
-        generation == impl_->owner_generation.end() ? 0U : generation->second,
-        std::make_shared<const std::vector<Impl::EventPtr>>(std::move(snapshot)),
-    };
-}
-
-bool EventLoop::canRestoreOwnerCheckpoint(
-    const OwnerCheckpoint& checkpoint
-) const noexcept {
-    Impl::Lock lock(*impl_);
-    // The shared clock never runs backwards: a shared-owner checkpoint is
-    // restorable only while the clock is untouched. Owner-owned queues can
-    // rewind to their captured time.
-    if (checkpoint.owner == shared_event_owner) {
-        if (checkpoint.time_ns != impl_->timeFor(checkpoint.owner)) return false;
-    } else if (checkpoint.time_ns > impl_->timeFor(checkpoint.owner)) {
-        return false;
-    }
-    // Fired event callbacks are observable effects: an epoch in which any
-    // captured event fired cannot be rolled back. Scheduling alone is
-    // undoable, so pending additions/removals are fine.
-    const auto* const snapshot = static_cast<const std::vector<Impl::EventPtr>*>(
-        checkpoint.captured_events.get()
-    );
-    if (snapshot == nullptr) return false;
-    for (const auto& event : *snapshot) {
-        if (!event->live) return false;
-    }
-    return true;
-}
-
-bool EventLoop::restoreOwnerCheckpoint(const OwnerCheckpoint& checkpoint) noexcept {
-    Impl::Lock lock(*impl_);
-    if (!canRestoreOwnerCheckpoint(checkpoint)) return false;
-    const auto* const snapshot = static_cast<const std::vector<Impl::EventPtr>*>(
-        checkpoint.captured_events.get()
-    );
-    if (snapshot == nullptr) return false;
-    auto* const queue = impl_->ownerQueue(checkpoint.owner);
-    if (queue == nullptr && !snapshot->empty()) return false;
-
-    // Undo events scheduled after the capture: mark them dead and drop them
-    // from the live index. Their queue entries become lazy garbage.
-    if (queue != nullptr) {
-        std::unordered_set<EventId> captured;
-        captured.reserve(snapshot->size());
-        for (const auto& event : *snapshot) captured.insert(event->id);
-        for (const auto& event : queue->container()) {
-            if (event->live && captured.find(event->id) == captured.end()) {
-                event->live = false;
-                impl_->live_events.erase(event->id);
-            }
-        }
-    }
-    impl_->setTime(checkpoint.owner, checkpoint.time_ns);
-    impl_->owner_generation[checkpoint.owner] = checkpoint.event_generation;
-    return true;
 }
 
 std::size_t EventLoop::pending() const noexcept {
