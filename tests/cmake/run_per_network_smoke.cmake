@@ -36,7 +36,6 @@ foreach(required_line IN ITEMS
     "network: per_vehicle_smoke"
     "stop: time-budget"
     "boards: 6"
-    "time_ns: 10000000"
 )
     string(FIND "${padded_stdout}" "\n${required_line}\n" line_position)
     if(line_position EQUAL -1)
@@ -46,6 +45,18 @@ foreach(required_line IN ITEMS
         )
     endif()
 endforeach()
+
+string(REGEX MATCH "time_ns: ([0-9]+)" time_match "${normalized_stdout}")
+if(time_match STREQUAL "")
+    message(FATAL_ERROR "network smoke output is missing a numeric time_ns line\nstdout:\n${run_stdout}")
+endif()
+set(stop_time_ns "${CMAKE_MATCH_1}")
+if(stop_time_ns LESS 10000000 OR stop_time_ns GREATER_EQUAL 11000000)
+    message(FATAL_ERROR
+        "network smoke stop time ${stop_time_ns} ns is outside [10000000, 11000000)\n"
+        "stdout:\n${run_stdout}"
+    )
+endif()
 
 string(REGEX MATCHALL "\nboard [^\n]*: stop=time-budget [^\n]*" board_stop_lines
     "\n${normalized_stdout}")
@@ -80,4 +91,4 @@ if(firmware_can_rx STREQUAL "")
     message(FATAL_ERROR "network trace contains no shared-bus can_rx record")
 endif()
 
-message(STATUS "six-board PER network reached exactly 10000000 ns with real CAN TX/RX")
+message(STATUS "six-board PER network stopped within documented deadline overshoot with real CAN TX/RX")
