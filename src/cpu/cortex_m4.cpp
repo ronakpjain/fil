@@ -1500,9 +1500,7 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::tryStepReversibleJitBlock
         return executeTrustedReversibleJitBlock(max_instructions);
     }
     TimedJitStepOutcome timed{};
-    const auto& slot = (*jit_blocks_)[jitBlockIndex(state_.r[15])];
-    const bool micro_ready = slot.micro_function && slot.micro_prefix_count != 0U;
-    auto execution = tryStepJitBlockImpl(max_instructions, true, !micro_ready,
+    auto execution = tryStepJitBlockImpl(max_instructions, true, true,
         &timed.instruction_cycles);
     if (!execution) return std::nullopt;
     timed.execution = std::move(*execution);

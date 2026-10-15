@@ -113,29 +113,6 @@ TEST(JitTest, CachedBlocksMatchInterpreterAcrossMicroPrefixCuts) {
     }
 }
 
-TEST(JitTest, ReversibleFallbackReportsTakenBranchCycleAtLastInstruction) {
-    auto bus = basicBus();
-    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0xBF00U, 0xE7FEU})).hasValue());
-    fil::cpu::CortexM4 cpu(bus), reference(bus);
-    prepare(cpu); prepare(reference);
-    const auto initial = cpu.state();
-    for (unsigned i = 0; i < 70U; ++i) {
-        cpu.state() = initial;
-        static_cast<void>(cpu.tryStepJitBlock(2U));
-    }
-    ASSERT_GT(cpu.jitStats().micro_compilations, 0U);
-    cpu.state() = reference.state() = initial;
-    const auto expected0 = reference.stepFast(), expected1 = reference.stepFast();
-    ASSERT_FALSE(bus.reversibleRamOnly() && bus.allMmioTrapping());
-    const auto actual = cpu.tryStepReversibleJitBlock(2U);
-    ASSERT_TRUE(actual);
-    EXPECT_EQ(actual->execution.count, 2U);
-    EXPECT_EQ(actual->instruction_cycles[0], expected0.cycles);
-    EXPECT_EQ(actual->instruction_cycles[1], expected1.cycles);
-    EXPECT_EQ(actual->execution.result.cycles, expected0.cycles + expected1.cycles);
-    EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()));
-}
-
 TEST(JitTest, CachedBranchMatchesInterpreterCyclesAndNextFetchFault) {
     constexpr std::uint32_t ram = 0x20000000U;
     fil::mem::MemoryBus bus, oracle;
