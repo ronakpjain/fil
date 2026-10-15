@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace fil::cpu {
 namespace {
@@ -1211,14 +1212,6 @@ std::optional<DecodedInstruction> decode32(
         if ((raw & pattern.mask) == pattern.value) return pattern.decode(first, second);
     }
     return std::nullopt;
-}
-
-std::span<const DecodePattern16> decodePatterns16() noexcept {
-    return patterns16;
-}
-
-std::span<const DecodePattern32> decodePatterns32() noexcept {
-    return patterns32;
 }
 
 bool decoderTablesHaveNoOverlaps() noexcept {

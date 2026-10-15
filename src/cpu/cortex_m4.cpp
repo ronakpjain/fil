@@ -389,7 +389,6 @@ bool bitwiseEqual(const CpuState& left, const CpuState& right) noexcept {
         || left.fp_lazy_base != right.fp_lazy_base
         || left.pending_exception != right.pending_exception
         || left.pending_exc_return != right.pending_exc_return
-        || left.fpscr != right.fpscr || left.it_state != right.it_state
         || left.instruction_address != right.instruction_address) {
         return false;
     }

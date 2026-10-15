@@ -11,10 +11,6 @@ TEST(DecoderTest, IdentifiesInstructionWidthsAndValidatesTables) {
     EXPECT_TRUE(fil::cpu::is32BitThumbPrefix(0xf800U)) << "F800 introduces a 32-bit encoding";
     EXPECT_TRUE(fil::cpu::decoderTablesHaveNoOverlaps())
         << "decoder mask/value rows do not overlap";
-    EXPECT_TRUE(!fil::cpu::decodePatterns16().empty())
-        << "16-bit decoder table is externally inspectable";
-    EXPECT_TRUE(!fil::cpu::decodePatterns32().empty())
-        << "32-bit decoder table is externally inspectable";
 }
 
 TEST(DecoderTest, DecodesRepresentativeSixteenBitFamilies) {

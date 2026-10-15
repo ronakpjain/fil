@@ -8,7 +8,6 @@
 
 #include <cstdint>
 #include <optional>
-#include <span>
 
 namespace fil::cpu {
 
@@ -42,12 +41,6 @@ struct DecodePattern32 {
     std::uint16_t first,
     std::uint16_t second
 ) noexcept;
-
-/** @brief Exposes the immutable 16-bit mask/value table for validation/tests. */
-[[nodiscard]] std::span<const DecodePattern16> decodePatterns16() noexcept;
-
-/** @brief Exposes the immutable 32-bit mask/value table for validation/tests. */
-[[nodiscard]] std::span<const DecodePattern32> decodePatterns32() noexcept;
 
 /** @brief Proves that no two rows in either decoder table can match one encoding. */
 [[nodiscard]] bool decoderTablesHaveNoOverlaps() noexcept;

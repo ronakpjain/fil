@@ -230,11 +230,6 @@ struct ShiftResult {
     return (it_state & 0x0fU) != 0;
 }
 
-/** @brief Returns whether the current instruction is last in an IT block. */
-[[nodiscard]] constexpr bool lastInItBlock(const std::uint8_t it_state) noexcept {
-    return inItBlock(it_state) && (it_state & 0x07U) == 0;
-}
-
 /** @brief Gets the condition applying to the current IT-block slot. */
 [[nodiscard]] constexpr Condition currentItCondition(const std::uint8_t it_state) noexcept {
     return static_cast<Condition>((it_state >> 4U) & 0x0fU);
