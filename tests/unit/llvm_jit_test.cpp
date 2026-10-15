@@ -658,6 +658,7 @@ TEST(LlvmJitIntegrationTest, MixedBlockNativePrefixPreservesSuffixAndLimits) {
         }
         ASSERT_TRUE(bus.loadBytes(ram, code).hasValue());
         fil::cpu::CortexM4 cpu(bus), reference(bus);
+        cpu.setMicroJitEnabled(false); // exercises the LLVM backend in isolation
         fil::cpu::CpuState initial{};
         initial.r[15] = ram;
         initial.r[1] = 7U;

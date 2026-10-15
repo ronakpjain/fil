@@ -272,6 +272,7 @@ TEST(NativeFastPathTest, BudgetedNativePrefixMatchesCachedCutsAndFetchAccounting
     ASSERT_TRUE(bus.loadBytes(code_base, halfwords({0x2001U, 0x3001U, 0x3801U, 0x2802U, 0xE7FEU}))
                     .hasValue());
     fil::cpu::CortexM4 cpu(bus);
+    cpu.setMicroJitEnabled(false); // exercises the LLVM backend in isolation
     fil::cpu::CortexM4 reference(bus);
     prepare(cpu);
     const auto initial = cpu.state();

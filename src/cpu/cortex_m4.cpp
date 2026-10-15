@@ -762,14 +762,22 @@ bool CortexM4::ensureMicroJit() {
 
 void CortexM4::prepareMicroBlock(JitBlockEntry& entry) {
     entry.micro_attempted = true;
+    entry.micro_prefix_count = 0U;
     if (!micro_jit_enabled_) return;
     if (!MicroJit::hostSupported() || entry.count < 2U) return;
+    // Leading FilIR-lowerable run: unconditional control flow only
+    // terminates a slot, so the run naturally satisfies the terminal rule.
+    // Suffix ops (memory, system, ...) keep their existing handlers.
     std::array<MicroSource, JitStepOutcome::max_block> sources{};
-    for (std::uint8_t i = 0U; i < entry.count; ++i) {
-        sources[i] = {entry.ops[i], entry.pcs[i], entry.sizes[i]};
+    std::uint8_t prefix = 0U;
+    for (; prefix < entry.count; ++prefix) {
+        sources[prefix] = {entry.ops[prefix], entry.pcs[prefix], entry.sizes[prefix]};
+        MicroInst lowered{};
+        if (!tryLowerMicroInst(sources[prefix], lowered).ok) break;
     }
+    if (prefix < 2U) return;
     MicroBlock block;
-    if (!buildMicroBlock({sources.data(), entry.count}, block).ok) return;
+    if (!buildMicroBlock({sources.data(), prefix}, block).ok) return;
     if (!ensureMicroJit()) return;
     const auto compile_start = std::chrono::steady_clock::now();
     MicroFunction fn = micro_jit_->compile(block, micro_jit_error_);
@@ -782,6 +790,7 @@ void CortexM4::prepareMicroBlock(JitBlockEntry& entry) {
         return;
     }
     entry.micro_function = fn;
+    entry.micro_prefix_count = prefix;
     ++jit_stats_.micro_compilations;
 }
 
@@ -2075,9 +2084,129 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
     // preserve the unused suffix instead of zero-filling the whole array.
     std::uint8_t first_cached = 0U;
     std::uint8_t cached_limit = execution_count;
+    // Bespoke stencil prefix: serves budgeted and trusted reversible paths
+    // with the same commit contract as native (direct commit, no traps).
+    // FilIR admits no memory/system/FP ops, so the memory guard and rollback
+    // machinery observe a pure integer transition, exactly like a native one.
+    // Conditional takes truncate the planned prefix via the retired count.
+    if (slot.micro_function && slot.micro_prefix_count != 0U && state_.it_state == 0U) {
+        const std::uint8_t micro_limit = static_cast<std::uint8_t>(std::min<std::size_t>(
+            std::min<std::size_t>(execution_count, slot.count), slot.micro_prefix_count));
+        if (micro_limit != 0U && first_cached == 0U) {
+            std::uint8_t planned = micro_limit;
+            bool stopped_on_budget = false;
+            std::uint32_t planned_cycles = 0U;
+            if (budget) {
+                ReversibleCycleBudget staged = *budget;
+                planned = 0U;
+                std::uint32_t planned_pc = state_.r[15];
+                for (; planned < micro_limit; ++planned) {
+                    const auto pc = slot.pcs[planned];
+                    const auto size = slot.sizes[planned];
+                    const auto& op = slot.ops[planned];
+                    if (planned_pc != pc) break;
+                    const auto base = slot.base_cycles[planned];
+                    const bool sequential = staged.have_fetch && pc == staged.fetch_end;
+                    const auto stall = staged.fetch_stall
+                        ? staged.fetch_stall(staged.context, pc, sequential) : 0U;
+                    // Conservative admission like native: the taken refill is
+                    // charged upfront; the actual below keeps only real costs.
+                    const auto worst = static_cast<std::uint32_t>(base)
+                        + slot.branch_penalty[planned] + stall;
+                    if (worst > staged.remaining_cycles
+                        || worst > std::numeric_limits<std::uint16_t>::max()) {
+                        stopped_on_budget = true;
+                        break;
+                    }
+                    std::uint32_t target = pc + size;
+                    if (op.kind == InstrKind::b || op.kind == InstrKind::bl) {
+                        target = static_cast<std::uint32_t>(
+                            static_cast<std::int64_t>(pc) + 4 + op.branch_offset)
+                            & ~std::uint32_t{1};
+                    }
+                    auto actual_cycles = base;
+                    if (target != pc + size) {
+                        actual_cycles = static_cast<std::uint16_t>(
+                            actual_cycles + slot.branch_penalty[planned]);
+                    }
+                    const auto charged = static_cast<std::uint32_t>(actual_cycles) + stall;
+                    staged.total_instruction_cycles[planned] =
+                        static_cast<std::uint16_t>(charged);
+                    staged.remaining_cycles -= charged;
+                    staged.have_fetch = true;
+                    staged.fetch_end = pc + size;
+                    timed.instruction_cycles[planned] = actual_cycles;
+                    planned_cycles += actual_cycles;
+                    planned_pc = target;
+                    if (slot.is_terminator[planned]) {
+                        ++planned;
+                        break;
+                    }
+                }
+                if (planned == 0U) {
+                    ++jit_stats_.fallbacks;
+                    return std::nullopt; // Callback ran once; no commit.
+                }
+                const std::size_t retired = slot.micro_function(&state_, planned);
+                if (retired == 0U || retired > planned) {
+                    ++jit_stats_.fallbacks;
+                    return std::nullopt;
+                }
+                const auto retired_u8 = static_cast<std::uint8_t>(retired);
+                if (retired_u8 < planned) {
+                    // Conditional taken: give back over-planned tail charges
+                    // (callbacks ran once during planning; adjust arithmetically).
+                    for (std::uint8_t j = retired_u8; j < planned; ++j) {
+                        staged.remaining_cycles += staged.total_instruction_cycles[j];
+                    }
+                    planned_cycles = 0U;
+                    for (std::uint8_t j = 0U; j < retired_u8; ++j) {
+                        planned_cycles += timed.instruction_cycles[j];
+                    }
+                    const auto last = static_cast<std::size_t>(retired_u8 - 1U);
+                    if (state_.r[15] != slot.pcs[last] + slot.sizes[last]) {
+                        timed.instruction_cycles[last] = static_cast<std::uint16_t>(
+                            timed.instruction_cycles[last] + slot.branch_penalty[last]);
+                        staged.total_instruction_cycles[last] = static_cast<std::uint16_t>(
+                            staged.total_instruction_cycles[last] + slot.branch_penalty[last]);
+                        staged.remaining_cycles -= slot.branch_penalty[last];
+                        planned_cycles += slot.branch_penalty[last];
+                    }
+                    staged.fetch_end = slot.pcs[last] + slot.sizes[last];
+                    staged.have_fetch = true;
+                }
+                state_.instruction_address = slot.pcs[retired_u8 - 1U];
+                total_cycles += planned_cycles;
+                *budget = staged;
+                first_cached = retired_u8;
+                if (stopped_on_budget) cached_limit = retired_u8;
+                ++jit_stats_.micro_executions;
+                jit_stats_.micro_instructions += retired_u8;
+            } else {
+                const std::size_t retired = slot.micro_function(&state_, micro_limit);
+                if (retired != 0U && retired <= micro_limit) {
+                    const auto retired_u8 = static_cast<std::uint8_t>(retired);
+                    state_.instruction_address = slot.pcs[retired_u8 - 1U];
+                    for (std::uint8_t i = 0U; i < retired_u8; ++i) {
+                        timed.instruction_cycles[i] = slot.base_cycles[i];
+                        total_cycles += slot.base_cycles[i];
+                    }
+                    const auto last = static_cast<std::size_t>(retired_u8 - 1U);
+                    if (state_.r[15] != slot.pcs[last] + slot.sizes[last]) {
+                        timed.instruction_cycles[last] = static_cast<std::uint16_t>(
+                            timed.instruction_cycles[last] + slot.branch_penalty[last]);
+                        total_cycles += slot.branch_penalty[last];
+                    }
+                    first_cached = retired_u8;
+                    ++jit_stats_.micro_executions;
+                    jit_stats_.micro_instructions += retired_u8;
+                }
+            }
+        }
+    }
 #if FIL_HAS_LLVM_JIT
     bool native_probe_sampled = false;
-    if (slot.native_function && slot.native_count != 0U) {
+    if (first_cached == 0U && slot.native_function && slot.native_count != 0U) {
         const auto count = std::min(execution_count, slot.native_count);
         auto& resident = native_state_->kernels[slot.native_slot];
         const bool candidate = resident.sampleable
@@ -2187,7 +2316,9 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
             first_cached = planned;
             if (stopped_on_budget) cached_limit = planned;
         }
-        if (first_cached != 0U) {
+    }
+#endif
+    if (first_cached != 0U) {
             for (std::uint8_t i = 0U; i < first_cached; ++i) {
                 out.pcs[i] = slot.pcs[i];
                 out.sizes[i] = slot.sizes[i];
@@ -2198,9 +2329,7 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
             last_raw = slot.raws[last];
             last_size = slot.sizes[last];
             last_suppress = slot.suppress_obs[last];
-        }
     }
-#endif
 
     for (std::uint8_t i = first_cached; i < cached_limit; ++i) {
         const DecodedInstruction& op = slot.ops[i];
@@ -2295,6 +2424,7 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
     if (slot.native_candidate_count != 0U || slot.native_function) ++native_clock_;
     if (out.count >= 2U && slot.native_candidate_count != 0U
         && !slot.native_function && !slot.native_attempted
+        && !slot.micro_function
         && slot.generation == memory_.executionGeneration()) {
         if (slot.native_hits < native_block_compile_threshold) ++slot.native_hits;
         else prepareNativeBlock(slot);
@@ -2403,47 +2533,50 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlockImpl(
         }
     }
 #endif
-    // Bespoke stencil kernel: one call retires up to the admitted prefix.
-    // Reversible capsules keep checked handlers so rollback retains
-    // checkpoints. Subsumes the cached fast loop for covered slots.
+    // Bespoke stencil kernel: one call retires the admitted leading prefix.
+    // The suffix (if any) falls through to the cached loops below, exactly
+    // like native prefix execution. Reversible capsules keep checked
+    // handlers so rollback retains checkpoints.
     if (!fast_only && out.count == 0U && slot.micro_function
-        && state_.it_state == 0U) {
-        const std::uint8_t micro_count = static_cast<std::uint8_t>(
-            std::min<std::size_t>(max_instructions, slot.count));
-        if (micro_count != 0U) {
-            const std::size_t retired = slot.micro_function(&state_, micro_count);
+        && slot.micro_prefix_count != 0U && state_.it_state == 0U) {
+        const std::uint8_t micro_limit = static_cast<std::uint8_t>(std::min<std::size_t>(
+            std::min<std::size_t>(max_instructions, slot.count), slot.micro_prefix_count));
+        if (micro_limit != 0U) {
+            const std::size_t retired = slot.micro_function(&state_, micro_limit);
             // The kernel reports its exact retired prefix: scheduler limits
             // via prefix exits, data-dependent conditional takes via stubs.
-            if (retired == 0U || retired > micro_count) goto commit_block;
-            const auto retired_u8 = static_cast<std::uint8_t>(retired);
-            for (std::uint8_t i = 0U; i < retired_u8; ++i) {
-                out.pcs[i] = slot.pcs[i];
-                out.sizes[i] = slot.sizes[i];
-            }
-            out.count = retired_u8;
-            const auto last = static_cast<std::size_t>(retired_u8 - 1U);
-            state_.instruction_address = slot.pcs[last];
-            std::uint32_t total = slot.base_prefix_cycles[retired_u8];
-            if (state_.r[15] != slot.pcs[last] + slot.sizes[last]) {
-                total += slot.branch_penalty[last];
-            }
-            if (instruction_cycles) {
+            // A taken branch lands r15 off the sequential PCs, so the slow
+            // loop below stops at its continuity check with nothing to redo.
+            if (retired != 0U && retired <= micro_limit) {
+                const auto retired_u8 = static_cast<std::uint8_t>(retired);
                 for (std::uint8_t i = 0U; i < retired_u8; ++i) {
-                    (*instruction_cycles)[i] = static_cast<std::uint16_t>(slot.base_cycles[i]);
+                    out.pcs[i] = slot.pcs[i];
+                    out.sizes[i] = slot.sizes[i];
                 }
+                out.count = retired_u8;
+                const auto last = static_cast<std::size_t>(retired_u8 - 1U);
+                state_.instruction_address = slot.pcs[last];
+                std::uint32_t total = slot.base_prefix_cycles[retired_u8];
                 if (state_.r[15] != slot.pcs[last] + slot.sizes[last]) {
-                    (*instruction_cycles)[last] = static_cast<std::uint16_t>(
-                        (*instruction_cycles)[last] + slot.branch_penalty[last]);
+                    total += slot.branch_penalty[last];
                 }
+                if (instruction_cycles) {
+                    for (std::uint8_t i = 0U; i < retired_u8; ++i) {
+                        (*instruction_cycles)[i] = static_cast<std::uint16_t>(slot.base_cycles[i]);
+                    }
+                    if (state_.r[15] != slot.pcs[last] + slot.sizes[last]) {
+                        (*instruction_cycles)[last] = static_cast<std::uint16_t>(
+                            (*instruction_cycles)[last] + slot.branch_penalty[last]);
+                    }
+                }
+                last_pc = slot.pcs[last];
+                last_raw = slot.raws[last];
+                last_size = slot.sizes[last];
+                last_suppress = slot.suppress_obs[last];
+                total_cycles = total;
+                ++jit_stats_.micro_executions;
+                jit_stats_.micro_instructions += retired_u8;
             }
-            last_pc = slot.pcs[last];
-            last_raw = slot.raws[last];
-            last_size = slot.sizes[last];
-            last_suppress = slot.suppress_obs[last];
-            total_cycles = total;
-            ++jit_stats_.micro_executions;
-            jit_stats_.micro_instructions += retired_u8;
-            goto commit_block;
         }
     }
     // Pure-integer fast block: no memory ops (no traps/generation changes),

@@ -220,6 +220,7 @@ public:
     void setMicroJitEnabled(bool enabled) noexcept {
         micro_jit_enabled_ = enabled;
     }
+    [[nodiscard]] const std::string& microJitError() const noexcept { return micro_jit_error_; }
 
     /** @brief Gets the diagnostic captured by the most recent failed fast step. */
     [[nodiscard]] const DiagnosticSnapshot& lastDiagnostic() const noexcept {
@@ -541,8 +542,10 @@ private:
         bool native_attempted{false};
         std::uint8_t native_candidate_count{0U};
         bool native_candidate_checked{false};
-        /// Bespoke stencil kernel for the whole block (full-count only).
+        /// Bespoke stencil kernel for the leading FilIR prefix (count in
+        /// micro_prefix_count); the suffix keeps existing handlers.
         MicroFunction micro_function{nullptr};
+        std::uint8_t micro_prefix_count{0U};
         bool micro_attempted{false};
         std::array<DecodedInstruction, JitStepOutcome::max_block> ops{};
         std::array<std::uint32_t, JitStepOutcome::max_block> pcs{};
@@ -603,7 +606,6 @@ private:
     bool micro_jit_enabled_{true};
     [[nodiscard]] bool ensureMicroJit();
     void prepareMicroBlock(JitBlockEntry& entry);
-    [[nodiscard]] const std::string& microJitError() const noexcept { return micro_jit_error_; }
     [[nodiscard]] bool ensureNativeCompiler();
     [[nodiscard]] std::uint8_t retainNativeKernel(std::shared_ptr<const NativeJitKernel> kernel);
     void touchNativeKernel(std::uint8_t slot) noexcept;
