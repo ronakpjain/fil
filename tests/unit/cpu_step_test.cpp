@@ -130,23 +130,6 @@ TEST(CpuStepTest, StrdStoresRepeatedSourceRegisterTwice) {
     EXPECT_EQ(second.value(), 0x12345678U);
 }
 
-TEST(CpuStepTest, TbbDataFaultStopsWithoutBranching) {
-    fil::mem::MemoryBus bus;
-    ASSERT_TRUE(bus.mapRam(flash_base, 64U, "table-branch-code", true).hasValue());
-    ASSERT_TRUE(bus.write16(flash_base, 0xe8d0U,
-        {fil::mem::AccessType::data_write, 0U}));
-    ASSERT_TRUE(bus.write16(flash_base + 2U, 0xf001U,
-        {fil::mem::AccessType::data_write, 0U}));
-    fil::cpu::CortexM4 cpu(bus);
-    prepare(cpu);
-    cpu.state().r[0] = 0x40000000U;
-    cpu.state().r[1] = 0U;
-    const auto result = cpu.step();
-    EXPECT_EQ(result.reason, fil::cpu::StopReason::bus_fault);
-    EXPECT_EQ(cpu.state().r[15], flash_base + 4U) << "faulting table load does not branch";
-    EXPECT_TRUE(result.diagnostic.bus_fault.has_value()) << "reports the table data fault";
-}
-
 TEST(CpuStepTest, ComparesCpuStateByStoredRepresentation) {
     fil::cpu::CpuState left;
     left.s[0] = std::bit_cast<float>(0x7fc00001U);
@@ -451,6 +434,22 @@ TEST(CpuStepTest, BoundedRunAndDataFaultsAreStructured) {
         EXPECT_TRUE(
             result.diagnostic.bus_fault && result.diagnostic.bus_fault->context.pc == flash_base)
             << "data fault retains precise instruction PC";
+    }
+    {
+        fil::mem::MemoryBus bus;
+        ASSERT_TRUE(bus.mapRam(flash_base, 64U, "table-branch-code", true).hasValue());
+        ASSERT_TRUE(bus.write16(flash_base, 0xe8d0U,
+            {fil::mem::AccessType::data_write, 0U}));
+        ASSERT_TRUE(bus.write16(flash_base + 2U, 0xf001U,
+            {fil::mem::AccessType::data_write, 0U}));
+        fil::cpu::CortexM4 cpu(bus);
+        prepare(cpu);
+        cpu.state().r[0] = 0x40000000U;
+        cpu.state().r[1] = 0U;
+        const auto result = cpu.step();
+        EXPECT_EQ(result.reason, fil::cpu::StopReason::bus_fault);
+        EXPECT_EQ(cpu.state().r[15], flash_base + 4U) << "faulting table load does not branch";
+        EXPECT_TRUE(result.diagnostic.bus_fault.has_value()) << "reports the table data fault";
     }
 }
 
