@@ -92,7 +92,8 @@ bool runMicro(const std::vector<std::uint16_t>& code, const CpuState& initial,
     final_out.r[15] = kFlash;
     final_out.thumb = true;
     final_out.halted = false;
-    fn(&final_out, block.ops.size());
+    const std::size_t retired = fn(&final_out, block.ops.size());
+    EXPECT_EQ(retired, block.ops.size());
     return true;
 }
 
@@ -190,6 +191,131 @@ TEST(MicroJitEmitterTest, PrefixExitsCommitPrecisely) {
     fn(&untouched, 0U);
     EXPECT_EQ(untouched.r[0], 0U);
     EXPECT_EQ(untouched.r[15], kFlash);
+}
+
+TEST(MicroJitEmitterTest, ConditionalBranchTakenAndFallthrough) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no micro-jit emitter on this host";
+    // movs r0, #N; cmp r0, #M; b<cond> +2 (skip one nop when taken); nop.
+    // T1 conditional branch: 0xD000 | cond<<8 | imm8; target = pc+4+imm8*2.
+    const std::uint16_t bne_over = static_cast<std::uint16_t>(0xD100U | 0x00U); // bne +2
+    const std::vector<std::uint16_t> code{0x2001U, 0x2801U, bne_over, 0xBF00U, 0xBF00U};
+    std::mt19937_64 rng(42U);
+    for (int trial = 0; trial < 10; ++trial) {
+        // Alternate taken / fallthrough by choosing the cmp operands.
+        const bool take = (trial % 2) == 0;
+        CpuState initial;
+        for (int i = 0; i <= 12; ++i) initial.r[i] = static_cast<std::uint32_t>(rng());
+        initial.r[14] = static_cast<std::uint32_t>(rng());
+        initial.xpsr = (1U << 24U) | 0x000F0000U | (1U << 27U)
+            | (static_cast<std::uint32_t>(rng() & 0xFU) << 28U);
+        initial.r[13] = kRam + 2048U;
+        // Force the cmp outcome: r0 ends as 1 (movs), compare vs 1.
+        // take -> need NE (r0 != 1)? r0 IS 1 -> EQ. Use two cmp variants:
+        std::vector<std::uint16_t> prog = code;
+        prog[1] = take ? 0x2802U : 0x2801U; // cmp r0, #2 (NE) vs #1 (EQ)
+        Fixture f;
+        CpuState ref_out{};
+        // Reference steps until PC leaves the straight-line region.
+        for (std::size_t i = 0; i < prog.size(); ++i) {
+            std::array<std::uint8_t, 2> by{
+                static_cast<std::uint8_t>(prog[i]), static_cast<std::uint8_t>(prog[i] >> 8U)};
+            EXPECT_TRUE(f.bus.loadBytes(kFlash + static_cast<std::uint32_t>(2U * i), by)
+                            .hasValue());
+        }
+        f.cpu.state() = initial;
+        f.cpu.state().r[15] = kFlash;
+        f.cpu.state().thumb = true;
+        f.cpu.state().halted = false;
+        // The micro kernel stops at a taken branch; mirror that exactly.
+        for (int i = 0; i < (take ? 3 : 5); ++i) {
+            auto result = f.cpu.stepFast();
+            ASSERT_EQ(result.reason, fil::cpu::StopReason::step_complete);
+        }
+        ref_out = f.cpu.state();
+        // Micro side.
+        std::vector<MicroSource> sources;
+        std::uint32_t pc = kFlash;
+        for (const auto half : prog) {
+            auto decoded = fil::cpu::decode16(half);
+            ASSERT_TRUE(decoded.has_value());
+            sources.push_back(MicroSource{*decoded, pc, 2U});
+            pc += 2U;
+        }
+        MicroBlock block;
+        ASSERT_TRUE(fil::cpu::buildMicroBlock({sources.data(), sources.size()}, block).ok);
+        std::string error;
+        auto jit = MicroJit::create(error);
+        ASSERT_TRUE(jit) << error;
+        MicroFunction fn = jit->compile(block, error);
+        ASSERT_TRUE(fn) << error;
+        CpuState micro_out = initial;
+        micro_out.r[15] = kFlash;
+        micro_out.thumb = true;
+        micro_out.halted = false;
+        const std::size_t retired = fn(&micro_out, block.ops.size());
+        EXPECT_EQ(retired, take ? 3U : 5U);
+        expectSameState(ref_out, micro_out);
+        if (::testing::Test::HasFailure()) {
+            ADD_FAILURE() << "taken=" << take;
+            return;
+        }
+    }
+}
+
+TEST(MicroJitEmitterTest, CbzCbnz) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no micro-jit emitter on this host";
+    // cbz r0, +2 (skip to movs when r0==0); nop; nop; movs r1, #7.
+    // T1 CBZ: 0xB100 | (imm6 bit5 -> bit9) | (imm6 bits4:0 -> bits7:3) | rn.
+    const auto cbz = [](std::uint8_t rn, std::uint32_t off) {
+        const std::uint32_t imm = off >> 1U;
+        return static_cast<std::uint16_t>(0xB100U | ((imm & 0x20U) << 4U)
+            | ((imm & 0x1FU) << 3U) | rn);
+    };
+    const std::vector<std::uint16_t> code{cbz(0, 2), 0xBF00U, 0xBF00U, 0x2107U};
+    for (const std::uint32_t r0 : {0U, 5U}) {
+        Fixture f;
+        for (std::size_t i = 0; i < code.size(); ++i) {
+            std::array<std::uint8_t, 2> by{
+                static_cast<std::uint8_t>(code[i]), static_cast<std::uint8_t>(code[i] >> 8U)};
+            ASSERT_TRUE(f.bus.loadBytes(kFlash + static_cast<std::uint32_t>(2U * i), by)
+                            .hasValue());
+        }
+        CpuState initial;
+        initial.r[0] = r0;
+        initial.xpsr = (1U << 24U);
+        initial.r[13] = kRam + 2048U;
+        f.cpu.state() = initial;
+        f.cpu.state().r[15] = kFlash;
+        f.cpu.state().thumb = true;
+        f.cpu.state().halted = false;
+        const bool take = (r0 == 0U);
+        const int steps = take ? 1 : 4;
+        for (int i = 0; i < steps; ++i) {
+            ASSERT_EQ(f.cpu.stepFast().reason, fil::cpu::StopReason::step_complete);
+        }
+        const CpuState ref_out = f.cpu.state();
+        std::vector<MicroSource> sources;
+        std::uint32_t pc = kFlash;
+        for (const auto half : code) {
+            auto decoded = fil::cpu::decode16(half);
+            ASSERT_TRUE(decoded.has_value());
+            sources.push_back(MicroSource{*decoded, pc, 2U});
+            pc += 2U;
+        }
+        MicroBlock block;
+        ASSERT_TRUE(fil::cpu::buildMicroBlock({sources.data(), sources.size()}, block).ok);
+        std::string error;
+        auto jit = MicroJit::create(error);
+        ASSERT_TRUE(jit) << error;
+        MicroFunction fn = jit->compile(block, error);
+        ASSERT_TRUE(fn) << error;
+        CpuState micro_out = initial;
+        micro_out.r[15] = kFlash;
+        micro_out.thumb = true;
+        micro_out.halted = false;
+        EXPECT_EQ(fn(&micro_out, block.ops.size()), take ? 1U : 4U);
+        expectSameState(ref_out, micro_out);
+    }
 }
 
 TEST(MicroJitEmitterTest, DeclinesMemory) {

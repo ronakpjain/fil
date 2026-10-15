@@ -29,9 +29,9 @@ namespace fil::cpu {
 struct CpuState;
 struct MicroBlock;
 
-/** Full-block kernel with scheduler prefix limits: executes up to
- *  max_instructions ops (1 <= max is assumed; 0 commits nothing). */
-using MicroFunction = void (*)(CpuState*, std::size_t);
+/** Block kernel with scheduler prefix limits: executes while data and
+ *  the limit allow, returns the retired count (0 commits nothing). */
+using MicroFunction = std::size_t (*)(CpuState*, std::size_t);
 
 class MicroJit {
 public:

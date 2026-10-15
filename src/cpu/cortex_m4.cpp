@@ -1818,10 +1818,11 @@ bool CortexM4::prepareJitBlock(const bool allow_single) {
     fresh.has_memory = has_memory;
     fresh.has_store = has_store;
     fresh.fast_base_cycles = base_sum;
-    // Bespoke stencil kernels cover pure-integer all-fast blocks wholesale.
-    // Prepare already gates on sustained use (jit_compile_threshold), so no
-    // extra hotness counter is needed: stencil emission costs microseconds.
-    if (fresh.all_fast && !fresh.has_memory && fresh.count >= 2U) {
+    // Bespoke stencil kernels cover integer superblocks wholesale, including
+    // conditional-branch flow-through that all_fast excludes. Prepare already
+    // gates on sustained use (jit_compile_threshold); lowering declines
+    // anything outside the FilIR subset, so no extra hotness counter is needed.
+    if (!fresh.has_memory && fresh.count >= 2U) {
         prepareMicroBlock(fresh);
     }
     // Precompute the peek preview: leading prefix cycles with divide at
@@ -2359,7 +2360,9 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlockImpl(
     const bool check_generation_per_op = slot.has_store;
     bool native_probe_sampled = false;
 #if FIL_HAS_LLVM_JIT
-    if (slot.native_function && state_.it_state == 0U) {
+    // A bespoke stencil kernel subsumes native dispatch for its slot: it
+    // carries no probe/policy overhead and matches the same commit contract.
+    if (slot.native_function && !slot.micro_function && state_.it_state == 0U) {
         // Samples execute both implementations on an identical shadow state,
         // and are triggered only by this sparse countdown (not per instruction).
         const auto native_count = std::min(execution_count, slot.native_count);
@@ -2408,20 +2411,24 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlockImpl(
         const std::uint8_t micro_count = static_cast<std::uint8_t>(
             std::min<std::size_t>(max_instructions, slot.count));
         if (micro_count != 0U) {
-            slot.micro_function(&state_, micro_count);
-            for (std::uint8_t i = 0U; i < micro_count; ++i) {
+            const std::size_t retired = slot.micro_function(&state_, micro_count);
+            // The kernel reports its exact retired prefix: scheduler limits
+            // via prefix exits, data-dependent conditional takes via stubs.
+            if (retired == 0U || retired > micro_count) goto commit_block;
+            const auto retired_u8 = static_cast<std::uint8_t>(retired);
+            for (std::uint8_t i = 0U; i < retired_u8; ++i) {
                 out.pcs[i] = slot.pcs[i];
                 out.sizes[i] = slot.sizes[i];
             }
-            out.count = micro_count;
-            const auto last = static_cast<std::size_t>(micro_count - 1U);
+            out.count = retired_u8;
+            const auto last = static_cast<std::size_t>(retired_u8 - 1U);
             state_.instruction_address = slot.pcs[last];
-            std::uint32_t total = slot.base_prefix_cycles[micro_count];
+            std::uint32_t total = slot.base_prefix_cycles[retired_u8];
             if (state_.r[15] != slot.pcs[last] + slot.sizes[last]) {
                 total += slot.branch_penalty[last];
             }
             if (instruction_cycles) {
-                for (std::uint8_t i = 0U; i < micro_count; ++i) {
+                for (std::uint8_t i = 0U; i < retired_u8; ++i) {
                     (*instruction_cycles)[i] = static_cast<std::uint16_t>(slot.base_cycles[i]);
                 }
                 if (state_.r[15] != slot.pcs[last] + slot.sizes[last]) {
@@ -2432,10 +2439,10 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlockImpl(
             last_pc = slot.pcs[last];
             last_raw = slot.raws[last];
             last_size = slot.sizes[last];
-            last_suppress = micro_count < slot.count ? false : slot.fast_last_suppress;
+            last_suppress = slot.suppress_obs[last];
             total_cycles = total;
             ++jit_stats_.micro_executions;
-            jit_stats_.micro_instructions += micro_count;
+            jit_stats_.micro_instructions += retired_u8;
             goto commit_block;
         }
     }

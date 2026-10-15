@@ -74,6 +74,9 @@ const char* toString(MicroOp op) noexcept {
     case MicroOp::rrx: return "rrx";
     case MicroOp::b: return "b";
     case MicroOp::bl: return "bl";
+    case MicroOp::b_cond: return "b_cond";
+    case MicroOp::cbz: return "cbz";
+    case MicroOp::cbnz: return "cbnz";
     }
     return "unknown";
 }
@@ -101,7 +104,11 @@ MicroLowerResult tryLowerMicroInst(const MicroSource& source, MicroInst& out) no
     inst.set_flags = d.set_flags;
     inst.branch_offset = d.branch_offset;
 
-    if (d.condition != Condition::al) {
+    // Only branch forms may carry a condition; everything else is AL-only
+    // (conditional ALU would need per-op predication in the kernel).
+    const bool is_branch = d.kind == InstrKind::b || d.kind == InstrKind::bl
+        || d.kind == InstrKind::cbz || d.kind == InstrKind::cbnz;
+    if (d.condition != Condition::al && !is_branch) {
         return {false, MicroLowerReason::bad_condition, "only AL is lowered"};
     }
     if (source.size != 2U && source.size != 4U) {
@@ -270,7 +277,27 @@ MicroLowerResult tryLowerMicroInst(const MicroSource& source, MicroInst& out) no
             || d.immediate_carry_valid || d.immediate_carry) {
             return {false, MicroLowerReason::bad_shape, "branch shape"};
         }
-        inst.op = d.kind == InstrKind::b ? MicroOp::b : MicroOp::bl;
+        // Conditional forward branches stay mid-block with a taken exit;
+        // unconditional forms (and BL) terminate the block.
+        inst.op = d.kind == InstrKind::b && d.condition != Condition::al
+            ? MicroOp::b_cond
+            : (d.kind == InstrKind::b ? MicroOp::b : MicroOp::bl);
+        if (inst.op == MicroOp::b_cond && d.condition == Condition::nv) {
+            return {false, MicroLowerReason::bad_condition, "NV branch"};
+        }
+        inst.condition = d.condition;
+        out = inst;
+        return {true, MicroLowerReason::ok, {}};
+    }
+    case InstrKind::cbz:
+    case InstrKind::cbnz: {
+        if (d.form != OperandForm::immediate || d.condition != Condition::al
+            || d.set_flags || !coreReg(d.rn) || d.branch_offset != 0) {
+            return {false, MicroLowerReason::bad_shape, "cbz shape"};
+        }
+        inst.op = d.kind == InstrKind::cbz ? MicroOp::cbz : MicroOp::cbnz;
+        inst.rn = d.rn;
+        inst.imm = d.imm;
         out = inst;
         return {true, MicroLowerReason::ok, {}};
     }
@@ -292,11 +319,13 @@ MicroLowerResult buildMicroBlock(std::span<const MicroSource> sources, MicroBloc
         MicroInst inst;
         MicroLowerResult r = tryLowerMicroInst(sources[i], inst);
         if (!r.ok) return r;
-        const bool is_branch = inst.op == MicroOp::b || inst.op == MicroOp::bl;
-        if (is_branch && i + 1U != sources.size()) {
+        // Unconditional control flow terminates; conditional branches flow
+        // through with a taken exit (superblock parity with prepareJitBlock).
+        const bool terminal = inst.op == MicroOp::b || inst.op == MicroOp::bl;
+        if (terminal && i + 1U != sources.size()) {
             return {false, MicroLowerReason::branch_not_terminal, "branch must terminate"};
         }
-        if (is_branch) block.ends_with_branch = true;
+        if (terminal) block.ends_with_branch = true;
         block.ops.push_back(inst);
     }
     out = std::move(block);
@@ -418,6 +447,33 @@ std::size_t interpretMicroBlock(const MicroBlock& block, MicroCpu& cpu, std::siz
                 else cpu.xpsr &= ~kFlagC;
             }
             break;
+        }
+        case MicroOp::b_cond: {
+            // Matches the cached loop: taken commits the prefix with the
+            // taken-path refill; not-taken falls through for 1 cycle.
+            const bool take = conditionPasses(op.condition, cpu.xpsr);
+            ++retired;
+            if (take) {
+                cpu.pc = static_cast<std::uint32_t>(
+                    static_cast<std::int64_t>(op.pc) + 4 + op.branch_offset) & ~1U;
+                return retired;
+            }
+            cpu.pc = op.pc + op.size;
+            continue;
+        }
+        case MicroOp::cbz:
+        case MicroOp::cbnz: {
+            // Matches execute(): r15 = (instrAddr + 4 + imm) & ~1 when taken.
+            const bool zero = readOp(cpu, op.rn) == 0U;
+            const bool take = op.op == MicroOp::cbz ? zero : !zero;
+            ++retired;
+            if (take) {
+                cpu.pc = static_cast<std::uint32_t>(
+                    static_cast<std::int64_t>(op.pc) + 4 + op.imm) & ~1U;
+                return retired;
+            }
+            cpu.pc = op.pc + op.size;
+            continue;
         }
         case MicroOp::b:
             // Matches branchTarget(): (instrAddr + 4 + offset) & ~1.

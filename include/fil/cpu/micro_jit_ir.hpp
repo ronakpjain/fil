@@ -53,6 +53,9 @@ enum class MicroOp : std::uint8_t {
     rrx,
     b,
     bl,
+    b_cond,
+    cbz,
+    cbnz,
 };
 
 /** Lowered guest instruction with normalized operands. */
@@ -62,6 +65,7 @@ struct MicroInst {
     std::uint8_t rn{0};
     std::uint8_t rm{0};
     std::uint32_t imm{0};
+    Condition condition{Condition::al};
     ShiftType shift{ShiftType::lsl};
     std::uint8_t shift_amount{0};
     bool set_flags{false};

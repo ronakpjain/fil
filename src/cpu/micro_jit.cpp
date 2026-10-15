@@ -176,6 +176,87 @@ public:
     void sub64Imm(std::uint32_t rd, std::uint32_t rn, std::uint32_t imm) {
         emit(0xD1000000U | ((imm & 0xfffU) << 10U) | ((rn & 31U) << 5U) | (rd & 31U));
     }
+    void cbzW(std::uint32_t rt, std::size_t label) {
+        fixups.push_back({words.size(), label, 1U});
+        emit(0x34000000U | (rt & 31U)); // cbz Wt, <patched>
+    }
+    void cbnzW(std::uint32_t rt, std::size_t label) {
+        fixups.push_back({words.size(), label, 1U});
+        emit(0x35000000U | (rt & 31U)); // cbnz Wt, <patched>
+    }
+    void movRet(std::uint32_t count) {
+        emit(0xD2800000U | ((count & 0xffffU) << 5U)); // movz x0, #count
+    }
+    // Evaluates a guest condition from the host flags without disturbing
+    // them (mrs/ubfm/eor/cbz only) and jumps to `taken` when it passes.
+    // Returns false for NV (rejected at lowering; defensive). Uses w1/x17.
+    bool emitCondTaken(Condition cond, std::size_t taken, std::string& error) {
+        mrsNzcv(17U);
+        const auto flag = [&](std::uint32_t bit) { ubfm(17U, 17U, bit, bit); };
+        switch (cond) {
+        case Condition::eq: flag(30U); cbnzW(17U, taken); return true;
+        case Condition::ne: flag(30U); cbzW(17U, taken); return true;
+        case Condition::cs: flag(29U); cbnzW(17U, taken); return true;
+        case Condition::cc: flag(29U); cbzW(17U, taken); return true;
+        case Condition::mi: flag(31U); cbnzW(17U, taken); return true;
+        case Condition::pl: flag(31U); cbzW(17U, taken); return true;
+        case Condition::vs: flag(28U); cbnzW(17U, taken); return true;
+        case Condition::vc: flag(28U); cbzW(17U, taken); return true;
+        case Condition::hi: { // C && !Z
+            flag(29U);
+            const auto done = makeLabel();
+            cbzW(17U, done);
+            mrsNzcv(17U);
+            flag(30U);
+            cbnzW(17U, taken);
+            bindLabel(done);
+            return true;
+        }
+        case Condition::ls: // !C || Z
+            flag(29U);
+            cbzW(17U, taken);
+            mrsNzcv(17U);
+            flag(30U);
+            cbnzW(17U, taken);
+            return true;
+        case Condition::ge: // N == V
+        case Condition::lt: { // N != V
+            ubfm(1U, 17U, 31U, 31U); // N -> w1
+            flag(28U); // V -> w17
+            logicReg(3U, 1U, 1U, 17U); // eor w1, w1, w17 (no flags)
+            if (cond == Condition::ge) cbzW(1U, taken);
+            else cbnzW(1U, taken);
+            return true;
+        }
+        case Condition::gt: { // !Z && N == V
+            flag(30U);
+            const auto done = makeLabel();
+            cbnzW(17U, done);
+            mrsNzcv(17U);
+            ubfm(1U, 17U, 31U, 31U);
+            flag(28U);
+            logicReg(3U, 1U, 1U, 17U);
+            cbzW(1U, taken);
+            bindLabel(done);
+            return true;
+        }
+        case Condition::le: // Z || N != V
+            flag(30U);
+            cbnzW(17U, taken);
+            mrsNzcv(17U);
+            ubfm(1U, 17U, 31U, 31U);
+            flag(28U);
+            logicReg(3U, 1U, 1U, 17U);
+            cbnzW(1U, taken);
+            return true;
+        case Condition::al: b(taken); return true;
+        case Condition::nv:
+            error = "micro-jit: NV condition";
+            return false;
+        }
+        error = "micro-jit: unknown condition";
+        return false;
+    }
     void b(std::size_t label) {
         fixups.push_back({words.size(), label, 2U});
         emit(0x14000000U); // b <patched>
@@ -517,8 +598,13 @@ bool emitOp(Emitter& e, const MicroInst& op, std::string& error) {
     }
     case MicroOp::b:
     case MicroOp::bl:
-        // Terminal PC/LR effects are compile-time constants in the epilogue.
-        return true;
+        return true; // terminal PC/LR effects are compile-time constants
+    case MicroOp::b_cond:
+    case MicroOp::cbz:
+    case MicroOp::cbnz:
+        // Control transfer is emitted by compile() (needs taken stubs).
+        error = "micro-jit: conditional branch in emitOp";
+        return false;
     }
     error = "unhandled micro op";
     return false;
@@ -679,22 +765,61 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
     std::vector<std::size_t> exit_labels;
     exit_labels.reserve(block.ops.size());
     for (std::size_t i = 0; i < block.ops.size(); ++i) exit_labels.push_back(e.makeLabel());
+    // Taken-branch stubs, one per conditional op (bound after the epilogues).
+    std::vector<std::size_t> taken_labels(block.ops.size(), 0U);
+    std::vector<bool> has_taken(block.ops.size(), false);
+    std::vector<std::uint32_t> taken_targets(block.ops.size(), 0U);
     for (std::size_t i = 0; i < block.ops.size(); ++i) {
-        if (!emitOp(e, block.ops[i], error)) return nullptr;
+        const auto& op = block.ops[i];
+        if (op.op == MicroOp::b_cond) {
+            taken_labels[i] = e.makeLabel();
+            has_taken[i] = true;
+            taken_targets[i] = static_cast<std::uint32_t>(
+                static_cast<std::int64_t>(op.pc) + 4 + op.branch_offset) & ~1U;
+        } else if (op.op == MicroOp::cbz || op.op == MicroOp::cbnz) {
+            taken_labels[i] = e.makeLabel();
+            has_taken[i] = true;
+            taken_targets[i] = static_cast<std::uint32_t>(
+                static_cast<std::int64_t>(op.pc) + 4 + op.imm) & ~1U;
+        }
+    }
+    for (std::size_t i = 0; i < block.ops.size(); ++i) {
+        const auto& op = block.ops[i];
+        if (op.op == MicroOp::b_cond) {
+            if (!e.emitCondTaken(op.condition, taken_labels[i], error)) return nullptr;
+        } else if (op.op == MicroOp::cbz) {
+            e.cbzW(hostReg(op.rn), taken_labels[i]); // taken when zero
+        } else if (op.op == MicroOp::cbnz) {
+            e.cbnzW(hostReg(op.rn), taken_labels[i]);
+        } else if (!emitOp(e, op, error)) {
+            return nullptr;
+        }
         if (i + 1U < block.ops.size()) {
             // After op i, i+1 ops retired: exit iff max < i+2.
             e.checkMax(static_cast<std::uint32_t>(i + 2U), exit_labels[i + 1U]);
         }
     }
     emitEpilogue(final_pc, last_pc, true);
-    e.b(done_label);
+    e.movRet(static_cast<std::uint32_t>(block.ops.size()));
+    const std::size_t end_label = e.makeLabel();
+    e.b(end_label);
     for (std::size_t i = 1U; i < block.ops.size(); ++i) {
         e.bindLabel(exit_labels[i]);
         // Retired ops [0, i): next PC is pcs[i], last address pcs[i-1].
         emitEpilogue(block.ops[i].pc, block.ops[i - 1U].pc, false);
+        e.movRet(static_cast<std::uint32_t>(i));
+        e.ret();
+    }
+    for (std::size_t i = 0; i < block.ops.size(); ++i) {
+        if (!has_taken[i]) continue;
+        e.bindLabel(taken_labels[i]);
+        emitEpilogue(taken_targets[i], block.ops[i].pc, false);
+        e.movRet(static_cast<std::uint32_t>(i + 1U));
         e.ret();
     }
     e.bindLabel(done_label);
+    e.movRet(0U);
+    e.bindLabel(end_label);
     e.ret();
     if (!e.patchBranches(error)) return nullptr;
 
