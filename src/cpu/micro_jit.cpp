@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <mutex>
 #include <vector>
 
@@ -48,6 +49,24 @@ constexpr std::uint32_t kFlagMask = xpsr_n | xpsr_z | xpsr_c | xpsr_v;
 // Guest r[i] -> host w(i+2); guest LR -> w15.
 constexpr std::uint32_t hostReg(std::uint8_t guest) noexcept {
     return guest == 14U ? 15U : static_cast<std::uint32_t>(2U + guest);
+}
+
+bool sameMicroInst(const MicroInst& a, const MicroInst& b) noexcept {
+    return a.op == b.op && a.rd == b.rd && a.rn == b.rn && a.rm == b.rm
+        && a.imm == b.imm && a.condition == b.condition && a.shift == b.shift
+        && a.shift_amount == b.shift_amount && a.set_flags == b.set_flags
+        && a.carry_valid == b.carry_valid && a.carry == b.carry
+        && a.shift_immediate == b.shift_immediate && a.branch_offset == b.branch_offset
+        && a.pc == b.pc && a.size == b.size;
+}
+
+bool sameMicroBlock(const MicroBlock& a, const MicroBlock& b) noexcept {
+    if (a.entry_pc != b.entry_pc || a.ends_with_branch != b.ends_with_branch
+        || a.ops.size() != b.ops.size()) return false;
+    for (std::size_t i = 0U; i < a.ops.size(); ++i) {
+        if (!sameMicroInst(a.ops[i], b.ops[i])) return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -639,7 +658,14 @@ bool emitOp(Emitter& e, const MicroInst& op, std::string& error) {
 
 struct MicroJit::Impl {
 #ifdef FIL_MICRO_JIT_AARCH64
+    struct CacheEntry {
+        MicroBlock block;
+        MicroFunction function{nullptr};
+    };
+    static constexpr std::size_t kCacheEntries = 128U;
+
     std::mutex mutex;
+    std::vector<CacheEntry> cache;
     std::uint8_t* base{nullptr};
     std::size_t capacity{0};
     std::size_t used{0};
@@ -736,6 +762,20 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
         error = "micro-jit: bad block size";
         return nullptr;
     }
+    // Serialize compilation and cache lookup: a hit reuses immutable code
+    // while the arena remains owned by this MicroJit instance.
+    std::lock_guard lock(impl_->mutex);
+    for (auto it = impl_->cache.begin(); it != impl_->cache.end(); ++it) {
+        if (sameMicroBlock(it->block, block)) {
+            const MicroFunction function = it->function;
+            if (std::next(it) != impl_->cache.end()) {
+                Impl::CacheEntry recent = std::move(*it);
+                impl_->cache.erase(it);
+                impl_->cache.push_back(std::move(recent));
+            }
+            return function;
+        }
+    }
     // Resolve terminal PC/LR effects now: branchTarget() + BL link value.
     std::uint32_t final_pc = 0U;
     std::uint32_t last_pc = 0U;
@@ -758,18 +798,68 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
     const std::size_t xpsr_off = offsetof(CpuState, xpsr);
     const std::size_t addr_off = offsetof(CpuState, instruction_address);
 
+    // Mask bits 0..12 are r0-r12; bit 13 represents LR (r14).
     Emitter e;
-    // Prologue: seed host flags from guest xPSR, retain non-NZCV bits,
-    // load r0-r12 + LR. x1 carries the scheduler prefix limit.
+    std::uint16_t read_mask = 0U;
+    std::uint16_t write_mask = 0U;
+    const auto reg_bit = [](std::uint8_t reg) -> std::uint16_t {
+        return reg <= 12U ? static_cast<std::uint16_t>(1U << reg)
+            : reg == 14U ? static_cast<std::uint16_t>(1U << 13U) : 0U;
+    };
+    for (const auto& op : block.ops) {
+        const auto reads = [&](std::uint8_t reg) { read_mask |= reg_bit(reg); };
+        const auto writes = [&](std::uint8_t reg) { write_mask |= reg_bit(reg); };
+        switch (op.op) {
+        case MicroOp::mov_imm: case MicroOp::movw: writes(op.rd); break;
+        case MicroOp::movt: reads(op.rd); writes(op.rd); break;
+        case MicroOp::add_imm: case MicroOp::sub_imm: reads(op.rn); writes(op.rd); break;
+        case MicroOp::cmp_imm: case MicroOp::cmn_imm: reads(op.rn); break;
+        case MicroOp::add_reg: case MicroOp::sub_reg:
+        case MicroOp::and_reg: case MicroOp::orr_reg: case MicroOp::eor_reg: case MicroOp::bic_reg:
+            reads(op.rn); reads(op.rm); writes(op.rd); break;
+        case MicroOp::add_shift: case MicroOp::sub_shift:
+            reads(op.rn); reads(op.rm); writes(op.rd); break;
+        case MicroOp::lsl: case MicroOp::lsr: case MicroOp::asr: case MicroOp::ror: case MicroOp::rrx:
+            if (op.shift_immediate) reads(op.rm);
+            else { reads(op.rn); reads(op.rm); }
+            writes(op.rd); break;
+        case MicroOp::cbz: case MicroOp::cbnz: reads(op.rn); break;
+        case MicroOp::bl: write_mask |= static_cast<std::uint16_t>(1U << 13U); break;
+        case MicroOp::nop: case MicroOp::b: case MicroOp::b_cond: break;
+        }
+    }
+    // Load every register referenced by the block, including destinations,
+    // so a prefix ending before a later write can safely commit the old value.
+    const std::uint16_t load_mask = static_cast<std::uint16_t>(read_mask | write_mask);
+    const auto emitRegisterTransfers = [&](std::uint16_t mask, bool store) {
+        auto transferOne = [&](std::uint32_t guest) {
+            const std::size_t off = guest == 13U ? r_off + 56U : r_off + guest * 4U;
+            const std::uint32_t host = guest == 13U ? 15U : 2U + guest;
+            if (store) e.strW(host, off); else e.ldrW(host, off);
+        };
+        for (std::uint32_t guest = 0U; guest < 13U;) {
+            if ((mask & (1U << guest)) == 0U) { ++guest; continue; }
+            if (guest < 12U && (mask & (1U << (guest + 1U))) != 0U) {
+                const std::size_t off = r_off + guest * 4U;
+                if (store) e.stpW(2U + guest, 3U + guest, off);
+                else e.ldpW(2U + guest, 3U + guest, off);
+                guest += 2U;
+            } else {
+                transferOne(guest++);
+            }
+        }
+        if ((mask & (1U << 13U)) != 0U) transferOne(13U);
+    };
+
+    // Prologue: seed host flags from guest xPSR and load only touched
+    // registers. x1 carries the scheduler prefix limit.
     e.ldrW(16U, xpsr_off);
     e.msrNzcv(16U);
     e.clearTopNibble(16U); // retained xPSR bits (~N/Z/C/V)
     const std::size_t done_label = e.makeLabel();
     e.cbzX1(done_label); // max == 0 commits nothing.
     e.stashMax(); // high32 of x16; low32 keeps retained bits.
-    for (std::uint32_t i = 0U; i < 6U; ++i) e.ldpW(2U + 2U * i, 3U + 2U * i, r_off + 8U * i);
-    e.ldrW(14U, r_off + 48U);
-    e.ldrW(15U, r_off + 56U);
+    emitRegisterTransfers(load_mask, false);
     // Commit epilogue shared by the full path and every prefix exit:
     // merge flags, store regs, then constant r15/instruction_address.
     // Prefix exits skip the BL link update (a terminal BL only runs full).
@@ -780,9 +870,7 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
         e.mrsNzcv(17U);
         e.logicReg(2U, 16U, 16U, 17U); // orr w16, w16, w17
         e.strW(16U, xpsr_off);
-        for (std::uint32_t i = 0U; i < 6U; ++i) e.stpW(2U + 2U * i, 3U + 2U * i, r_off + 8U * i);
-        e.strW(14U, r_off + 48U);
-        e.strW(15U, r_off + 56U);
+        emitRegisterTransfers(write_mask, true);
         e.movImm(17U, pc_value);
         e.strW(17U, r_off + 60U);
         e.movImm(17U, ia_value);
@@ -855,7 +943,6 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
                   << std::setfill('0') << e.words[i] << std::dec << '\n';
     }
 #endif
-    std::lock_guard lock(impl_->mutex);
     if (!impl_->makeWritable(error)) return nullptr;
     std::size_t bytes = 0U;
     void* slot = impl_->append(e.words, error, bytes);
@@ -865,6 +952,8 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
     bytes_emitted_ += bytes;
     MicroFunction fn = nullptr;
     std::memcpy(&fn, &slot, sizeof(fn));
+    if (impl_->cache.size() == Impl::kCacheEntries) impl_->cache.erase(impl_->cache.begin());
+    impl_->cache.push_back(Impl::CacheEntry{block, fn});
     return fn;
 #else
     (void)block;

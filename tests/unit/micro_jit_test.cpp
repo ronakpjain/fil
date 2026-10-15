@@ -175,6 +175,40 @@ TEST(MicroJitEmitterTest, TerminalBranch) {
     checkProgram({0xBF00U, 0xBF00U, 0xE000U}, 5U);
 }
 
+TEST(MicroJitEmitterTest, CompileCacheReusesExactBlocks) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no micro-jit emitter on this host";
+    std::vector<MicroSource> sources{
+        MicroSource{*fil::cpu::decode16(0x2001U), kFlash, 2U},
+        MicroSource{*fil::cpu::decode16(0x2102U), kFlash + 2U, 2U},
+    };
+    MicroBlock original;
+    ASSERT_TRUE(fil::cpu::buildMicroBlock(sources, original).ok);
+    std::string error;
+    auto jit = MicroJit::create(error); ASSERT_TRUE(jit) << error;
+
+    const MicroFunction first = jit->compile(original, error);
+    ASSERT_NE(first, nullptr) << error;
+    const auto first_bytes = jit->bytesEmitted();
+    EXPECT_EQ(jit->compilations(), 1U);
+    ASSERT_NE(jit->compile(original, error), nullptr) << error;
+    EXPECT_EQ(jit->compile(original, error), first);
+    EXPECT_EQ(jit->compilations(), 1U);
+    EXPECT_EQ(jit->bytesEmitted(), first_bytes);
+
+    MicroBlock changed_operand = original;
+    ++changed_operand.ops[0].imm;
+    ASSERT_NE(jit->compile(changed_operand, error), nullptr) << error;
+    EXPECT_EQ(jit->compilations(), 2U);
+    EXPECT_GT(jit->bytesEmitted(), first_bytes);
+
+    MicroBlock changed_pc = original;
+    changed_pc.entry_pc += 2U;
+    changed_pc.ops[0].pc += 2U;
+    changed_pc.ops[1].pc += 2U;
+    ASSERT_NE(jit->compile(changed_pc, error), nullptr) << error;
+    EXPECT_EQ(jit->compilations(), 3U);
+}
+
 TEST(MicroJitEmitterTest, PrefixExitsCommitPrecisely) {
     if (!MicroJit::hostSupported()) GTEST_SKIP() << "no micro-jit emitter on this host";
     // movs r0,#1; movs r1,#2; movs r2,#3: retire 1 and 2-op prefixes.
@@ -194,12 +228,16 @@ TEST(MicroJitEmitterTest, PrefixExitsCommitPrecisely) {
     ASSERT_TRUE(fn) << error;
     for (const std::size_t max : {1U, 2U, 3U, 16U}) {
         CpuState state;
+        for (std::size_t reg = 0U; reg <= 14U; ++reg)
+            state.r[reg] = 0xA5000000U + static_cast<std::uint32_t>(reg);
         state.r[15] = kFlash;
         fn(&state, max);
         const std::size_t retired = std::min<std::size_t>(max, 3U);
-        EXPECT_EQ(state.r[0], retired >= 1U ? 1U : 0U);
-        EXPECT_EQ(state.r[1], retired >= 2U ? 2U : 0U);
-        EXPECT_EQ(state.r[2], retired >= 3U ? 3U : 0U);
+        EXPECT_EQ(state.r[0], 1U);
+        EXPECT_EQ(state.r[1], retired >= 2U ? 2U : 0xA5000001U);
+        EXPECT_EQ(state.r[2], retired >= 3U ? 3U : 0xA5000002U);
+        for (std::size_t reg = 3U; reg <= 14U; ++reg)
+            EXPECT_EQ(state.r[reg], 0xA5000000U + static_cast<std::uint32_t>(reg)) << "r" << reg;
         EXPECT_EQ(state.r[15], kFlash + static_cast<std::uint32_t>(2U * retired));
         EXPECT_EQ(state.instruction_address,
                   retired == 0U ? 0U : kFlash + static_cast<std::uint32_t>(2U * (retired - 1U)));
@@ -210,6 +248,44 @@ TEST(MicroJitEmitterTest, PrefixExitsCommitPrecisely) {
     fn(&untouched, 0U);
     EXPECT_EQ(untouched.r[0], 0U);
     EXPECT_EQ(untouched.r[15], kFlash);
+}
+
+TEST(MicroJitEmitterTest, PrefixBeforeBlPreservesLrAndBlWritesLink) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no micro-jit emitter on this host";
+    constexpr std::uint32_t initial_lr = 0x12345678U;
+    const auto mov = fil::cpu::decode16(0x2001U);
+    const auto bl = fil::cpu::decode32(0xF000U, 0xF800U);
+    ASSERT_TRUE(mov && bl);
+    const std::array<MicroSource, 2> sources{{
+        {*mov, kFlash, 2U}, {*bl, kFlash + 2U, 4U}}};
+    MicroBlock block;
+    ASSERT_TRUE(fil::cpu::buildMicroBlock(sources, block).ok);
+    std::string error;
+    auto jit = MicroJit::create(error); ASSERT_TRUE(jit) << error;
+    auto fn = jit->compile(block, error); ASSERT_TRUE(fn) << error;
+
+    for (const std::size_t limit : {1U, 2U}) {
+        Fixture f;
+        write16(f, kFlash, 0x2001U);
+        write16(f, kFlash + 2U, 0xF000U);
+        write16(f, kFlash + 4U, 0xF800U);
+        CpuState initial;
+        for (std::size_t reg = 0U; reg <= 14U; ++reg)
+            initial.r[reg] = 0xB6000000U + static_cast<std::uint32_t>(reg);
+        initial.r[14] = initial_lr;
+        initial.r[13] = kRam + 2048U;
+        initial.xpsr = (1U << 24U) | 0x000F0000U;
+        f.cpu.state() = initial; f.cpu.state().r[15] = kFlash;
+        f.cpu.state().thumb = true; f.cpu.state().halted = false;
+        for (std::size_t i = 0; i < limit; ++i)
+            ASSERT_EQ(f.cpu.stepFast().reason, fil::cpu::StopReason::step_complete);
+        const CpuState reference = f.cpu.state();
+        CpuState actual = initial; actual.r[15] = kFlash; actual.thumb = true;
+        const auto result = fn(&actual, limit);
+        EXPECT_EQ(static_cast<std::size_t>(result & 0xffffffffU), limit);
+        expectSameState(reference, actual);
+        EXPECT_EQ(actual.r[14], limit == 1U ? initial_lr : ((kFlash + 6U) | 1U));
+    }
 }
 
 TEST(MicroJitEmitterTest, ConditionalBranchTakenAndFallthrough) {

@@ -398,6 +398,7 @@ void CortexM4::prepareMicroBlock(JitBlockEntry& entry) {
     MicroBlock block;
     if (!buildMicroBlock({sources.data(), prefix}, block).ok) return;
     if (!ensureMicroJit()) return;
+    const auto compilations_before = micro_jit_->compilations();
     const auto compile_start = std::chrono::steady_clock::now();
     MicroFunction fn = micro_jit_->compile(block, micro_jit_error_);
     const auto compile_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<
@@ -410,7 +411,9 @@ void CortexM4::prepareMicroBlock(JitBlockEntry& entry) {
     }
     entry.micro_function = fn;
     entry.micro_prefix_count = prefix;
-    ++jit_stats_.micro_compilations;
+    // Reattaching an already emitted kernel after a block-cache eviction is
+    // not a new native compilation.
+    jit_stats_.micro_compilations += micro_jit_->compilations() - compilations_before;
 }
 
 bool CortexM4::reset(const elf::ElfImage& image) noexcept {
