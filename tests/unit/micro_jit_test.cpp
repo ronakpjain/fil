@@ -46,11 +46,30 @@ void write16(Fixture& f, std::uint32_t addr, std::uint16_t half) {
     EXPECT_TRUE(f.bus.loadBytes(addr, bytes).hasValue());
 }
 
-std::uint32_t runReference(Fixture& f, const std::vector<std::uint16_t>& code,
-                           const CpuState& initial, CpuState& final_out, int steps) {
+void loadProgram(Fixture& f, const std::vector<std::uint16_t>& code) {
     for (std::size_t i = 0; i < code.size(); ++i) {
         write16(f, kFlash + static_cast<std::uint32_t>(2U * i), code[i]);
     }
+}
+
+std::vector<MicroSource> decodeProgram(const std::vector<std::uint16_t>& code) {
+    std::vector<MicroSource> sources;
+    std::uint32_t pc = kFlash;
+    for (const auto half : code) {
+        auto decoded = fil::cpu::decode16(half);
+        if (!decoded) {
+            ADD_FAILURE() << "decode16 failed for " << std::hex << half;
+            return {};
+        }
+        sources.push_back(MicroSource{*decoded, pc, 2U});
+        pc += 2U;
+    }
+    return sources;
+}
+
+std::uint32_t runReference(Fixture& f, const std::vector<std::uint16_t>& code,
+                           const CpuState& initial, CpuState& final_out, int steps) {
+    loadProgram(f, code);
     f.cpu.state() = initial;
     f.cpu.state().r[15] = kFlash;
     f.cpu.state().thumb = true;
@@ -216,12 +235,7 @@ TEST(MicroJitEmitterTest, ConditionalBranchTakenAndFallthrough) {
         Fixture f;
         CpuState ref_out{};
         // Reference steps until PC leaves the straight-line region.
-        for (std::size_t i = 0; i < prog.size(); ++i) {
-            std::array<std::uint8_t, 2> by{
-                static_cast<std::uint8_t>(prog[i]), static_cast<std::uint8_t>(prog[i] >> 8U)};
-            EXPECT_TRUE(f.bus.loadBytes(kFlash + static_cast<std::uint32_t>(2U * i), by)
-                            .hasValue());
-        }
+        loadProgram(f, prog);
         f.cpu.state() = initial;
         f.cpu.state().r[15] = kFlash;
         f.cpu.state().thumb = true;
@@ -233,14 +247,8 @@ TEST(MicroJitEmitterTest, ConditionalBranchTakenAndFallthrough) {
         }
         ref_out = f.cpu.state();
         // Micro side.
-        std::vector<MicroSource> sources;
-        std::uint32_t pc = kFlash;
-        for (const auto half : prog) {
-            auto decoded = fil::cpu::decode16(half);
-            ASSERT_TRUE(decoded.has_value());
-            sources.push_back(MicroSource{*decoded, pc, 2U});
-            pc += 2U;
-        }
+        const auto sources = decodeProgram(prog);
+        ASSERT_EQ(sources.size(), prog.size());
         MicroBlock block;
         ASSERT_TRUE(fil::cpu::buildMicroBlock({sources.data(), sources.size()}, block).ok);
         std::string error;
@@ -277,12 +285,7 @@ TEST(MicroJitEmitterTest, CbzCbnz) {
     const std::vector<std::uint16_t> code{cbz(0, 2), 0xBF00U, 0xBF00U, 0x2107U};
     for (const std::uint32_t r0 : {0U, 5U}) {
         Fixture f;
-        for (std::size_t i = 0; i < code.size(); ++i) {
-            std::array<std::uint8_t, 2> by{
-                static_cast<std::uint8_t>(code[i]), static_cast<std::uint8_t>(code[i] >> 8U)};
-            ASSERT_TRUE(f.bus.loadBytes(kFlash + static_cast<std::uint32_t>(2U * i), by)
-                            .hasValue());
-        }
+        loadProgram(f, code);
         CpuState initial;
         initial.r[0] = r0;
         initial.xpsr = (1U << 24U);
@@ -297,14 +300,8 @@ TEST(MicroJitEmitterTest, CbzCbnz) {
             ASSERT_EQ(f.cpu.stepFast().reason, fil::cpu::StopReason::step_complete);
         }
         const CpuState ref_out = f.cpu.state();
-        std::vector<MicroSource> sources;
-        std::uint32_t pc = kFlash;
-        for (const auto half : code) {
-            auto decoded = fil::cpu::decode16(half);
-            ASSERT_TRUE(decoded.has_value());
-            sources.push_back(MicroSource{*decoded, pc, 2U});
-            pc += 2U;
-        }
+        const auto sources = decodeProgram(code);
+        ASSERT_EQ(sources.size(), code.size());
         MicroBlock block;
         ASSERT_TRUE(fil::cpu::buildMicroBlock({sources.data(), sources.size()}, block).ok);
         std::string error;
@@ -330,12 +327,7 @@ TEST(MicroJitEmitterTest, AllConditionsMatchInterpreterAndReportFailed) {
         const std::vector<std::uint16_t> code{0xBF00U, branch, 0xBF00U, 0xBF00U, 0xBF00U};
         for (std::uint32_t flags = 0U; flags < 16U; ++flags) {
             Fixture f;
-            for (std::size_t i = 0; i < code.size(); ++i) {
-                std::array<std::uint8_t, 2> by{
-                    static_cast<std::uint8_t>(code[i]), static_cast<std::uint8_t>(code[i] >> 8U)};
-                ASSERT_TRUE(
-                    f.bus.loadBytes(kFlash + static_cast<std::uint32_t>(2U * i), by).hasValue());
-            }
+            loadProgram(f, code);
             CpuState initial;
             initial.xpsr = (1U << 24U) | 0x000F0000U | (flags << 28U);
             initial.r[13] = kRam + 2048U;
