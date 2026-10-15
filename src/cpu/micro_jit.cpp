@@ -30,6 +30,11 @@
 #include <mutex>
 #include <vector>
 
+#if defined(FIL_MICRO_JIT_DUMP)
+#include <iomanip>
+#include <iostream>
+#endif
+
 #if defined(__aarch64__) || defined(_M_ARM64)
 #define FIL_MICRO_JIT_AARCH64 1
 #include <sys/mman.h>
@@ -844,10 +849,12 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
     e.ret();
     if (!e.patchBranches(error)) return nullptr;
 
-    if (std::getenv("FIL_MICRO_JIT_DUMP") != nullptr) {
-        for (std::size_t i = 0; i < e.words.size(); ++i)
-            std::fprintf(stderr, "  micro[%zu] = %08x\n", i, e.words[i]);
+#if defined(FIL_MICRO_JIT_DUMP)
+    for (std::size_t i = 0; i < e.words.size(); ++i) {
+        std::clog << "  micro[" << i << "] = " << std::hex << std::setw(8)
+                  << std::setfill('0') << e.words[i] << std::dec << '\n';
     }
+#endif
     std::lock_guard lock(impl_->mutex);
     if (!impl_->makeWritable(error)) return nullptr;
     std::size_t bytes = 0U;
