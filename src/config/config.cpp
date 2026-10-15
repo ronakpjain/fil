@@ -538,16 +538,34 @@ std::filesystem::path resolveRelative(
 namespace {
 using namespace detail;
 
+/// @brief Parses a named object after validating its keyed-object shape.
+template <typename Value, typename ParseEntry>
+Result<std::vector<Value>> parseNamedObject(
+    const JsonValue& value,
+    const std::filesystem::path& path,
+    const std::string_view description,
+    ParseEntry&& parse_entry
+) {
+    auto entries = requireObject(value, path, description);
+    if (!entries) return entries.error();
+    std::vector<Value> result;
+    result.reserve(entries.value()->size());
+    for (const auto& [name, definition] : *entries.value()) {
+        auto parsed = parse_entry(name, *definition);
+        if (!parsed) return parsed.error();
+        result.push_back(std::move(parsed).value());
+    }
+    return result;
+}
+
 /// @brief Parses the board `gpio` object keyed by pin name.
 Result<std::vector<GpioPinConfig>> parseGpio(
     const JsonValue& value,
     const std::filesystem::path& path
 ) {
-    auto pins = requireObject(value, path, "key 'gpio'");
-    if (!pins) return pins.error();
-    std::vector<GpioPinConfig> result;
-    for (const auto& [pin, definition] : *pins.value()) {
-        auto object = requireObject(*definition, path, "GPIO pin '" + pin + "'");
+    return parseNamedObject<GpioPinConfig>(value, path, "key 'gpio'",
+        [&](const std::string& pin, const JsonValue& definition) -> Result<GpioPinConfig> {
+        auto object = requireObject(definition, path, "GPIO pin '" + pin + "'");
         if (!object) return object.error();
         auto unknown = rejectUnknown(*object.value(), path, {"mode", "value", "trace"});
         if (!unknown) return unknown.error();
@@ -572,9 +590,8 @@ Result<std::vector<GpioPinConfig>> parseGpio(
             if (!parsed) return parsed.error();
             config.trace = parsed.value();
         }
-        result.push_back(std::move(config));
-    }
-    return result;
+        return config;
+    });
 }
 
 /// @brief Parses the board `can` object keyed by controller name.
@@ -582,11 +599,9 @@ Result<std::vector<CanControllerConfig>> parseCan(
     const JsonValue& value,
     const std::filesystem::path& path
 ) {
-    auto controllers = requireObject(value, path, "key 'can'");
-    if (!controllers) return controllers.error();
-    std::vector<CanControllerConfig> result;
-    for (const auto& [instance, definition] : *controllers.value()) {
-        auto object = requireObject(*definition, path, "CAN controller '" + instance + "'");
+    return parseNamedObject<CanControllerConfig>(value, path, "key 'can'",
+        [&](const std::string& instance, const JsonValue& definition) -> Result<CanControllerConfig> {
+        auto object = requireObject(definition, path, "CAN controller '" + instance + "'");
         if (!object) return object.error();
         auto unknown = rejectUnknown(*object.value(), path, {"bus", "loopback"});
         if (!unknown) return unknown.error();
@@ -598,9 +613,8 @@ Result<std::vector<CanControllerConfig>> parseCan(
             if (!parsed) return parsed.error();
             config.loopback = parsed.value();
         }
-        result.push_back(std::move(config));
-    }
-    return result;
+        return config;
+    });
 }
 
 /// @brief Parses the board `usart` object keyed by peripheral name.
@@ -608,11 +622,9 @@ Result<std::vector<UsartConfig>> parseUsart(
     const JsonValue& value,
     const std::filesystem::path& path
 ) {
-    auto controllers = requireObject(value, path, "key 'usart'");
-    if (!controllers) return controllers.error();
-    std::vector<UsartConfig> result;
-    for (const auto& [instance, definition] : *controllers.value()) {
-        auto object = requireObject(*definition, path, "USART '" + instance + "'");
+    return parseNamedObject<UsartConfig>(value, path, "key 'usart'",
+        [&](const std::string& instance, const JsonValue& definition) -> Result<UsartConfig> {
+        auto object = requireObject(definition, path, "USART '" + instance + "'");
         if (!object) return object.error();
         auto unknown = rejectUnknown(*object.value(), path, {"tx_log", "rx"});
         if (!unknown) return unknown.error();
@@ -635,9 +647,8 @@ Result<std::vector<UsartConfig>> parseUsart(
                 config.scripted_rx.push_back(static_cast<std::uint8_t>(parsed.value()));
             }
         }
-        result.push_back(std::move(config));
-    }
-    return result;
+        return config;
+    });
 }
 
 /// @brief Parses one ADC channel scalar or waveform object.
@@ -692,11 +703,9 @@ Result<std::vector<AdcConfig>> parseAdc(
     const JsonValue& value,
     const std::filesystem::path& path
 ) {
-    auto controllers = requireObject(value, path, "key 'adc'");
-    if (!controllers) return controllers.error();
-    std::vector<AdcConfig> result;
-    for (const auto& [instance, definition] : *controllers.value()) {
-        auto object = requireObject(*definition, path, "ADC '" + instance + "'");
+    return parseNamedObject<AdcConfig>(value, path, "key 'adc'",
+        [&](const std::string& instance, const JsonValue& definition) -> Result<AdcConfig> {
+        auto object = requireObject(definition, path, "ADC '" + instance + "'");
         if (!object) return object.error();
         auto unknown = rejectUnknown(*object.value(), path, {"channels"});
         if (!unknown) return unknown.error();
@@ -715,9 +724,8 @@ Result<std::vector<AdcConfig>> parseAdc(
             if (!parsed) return parsed.error();
             config.channels.emplace(static_cast<std::uint8_t>(channel.value()), std::move(parsed).value());
         }
-        result.push_back(std::move(config));
-    }
-    return result;
+        return config;
+    });
 }
 
 /// @brief Parses the board `spi` object keyed by peripheral name.
@@ -725,11 +733,9 @@ Result<std::vector<SpiConfig>> parseSpi(
     const JsonValue& value,
     const std::filesystem::path& path
 ) {
-    auto controllers = requireObject(value, path, "key 'spi'");
-    if (!controllers) return controllers.error();
-    std::vector<SpiConfig> result;
-    for (const auto& [instance, definition] : *controllers.value()) {
-        auto object = requireObject(*definition, path, "SPI '" + instance + "'");
+    return parseNamedObject<SpiConfig>(value, path, "key 'spi'",
+        [&](const std::string& instance, const JsonValue& definition) -> Result<SpiConfig> {
+        auto object = requireObject(definition, path, "SPI '" + instance + "'");
         if (!object) return object.error();
         auto unknown = rejectUnknown(*object.value(), path, {"device"});
         if (!unknown) return unknown.error();
@@ -740,9 +746,8 @@ Result<std::vector<SpiConfig>> parseSpi(
             if (!parsed) return parsed.error();
             config.device = std::move(parsed).value();
         }
-        result.push_back(std::move(config));
-    }
-    return result;
+        return config;
+    });
 }
 
 } // namespace

@@ -50,7 +50,7 @@ TEST(SmokeTest, ExecutionSlowdownSwitchesAreRejected) {
     for (const std::string_view command : {"run", "run-network", "watch-network", "serve-network"}) {
         for (const std::string_view option : {
                  "--no-jit", "--no-ram-capsules", "--no-loop-batching",
-                 "--deferred-prefixes"}) {
+                 "--deferred-prefixes", "--jit", "--ram-capsules", "--loop-batching"}) {
             if (command == "run" && option == "--no-ram-capsules") continue;
             std::vector<std::string_view> args{command, "missing-jit-config.json", option};
             if (command == "serve-network") {
@@ -77,17 +77,6 @@ TEST(SmokeTest, FidelityReducingAdcDecimationRemainsExplicitlyAvailable) {
         std::ostringstream err;
         EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::config_error) << command;
         EXPECT_EQ(err.str().find("unknown"), std::string::npos) << command;
-    }
-}
-
-TEST(SmokeTest, PositiveJitAndCapsuleAndLoopBatchOptionsAreRejected) {
-    for (const std::string_view option : {"--jit", "--ram-capsules", "--loop-batching"}) {
-        const std::string_view args[]{"run", "missing-jit-config.json", option};
-        std::ostringstream out;
-        std::ostringstream err;
-        const auto result = fil::cli::run(args, out, err);
-        EXPECT_EQ(result, fil::cli::ExitCode::usage_error) << option;
-        EXPECT_NE(err.str().find("unknown"), std::string::npos) << option;
     }
 }
 

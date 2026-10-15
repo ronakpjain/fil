@@ -40,6 +40,14 @@ namespace {
 
 constexpr std::string_view version = "0.1.0";
 
+std::optional<std::string_view> nextOptionValue(
+    const std::span<const std::string_view> args,
+    std::size_t& index
+) {
+    if (index + 1U >= args.size()) return std::nullopt;
+    return args[++index];
+}
+
 struct PendingCanInjection {
     std::string bus;
     std::uint64_t at_ms{0};
@@ -671,12 +679,8 @@ ExitCode runBoardCommand(
 
     for (std::size_t index = 2; index < args.size(); ++index) {
         const std::string_view option = args[index];
-        const auto valueAfter = [&]() -> std::optional<std::string_view> {
-            if (index + 1 >= args.size()) return std::nullopt;
-            return args[++index];
-        };
         if (option == "--duration-ms" || option == "--max-instructions" || option == "--stop-address" || option == "--adc-decimation") {
-            const auto value = valueAfter();
+            const auto value = nextOptionValue(args, index);
             if (!value) {
                 err << "fil: " << option << " requires a value\n";
                 return ExitCode::usage_error;
@@ -703,7 +707,7 @@ ExitCode runBoardCommand(
                 stop_address = static_cast<std::uint32_t>(parsed.value());
             }
         } else if (option == "--stop-at-symbol" || option == "--trace") {
-            const auto value = valueAfter();
+            const auto value = nextOptionValue(args, index);
             if (!value) {
                 err << "fil: " << option << " requires a value\n";
                 return ExitCode::usage_error;
@@ -832,10 +836,6 @@ ExitCode compareStlinkCommand(
 
     for (std::size_t index = 2U; index < args.size(); ++index) {
         const std::string_view option = args[index];
-        const auto valueAfter = [&]() -> std::optional<std::string_view> {
-            if (index + 1U >= args.size()) return std::nullopt;
-            return args[++index];
-        };
         if (option == "--flash") {
             flash = true;
         } else if (option == "--strict-mmio") {
@@ -844,7 +844,7 @@ ExitCode compareStlinkCommand(
             strict_mmio = false;
         } else if (option == "--max-instructions" || option == "--stop-address"
                    || option == "--timeout-ms") {
-            const auto value = valueAfter();
+            const auto value = nextOptionValue(args, index);
             if (!value) {
                 err << "fil: " << option << " requires a value\n";
                 return ExitCode::usage_error;
@@ -880,7 +880,7 @@ ExitCode compareStlinkCommand(
                 );
             }
         } else if (option == "--memory") {
-            const auto value = valueAfter();
+            const auto value = nextOptionValue(args, index);
             if (!value) {
                 err << "fil: --memory requires ADDRESS:LENGTH\n";
                 return ExitCode::usage_error;
@@ -894,7 +894,7 @@ ExitCode compareStlinkCommand(
         } else if (option == "--stop-at-symbol" || option == "--serial"
                    || option == "--openocd" || option == "--artifacts"
                    || option == "--register" || option == "--ignore-register") {
-            const auto value = valueAfter();
+            const auto value = nextOptionValue(args, index);
             if (!value) {
                 err << "fil: " << option << " requires a value\n";
                 return ExitCode::usage_error;
@@ -1104,12 +1104,8 @@ ExitCode runNetworkCommand(
 
     for (std::size_t index = 2; index < args.size(); ++index) {
         const std::string_view option = args[index];
-        const auto valueAfter = [&]() -> std::optional<std::string_view> {
-            if (index + 1 >= args.size()) return std::nullopt;
-            return args[++index];
-        };
         if (option == "--duration-ms" || option == "--max-instructions" || option == "--quantum" || option == "--adc-decimation") {
-            const auto value = valueAfter();
+            const auto value = nextOptionValue(args, index);
             if (!value) {
                 err << "fil: " << option << " requires a value\n";
                 return ExitCode::usage_error;
@@ -1130,7 +1126,7 @@ ExitCode runNetworkCommand(
             }
             else quantum = parsed.value();
         } else if (option == "--trace" || option == "--inject-can") {
-            const auto value = valueAfter();
+            const auto value = nextOptionValue(args, index);
             if (!value) {
                 err << "fil: " << option << " requires a value\n";
                 return ExitCode::usage_error;
@@ -1348,14 +1344,10 @@ ExitCode networkMonitorCommand(
 
     for (std::size_t index = 2U; index < args.size(); ++index) {
         const std::string_view option = args[index];
-        const auto valueAfter = [&]() -> std::optional<std::string_view> {
-            if (index + 1U >= args.size()) return std::nullopt;
-            return args[++index];
-        };
         if (option == "--max-instructions" || option == "--quantum"
             || option == "--duration-ms" || option == "--refresh-ms"
             || option == "--adc-decimation") {
-            const auto value = valueAfter();
+            const auto value = nextOptionValue(args, index);
             if (!value) {
                 err << "fil: " << option << " requires a value\n";
                 return ExitCode::usage_error;
@@ -1393,7 +1385,7 @@ ExitCode networkMonitorCommand(
                 refresh_ms = parsed.value();
             }
         } else if (option == "--live-filter" || option == "--trace-type") {
-            const auto value = valueAfter();
+            const auto value = nextOptionValue(args, index);
             if (!value || value->empty()) {
                 err << "fil: --live-filter requires a value\n";
                 return ExitCode::usage_error;
