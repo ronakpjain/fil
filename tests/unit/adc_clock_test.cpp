@@ -1,5 +1,6 @@
 #include "fil/cortexm/system_control.hpp"
 #include "fil/stm32g4/stm32g4.hpp"
+#include "../fixture_support.hpp"
 
 #include <array>
 #include <cstdint>
@@ -12,7 +13,7 @@ namespace {
 class AdcClockTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        auto result = fil::stm32g4::Stm32G4::create(events, trace, system, true, 16'000'000U);
+        auto result = fil::stm32g4::Stm32G4::create(rig.events, rig.trace, rig.system, true, 16'000'000U);
         ASSERT_TRUE(result);
         mcu = std::move(result).value();
         writeRcc(0x4cU, (1U << 13U) | (1U << 14U)); // AHB2ENR ADC12/345EN
@@ -34,19 +35,17 @@ protected:
     }
     void expectConversion(fil::stm32g4::AdcPeripheral* adc, const std::uint64_t hz) {
         const auto before = adc->samples().size();
-        const auto deadline = events.now() + delay(hz);
+        const auto deadline = rig.events.now() + delay(hz);
         start(adc);
-        ASSERT_EQ(events.runDueEvents(deadline - 1U).events_executed, 0U);
+        ASSERT_EQ(rig.events.runDueEvents(deadline - 1U).events_executed, 0U);
         EXPECT_EQ(adc->samples().size(), before);
-        ASSERT_EQ(events.runDueEvents(deadline).events_executed, 1U);
+        ASSERT_EQ(rig.events.runDueEvents(deadline).events_executed, 1U);
         ASSERT_EQ(adc->samples().size(), before + 1U);
         EXPECT_EQ(adc->samples().back().time_ns, deadline);
         ASSERT_TRUE(adc->write(0x08U, word, 1U << 1U, {})); // disable before CCR changes
     }
     static constexpr auto word = fil::mem::AccessSize::word;
-    fil::sim::EventLoop events;
-    fil::sim::TraceRecorder trace;
-    fil::cortexm::SystemControl system;
+    fil::test::SimulationRig rig;
     std::unique_ptr<fil::stm32g4::Stm32G4> mcu;
 };
 
@@ -89,10 +88,10 @@ TEST_F(AdcClockTest, IndependentGroupsSelectPllpOrSysclkWithoutChangingSysclk) {
     auto* adc3 = mcu->adc("ADC3");
     start(adc1);
     start(adc3);
-    ASSERT_EQ(events.runDueEvents(625U).events_executed, 1U);
+    ASSERT_EQ(rig.events.runDueEvents(625U).events_executed, 1U);
     ASSERT_EQ(adc1->samples().size(), 1U);
     EXPECT_TRUE(adc3->samples().empty());
-    ASSERT_EQ(events.runDueEvents(938U).events_executed, 1U);
+    ASSERT_EQ(rig.events.runDueEvents(938U).events_executed, 1U);
     ASSERT_EQ(adc3->samples().size(), 1U);
     EXPECT_EQ(adc3->samples().front().time_ns, 938U);
 }
@@ -120,7 +119,7 @@ TEST_F(AdcClockTest, MissingAndReservedAsyncSourcesProduceNoConversions) {
         SCOPED_TRACE(selector);
         writeRcc(0x88U, selector << 28U); // PLL is disabled for selector 1
         start(adc);
-        ASSERT_EQ(events.advanceBy(1'000'000U).events_executed, 0U);
+        ASSERT_EQ(rig.events.advanceBy(1'000'000U).events_executed, 0U);
         EXPECT_TRUE(adc->samples().empty());
         ASSERT_TRUE(adc->write(0x08U, word, 1U << 1U, {}));
     }
@@ -128,7 +127,7 @@ TEST_F(AdcClockTest, MissingAndReservedAsyncSourcesProduceNoConversions) {
     for (std::uint32_t presc = 12U; presc < 16U; ++presc) {
         writeCommon(presc << 18U);
         start(adc);
-        ASSERT_EQ(events.advanceBy(1'000'000U).events_executed, 0U);
+        ASSERT_EQ(rig.events.advanceBy(1'000'000U).events_executed, 0U);
         EXPECT_TRUE(adc->samples().empty());
         ASSERT_TRUE(adc->write(0x08U, word, 1U << 1U, {}));
     }
@@ -147,7 +146,7 @@ TEST_F(AdcClockTest, DisabledPllpOutputAndMissingPllSourceDoNotFallBack) {
          }) {
         writeRcc(0x0cU, config);
         start(adc);
-        ASSERT_EQ(events.advanceBy(1'000'000U).events_executed, 0U);
+        ASSERT_EQ(rig.events.advanceBy(1'000'000U).events_executed, 0U);
         EXPECT_TRUE(adc->samples().empty());
         ASSERT_TRUE(adc->write(0x08U, word, 1U << 1U, {}));
     }
@@ -157,13 +156,13 @@ TEST_F(AdcClockTest, ClockMuxStopAndResumePreservesRemainingConversionProgress) 
     auto* adc = mcu->adc("ADC1");
     writeRcc(0x88U, 2U << 28U);
     start(adc); // 938 ns deadline at 16 MHz
-    ASSERT_EQ(events.advanceBy(400U).events_executed, 0U);
+    ASSERT_EQ(rig.events.advanceBy(400U).events_executed, 0U);
     writeRcc(0x88U, 0U);
-    ASSERT_EQ(events.advanceBy(10'000U).events_executed, 0U);
+    ASSERT_EQ(rig.events.advanceBy(10'000U).events_executed, 0U);
     EXPECT_TRUE(adc->samples().empty());
     writeRcc(0x88U, 2U << 28U);
-    ASSERT_EQ(events.runDueEvents(10'937U).events_executed, 0U);
-    ASSERT_EQ(events.runDueEvents(10'938U).events_executed, 1U);
+    ASSERT_EQ(rig.events.runDueEvents(10'937U).events_executed, 0U);
+    ASSERT_EQ(rig.events.runDueEvents(10'938U).events_executed, 1U);
     ASSERT_EQ(adc->samples().size(), 1U);
     EXPECT_EQ(adc->samples().front().time_ns, 10'938U);
 }
@@ -172,10 +171,10 @@ TEST_F(AdcClockTest, RccAhbDividerChangeReschedulesSynchronousConversion) {
     auto* adc = mcu->adc("ADC1");
     writeCommon(2U << 16U); // HCLK/2: 1875 ns
     start(adc);
-    ASSERT_EQ(events.advanceBy(375U).events_executed, 0U);
+    ASSERT_EQ(rig.events.advanceBy(375U).events_executed, 0U);
     writeRcc(0x08U, 1U | (8U << 4U)); // HCLK /2, ADC remaining time doubles
-    ASSERT_EQ(events.runDueEvents(3374U).events_executed, 0U);
-    ASSERT_EQ(events.runDueEvents(3375U).events_executed, 1U);
+    ASSERT_EQ(rig.events.runDueEvents(3374U).events_executed, 0U);
+    ASSERT_EQ(rig.events.runDueEvents(3375U).events_executed, 1U);
     ASSERT_EQ(adc->samples().size(), 1U);
     EXPECT_EQ(adc->samples().front().time_ns, 3375U);
 }
@@ -183,11 +182,11 @@ TEST_F(AdcClockTest, RccAhbDividerChangeReschedulesSynchronousConversion) {
 TEST_F(AdcClockTest, ConversionStartedWithoutAClockWaitsUntilSourceIsSelected) {
     auto* adc = mcu->adc("ADC1");
     start(adc);
-    ASSERT_EQ(events.advanceBy(10'000U).events_executed, 0U);
+    ASSERT_EQ(rig.events.advanceBy(10'000U).events_executed, 0U);
     EXPECT_TRUE(adc->samples().empty());
     writeRcc(0x88U, 2U << 28U);
-    ASSERT_EQ(events.runDueEvents(10'937U).events_executed, 0U);
-    ASSERT_EQ(events.runDueEvents(10'938U).events_executed, 1U);
+    ASSERT_EQ(rig.events.runDueEvents(10'937U).events_executed, 0U);
+    ASSERT_EQ(rig.events.runDueEvents(10'938U).events_executed, 1U);
     EXPECT_EQ(adc->samples().front().time_ns, 10'938U);
 }
 
@@ -195,31 +194,31 @@ TEST_F(AdcClockTest, SynchronousBusClockGatePausesAndResumesConversion) {
     auto* adc = mcu->adc("ADC1");
     writeCommon(3U << 16U); // HCLK/4: 3750 ns
     start(adc);
-    ASSERT_EQ(events.advanceBy(750U).events_executed, 0U);
+    ASSERT_EQ(rig.events.advanceBy(750U).events_executed, 0U);
     writeRcc(0x4cU, 1U << 14U); // gate ADC12 only
-    ASSERT_EQ(events.advanceBy(10'000U).events_executed, 0U);
+    ASSERT_EQ(rig.events.advanceBy(10'000U).events_executed, 0U);
     EXPECT_TRUE(adc->samples().empty());
     writeRcc(0x4cU, (1U << 13U) | (1U << 14U));
-    ASSERT_EQ(events.runDueEvents(13'749U).events_executed, 0U);
-    ASSERT_EQ(events.runDueEvents(13'750U).events_executed, 1U);
+    ASSERT_EQ(rig.events.runDueEvents(13'749U).events_executed, 0U);
+    ASSERT_EQ(rig.events.runDueEvents(13'750U).events_executed, 1U);
     EXPECT_EQ(adc->samples().front().time_ns, 13'750U);
 }
 
 TEST_F(AdcClockTest, ClockStopPreservesLazyContinuousDeadline) {
     auto* adc = mcu->adc("ADC1");
-    trace.setEnabled(false);
+    rig.trace.setEnabled(false);
     adc->setSampleHistoryEnabled(false);
     ASSERT_TRUE(adc->write(0x0cU, word, 1U << 13U, {}));
     writeRcc(0x88U, 2U << 28U);
     start(adc);
-    ASSERT_EQ(events.advanceBy(400U).events_executed, 0U);
+    ASSERT_EQ(rig.events.advanceBy(400U).events_executed, 0U);
     writeRcc(0x88U, 0U);
-    ASSERT_EQ(events.advanceBy(10'000U).events_executed, 0U);
+    ASSERT_EQ(rig.events.advanceBy(10'000U).events_executed, 0U);
     ASSERT_TRUE(adc->read(0x00U, word, {}));
     writeRcc(0x88U, 2U << 28U);
     adc->setSampleHistoryEnabled(true);
-    ASSERT_EQ(events.runDueEvents(10'937U).events_executed, 0U);
-    ASSERT_EQ(events.runDueEvents(10'938U).events_executed, 1U);
+    ASSERT_EQ(rig.events.runDueEvents(10'937U).events_executed, 0U);
+    ASSERT_EQ(rig.events.runDueEvents(10'938U).events_executed, 1U);
     ASSERT_EQ(adc->samples().size(), 1U);
     EXPECT_EQ(adc->samples().front().time_ns, 10'938U);
 }
@@ -230,14 +229,14 @@ TEST_F(AdcClockTest, ClockStopPreservesDecimationGapLanding) {
     ASSERT_TRUE(adc->write(0x0cU, word, 1U << 13U, {}));
     writeRcc(0x88U, 2U << 28U);
     start(adc);
-    ASSERT_EQ(events.runDueEvents(938U).events_executed, 1U);
-    ASSERT_EQ(events.advanceBy(62U).events_executed, 0U);
+    ASSERT_EQ(rig.events.runDueEvents(938U).events_executed, 1U);
+    ASSERT_EQ(rig.events.advanceBy(62U).events_executed, 0U);
     writeRcc(0x88U, 0U);
-    ASSERT_EQ(events.advanceBy(10'000U).events_executed, 0U);
+    ASSERT_EQ(rig.events.advanceBy(10'000U).events_executed, 0U);
     writeRcc(0x88U, 2U << 28U);
-    ASSERT_EQ(events.runDueEvents(11'876U).events_executed, 1U);
+    ASSERT_EQ(rig.events.runDueEvents(11'876U).events_executed, 1U);
     EXPECT_EQ(adc->samples().size(), 1U); // skipped scan remains skipped
-    ASSERT_EQ(events.runDueEvents(12'814U).events_executed, 1U);
+    ASSERT_EQ(rig.events.runDueEvents(12'814U).events_executed, 1U);
     ASSERT_EQ(adc->samples().size(), 2U);
     EXPECT_EQ(adc->samples().back().time_ns, 12'814U);
 }
@@ -246,11 +245,11 @@ TEST_F(AdcClockTest, DisablingSuspendedConversionDoesNotResurrectItOnResume) {
     auto* adc = mcu->adc("ADC1");
     writeRcc(0x88U, 2U << 28U);
     start(adc);
-    ASSERT_EQ(events.advanceBy(400U).events_executed, 0U);
+    ASSERT_EQ(rig.events.advanceBy(400U).events_executed, 0U);
     writeRcc(0x88U, 0U);
     ASSERT_TRUE(adc->write(0x08U, word, 1U << 1U, {}));
     writeRcc(0x88U, 2U << 28U);
-    ASSERT_EQ(events.advanceBy(10'000U).events_executed, 0U);
+    ASSERT_EQ(rig.events.advanceBy(10'000U).events_executed, 0U);
     EXPECT_TRUE(adc->samples().empty());
     expectConversion(adc, 16'000'000U);
 }
@@ -260,12 +259,12 @@ TEST_F(AdcClockTest, FullMachineResetClearsLiveAdcClockInputs) {
     expectConversion(mcu->adc("ADC1"), 16'000'000U);
     mcu->reset();
     start(mcu->adc("ADC1"));
-    ASSERT_EQ(events.advanceBy(10'000U).events_executed, 0U);
+    ASSERT_EQ(rig.events.advanceBy(10'000U).events_executed, 0U);
     EXPECT_TRUE(mcu->adc("ADC1")->samples().empty());
     writeRcc(0x4cU, 1U << 13U);
     writeRcc(0x88U, 2U << 28U);
-    const auto deadline = events.now() + 938U;
-    ASSERT_EQ(events.runDueEvents(deadline).events_executed, 1U);
+    const auto deadline = rig.events.now() + 938U;
+    ASSERT_EQ(rig.events.runDueEvents(deadline).events_executed, 1U);
     EXPECT_EQ(mcu->adc("ADC1")->samples().front().time_ns, deadline);
 }
 
@@ -300,9 +299,9 @@ TEST_F(AdcClockTest, RccGroupResetCancelsOnlyItsOwnConversionsAndCommonRegisters
     auto* adc3 = mcu->adc("ADC3");
     start(adc1);
     start(adc3);
-    ASSERT_EQ(events.advanceBy(400U).events_executed, 0U);
+    ASSERT_EQ(rig.events.advanceBy(400U).events_executed, 0U);
     writeRcc(0x2cU, 1U << 13U); // AHB2RSTR ADC12RST
-    ASSERT_EQ(events.runDueEvents(938U).events_executed, 1U);
+    ASSERT_EQ(rig.events.runDueEvents(938U).events_executed, 1U);
     EXPECT_TRUE(adc1->samples().empty());
     ASSERT_EQ(adc3->samples().size(), 1U);
     const auto control = adc1->read(0x08U, word, {});
@@ -318,10 +317,10 @@ TEST_F(AdcClockTest, SynchronousDivideByOneRejectsDividedAhbClock) {
     writeCommon(1U << 16U);
     auto* adc = mcu->adc("ADC1");
     start(adc);
-    ASSERT_EQ(events.advanceBy(10'000U).events_executed, 0U);
+    ASSERT_EQ(rig.events.advanceBy(10'000U).events_executed, 0U);
     EXPECT_TRUE(adc->samples().empty());
     writeRcc(0x08U, 1U); // permitted HPRE restores the pending clock budget
-    ASSERT_EQ(events.runDueEvents(10'938U).events_executed, 1U);
+    ASSERT_EQ(rig.events.runDueEvents(10'938U).events_executed, 1U);
     ASSERT_EQ(adc->samples().size(), 1U);
     EXPECT_EQ(adc->samples().front().time_ns, 10'938U);
 }
@@ -334,11 +333,11 @@ TEST_F(AdcClockTest, StoppingClockInsideSampleCallbackSuspendsTheNextRank) {
         if (adc->samples().size() == 1U) writeRcc(0x88U, 0U);
     });
     start(adc);
-    ASSERT_EQ(events.runDueEvents(938U).events_executed, 1U);
-    ASSERT_EQ(events.advanceBy(10'000U).events_executed, 0U);
+    ASSERT_EQ(rig.events.runDueEvents(938U).events_executed, 1U);
+    ASSERT_EQ(rig.events.advanceBy(10'000U).events_executed, 0U);
     ASSERT_EQ(adc->samples().size(), 1U);
     writeRcc(0x88U, 2U << 28U);
-    ASSERT_EQ(events.runDueEvents(11'876U).events_executed, 1U);
+    ASSERT_EQ(rig.events.runDueEvents(11'876U).events_executed, 1U);
     ASSERT_EQ(adc->samples().size(), 2U);
     EXPECT_EQ(adc->samples().back().time_ns, 11'876U);
     EXPECT_EQ(adc->samples().back().channel, 2U);
@@ -354,11 +353,11 @@ TEST_F(AdcClockTest, BothGroupsHonorBusGatesInEverySynchronousMode) {
             writeRcc(0x4cU, group345 ? 1U << 13U : 1U << 14U);
             const auto before = adc->samples().size();
             start(adc);
-            ASSERT_EQ(events.advanceBy(10'000U).events_executed, 0U);
+            ASSERT_EQ(rig.events.advanceBy(10'000U).events_executed, 0U);
             EXPECT_EQ(adc->samples().size(), before);
             writeRcc(0x4cU, (1U << 13U) | (1U << 14U));
-            const auto deadline = events.now() + delay(16'000'000U / (1U << (mode - 1U)));
-            ASSERT_EQ(events.runDueEvents(deadline).events_executed, 1U);
+            const auto deadline = rig.events.now() + delay(16'000'000U / (1U << (mode - 1U)));
+            ASSERT_EQ(rig.events.runDueEvents(deadline).events_executed, 1U);
             ASSERT_EQ(adc->samples().size(), before + 1U);
             EXPECT_EQ(adc->samples().back().time_ns, deadline);
             ASSERT_TRUE(adc->write(0x08U, word, 1U << 1U, {}));
@@ -372,9 +371,9 @@ TEST_F(AdcClockTest, AsynchronousKernelIsIndependentOfTheBusClockGate) {
     auto* adc3 = mcu->adc("ADC3");
     start(adc1);
     start(adc3);
-    ASSERT_EQ(events.advanceBy(400U).events_executed, 0U);
+    ASSERT_EQ(rig.events.advanceBy(400U).events_executed, 0U);
     writeRcc(0x4cU, 0U); // Gate interface HCLK, not the asynchronous kernel.
-    ASSERT_EQ(events.runDueEvents(938U).events_executed, 2U);
+    ASSERT_EQ(rig.events.runDueEvents(938U).events_executed, 2U);
     ASSERT_EQ(adc1->samples().size(), 1U);
     ASSERT_EQ(adc3->samples().size(), 1U);
     EXPECT_EQ(adc1->samples().front().time_ns, 938U);
@@ -386,13 +385,13 @@ TEST_F(AdcClockTest, StoppingClockOnFinalSingleShotSampleDoesNotRestartOnResume)
     auto* adc = mcu->adc("ADC1");
     adc->setSampleCallback([&](const fil::stm32g4::AdcSample&) { writeRcc(0x88U, 0U); });
     start(adc);
-    ASSERT_EQ(events.runDueEvents(938U).events_executed, 1U);
+    ASSERT_EQ(rig.events.runDueEvents(938U).events_executed, 1U);
     ASSERT_EQ(adc->samples().size(), 1U);
     const auto control = adc->read(0x08U, word, {});
     ASSERT_TRUE(control);
     EXPECT_EQ(control.value() & (1U << 2U), 0U);
     writeRcc(0x88U, 2U << 28U);
-    ASSERT_EQ(events.advanceBy(10'000U).events_executed, 0U);
+    ASSERT_EQ(rig.events.advanceBy(10'000U).events_executed, 0U);
     EXPECT_EQ(adc->samples().size(), 1U);
 }
 

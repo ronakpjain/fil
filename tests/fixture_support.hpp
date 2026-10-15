@@ -87,3 +87,18 @@ inline config::BoardConfig fixtureBoardConfig(const std::string_view name = "fix
 }
 
 } // namespace fil::test
+
+// Common isolated event/trace/system state for peripheral integration tests.
+#include "fil/cortexm/system_control.hpp"
+#include "fil/sim/event_loop.hpp"
+#include "fil/sim/trace.hpp"
+
+namespace fil::test {
+
+struct SimulationRig {
+    sim::EventLoop events;
+    sim::TraceRecorder trace;
+    cortexm::SystemControl system;
+};
+
+} // namespace fil::test
