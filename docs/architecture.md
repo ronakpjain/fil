@@ -19,7 +19,7 @@ editable, uncompressed draw.io XML embedded inside it.
 | 6 | Address resolution, access permissions, MMIO dispatch and mutation tracking |
 | 7 | Instruction cache, fetch/decode, specialized handlers and retirement |
 | 8 | Pending exception selection, stack frames, nesting and EXC_RETURN |
-| 9 | Native JIT compilation, residency, matched timing windows and adaptive dispatch |
+| 9 | JIT compilation and dispatch |
 | 10 | Network time frontiers, lane ordering, admission limits and observation barriers |
 | 11 | Reversible RAM capsules, period certificates, rollback and materialization cuts |
 | 12 | ADC conversion events, DMA transfers, interrupts and FDCAN delivery |
