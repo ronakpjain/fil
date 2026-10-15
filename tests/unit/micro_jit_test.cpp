@@ -92,7 +92,7 @@ bool runMicro(const std::vector<std::uint16_t>& code, const CpuState& initial,
     final_out.r[15] = kFlash;
     final_out.thumb = true;
     final_out.halted = false;
-    fn(&final_out);
+    fn(&final_out, block.ops.size());
     return true;
 }
 
@@ -153,6 +153,43 @@ TEST(MicroJitEmitterTest, TerminalBranch) {
     // nops then a terminal b with offset 0 (target = branch pc + 4).
     // The branch must be last: FilIR rejects branch-not-terminal.
     checkProgram({0xBF00U, 0xBF00U, 0xE000U}, 5U);
+}
+
+TEST(MicroJitEmitterTest, PrefixExitsCommitPrecisely) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no micro-jit emitter on this host";
+    // movs r0,#1; movs r1,#2; movs r2,#3: retire 1 and 2-op prefixes.
+    const std::vector<std::uint16_t> code{0x2001U, 0x2102U, 0x2203U};
+    std::vector<MicroSource> sources;
+    std::uint32_t pc = kFlash;
+    for (const auto half : code) {
+        sources.push_back(MicroSource{*fil::cpu::decode16(half), pc, 2U});
+        pc += 2U;
+    }
+    MicroBlock block;
+    ASSERT_TRUE(fil::cpu::buildMicroBlock({sources.data(), sources.size()}, block).ok);
+    std::string error;
+    auto jit = MicroJit::create(error);
+    ASSERT_TRUE(jit) << error;
+    MicroFunction fn = jit->compile(block, error);
+    ASSERT_TRUE(fn) << error;
+    for (const std::size_t max : {1U, 2U, 3U, 16U}) {
+        CpuState state;
+        state.r[15] = kFlash;
+        fn(&state, max);
+        const std::size_t retired = std::min<std::size_t>(max, 3U);
+        EXPECT_EQ(state.r[0], retired >= 1U ? 1U : 0U);
+        EXPECT_EQ(state.r[1], retired >= 2U ? 2U : 0U);
+        EXPECT_EQ(state.r[2], retired >= 3U ? 3U : 0U);
+        EXPECT_EQ(state.r[15], kFlash + static_cast<std::uint32_t>(2U * retired));
+        EXPECT_EQ(state.instruction_address,
+                  retired == 0U ? 0U : kFlash + static_cast<std::uint32_t>(2U * (retired - 1U)));
+    }
+    // max == 0 commits nothing.
+    CpuState untouched;
+    untouched.r[15] = kFlash;
+    fn(&untouched, 0U);
+    EXPECT_EQ(untouched.r[0], 0U);
+    EXPECT_EQ(untouched.r[15], kFlash);
 }
 
 TEST(MicroJitEmitterTest, DeclinesMemory) {

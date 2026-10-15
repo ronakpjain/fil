@@ -29,8 +29,9 @@ namespace fil::cpu {
 struct CpuState;
 struct MicroBlock;
 
-/** Full-block kernel: executes every op in the compiled block. */
-using MicroFunction = void (*)(CpuState*);
+/** Full-block kernel with scheduler prefix limits: executes up to
+ *  max_instructions ops (1 <= max is assumed; 0 commits nothing). */
+using MicroFunction = void (*)(CpuState*, std::size_t);
 
 class MicroJit {
 public:

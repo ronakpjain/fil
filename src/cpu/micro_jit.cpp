@@ -132,8 +132,77 @@ public:
     void cmpImm(std::uint32_t rn, std::uint32_t imm) {
         emit(0x71000000U | ((imm & 0xfffU) << 10U) | ((rn & 31U) << 5U) | 31U);
     }
+    // Stash the scheduler limit (x1) in the high half of x16; the low half
+    // keeps retained xPSR bits. Flag sequences freely clobber w1/x1, so the
+    // limit cannot live there across ops. W-ops on w16 leave high32 intact
+    // only if untouched: stash AFTER clearTopNibble, read via limitCheck.
+    void stashMax() {
+        emit(0xB3400000U | (32U << 16U) | (31U << 10U) | (1U << 5U) | 16U); // bfi x16, x1, #32, #32
+    }
+    // Compare stashed max against `count` (clobbers x17, preserves flags).
+    // Exit (unsigned wrap) iff max < count: sub leaves the top bit set
+    // exactly when max-count wraps, and plain sub/lsr/cbnz touch no flags.
+    void checkMax(std::uint32_t count, std::size_t exit_label) {
+        lsr64(17U, 16U, 32U); // max -> x17
+        sub64Imm(17U, 17U, count); // wraps iff max < count
+        lsr64(17U, 17U, 63U); // wrap bit -> bit0
+        cbnzX17(exit_label);
+    }
     void csel(std::uint32_t rd, std::uint32_t rn, std::uint32_t rm, std::uint32_t cond) {
         emit(0x1A800000U | ((rm & 31U) << 16U) | ((cond & 15U) << 12U) | ((rn & 31U) << 5U) | (rd & 31U));
+    }
+    // Branches (targets patched by patchBranches): conditional LS, CBZ, B.
+    struct BranchFixup {
+        std::size_t word{0};
+        std::size_t target{0};
+        std::uint8_t kind{0}; // 0=unused, 1=cbz/cbnz (imm19), 2=b (imm26)
+    };
+    std::vector<BranchFixup> fixups;
+    // Returns a label id bound to the NEXT emitted word.
+    std::vector<std::size_t> labels;
+    std::size_t makeLabel() {
+        labels.push_back(words.size());
+        return labels.size() - 1U;
+    }
+    void bindLabel(std::size_t id) { labels[id] = words.size(); }
+    void cbzX1(std::size_t label) {
+        fixups.push_back({words.size(), label, 1U});
+        emit(0xB4000000U | 1U); // cbz x1, <patched>
+    }
+    void cbnzX17(std::size_t label) {
+        fixups.push_back({words.size(), label, 1U});
+        emit(0xB5000000U | 17U); // cbnz x17, <patched>
+    }
+    void sub64Imm(std::uint32_t rd, std::uint32_t rn, std::uint32_t imm) {
+        emit(0xD1000000U | ((imm & 0xfffU) << 10U) | ((rn & 31U) << 5U) | (rd & 31U));
+    }
+    void b(std::size_t label) {
+        fixups.push_back({words.size(), label, 2U});
+        emit(0x14000000U); // b <patched>
+    }
+    bool patchBranches(std::string& error) {
+        // fix.word/target are word indices; cond-branch immediates count
+        // words (the x4 scaling is architectural), so deltas here are
+        // already word-scaled and always aligned by construction.
+        for (const auto& fix : fixups) {
+            const std::int64_t delta = static_cast<std::int64_t>(labels[fix.target])
+                - static_cast<std::int64_t>(fix.word);
+            if (fix.kind == 2U) {
+                if (delta < -(1LL << 25) || delta > ((1LL << 25) - 1LL)) {
+                    error = "micro-jit: branch out of range";
+                    return false;
+                }
+                words[fix.word] |= static_cast<std::uint32_t>(delta & 0x03ffffffU);
+            } else {
+                if (delta < -(1LL << 18) || delta > ((1LL << 18) - 1LL)) {
+                    error = "micro-jit: branch out of range";
+                    return false;
+                }
+                words[fix.word] |= static_cast<std::uint32_t>(
+                    (static_cast<std::uint32_t>(delta) & 0x7ffffU) << 5U);
+            }
+        }
+        return true;
     }
     // --- loads/stores -----------------------------------------------------
     void ldrW(std::uint32_t rt, std::size_t byte_off) {
@@ -580,29 +649,54 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
 
     Emitter e;
     // Prologue: seed host flags from guest xPSR, retain non-NZCV bits,
-    // load r0-r12 + LR.
+    // load r0-r12 + LR. x1 carries the scheduler prefix limit.
     e.ldrW(16U, xpsr_off);
     e.msrNzcv(16U);
     e.clearTopNibble(16U); // retained xPSR bits (~N/Z/C/V)
+    const std::size_t done_label = e.makeLabel();
+    e.cbzX1(done_label); // max == 0 commits nothing.
+    e.stashMax(); // high32 of x16; low32 keeps retained bits.
     for (std::uint32_t i = 0U; i < 6U; ++i) e.ldpW(2U + 2U * i, 3U + 2U * i, r_off + 8U * i);
     e.ldrW(14U, r_off + 48U);
     e.ldrW(15U, r_off + 56U);
-    for (const auto& op : block.ops) {
-        if (!emitOp(e, op, error)) return nullptr;
+    // Commit epilogue shared by the full path and every prefix exit:
+    // merge flags, store regs, then constant r15/instruction_address.
+    // Prefix exits skip the BL link update (a terminal BL only runs full).
+    const auto emitEpilogue = [&](std::uint32_t pc_value, std::uint32_t ia_value,
+                                  bool link) {
+        if (link && have_lr) e.movImm(15U, lr_value);
+        e.mrsNzcv(17U);
+        e.logicReg(2U, 16U, 16U, 17U); // orr w16, w16, w17
+        e.strW(16U, xpsr_off);
+        for (std::uint32_t i = 0U; i < 6U; ++i) e.stpW(2U + 2U * i, 3U + 2U * i, r_off + 8U * i);
+        e.strW(14U, r_off + 48U);
+        e.strW(15U, r_off + 56U);
+        e.movImm(17U, pc_value);
+        e.strW(17U, r_off + 60U);
+        e.movImm(17U, ia_value);
+        e.strW(17U, addr_off);
+    };
+    std::vector<std::size_t> exit_labels;
+    exit_labels.reserve(block.ops.size());
+    for (std::size_t i = 0; i < block.ops.size(); ++i) exit_labels.push_back(e.makeLabel());
+    for (std::size_t i = 0; i < block.ops.size(); ++i) {
+        if (!emitOp(e, block.ops[i], error)) return nullptr;
+        if (i + 1U < block.ops.size()) {
+            // After op i, i+1 ops retired: exit iff max < i+2.
+            e.checkMax(static_cast<std::uint32_t>(i + 2U), exit_labels[i + 1U]);
+        }
     }
-    // Epilogue.
-    if (have_lr) e.movImm(15U, lr_value);
-    e.mrsNzcv(17U);
-    e.logicReg(2U, 16U, 16U, 17U); // orr w16, w16, w17
-    e.strW(16U, xpsr_off);
-    for (std::uint32_t i = 0U; i < 6U; ++i) e.stpW(2U + 2U * i, 3U + 2U * i, r_off + 8U * i);
-    e.strW(14U, r_off + 48U);
-    e.strW(15U, r_off + 56U);
-    e.movImm(17U, final_pc);
-    e.strW(17U, r_off + 60U);
-    e.movImm(17U, last_pc);
-    e.strW(17U, addr_off);
+    emitEpilogue(final_pc, last_pc, true);
+    e.b(done_label);
+    for (std::size_t i = 1U; i < block.ops.size(); ++i) {
+        e.bindLabel(exit_labels[i]);
+        // Retired ops [0, i): next PC is pcs[i], last address pcs[i-1].
+        emitEpilogue(block.ops[i].pc, block.ops[i - 1U].pc, false);
+        e.ret();
+    }
+    e.bindLabel(done_label);
     e.ret();
+    if (!e.patchBranches(error)) return nullptr;
 
     if (std::getenv("FIL_MICRO_JIT_DUMP") != nullptr) {
         for (std::size_t i = 0; i < e.words.size(); ++i)

@@ -2400,32 +2400,44 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlockImpl(
         }
     }
 #endif
-    // Bespoke stencil kernel: one call retires the whole block. Full-count
-    // execution only (capped prefixes keep the paths below); reversible
-    // capsules keep checked handlers so rollback retains checkpoints.
-    // Subsumes the cached fast loop and any native kernel for this slot.
+    // Bespoke stencil kernel: one call retires up to the admitted prefix.
+    // Reversible capsules keep checked handlers so rollback retains
+    // checkpoints. Subsumes the cached fast loop for covered slots.
     if (!fast_only && out.count == 0U && slot.micro_function
-        && max_instructions >= slot.count && state_.it_state == 0U) {
-        slot.micro_function(&state_);
-        const std::uint8_t last = static_cast<std::uint8_t>(slot.count - 1U);
-        for (std::uint8_t i = 0U; i < slot.count; ++i) {
-            out.pcs[i] = slot.pcs[i];
-            out.sizes[i] = slot.sizes[i];
+        && state_.it_state == 0U) {
+        const std::uint8_t micro_count = static_cast<std::uint8_t>(
+            std::min<std::size_t>(max_instructions, slot.count));
+        if (micro_count != 0U) {
+            slot.micro_function(&state_, micro_count);
+            for (std::uint8_t i = 0U; i < micro_count; ++i) {
+                out.pcs[i] = slot.pcs[i];
+                out.sizes[i] = slot.sizes[i];
+            }
+            out.count = micro_count;
+            const auto last = static_cast<std::size_t>(micro_count - 1U);
+            state_.instruction_address = slot.pcs[last];
+            std::uint32_t total = slot.base_prefix_cycles[micro_count];
+            if (state_.r[15] != slot.pcs[last] + slot.sizes[last]) {
+                total += slot.branch_penalty[last];
+            }
+            if (instruction_cycles) {
+                for (std::uint8_t i = 0U; i < micro_count; ++i) {
+                    (*instruction_cycles)[i] = static_cast<std::uint16_t>(slot.base_cycles[i]);
+                }
+                if (state_.r[15] != slot.pcs[last] + slot.sizes[last]) {
+                    (*instruction_cycles)[last] = static_cast<std::uint16_t>(
+                        (*instruction_cycles)[last] + slot.branch_penalty[last]);
+                }
+            }
+            last_pc = slot.pcs[last];
+            last_raw = slot.raws[last];
+            last_size = slot.sizes[last];
+            last_suppress = micro_count < slot.count ? false : slot.fast_last_suppress;
+            total_cycles = total;
+            ++jit_stats_.micro_executions;
+            jit_stats_.micro_instructions += micro_count;
+            goto commit_block;
         }
-        out.count = slot.count;
-        state_.instruction_address = slot.pcs[last];
-        std::uint32_t total = slot.fast_base_cycles;
-        if (state_.r[15] != slot.pcs[last] + slot.sizes[last]) {
-            total += slot.branch_penalty[last];
-        }
-        last_pc = slot.pcs[last];
-        last_raw = slot.raws[last];
-        last_size = slot.sizes[last];
-        last_suppress = slot.fast_last_suppress;
-        total_cycles = total;
-        ++jit_stats_.micro_executions;
-        jit_stats_.micro_instructions += slot.count;
-        goto commit_block;
     }
     // Pure-integer fast block: no memory ops (no traps/generation changes),
     // no generic ops (no conditions/faults), IT/pending checked at prepare.
