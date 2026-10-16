@@ -118,7 +118,7 @@ bool runMicro(const std::vector<std::uint16_t>& code, const CpuState& initial,
 }
 
 void expectSameState(const CpuState& a, const CpuState& b) {
-    for (int i = 0; i <= 12; ++i) EXPECT_EQ(a.r[i], b.r[i]) << "r" << i;
+    for (std::size_t i = 0U; i <= 12U; ++i) EXPECT_EQ(a.r[i], b.r[i]) << "r" << i;
     EXPECT_EQ(a.r[14], b.r[14]) << "lr";
     EXPECT_EQ(a.r[15], b.r[15]) << "pc";
     EXPECT_EQ(a.instruction_address, b.instruction_address) << "instr addr";
@@ -130,7 +130,7 @@ void checkProgram(const std::vector<std::uint16_t>& code, std::uint64_t seed_bas
     std::mt19937_64 rng(seed_base);
     for (int trial = 0; trial < 25; ++trial) {
         CpuState initial;
-        for (int i = 0; i <= 12; ++i) initial.r[i] = static_cast<std::uint32_t>(rng());
+        for (std::size_t i = 0U; i <= 12U; ++i) initial.r[i] = static_cast<std::uint32_t>(rng());
         initial.r[14] = static_cast<std::uint32_t>(rng());
         initial.xpsr = (1U << 24U) | 0x000F0000U | (1U << 27U) // T + GE + Q (must survive)
             | (static_cast<std::uint32_t>(rng() & 0xFU) << 28U); // random NZCV
@@ -350,7 +350,7 @@ TEST(MicroJitEmitterTest, ConditionalBranchTakenAndFallthrough) {
         // Alternate taken / fallthrough by choosing the cmp operands.
         const bool take = (trial % 2) == 0;
         CpuState initial;
-        for (int i = 0; i <= 12; ++i) initial.r[i] = static_cast<std::uint32_t>(rng());
+        for (std::size_t i = 0U; i <= 12U; ++i) initial.r[i] = static_cast<std::uint32_t>(rng());
         initial.r[14] = static_cast<std::uint32_t>(rng());
         initial.xpsr = (1U << 24U) | 0x000F0000U | (1U << 27U)
             | (static_cast<std::uint32_t>(rng() & 0xFU) << 28U);
@@ -496,10 +496,10 @@ TEST(MicroJitEmitterTest, AllConditionsMatchInterpreterAndReportFailed) {
             f.cpu.state().thumb = true;
             f.cpu.state().halted = false;
             int ref_steps = 0;
-            for (int i = 0; i < 5; ++i) {
+            for (std::uint32_t i = 0U; i < 5U; ++i) {
                 ASSERT_EQ(f.cpu.stepFast().reason, fil::cpu::StopReason::step_complete);
                 ++ref_steps;
-                if (f.cpu.state().r[15] != kFlash + 2U * static_cast<std::uint32_t>(i + 1U)) break;
+                if (f.cpu.state().r[15] != kFlash + 2U * (i + 1U)) break;
             }
             const CpuState ref_out = f.cpu.state();
             // Micro side.

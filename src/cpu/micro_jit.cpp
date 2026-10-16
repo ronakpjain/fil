@@ -23,7 +23,6 @@
 #include "fil/cpu/cortex_m4.hpp"
 #include "fil/cpu/micro_jit_ir.hpp"
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -43,8 +42,6 @@
 
 namespace fil::cpu {
 namespace {
-
-constexpr std::uint32_t kFlagMask = xpsr_n | xpsr_z | xpsr_c | xpsr_v;
 
 // Guest r[i] -> host w(i+2); guest LR -> w15.
 constexpr std::uint32_t hostReg(std::uint8_t guest) noexcept {
@@ -137,6 +134,9 @@ public:
     void ubfm(std::uint32_t rd, std::uint32_t rn, std::uint32_t immr, std::uint32_t imms) {
         emit(0x53000000U | ((immr & 31U) << 16U) | ((imms & 31U) << 10U) | ((rn & 31U) << 5U) | (rd & 31U));
     }
+    void ubfm64(std::uint32_t rd, std::uint32_t rn, std::uint32_t immr, std::uint32_t imms) {
+        emit(0xD3400000U | ((immr & 63U) << 16U) | ((imms & 63U) << 10U) | ((rn & 31U) << 5U) | (rd & 31U));
+    }
     void sbfmAsr(std::uint32_t rd, std::uint32_t rn, std::uint32_t amount) {
         emit(0x13000000U | ((amount & 31U) << 16U) | (31U << 10U) | ((rn & 31U) << 5U) | (rd & 31U));
     }
@@ -174,8 +174,7 @@ public:
     // Exit iff max < count. Mask to the dedicated 16-bit limit field so the
     // failed-branch mask in x16[63:48] cannot affect the scheduler.
     void checkMax(std::uint32_t count, std::size_t exit_label) {
-        lsr64(17U, 16U, 32U);
-        ubfm(17U, 17U, 0U, 15U);
+        ubfm64(17U, 16U, 32U, 47U); // ubfx x17, x16, #32, #16
         sub64Imm(17U, 17U, count);
         lsr64(17U, 17U, 63U); // wrap bit -> bit0
         cbnzX17(exit_label);
