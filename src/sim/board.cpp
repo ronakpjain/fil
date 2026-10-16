@@ -777,23 +777,6 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
     // clock/flash timing inputs cannot change during this speculative span.
     if (cycle_table_hz_ != frequency) rebuildCycleTable(frequency);
     const auto& flash = peripherals_->flash();
-    struct FetchTiming {
-        const stm32g4::FlashPeripheral* flash;
-        std::uint16_t wait;
-        bool art_hit;
-    };
-    const FetchTiming fetch_timing{&flash, static_cast<std::uint16_t>(flash.waitStates()),
-        flash.prefetchEnabled() || flash.instructionCacheEnabled()};
-    cpu::CortexM4::ReversibleCycleBudget budget;
-    budget.remaining_cycles = cycle_credit;
-    budget.context = &fetch_timing;
-    budget.have_fetch = prefix.entry_have_fetch;
-    budget.fetch_end = prefix.entry_fetch_end;
-    budget.fetch_stall = +[](const void* context, const std::uint32_t pc, const bool sequential) {
-        const auto& timing = *static_cast<const FetchTiming*>(context);
-        if (timing.wait == 0U || (sequential && timing.art_hit)) return std::uint16_t{0U};
-        return timing.flash->isFlashAddress(pc) ? timing.wait : std::uint16_t{0U};
-    };
     const auto elapsed_for_span = [&](const std::uint64_t total_cycles) {
         if (total_cycles < cycle_table_size) {
             const auto& entry = cycle_table_[static_cast<std::size_t>(total_cycles)];
@@ -807,12 +790,12 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
     if (idempotent_period_cache_) {
         const auto& cert = *idempotent_period_cache_;
         bool valid = cert.count != 0U
-            && memory_.restorationGeneration() == cert.restoration_generation
-            && memory_.restorationGeneration() == period_validation_restoration_generation_
+            && restoration_generation == cert.restoration_generation
+            && restoration_generation == period_validation_restoration_generation_
             && memory_.ramInputsCompatibleSince(period_validation_checkpoint_, cert.full_footprint)
-            && memory_.executionGeneration() == cert.execution_generation
-            && peripherals_->rcc().systemClockHz() == cert.clock_hz
-            && peripherals_->flash().acrGeneration() == cert.flash_acr_generation;
+            && prefix.execution_generation == cert.execution_generation
+            && frequency == cert.clock_hz
+            && prefix.flash_generation == cert.flash_acr_generation;
         std::size_t phase = 0U;
         if (valid) {
             valid = false;
@@ -960,10 +943,10 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
             || !cert->entry.matches(cpu_->state())
             || cert->entry_have_fetch != prefix.entry_have_fetch
             || cert->entry_fetch_end != prefix.entry_fetch_end) continue;
-        const bool valid = memory_.restorationGeneration() == cert->restoration_generation
-            && memory_.restorationGeneration() == transition_restoration_generations_[slot]
+        const bool valid = restoration_generation == cert->restoration_generation
+            && restoration_generation == transition_restoration_generations_[slot]
             && memory_.ramInputsCompatibleSince(transition_validation_checkpoints_[slot], cert->full_footprint)
-            && memory_.executionGeneration() == cert->execution_generation
+            && prefix.execution_generation == cert->execution_generation
             && frequency == cert->clock_hz
             && prefix.flash_generation == cert->flash_generation;
         if (!valid) {
@@ -1008,6 +991,25 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
         ++transition_hotness_[slot];
         return true;
     }
+    // Cache hits need neither the flash timing snapshot nor the speculative
+    // budget (including its per-instruction arrays). Initialize only on a miss.
+    struct FetchTiming {
+        const stm32g4::FlashPeripheral* flash;
+        std::uint16_t wait;
+        bool art_hit;
+    };
+    const FetchTiming fetch_timing{&flash, static_cast<std::uint16_t>(flash.waitStates()),
+        flash.prefetchEnabled() || flash.instructionCacheEnabled()};
+    cpu::CortexM4::ReversibleCycleBudget budget;
+    budget.remaining_cycles = cycle_credit;
+    budget.context = &fetch_timing;
+    budget.have_fetch = prefix.entry_have_fetch;
+    budget.fetch_end = prefix.entry_fetch_end;
+    budget.fetch_stall = +[](const void* context, const std::uint32_t pc, const bool sequential) {
+        const auto& timing = *static_cast<const FetchTiming*>(context);
+        if (timing.wait == 0U || (sequential && timing.art_hit)) return std::uint16_t{0U};
+        return timing.flash->isFlashAddress(pc) ? timing.wait : std::uint16_t{0U};
+    };
     // The ordinary reversible-evaluation metadata remains fixed-capacity;
     // only a validated period certificate can admit the larger compressed span.
     limit = std::min(limit, ReversibleRamPrefix::max_instructions);
