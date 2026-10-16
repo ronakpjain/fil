@@ -2,12 +2,17 @@ cmake_minimum_required(VERSION 3.20)
 
 project(fil VERSION 0.1.0 LANGUAGES CXX)
 
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+if(NOT DEFINED CMAKE_EXPORT_COMPILE_COMMANDS
+    OR "${CMAKE_EXPORT_COMPILE_COMMANDS}" STREQUAL "")
+    set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL
+        "Generate compile_commands.json for clangd" FORCE)
+endif()
 
 # CMake generates this database in the build tree. Point clangd at the
 # source-root database so it follows whichever out-of-tree build was configured
 # most recently, regardless of that build directory's name.
-if(CMAKE_GENERATOR MATCHES "Ninja|Makefiles"
+if(CMAKE_EXPORT_COMPILE_COMMANDS
+    AND CMAKE_GENERATOR MATCHES "Ninja|Makefiles"
     AND NOT CMAKE_BINARY_DIR STREQUAL CMAKE_SOURCE_DIR)
     set(FIL_COMPILE_COMMANDS_LINK "${CMAKE_SOURCE_DIR}/compile_commands.json")
     file(REMOVE "${FIL_COMPILE_COMMANDS_LINK}")
