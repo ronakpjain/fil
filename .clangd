@@ -1,3 +1,2 @@
 CompileFlags:
-  CompilationDatabase: build
-  Add: [-std=c++20, -I../include, -I../tests]
+  CompilationDatabase: .

@@ -4,6 +4,20 @@ project(fil VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# CMake generates this database in the build tree. Point clangd at the
+# source-root database so it follows whichever out-of-tree build was configured
+# most recently, regardless of that build directory's name.
+if(CMAKE_GENERATOR MATCHES "Ninja|Makefiles"
+    AND NOT CMAKE_BINARY_DIR STREQUAL CMAKE_SOURCE_DIR)
+    set(FIL_COMPILE_COMMANDS_LINK "${CMAKE_SOURCE_DIR}/compile_commands.json")
+    file(REMOVE "${FIL_COMPILE_COMMANDS_LINK}")
+    file(CREATE_LINK
+        "${CMAKE_BINARY_DIR}/compile_commands.json"
+        "${FIL_COMPILE_COMMANDS_LINK}"
+        SYMBOLIC
+    )
+endif()
+
 # The emulator's normal mode is a performance-sensitive interpreter. Keep
 # explicit Debug/sanitizer builds available, but do not silently produce an
 # unoptimized executable when a single-config generator is used without a
