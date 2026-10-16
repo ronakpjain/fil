@@ -4,16 +4,22 @@
  *  @brief Bespoke FilIR stencil JIT: host machine code.
  *
  *  MicroJit compiles a FilIR MicroBlock (straight-line unconditional
- *  integer ops, terminal B/BL) into a single straight-line AArch64
+ *  integer ops, terminal B/BL) into a single straight-line host
  *  function with one entry point and no internal branches:
  *
  *      void fn(CpuState* state);
  *
+ *  Supported hosts carry a stencil emitter (AArch64, x86_64); the AArch64
+ *  kernel rides the host flags between ops, while the x86_64 kernel keeps
+ *  guest N/Z/C/V in a register (the flag encodings differ) with identical
+ *  guest-visible semantics.
+ *
  *  The caller guarantees full-block execution (max >= block size),
  *  Thumb/IT/pending/halted checks, and generation validity; the kernel
  *  touches only r0-r12, LR, xPSR NZCV, r15, and instruction_address.
- *  Guest N/Z/C/V ride the host flags between ops; Q/GE/IT/ISR/T bits
- *  are preserved. Cache slots own no resources: code lives in one
+ *  Guest N/Z/C/V ride the host flags between ops on AArch64; Q/GE/IT/ISR/T bits
+ *  are preserved. On x86_64 the guest flags live in a register instead.
+ *  Cache slots own no resources: code lives in one
  *  bump-allocated RX arena for the CPU lifetime, so eviction is a
  *  slot-pointer clear and executable-write invalidation keeps working
  *  through the existing generation checks.
@@ -41,7 +47,7 @@ public:
     MicroJit(const MicroJit&) = delete;
     MicroJit& operator=(const MicroJit&) = delete;
 
-    /** True on hosts with a stencil emitter (AArch64); else all compiles decline. */
+    /** True on hosts with a stencil emitter (AArch64, x86_64); else all compiles decline. */
     [[nodiscard]] static bool hostSupported() noexcept;
 
     [[nodiscard]] static std::unique_ptr<MicroJit> create(std::string& error);
@@ -54,6 +60,7 @@ public:
 
 private:
     MicroJit() noexcept = default;
+    MicroFunction compileX86(const MicroBlock& block, std::string& error);
     struct Impl;
     std::unique_ptr<Impl> impl_;
     std::uint64_t compilations_{0};
