@@ -810,13 +810,15 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
     Emitter e;
     std::uint16_t read_mask = 0U;
     std::uint16_t write_mask = 0U;
+    std::vector<std::uint16_t> cumulative_write_masks{0U};
     const auto reg_bit = [](std::uint8_t reg) -> std::uint16_t {
         return reg <= 12U ? static_cast<std::uint16_t>(1U << reg)
             : reg == 14U ? static_cast<std::uint16_t>(1U << 13U) : 0U;
     };
     for (const auto& op : block.ops) {
+        std::uint16_t op_write_mask = 0U;
         const auto reads = [&](std::uint8_t reg) { read_mask |= reg_bit(reg); };
-        const auto writes = [&](std::uint8_t reg) { write_mask |= reg_bit(reg); };
+        const auto writes = [&](std::uint8_t reg) { op_write_mask |= reg_bit(reg); };
         switch (op.op) {
         case MicroOp::mov_imm: case MicroOp::movw: writes(op.rd); break;
         case MicroOp::movt: reads(op.rd); writes(op.rd); break;
@@ -832,9 +834,12 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
             else { reads(op.rn); reads(op.rm); }
             writes(op.rd); break;
         case MicroOp::cbz: case MicroOp::cbnz: reads(op.rn); break;
-        case MicroOp::bl: write_mask |= static_cast<std::uint16_t>(1U << 13U); break;
+        case MicroOp::bl: op_write_mask |= static_cast<std::uint16_t>(1U << 13U); break;
         case MicroOp::nop: case MicroOp::b: case MicroOp::b_cond: break;
         }
+        write_mask |= op_write_mask;
+        cumulative_write_masks.push_back(static_cast<std::uint16_t>(
+            cumulative_write_masks.back() | op_write_mask));
     }
     // Load every register referenced by the block, including destinations,
     // so a prefix ending before a later write can safely commit the old value.
@@ -876,13 +881,13 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
     // merge flags, store regs, then constant r15/instruction_address.
     // Prefix exits skip the BL link update (a terminal BL only runs full).
     const auto emitEpilogue = [&](std::uint32_t pc_value, std::uint32_t ia_value,
-                                  bool link) {
+                                  bool link, std::uint16_t store_mask) {
         if (link && have_lr) e.movImm(15U, lr_value);
         e.lsr64(1U, 16U, 48U); // failed-branch mask -> x1 before merge
         e.mrsNzcv(17U);
         e.logicReg(2U, 16U, 16U, 17U); // orr w16, w16, w17
         e.strW(16U, xpsr_off);
-        emitRegisterTransfers(write_mask, true);
+        emitRegisterTransfers(store_mask, true);
         e.movImm(17U, pc_value);
         e.strW(17U, r_off + 60U);
         e.movImm(17U, ia_value);
@@ -925,21 +930,23 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
             e.checkMax(static_cast<std::uint32_t>(i + 2U), exit_labels[i + 1U]);
         }
     }
-    emitEpilogue(final_pc, last_pc, true);
+    emitEpilogue(final_pc, last_pc, true, cumulative_write_masks[block.ops.size()]);
     e.movRetMasked(static_cast<std::uint32_t>(block.ops.size()));
     const std::size_t end_label = e.makeLabel();
     e.b(end_label);
     for (std::size_t i = 1U; i < block.ops.size(); ++i) {
         e.bindLabel(exit_labels[i]);
         // Retired ops [0, i): next PC is pcs[i], last address pcs[i-1].
-        emitEpilogue(block.ops[i].pc, block.ops[i - 1U].pc, false);
+        emitEpilogue(block.ops[i].pc, block.ops[i - 1U].pc, false,
+                     cumulative_write_masks[i]);
         e.movRetMasked(static_cast<std::uint32_t>(i));
         e.ret();
     }
     for (std::size_t i = 0; i < block.ops.size(); ++i) {
         if (!has_taken[i]) continue;
         e.bindLabel(taken_labels[i]);
-        emitEpilogue(taken_targets[i], block.ops[i].pc, false);
+        emitEpilogue(taken_targets[i], block.ops[i].pc, false,
+                     cumulative_write_masks[i + 1U]);
         e.movRetMasked(static_cast<std::uint32_t>(i + 1U));
         e.ret();
     }

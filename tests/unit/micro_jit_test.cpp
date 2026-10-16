@@ -212,8 +212,9 @@ TEST(MicroJitEmitterTest, CompileCacheReusesExactBlocks) {
 
 TEST(MicroJitEmitterTest, PrefixExitsCommitPrecisely) {
     if (!MicroJit::hostSupported()) GTEST_SKIP() << "no micro-jit emitter on this host";
-    // movs r0,#1; movs r1,#2; movs r2,#3: retire 1 and 2-op prefixes.
-    const std::vector<std::uint16_t> code{0x2001U, 0x2102U, 0x2203U};
+    // Repeated r2 writes followed by sparse r7 write: prefixes must only
+    // store registers written by retired ops, preserving distinct sentinels.
+    const std::vector<std::uint16_t> code{0x2201U, 0x2202U, 0x2703U};
     std::vector<MicroSource> sources;
     std::uint32_t pc = kFlash;
     for (const auto half : code) {
@@ -234,11 +235,14 @@ TEST(MicroJitEmitterTest, PrefixExitsCommitPrecisely) {
         state.r[15] = kFlash;
         fn(&state, max);
         const std::size_t retired = std::min<std::size_t>(max, 3U);
-        EXPECT_EQ(state.r[0], 1U);
-        EXPECT_EQ(state.r[1], retired >= 2U ? 2U : 0xA5000001U);
-        EXPECT_EQ(state.r[2], retired >= 3U ? 3U : 0xA5000002U);
-        for (std::size_t reg = 3U; reg <= 14U; ++reg)
+        EXPECT_EQ(state.r[0], 0xA5000000U);
+        EXPECT_EQ(state.r[1], 0xA5000001U);
+        EXPECT_EQ(state.r[2], retired == 0U ? 0xA5000002U : retired == 1U ? 1U : 2U);
+        EXPECT_EQ(state.r[7], retired >= 3U ? 3U : 0xA5000007U);
+        for (std::size_t reg = 3U; reg <= 14U; ++reg) {
+            if (reg == 7U) continue;
             EXPECT_EQ(state.r[reg], 0xA5000000U + static_cast<std::uint32_t>(reg)) << "r" << reg;
+        }
         EXPECT_EQ(state.r[15], kFlash + static_cast<std::uint32_t>(2U * retired));
         EXPECT_EQ(state.instruction_address,
                   retired == 0U ? 0U : kFlash + static_cast<std::uint32_t>(2U * (retired - 1U)));
@@ -394,6 +398,38 @@ TEST(MicroJitEmitterTest, ConditionalBranchTakenAndFallthrough) {
             return;
         }
     }
+}
+
+TEST(MicroJitEmitterTest, TakenBranchStoresOnlyRetiredPrefixWrites) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no micro-jit emitter on this host";
+    // movs r2,#1; cmp r2,#2; bne +2; movs r7,#9; movs r5,#10.
+    // The taken branch retires its own op, but neither sparse future write.
+    const std::vector<std::uint16_t> code{0x2201U, 0x2A02U, 0xD101U, 0x2709U, 0x250AU};
+    const auto sources = decodeProgram(code);
+    ASSERT_EQ(sources.size(), code.size());
+    MicroBlock block;
+    ASSERT_TRUE(fil::cpu::buildMicroBlock({sources.data(), sources.size()}, block).ok);
+    ASSERT_EQ(block.ops.back().op, fil::cpu::MicroOp::mov_imm);
+    ASSERT_EQ(block.ops.back().rd, 5U);
+    std::string error;
+    auto jit = MicroJit::create(error);
+    ASSERT_TRUE(jit) << error;
+    const auto fn = jit->compile(block, error);
+    ASSERT_TRUE(fn) << error;
+
+    CpuState state;
+    for (std::size_t reg = 0U; reg <= 14U; ++reg)
+        state.r[reg] = 0xC7000000U + static_cast<std::uint32_t>(reg);
+    state.r[15] = kFlash;
+    state.xpsr = fil::cpu::xpsr_t;
+    const auto result = fn(&state, block.ops.size());
+    EXPECT_EQ(static_cast<std::size_t>(result & 0xffffffffU), 3U);
+    EXPECT_EQ(static_cast<std::uint32_t>(result >> 32U), 0U);
+    EXPECT_EQ(state.r[2], 1U);
+    EXPECT_EQ(state.r[7], 0xC7000007U);
+    EXPECT_EQ(state.r[5], 0xC7000005U);
+    EXPECT_EQ(state.r[15], kFlash + 10U);
+    EXPECT_EQ(state.instruction_address, kFlash + 4U);
 }
 
 TEST(MicroJitEmitterTest, CbzCbnz) {
