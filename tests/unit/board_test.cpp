@@ -237,6 +237,35 @@ TEST(BoardTest, IdempotentPeriodCacheReusesNonzeroPeriodPhase) {
                                        exact.value()->cpu().state()));
 }
 
+TEST(BoardTest, CachedPeriodCutsDoNotUseSpeculativeRollbackSnapshot) {
+    for (const std::size_t cut : {1U, 5U, 12U}) {
+        auto exact = fil::sim::Board::load(fixtureBoard());
+        auto cached = fil::sim::Board::load(fixtureBoard());
+        ASSERT_TRUE(exact && cached);
+        ASSERT_TRUE(warmIdempotentPeriodCache(*exact.value()));
+        ASSERT_TRUE(warmIdempotentPeriodCache(*cached.value()));
+
+        fil::sim::Board::ReversibleRamPrefix prefix;
+        // A reused output may retain an unrelated rollback snapshot on hits.
+        prefix.entry_state.r.fill(0xdeadbeefU);
+        prefix.entry_state.halted = true;
+        ASSERT_TRUE(cached.value()->prepareReversibleRamPrefix(prefix, 12U));
+        ASSERT_TRUE(prefix.period_certificate);
+        ASSERT_EQ(prefix.memoized_count, 12U);
+        const auto result = cached.value()->materializeReversibleRamPrefix(prefix, cut);
+
+        fil::sim::BoardRunOptions options;
+        options.duration_ns = 0U;
+        options.enable_loop_batching = false;
+        options.max_instructions = cut;
+        const auto reference = exact.value()->run(options);
+        EXPECT_EQ(result.cpu_result.instructions, reference.instructions);
+        EXPECT_EQ(result.cpu_result.cycles, reference.cycles);
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(cached.value()->cpu().state(),
+                                         exact.value()->cpu().state()));
+    }
+}
+
 TEST(BoardTest, IdempotentPeriodCacheRejectsChangedFlashClockAndCodeGeneration) {
     {
         auto board = fil::sim::Board::load(fixtureBoard());

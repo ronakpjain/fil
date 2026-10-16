@@ -95,6 +95,13 @@ Network commands use the compact exact single-instruction scheduler by default; 
 
 Guarded RAM capsules are automatic on eligible network work. Diagnostic safety fallbacks preserve behavior when tracing, spin detection, or other observation-sensitive conditions make capsule execution unsafe. Only journaled, reversible writes to non-executable private RAM are admitted; MMIO, FP/system operations, executable stores, unsupported handlers, and unsafe event boundaries end a span. CAN delivery and board-failure draining are observation barriers. CPU/RAM state must not be inspected or modified while a prefix is active except through scheduled callbacks, which materialize it first. Reentrant or concurrent mutation of a running World is unsupported. Run options are snapshotted per invocation.
 
+Certificate-hit admission retains entry read footprints, memory checkpoints,
+generation validation, and owner-aware event horizons, but skips the speculative
+rollback-state snapshot and new-transition hotness probe. Cached cuts restore
+certified states directly; cache misses capture rollback state before execution.
+Non-mutating certificate validation reuses the entry checkpoint rather than
+sampling it again after restoring only CPU/fetch state.
+
 Native kernels keep the scheduler prefix limit and failed-conditional mask in disjoint fields. Requests are clamped to the block length before packing, and each prefix check reads only the limit field. This corrects a regression in which a failed conditional branch could enlarge the limit, execute an unreported suffix, undercharge cycles, and eventually break interrupted replay. Dispatch restores CPU state if a kernel reports an impossible retirement count; it must never retain speculative changes from a declined kernel.
 
 Validation combines emitter and reversible-execution prefix regressions with real-firmware comparisons against capsules-disabled execution, including trace equality and final counters/PCs beyond the former failure point. These comparisons cover the tested workloads and intervals, not all possible firmware. Use `WorldRunOptions::enable_ram_capsules` for API comparisons; CLI comparisons currently require changing the network-command defaults in `src/cli/cli.cpp`. Comparing two capsule-enabled runs alone does not establish equivalence to exact dispatch.

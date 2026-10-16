@@ -193,6 +193,7 @@ public:
                 state.pending_exc_return = pending_exc_return;
             }
         };
+        /// Rollback state for speculative prefixes; unused on certificate hits.
         IntegerSnapshot entry_state{};
         mem::MemoryBus::SideEffectCheckpoint memory_checkpoint{};
         mem::MemoryBus::SideEffectCheckpoint evaluated_checkpoint{};

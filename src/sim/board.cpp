@@ -728,7 +728,6 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
     // likewise consult only the admitted prefix.
     prefix.start_time_ns = now;
     prefix.entry_pc = cpu_->state().r[15];
-    prefix.entry_state.capture(cpu_->state());
     prefix.clock_hz = frequency;
     prefix.time_fraction = time_fraction_;
     prefix.flash_generation = peripherals_->flash().acrGeneration();
@@ -739,27 +738,7 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
     prefix.entry_fetch_end = last_fetch_end_;
     const std::size_t transition_bucket = ((prefix.entry_pc >> 1U)
         ^ (prefix.entry_pc >> 5U)) & (transition_bucket_count - 1U);
-    auto& probe = transition_probes_[transition_bucket];
     const auto restoration_generation = memory_.restorationGeneration();
-    const bool same_probe = probe.valid && probe.entry.matches(cpu_->state())
-        && probe.have_fetch == prefix.entry_have_fetch
-        && probe.fetch_end == prefix.entry_fetch_end
-        && probe.execution_generation == prefix.execution_generation
-        && probe.restoration_generation == restoration_generation
-        && probe.clock_hz == frequency && probe.flash_generation == prefix.flash_generation;
-    if (same_probe) {
-        if (probe.observations < transition_hotness_threshold) ++probe.observations;
-    } else {
-        probe.entry = prefix.entry_state;
-        probe.valid = true;
-        probe.have_fetch = prefix.entry_have_fetch;
-        probe.fetch_end = prefix.entry_fetch_end;
-        probe.observations = 1U;
-        probe.execution_generation = prefix.execution_generation;
-        probe.restoration_generation = restoration_generation;
-        probe.clock_hz = frequency;
-        probe.flash_generation = prefix.flash_generation;
-    }
     const auto restore_entry = [&] {
         const auto current = memory_.sideEffectCheckpoint();
         if (current.mutation_sequence != prefix.memory_checkpoint.mutation_sequence
@@ -925,10 +904,10 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
                 prefix.memoized_count = prefix.count;
                 prefix.evaluated.count = static_cast<std::uint8_t>(std::min<std::size_t>(
                     prefix.count, ReversibleRamPrefix::max_instructions));
-                prefix.memory_checkpoint = memory_.sideEffectCheckpoint();
+                // Validation and state matching above do not mutate memory.
                 prefix.evaluated_checkpoint = prefix.memory_checkpoint;
                 period_validation_checkpoint_ = prefix.memory_checkpoint;
-                period_validation_restoration_generation_ = memory_.restorationGeneration();
+                period_validation_restoration_generation_ = restoration_generation;
                 return true;
             }
         }
@@ -976,20 +955,44 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
         prefix.memoized_count = prefix.count;
         prefix.transition_certificate = cert;
         prefix.transition_cache_slot = slot;
-        prefix.transition_validation_checkpoint = memory_.sideEffectCheckpoint();
-        prefix.transition_restoration_generation = memory_.restorationGeneration();
+        prefix.transition_validation_checkpoint = prefix.memory_checkpoint;
+        prefix.transition_restoration_generation = restoration_generation;
         prefix.evaluated.result.reason = cpu::StopReason::step_complete;
         prefix.evaluated.result.instructions = static_cast<std::uint32_t>(prefix.count);
         prefix.evaluated.count = static_cast<std::uint8_t>(prefix.count);
         cert->states[prefix.count].restore(cpu_->state());
         have_last_fetch_ = cert->have_fetch[prefix.count];
         last_fetch_end_ = cert->fetch_end[prefix.count];
-        prefix.memory_checkpoint = memory_.sideEffectCheckpoint();
         prefix.evaluated_checkpoint = prefix.memory_checkpoint;
         transition_validation_checkpoints_[slot] = prefix.transition_validation_checkpoint;
         transition_restoration_generations_[slot] = prefix.transition_restoration_generation;
         ++transition_hotness_[slot];
         return true;
+    }
+    // Cached cuts restore certificate states directly, never entry_state.
+    // Capture the rollback snapshot only before actual speculative execution.
+    prefix.entry_state.capture(cpu_->state());
+    // Only misses need hotness tracking for building a new transition. A hit
+    // already has a certificate; avoid another full entry-state comparison.
+    auto& probe = transition_probes_[transition_bucket];
+    const bool same_probe = probe.valid && probe.entry.matches(cpu_->state())
+        && probe.have_fetch == prefix.entry_have_fetch
+        && probe.fetch_end == prefix.entry_fetch_end
+        && probe.execution_generation == prefix.execution_generation
+        && probe.restoration_generation == restoration_generation
+        && probe.clock_hz == frequency && probe.flash_generation == prefix.flash_generation;
+    if (same_probe) {
+        if (probe.observations < transition_hotness_threshold) ++probe.observations;
+    } else {
+        probe.entry = prefix.entry_state;
+        probe.valid = true;
+        probe.have_fetch = prefix.entry_have_fetch;
+        probe.fetch_end = prefix.entry_fetch_end;
+        probe.observations = 1U;
+        probe.execution_generation = prefix.execution_generation;
+        probe.restoration_generation = restoration_generation;
+        probe.clock_hz = frequency;
+        probe.flash_generation = prefix.flash_generation;
     }
     // Cache hits need neither the flash timing snapshot nor the speculative
     // budget (including its per-instruction arrays). Initialize only on a miss.
