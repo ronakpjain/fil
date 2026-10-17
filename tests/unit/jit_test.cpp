@@ -453,6 +453,97 @@ TEST(JitTest, BudgetedReversiblePrefixDebitsExactCommittedCosts) {
     EXPECT_EQ(stored.value(), cpu.state().r[0]);
 }
 
+TEST(JitTest, PerformanceAdmissionPreservesStateAndReusesKernelVerdicts) {
+    if (!fil::cpu::MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
+    auto bus = basicBus();
+    const auto code = halfwords({0x4620U, 0x4681U, 0x464aU, 0xe000U});
+    ASSERT_TRUE(bus.loadBytes(flash_base, code));
+    fil::cpu::CortexM4 cpu(bus);
+    prepare(cpu);
+    cpu.state().r[4] = 0x87654321U;
+    const auto initial = cpu.state();
+    const auto warm = [&] {
+        const auto checkpoint = bus.sideEffectCheckpoint();
+        const auto footprint = bus.readFootprint();
+        for (std::uint32_t i = 0U; i < 70U; ++i)
+            static_cast<void>(cpu.prepareJitBlock());
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), initial));
+        const auto after = bus.sideEffectCheckpoint();
+        EXPECT_EQ(after.mutation_sequence, checkpoint.mutation_sequence);
+        EXPECT_EQ(after.mmio_generation, checkpoint.mmio_generation);
+        EXPECT_EQ(after.journal_generation, checkpoint.journal_generation);
+        // Decode fetches may read flash; calibration must not touch RAM.
+        EXPECT_EQ(bus.readFootprint().words, footprint.words);
+    };
+    warm();
+    const auto first = cpu.jitStats();
+    ASSERT_EQ(first.micro_admitted + first.micro_rejected, 1U);
+    ASSERT_GT(first.micro_admission_cost_ns, 0U);
+    EXPECT_EQ(first.micro_executions, 0U);
+    EXPECT_EQ(first.micro_instructions, 0U);
+    EXPECT_EQ(first.block_executions, 0U);
+    EXPECT_EQ(first.block_instructions, 0U);
+    // Re-decode identical code after generation invalidation. The immutable
+    // native kernel and its measured verdict must both be reused.
+    ASSERT_TRUE(bus.loadBytes(flash_base, code));
+    warm();
+    const auto second = cpu.jitStats();
+    EXPECT_EQ(second.micro_compilations, first.micro_compilations);
+    EXPECT_EQ(second.micro_admitted, first.micro_admitted);
+    EXPECT_EQ(second.micro_rejected, first.micro_rejected);
+    EXPECT_EQ(second.micro_admission_cost_ns, first.micro_admission_cost_ns);
+}
+
+TEST(JitTest, RegisterMovNativePrefixesKeepCyclesBranchesAndMemoryDeclinesExact) {
+    for (const bool zero : {false, true}) {
+        for (const std::size_t requested : {1U, 2U, 3U, 4U, 5U}) {
+            auto bus = basicBus();
+            // mov r0,r4; mov r9,r0; mov r2,r9; beq +0; ldr r2,[r3]; nop.
+            ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({
+                0x4620U, 0x4681U, 0x464aU, 0xd000U, 0x681aU, 0xbf00U})).hasValue());
+            bus.setReversibleRamOnly(true);
+            bus.setAllMmioTrapping(true);
+            fil::cpu::CortexM4 cpu(bus), reference(bus);
+            prepare(cpu);
+            prepare(reference);
+            cpu.state().r[4] = reference.state().r[4] = 0x87654321U;
+            cpu.state().r[3] = reference.state().r[3] = 0x40000000U;
+            cpu.state().xpsr = reference.state().xpsr = 0xb9000000U
+                | (zero ? 0x40000000U : 0U);
+            for (std::uint32_t i = 0U; i < 70U; ++i)
+                static_cast<void>(cpu.prepareJitBlock());
+            FakeFetchStalls stalls{3U, 1U};
+            fil::cpu::CortexM4::ReversibleCycleBudget budget{};
+            budget.remaining_cycles = 100U;
+            budget.fetch_stall = fakeFetchStall;
+            budget.context = &stalls;
+            const auto result = cpu.tryStepBudgetedReversibleJitBlock(requested, budget);
+            ASSERT_TRUE(result);
+            const auto count = std::min<std::size_t>(requested, 4U);
+            ASSERT_EQ(result->execution.count, count);
+            std::uint64_t total = 0U;
+            std::uint32_t cycles = 0U;
+            for (std::size_t i = 0U; i < count; ++i) {
+                const auto step = reference.stepFast();
+                ASSERT_EQ(step.reason, fil::cpu::StopReason::step_complete);
+                EXPECT_EQ(result->instruction_cycles[i], step.cycles);
+                EXPECT_EQ(budget.total_instruction_cycles[i], step.cycles + (i == 0U ? 3U : 1U));
+                total += budget.total_instruction_cycles[i];
+                cycles += step.cycles;
+            }
+            EXPECT_EQ(result->execution.result.cycles, cycles);
+            EXPECT_EQ(budget.remaining_cycles, 100U - total);
+            EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()));
+            EXPECT_EQ(budget.fetch_end, flash_base + static_cast<std::uint32_t>(2U * count));
+            if (fil::cpu::MicroJit::hostSupported()) {
+                const auto stats = cpu.jitStats();
+                EXPECT_GT(stats.micro_admitted + stats.micro_rejected, 0U);
+                EXPECT_TRUE(stats.micro_instructions == 0U || stats.micro_instructions == count);
+            }
+        }
+    }
+}
+
 TEST(JitTest, BudgetedReversibleBlockRejectsBeforeTakenBranchSideEffects) {
     auto bus = basicBus();
     ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0xBF00U, 0xE7FFU})).hasValue());

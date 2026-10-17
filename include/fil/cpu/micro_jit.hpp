@@ -25,6 +25,7 @@
  *  through the existing generation checks.
  */
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -40,6 +41,12 @@ struct MicroBlock;
  *  failed-conditional-branch mask (bit i = op i was b_cond with a failed
  *  condition, charged 1 cycle rather than its base cost) in the high 32. */
 using MicroFunction = std::uint64_t (*)(CpuState*, std::size_t);
+
+/** Paired host timings for kernel admission. Require a 10% median saving and
+ *  wins in at least four of five alternating-order samples; ties decline. */
+[[nodiscard]] bool microKernelProfitable(
+    std::array<std::uint64_t, 5> native_ns,
+    std::array<std::uint64_t, 5> handler_ns) noexcept;
 
 class MicroJit {
 public:

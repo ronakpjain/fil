@@ -44,6 +44,22 @@
 #endif
 
 namespace fil::cpu {
+
+bool microKernelProfitable(std::array<std::uint64_t, 5> native_ns,
+                           std::array<std::uint64_t, 5> handler_ns) noexcept {
+    std::size_t wins = 0U;
+    for (std::size_t i = 0U; i < native_ns.size(); ++i) {
+        if (native_ns[i] != 0U && native_ns[i] < handler_ns[i]) ++wins;
+    }
+    std::sort(native_ns.begin(), native_ns.end());
+    std::sort(handler_ns.begin(), handler_ns.end());
+    const auto native = native_ns[2];
+    const auto handler = handler_ns[2];
+    // Subtraction avoids overflow even for saturated timing samples.
+    return wins >= 4U && native != 0U && handler != 0U
+        && native < handler && native <= handler - handler / 10U;
+}
+
 namespace {
 
 // Guest r[i] -> host w(i+2); guest LR -> w15.
@@ -460,6 +476,10 @@ bool emitOp(Emitter& e, const MicroInst& op, std::string& error) {
                 e.setNzKeepCv(wd);
             }
         }
+        return true;
+    case MicroOp::mov_reg:
+        if (wd != wm) e.logicReg(2U, wd, 31U, wm);
+        if (op.set_flags) e.setNzKeepCv(wd);
         return true;
     case MicroOp::movw:
         e.movz(wd, op.imm & 0xffffU, 0U);
@@ -1544,6 +1564,7 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
         const auto writes = [&](std::uint8_t reg) { op_write_mask |= reg_bit(reg); };
         switch (op.op) {
         case MicroOp::mov_imm: case MicroOp::movw: writes(op.rd); break;
+        case MicroOp::mov_reg: reads(op.rm); writes(op.rd); break;
         case MicroOp::movt: reads(op.rd); writes(op.rd); break;
         case MicroOp::add_imm: case MicroOp::sub_imm: reads(op.rn); writes(op.rd); break;
         case MicroOp::cmp_imm: case MicroOp::cmn_imm: reads(op.rn); break;

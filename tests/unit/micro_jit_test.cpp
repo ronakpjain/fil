@@ -154,6 +154,71 @@ TEST(MicroJitEmitterTest, MovAddSubCmp) {
     checkProgram({0x2001U, 0x1C81U, 0x1E4AU, 0x2A01U, 0x2205U}, 1U); // movs/adds/subs/cmp/movs
 }
 
+TEST(MicroJitEmitterTest, RegisterMovAliasesAndHighCoreRegisters) {
+    // MOVs do not set flags: copies, aliasing, high core regs, then consume r9.
+    checkProgram({0x4620U, 0x4681U, 0x464AU, 0x4600U, 0x4613U}, 0x4d4f56U);
+}
+
+TEST(MicroJitEmitterTest, FlagSettingRegisterMovPreservesCarryAndOverflow) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no micro-jit emitter on this host";
+    const auto decoded = fil::cpu::decode32(0xea5fU, 0x0001U); // movs.w r0, r1
+    ASSERT_TRUE(decoded);
+    ASSERT_EQ(decoded->kind, fil::cpu::InstrKind::mov);
+    ASSERT_TRUE(decoded->set_flags);
+    const MicroSource source{*decoded, kFlash, 4U};
+    MicroBlock block;
+    ASSERT_TRUE(fil::cpu::buildMicroBlock({&source, 1U}, block).ok);
+    std::string error;
+    auto jit = MicroJit::create(error);
+    ASSERT_TRUE(jit) << error;
+    const auto fn = jit->compile(block, error);
+    ASSERT_TRUE(fn) << error;
+    for (std::uint32_t flags = 0U; flags < 16U; ++flags) {
+        for (const auto value : {0U, 1U, 0x80000000U, 0xffffffffU}) {
+            CpuState initial;
+            initial.r[1] = value;
+            initial.r[15] = kFlash;
+            initial.xpsr = 0x090f0000U | (flags << 28U);
+            auto actual = initial;
+            EXPECT_EQ(fn(&actual, 1U) & 0xffffffffU, 1U);
+            Fixture fixture;
+            CpuState expected;
+            runReference(fixture, {0xea5fU, 0x0001U}, initial, expected, 1);
+            expectSameState(expected, actual);
+        }
+    }
+}
+
+TEST(MicroJitEmitterTest, RegisterMovPrefixCommitsMatchStepping) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no micro-jit emitter on this host";
+    const std::vector<std::uint16_t> code{0x4620U, 0x4681U, 0x464AU, 0x4600U, 0x4613U};
+    std::vector<MicroSource> sources;
+    for (std::size_t i = 0U; i < code.size(); ++i)
+        sources.push_back({*fil::cpu::decode16(code[i]), kFlash + static_cast<std::uint32_t>(2U * i), 2U});
+    MicroBlock block;
+    ASSERT_TRUE(fil::cpu::buildMicroBlock(sources, block).ok);
+    std::string error;
+    auto jit = MicroJit::create(error);
+    ASSERT_TRUE(jit) << error;
+    const auto fn = jit->compile(block, error);
+    ASSERT_TRUE(fn) << error;
+    for (std::size_t limit = 0U; limit <= code.size(); ++limit) {
+        CpuState initial;
+        for (std::size_t r = 0U; r <= 14U; ++r)
+            initial.r[r] = 0xa5000000U + static_cast<std::uint32_t>(r);
+        initial.r[15] = kFlash;
+        initial.xpsr = 0xf90f0000U;
+        auto actual = initial;
+        const auto retired = fn(&actual, limit) & 0xffffffffU;
+        EXPECT_EQ(retired, limit);
+        Fixture fixture;
+        CpuState expected;
+        runReference(fixture, code, initial, expected, static_cast<int>(limit));
+        expectSameState(expected, actual);
+        EXPECT_EQ(actual.r[13], initial.r[13]);
+    }
+}
+
 TEST(MicroJitEmitterTest, MovwMovtLogical) {
     // movs + ands/orrs/eors/bics (all T1, always flag-setting).
     checkProgram({0x200FU, 0x4001U, 0x4308U, 0x405AU, 0x4383U}, 2U);

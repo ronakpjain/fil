@@ -11,7 +11,8 @@
  *  for differential testing against the existing executor.
  *
  *  Scope includes the admitted integer forms plus shifted register forms:
- *  NOP, MOV/MOVW/MOVT immediate, ADD/SUB/CMP/CMN immediate, unshifted
+ *  NOP, MOV/MOVW/MOVT immediate, unshifted MOV register,
+ *  ADD/SUB/CMP/CMN immediate, unshifted
  *  AND/ORR/EOR/BIC and ADD/SUB, shifted ADD/SUB, LSL/LSR/ASR/ROR/RRX,
  *  and a terminal unconditional B/BL. Everything else (memory/MMIO,
  *  ADC/SBC, SP/PC operands, IT, system, FP) stays on cached handlers.
@@ -32,6 +33,7 @@ namespace fil::cpu {
 enum class MicroOp : std::uint8_t {
     nop,
     mov_imm,
+    mov_reg,
     movw,
     movt,
     add_imm,

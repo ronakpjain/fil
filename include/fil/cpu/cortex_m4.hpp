@@ -14,6 +14,7 @@
 #include <optional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 namespace fil::elf {
 class ElfImage;
@@ -386,6 +387,9 @@ public:
         std::uint64_t micro_instructions{0};
         std::uint64_t micro_compilation_failures{0};
         std::uint64_t micro_compile_cost_ns{0};
+        std::uint64_t micro_admitted{0};
+        std::uint64_t micro_rejected{0};
+        std::uint64_t micro_admission_cost_ns{0};
     };
     [[nodiscard]] JitStats jitStats() const noexcept { return jit_stats_; }
     /**
@@ -540,8 +544,12 @@ private:
     static constexpr std::uint16_t jit_compile_threshold = 50U;
     std::unique_ptr<MicroJit> micro_jit_;
     std::string micro_jit_error_;
+    // Kernels live in an immutable arena; verdicts survive block-cache eviction.
+    std::unordered_map<MicroFunction, bool> micro_admission_cache_;
     [[nodiscard]] bool ensureMicroJit();
     void prepareMicroBlock(JitBlockEntry& entry);
+    [[nodiscard]] bool admitMicroBlock(const JitBlockEntry& entry,
+        MicroFunction function, std::uint8_t prefix);
     // Total cycle overcharge when failed conditional branches in a retired
     // micro prefix were planned at base cost (each retires for 1 cycle).
     [[nodiscard]] static std::uint32_t microFailedAdjust(

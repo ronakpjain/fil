@@ -84,6 +84,15 @@ MicroLowerResult tryLowerMicroInst(const MicroSource& source, MicroInst& out) no
         out = inst;
         return {true, MicroLowerReason::ok, {}};
     case InstrKind::mov:
+        // MOV ignores rn (narrow decode carries rd; wide alias carries 15).
+        if (registerShape(d) && d.shift_type == ShiftType::lsl
+            && d.shift_amount == 0U && coreReg(d.rd) && coreReg(d.rm)) {
+            inst.op = MicroOp::mov_reg;
+            inst.rd = d.rd;
+            inst.rm = d.rm;
+            out = inst;
+            return {true, MicroLowerReason::ok, {}};
+        }
         if (!immediateShape(d) || !coreReg(d.rd)) {
             return {false, !coreReg(d.rd) ? MicroLowerReason::bad_register : MicroLowerReason::bad_shape, "mov imm"};
         }
@@ -311,6 +320,12 @@ std::size_t interpretMicroBlock(const MicroBlock& block, MicroCpu& cpu, std::siz
                 if (c) cpu.xpsr |= kFlagC;
             }
             break;
+        case MicroOp::mov_reg: {
+            const auto value = readOp(cpu, op.rm);
+            writeOp(cpu, op.rd, value);
+            if (op.set_flags) applyNz(cpu, value, true);
+            break;
+        }
         case MicroOp::movw: writeOp(cpu, op.rd, op.imm & 0xffffU); break;
         case MicroOp::movt:
             writeOp(cpu, op.rd, (readOp(cpu, op.rd) & 0xffffU) | ((op.imm & 0xffffU) << 16U));

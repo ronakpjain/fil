@@ -409,11 +409,111 @@ void CortexM4::prepareMicroBlock(JitBlockEntry& entry) {
         ++jit_stats_.micro_compilation_failures;
         return;
     }
+    // Reattaching an already emitted kernel after a block-cache eviction is
+    // not a new native compilation or a new calibration.
+    jit_stats_.micro_compilations += micro_jit_->compilations() - compilations_before;
+    if (!admitMicroBlock(entry, fn, prefix)) return;
     entry.micro_function = fn;
     entry.micro_prefix_count = prefix;
-    // Reattaching an already emitted kernel after a block-cache eviction is
-    // not a new native compilation.
-    jit_stats_.micro_compilations += micro_jit_->compilations() - compilations_before;
+}
+
+bool CortexM4::admitMicroBlock(const JitBlockEntry& entry,
+    const MicroFunction function, const std::uint8_t prefix) {
+    if (const auto found = micro_admission_cache_.find(function);
+        found != micro_admission_cache_.end()) return found->second;
+
+    const auto start = std::chrono::steady_clock::now();
+    // Exercise the real budgeted dispatcher, limited to the lowered integer
+    // prefix. No suffix, timing callback, journal, or simulated clock is touched.
+    // Publish the candidate temporarily under an RAII save; calibration's
+    // execution statistics and decline streaks must not leak into real work.
+    auto& slot = (*jit_blocks_)[jitBlockIndex(entry.pc)];
+    struct RestoreContext {
+        CpuState& state;
+        JitBlockEntry& slot;
+        JitStats& stats;
+        CpuState saved;
+        JitBlockEntry saved_slot;
+        JitStats saved_stats;
+        bool keep_stats{false};
+        ~RestoreContext() {
+            state = saved;
+            slot = saved_slot;
+            if (!keep_stats) stats = saved_stats;
+        }
+    } restore{state_, slot, jit_stats_, state_, slot, jit_stats_};
+    slot = entry;
+    slot.valid = true;
+    slot.micro_prefix_count = prefix;
+    const auto input = [&](const std::size_t round) {
+        state_ = restore.saved;
+        state_.r[15] = entry.pc;
+        state_.xpsr = (state_.xpsr & 0x0fffffffU)
+            | (static_cast<std::uint32_t>((round / prefix) & 15U) << 28U);
+    };
+    const auto run = [&](const std::size_t limit, const bool use_native) {
+        slot.micro_function = use_native ? function : nullptr;
+        ReversibleCycleBudget budget;
+        budget.remaining_cycles = 65535U;
+        budget.have_fetch = true;
+        budget.fetch_end = entry.pc;
+        return executeTrustedReversibleJitBlock(limit, &budget);
+    };
+
+    // Validate the scratch runner and warm both paths for every prefix and
+    // NZCV combination before measuring. A mismatch simply keeps handlers.
+    bool valid = true;
+    for (std::size_t round = 0U; round < static_cast<std::size_t>(prefix) * 16U; ++round) {
+        const auto limit = 1U + round % prefix;
+        input(round);
+        const auto expected_result = run(limit, false);
+        const auto expected = state_;
+        input(round);
+        const auto result = run(limit, true);
+        if (!result || !expected_result
+            || result->execution.count != expected_result->execution.count
+            || result->execution.result.cycles != expected_result->execution.result.cycles
+            || !bitwiseEqual(expected, state_)) {
+            valid = false;
+            break;
+        }
+    }
+    std::array<std::uint64_t, 5> native_ns{}, handler_ns{};
+    if (valid) {
+        const auto rounds = std::max<std::size_t>(128U, static_cast<std::size_t>(prefix) * 16U);
+        volatile std::uint32_t checksum = 0U;
+        const auto measure = [&](const bool use_native) {
+            const auto begin = std::chrono::steady_clock::now();
+            for (std::size_t round = 0U; round < rounds; ++round) {
+                input(round);
+                const auto limit = 1U + round % prefix;
+                const auto result = run(limit, use_native);
+                checksum = checksum ^ state_.r[0] ^ state_.xpsr
+                    ^ (result ? result->execution.count : 0U);
+            }
+            return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - begin).count());
+        };
+        for (std::size_t sample = 0U; sample < native_ns.size(); ++sample) {
+            if ((sample & 1U) == 0U) {
+                handler_ns[sample] = measure(false);
+                native_ns[sample] = measure(true);
+            } else {
+                native_ns[sample] = measure(true);
+                handler_ns[sample] = measure(false);
+            }
+        }
+    }
+    const bool admitted = valid && microKernelProfitable(native_ns, handler_ns);
+    jit_stats_ = restore.saved_stats;
+    restore.keep_stats = true;
+    micro_admission_cache_.emplace(function, admitted);
+    if (admitted) ++jit_stats_.micro_admitted;
+    else ++jit_stats_.micro_rejected;
+    const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count());
+    jit_stats_.micro_admission_cost_ns = saturatingCounterAdd(jit_stats_.micro_admission_cost_ns, elapsed);
+    return admitted;
 }
 
 bool CortexM4::reset(const elf::ElfImage& image) noexcept {
@@ -1409,7 +1509,10 @@ bool CortexM4::prepareJitBlock(const bool allow_single) {
     // conditional-branch flow-through that all_fast excludes. Prepare already
     // gates on sustained use (jit_compile_threshold); lowering declines
     // anything outside the FilIR subset, so no extra hotness counter is needed.
-    if (!fresh.has_memory && fresh.count >= 2U) {
+    // Lowering stops at the first unsupported operation. A memory suffix
+    // does not prevent compiling a pure integer prefix; checked handlers still
+    // own every memory access, decline, and executable-generation change.
+    if (fresh.count >= 2U) {
         prepareMicroBlock(fresh);
     }
     // Precompute the peek preview: leading prefix cycles with divide at

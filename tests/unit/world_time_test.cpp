@@ -161,8 +161,12 @@ TEST(WorldTimeTest, CapsuleFailedConditionalPreservesInstructionBudgetCuts) {
         ASSERT_TRUE(reference && actual);
         EXPECT_GT(actual.value().deferred_prefixes, 0U);
 #if defined(FIL_ENABLE_MICRO_JIT) && FIL_ENABLE_MICRO_JIT
-        if (fil::cpu::MicroJit::hostSupported())
-            EXPECT_GT(capsules.value()->board("alpha")->cpu().jitStats().micro_executions, 0U);
+        if (fil::cpu::MicroJit::hostSupported()) {
+            const auto stats = capsules.value()->board("alpha")->cpu().jitStats();
+            // Admission is host-performance dependent; either path must match
+            // exact dispatch. Direct emitter tests force native prefix cuts.
+            EXPECT_GT(stats.micro_admitted + stats.micro_rejected, 0U);
+        }
 #endif
         EXPECT_EQ(actual.value().instructions, reference.value().instructions);
         EXPECT_EQ(actual.value().cycles, reference.value().cycles);
