@@ -23,6 +23,7 @@
 #include "fil/cpu/cortex_m4.hpp"
 #include "fil/cpu/micro_jit_ir.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -1094,6 +1095,11 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
             e.aluRImm(4U, kNzcv, keep);
             if (set != 0U) e.aluRImm(1U, kNzcv, set);
         }
+        return true;
+    case MicroOp::mov_reg:
+        loadGuest(e, kEax, o, op.rm);
+        if (op.set_flags) endLogic(e, o, false, op.rd); // N/Z updated; C/V retained
+        else storeGuest(e, o, op.rd, kEax);
         return true;
     case MicroOp::movw:
         e.movM32Imm(kState, guestDisp(o, op.rd), op.imm & 0xffffU);
