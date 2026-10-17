@@ -663,7 +663,12 @@ StopReason CortexM4::execute(
         const auto result = memory_.read32(address, context);
         if (!result) return failBus(result.fault(), "word load failed");
         if (instruction.rd == 15U) {
-            if (!state_.branchWritePc(result.value())) {
+            // Interrupt epilogues may restore EXC_RETURN with LDR PC rather
+            // than BX/POP. Pend the return before the scheduler unpacks the
+            // exception frame, retaining this instruction's base writeback.
+            if (isExceptionReturn(result.value())) {
+                state_.pending_exc_return = result.value();
+            } else if (!state_.branchWritePc(result.value())) {
                 return failInvalid("load to PC selected non-Thumb state");
             }
         } else {

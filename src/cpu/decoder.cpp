@@ -827,6 +827,13 @@ struct ExpandedImmediate {
         }
     }
 
+    // LDRB's unsigned immediate encoding with Rt == PC is PLD, not a
+    // byte load. Cortex-M4 treats this optional prefetch hint as a NOP:
+    // it must not read memory or change architectural state.
+    if (op == 0xf890U && (second & 0xf000U) == 0xf000U) {
+        return base32(first, second, InstrKind::nop);
+    }
+
     auto result = base32(first, second, kind, OperandForm::immediate);
     result.rn = static_cast<std::uint8_t>(first & 0x0fU);
     result.rd = static_cast<std::uint8_t>((second >> 12U) & 0x0fU);

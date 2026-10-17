@@ -711,6 +711,53 @@ TEST(CpuStepTest, ExecutesSystemInstructionsAndRaisesConsumableMarkers) {
         << "POP exposes consumable EXC_RETURN marker";
 }
 
+TEST(CpuStepTest, WordLoadToPcRecognizesExceptionReturnAndPreservesWriteback) {
+    for (const std::uint32_t target : {0xfffffff1U, 0xfffffff9U, 0xfffffffdU,
+                                      flash_base + 0x21U}) {
+        SCOPED_TRACE(target);
+        auto bus = basicBus();
+        ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0xf85dU, 0xfb04U})).hasValue());
+        fil::cpu::CortexM4 cpu(bus);
+        prepare(cpu);
+        cpu.state().xpsr = (cpu.state().xpsr & ~fil::cpu::xpsr_ipsr_mask) | 102U;
+        const std::uint32_t original_sp = cpu.state().activeSp();
+        ASSERT_TRUE(bus.write32(original_sp, target).hasValue());
+
+        EXPECT_EQ(cpu.step().reason, fil::cpu::StopReason::step_complete);
+        EXPECT_EQ(cpu.state().activeSp(), original_sp + 4U);
+        if (target >= 0xfffffff0U) {
+            ASSERT_TRUE(cpu.state().pending_exc_return.has_value());
+            EXPECT_EQ(*cpu.state().pending_exc_return, target);
+            EXPECT_EQ(cpu.state().r[15], flash_base + 4U);
+        } else {
+            EXPECT_FALSE(cpu.state().pending_exc_return.has_value());
+            EXPECT_EQ(cpu.state().r[15], target & ~1U);
+        }
+    }
+}
+
+TEST(CpuStepTest, PrefetchDataImmediateHintDoesNotReadMemoryOrModifyRegisters) {
+    auto bus = basicBus();
+    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({
+        0xf890U, 0xf000U, // pld [r0]
+        0xf891U, 0xf020U, // pld [r1, #32]
+    })).hasValue());
+    fil::cpu::CortexM4 cpu(bus);
+    prepare(cpu);
+    cpu.state().r[0] = 0xffff0000U; // Unmapped addresses must not cause a bus fault.
+    cpu.state().r[1] = 0xffff0000U;
+    const auto registers = cpu.state().r;
+    const auto xpsr = cpu.state().xpsr;
+    for (unsigned step = 0U; step < 2U; ++step) {
+        EXPECT_EQ(cpu.step().reason, fil::cpu::StopReason::step_complete);
+        for (unsigned reg = 0U; reg < 15U; ++reg) {
+            EXPECT_EQ(cpu.state().r[reg], registers[reg]);
+        }
+        EXPECT_EQ(cpu.state().r[15], flash_base + (step + 1U) * 4U);
+        EXPECT_EQ(cpu.state().xpsr, xpsr);
+    }
+}
+
 TEST(CpuStepTest, MasksBasepriToImplementedPriorityBits) {
     for (const std::uint32_t value : {0U, 0x0fU, 0x10U, 0x1fU, 0xffU, 0x100U}) {
         SCOPED_TRACE(value);
