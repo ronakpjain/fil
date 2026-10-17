@@ -64,8 +64,9 @@ against the non-capsule path on real firmware; see the known issue in
 Decoded-instruction and memory caches, bounded scheduler bursts, eligible
 guarded RAM capsules on network commands, and proven-loop batching on
 single-board `run` reduce host overhead. Network loop batching is off by default.
-Release builds use IPO when supported; optional PGO trains on a representative
-workload.
+Release builds use IPO when supported. Makefile builds also enable host CPU
+tuning by default; use `NATIVE=OFF` for portable binaries. Optional `make pgo`
+trains on a representative workload and retains the same CPU-tuning setting.
 
 ADC decimation 1 is the full-fidelity default. `--adc-decimation N` (1–1024)
 is an **opt-in fidelity tradeoff** for continuous ADC scans: only one scan in N

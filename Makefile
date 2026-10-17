@@ -17,6 +17,8 @@ CTEST_JOBS ?= $(JOBS)
 TESTS ?= ON
 DOCS ?= ON
 IPO ?= ON
+# Local builds target this CPU; use NATIVE=OFF for portable binaries.
+NATIVE ?= ON
 ASAN ?= OFF
 UBSAN ?= OFF
 PGO_GENERATE ?= OFF
@@ -95,6 +97,7 @@ configure:
 		-DFIL_BUILD_TESTS="$(TESTS)" \
 		-DFIL_BUILD_DOCS="$(DOCS)" \
 		-DFIL_ENABLE_IPO="$(IPO)" \
+		-DFIL_ENABLE_NATIVE="$(NATIVE)" \
 		-DFIL_ENABLE_ASAN="$(ASAN)" \
 		-DFIL_ENABLE_UBSAN="$(UBSAN)" \
 		-DFIL_PGO_GENERATE="$(PGO_GENERATE)" \
@@ -282,4 +285,5 @@ help:
 	  '                Stages: pgo-generate | pgo-train | pgo-merge | pgo-use | pgo-test' \
 	  '                Set PGO_CXX/LLVM_PROFDATA to matching LLVM versions' \
 	  'Cleanup:        make clean [BUILD_DIR=...] | clean-pgo | clean-all' \
+	  'CPU tuning:     NATIVE=ON (default); NATIVE=OFF for portable binaries' \
 	  'Options:        BUILD_DIR=build GENERATOR=Ninja JOBS=8 CTEST_JOBS=8 BUILD_TYPE=Release'

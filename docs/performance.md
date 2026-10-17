@@ -68,6 +68,11 @@ make BUILD_DIR=build-release BUILD_TYPE=Release IPO=ON test
 ```
 
 - IPO/LTO is enabled when supported. Debug and sanitizer builds are not throughput baselines.
+- Makefile builds default to `NATIVE=ON`, selecting a supported host CPU flag
+  (`-march=native`, or `-mcpu=native` where supported). Use `NATIVE=OFF` for
+  portable binaries. Cross-compilation skips host tuning; unsupported compilers
+  fall back to portable defaults. Direct CMake builds remain portable unless
+  `-DFIL_ENABLE_NATIVE=ON` is supplied.
 
 ### Profile-guided optimization
 
@@ -87,14 +92,15 @@ The target cleans old PGO outputs, builds, trains, merges profiles, rebuilds wit
 
 ### Host-tuned PGO build (local throughput)
 
-On x86-64 with Clang, a local-only build can additionally target the host CPU.
-Use the same flags for profile generation and profile use:
+Makefile builds target the host CPU by default, including both PGO profile
+generation and profile use. PGO itself remains opt-in; plain `make` does not
+train a profile. For example:
 
 ```bash
 make pgo JOBS=6 CTEST_JOBS=4 \
   PGO_GENERATE_BUILD_DIR=build-runtime-pgo-generate \
   PGO_BUILD_DIR=build-runtime-native \
-  CMAKE_ARGS='-DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -march=native"' \
+  NATIVE=ON \
   PGO_TRAIN_ARGS='run-network configs/networks/per_vehicle.json --duration-ms 3000 --max-instructions 150000000 --quantum 1024 --strict-mmio --adc-decimation 1'
 
 tools/bench_full_network.sh --binary build-runtime-native/fil \
@@ -102,8 +108,8 @@ tools/bench_full_network.sh --binary build-runtime-native/fil \
 ```
 
 `make pgo` replaces the selected PGO build directories. Host-tuned binaries may
-require CPU features unavailable on other machines; retain the portable defaults
-for distribution. Neither PGO nor host tuning changes ADC fidelity or simulated
+require CPU features unavailable on other machines; use `NATIVE=OFF` for
+distribution. Neither PGO nor host tuning changes ADC fidelity or simulated
 instruction timing.
 
 A local x86-64 measurement with Clang 23, ADC decimation 1, and all six boards
