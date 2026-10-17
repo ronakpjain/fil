@@ -100,8 +100,8 @@ A network declares named CAN buses and a stable board order:
   "schema_version": 1,
   "name": "per_vehicle",
   "buses": {
-    "vcan": {"type": "can", "bitrate": 500000},
-    "mcan": {"type": "can", "bitrate": 500000}
+    "VCAN": {"type": "can", "bitrate": 500000},
+    "MCAN": {"type": "can", "bitrate": 500000}
   },
   "boards": [
     "../boards/dashboard.json",
@@ -126,7 +126,7 @@ A network's optional `stimuli` array contains paths to versioned JSON stimulus s
   "events": [
     {"type":"gpio", "at_ms":0, "board":"main_module", "pin":"PB9", "value":true},
     {"type":"adc", "at_ms":0, "board":"dashboard", "instance":"ADC1", "channel":9, "value":650},
-    {"type":"can", "at_ms":500, "repeat":{"every_ms":500,"count":5}, "bus":"mcan", "id":"0x231", "data":[0,41,0,0]},
+    {"type":"can", "at_ms":500, "repeat":{"every_ms":500,"count":5}, "bus":"MCAN", "id":"0x231", "data":[0,41,0,0]},
     {"type":"usart", "at_ms":100, "board":"dashboard", "instance":"USART1", "bytes":[72,105]}
   ]
 }

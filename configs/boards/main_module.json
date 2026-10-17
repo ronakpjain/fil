@@ -5,7 +5,7 @@
   "elf": "../../../../PER/monorepo/firmware/output/main_module/main_module.elf",
   "vector_base": "0x08008000",
   "can": {
-    "FDCAN2": {"bus": "vcan"},
-    "FDCAN3": {"bus": "mcan"}
+    "FDCAN2": {"bus": "VCAN"},
+    "FDCAN3": {"bus": "MCAN"}
   }
 }

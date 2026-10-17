@@ -4,5 +4,5 @@
   "mcu": "../mcus/stm32g474retx.json",
   "elf": "../../../../PER/monorepo/firmware/output/a_box/a_box.elf",
   "vector_base": "0x08008000",
-  "can": {"FDCAN1": {"bus": "vcan"}}
+  "can": {"FDCAN1": {"bus": "VCAN"}}
 }
