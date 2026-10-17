@@ -85,6 +85,35 @@ The target cleans old PGO outputs, builds, trains, merges profiles, rebuilds wit
   decimation 1 retains every conversion.
 - Individual stages: `pgo-generate`, `pgo-train`, `pgo-merge`, `pgo-use`, `pgo-test`.
 
+### Host-tuned PGO build (local throughput)
+
+On x86-64 with Clang, a local-only build can additionally target the host CPU.
+Use the same flags for profile generation and profile use:
+
+```bash
+make pgo JOBS=6 CTEST_JOBS=4 \
+  PGO_GENERATE_BUILD_DIR=build-runtime-pgo-generate \
+  PGO_BUILD_DIR=build-runtime-native \
+  CMAKE_ARGS='-DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -march=native"' \
+  PGO_TRAIN_ARGS='run-network configs/networks/per_vehicle.json --duration-ms 3000 --max-instructions 150000000 --quantum 1024 --strict-mmio --adc-decimation 1'
+
+tools/bench_full_network.sh --binary build-runtime-native/fil \
+  --duration-ms 10000 --reps 3
+```
+
+`make pgo` replaces the selected PGO build directories. Host-tuned binaries may
+require CPU features unavailable on other machines; retain the portable defaults
+for distribution. Neither PGO nor host tuning changes ADC fidelity or simulated
+instruction timing.
+
+A local x86-64 measurement with Clang 23, ADC decimation 1, and all six boards
+reaching 10 simulated seconds gave a median of 9.530 wall seconds (1.049×
+realtime), versus 13.833 seconds for plain Release with IPO. These are three
+alternating runs per binary with matching counters and final PCs, including
+startup. This is a build-configuration comparison, not a code-only speedup or a
+realtime guarantee on other hosts. Rebenchmark after source or firmware changes;
+the margin above realtime is small.
+
 ## Network comparison
 
 Build the target firmware before measuring its configured network. Firmware
