@@ -93,15 +93,15 @@ Current binding details matter when authoring tests:
 
 ## Network configuration
 
-A network declares named CAN buses and a stable board order:
+A network declares CAN buses by string ID and a stable board order:
 
 ```json
 {
   "schema_version": 1,
   "name": "per_vehicle",
   "buses": {
-    "VCAN": {"type": "can", "bitrate": 500000},
-    "MCAN": {"type": "can", "bitrate": 500000}
+    "0": {"type": "can", "bitrate": 500000},
+    "1": {"type": "can", "bitrate": 500000}
   },
   "boards": [
     "../boards/dashboard.json",
@@ -111,7 +111,7 @@ A network declares named CAN buses and a stable board order:
 }
 ```
 
-At least one board is required. Only `type: "can"` is supported, bitrate must be nonzero, board names must be unique, and every board CAN attachment must name a declared bus. Board array order is the deterministic round-robin scheduling order. Bitrate is currently topology metadata; virtual CAN delivery is synchronous and does not model wire time or arbitration.
+For the PER networks, SuperDBC bus ID `"0"` maps to VCAN and `"1"` maps to MCAN; these IDs are used as string keys in network configs and as string values in board attachments and CAN stimuli/expectations. At least one board is required. Only `type: "can"` is supported, bitrate must be nonzero, board names must be unique, and every board CAN attachment must name a declared bus. Board array order is the deterministic round-robin scheduling order. Bitrate is currently topology metadata; virtual CAN delivery is synchronous and does not model wire time or arbitration.
 
 The repository provides `configs/networks/per_vehicle.json` for application firmware and `configs/networks/per_vehicle_bootloaders.json` for bootloader firmware. The bootloader board configs use vector base `0x08000000`; application configs use `0x08008000`. These ELF paths target an external firmware checkout and must exist to run the networks.
 
@@ -126,7 +126,7 @@ A network's optional `stimuli` array contains paths to versioned JSON stimulus s
   "events": [
     {"type":"gpio", "at_ms":0, "board":"main_module", "pin":"PB9", "value":true},
     {"type":"adc", "at_ms":0, "board":"dashboard", "instance":"ADC1", "channel":9, "value":650},
-    {"type":"can", "at_ms":500, "repeat":{"every_ms":500,"count":5}, "bus":"MCAN", "id":"0x231", "data":[0,41,0,0]},
+    {"type":"can", "at_ms":500, "repeat":{"every_ms":500,"count":5}, "bus":"1", "id":"0x231", "data":[0,41,0,0]},
     {"type":"usart", "at_ms":100, "board":"dashboard", "instance":"USART1", "bytes":[72,105]}
   ]
 }

@@ -4,5 +4,5 @@
   "mcu": "../mcus/stm32g474retx.json",
   "elf": "../../../../PER/monorepo/firmware/output/rear_driveline/rear_driveline.elf",
   "vector_base": "0x08008000",
-  "can": {"FDCAN2": {"bus": "VCAN"}}
+  "can": {"FDCAN2": {"bus": "0"}}
 }

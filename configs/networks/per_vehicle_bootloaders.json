@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "name": "per_vehicle_bootloaders",
-  "buses": {"VCAN": {"type": "can", "bitrate": 500000}},
+  "buses": {"0": {"type": "can", "bitrate": 500000}},
   "boards": [
     "../boards/bootloader_dashboard.json",
     "../boards/bootloader_main_module.json",

@@ -2,8 +2,8 @@
   "schema_version": 1,
   "name": "per_vehicle",
   "buses": {
-    "VCAN": {"type": "can", "bitrate": 500000},
-    "MCAN": {"type": "can", "bitrate": 500000}
+    "0": {"type": "can", "bitrate": 500000},
+    "1": {"type": "can", "bitrate": 500000}
   },
   "boards": [
     "../boards/dashboard.json",
