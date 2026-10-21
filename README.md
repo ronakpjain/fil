@@ -30,6 +30,8 @@ FDCAN controllers. Unsupported instructions fail explicitly; not all hardware
 and timing effects are modeled. See [Architecture](docs/architecture.md),
 [instruction coverage](docs/thumb_instruction_coverage.md), and
 [peripheral coverage](docs/stm32g4_peripheral_coverage.md) for the support boundary.
+The [peripheral reference](docs/peripheral/index.md) describes each modeled
+device's behavior, usage, and limitations.
 
 `run` executes one board; `run-network` executes a configured network as a
 human-readable batch job; `watch-network` is the human-facing live monitor with

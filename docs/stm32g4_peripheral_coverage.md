@@ -201,10 +201,12 @@ timer families are described in RM0440 §30.5, RM0440 §31.7 and RM0440 §32.4.
 
 ### FDCAN
 
-Only RX FIFO 0 (three elements) and three TX buffers are functional. There is
-no bit timing, arbitration, ACK/retry, error accounting, TX event FIFO,
-RX FIFO 1, or full M_CAN configuration-rule conformance. XIDAM is stored but
-not applied.
+Only RX FIFO 0 (three elements) and three TX buffers are functional. Network
+buses default to bitrate-aware classic-CAN timing and frame-level arbitration;
+see [CAN and FDCAN](peripheral/can.md) for timing, admission, and lifecycle
+contracts. Controller bit-timing registers do not configure virtual wire timing.
+ACK/retry, error accounting, TX event FIFO, RX FIFO 1, and full M_CAN
+configuration-rule conformance are absent. XIDAM is stored but not applied.
 
 | Behavior | Reference | Named test evidence | Fidelity / limits |
 |---|---|---|---|

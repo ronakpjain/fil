@@ -104,7 +104,7 @@ reported only at EOF. Explicit `immediate` mode delivers synchronously in
 attachment order. The timed model arbitrates sender-head frames by the classic CAN identifier
 arbitration field, rejects CAN-FD timing, and leaves same-ID error/retry and
 ACK/error behavior idealized. See
-[bitrate-aware CAN delivery](can_bitrate_delivery.md).
+[CAN and FDCAN](peripheral/can.md).
 
 See [STM32G4 peripheral coverage](stm32g4_peripheral_coverage.md) for modeled
 semantics and intentional gaps.
