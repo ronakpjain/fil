@@ -189,6 +189,100 @@ TEST(FdcanTest, TimedTransmissionDefersCompletionAndResetCancels) {
     EXPECT_EQ(readWord(receiver, fil::stm32g4::FdcanPeripheral::rxf0sOffset) & 0xfU, 1U);
 }
 
+TEST(FdcanTest, TimedTransmitFifoReservesSlotsAndIgnoresPendingRequests) {
+    fil::sim::EventLoop loop;
+    fil::stm32g4::FdcanMessageRam ram;
+    fil::devices::VirtualCanBus bus("timed", 500'000U,
+        fil::devices::VirtualCanBus::DeliveryMode::timed, 8U);
+    bus.setEventLoop(&loop);
+    fil::stm32g4::FdcanPeripheral sender(1U, ram, &loop);
+    ASSERT_TRUE(sender.attachBus(bus, "sender"));
+    std::vector<std::uint8_t> received;
+    ASSERT_TRUE(bus.attach("observer", false, [&](const auto& frame, const auto) {
+        received.push_back(frame.data[0]);
+    }));
+    writeWord(sender, fil::stm32g4::FdcanPeripheral::cccrOffset, 0U);
+
+    for (std::uint32_t buffer = 0U; buffer < 3U; ++buffer) {
+        const auto status = readWord(sender, fil::stm32g4::FdcanPeripheral::txfqsOffset);
+        ASSERT_EQ((status >> 16U) & 0x3U, buffer);
+        const auto offset = fil::stm32g4::FdcanMessageRam::txFifoOffset
+            + buffer * fil::stm32g4::FdcanMessageRam::txFifoElementSize;
+        ram.storeWord(0U, offset, 0x123U << 18U);
+        ram.storeWord(0U, offset + 4U, 1U << 16U);
+        ram.storeWord(0U, offset + 8U, buffer);
+        writeWord(sender, fil::stm32g4::FdcanPeripheral::txbarOffset, 1U << buffer);
+        EXPECT_EQ(readWord(sender, fil::stm32g4::FdcanPeripheral::txfqsOffset) & 0x7U,
+                  2U - buffer);
+    }
+    EXPECT_NE(readWord(sender, fil::stm32g4::FdcanPeripheral::txfqsOffset) & (1U << 21U), 0U);
+    EXPECT_EQ(readWord(sender, 0x0c8U), 0x7U);
+    EXPECT_EQ(bus.queuedTransmissions(), 3U);
+
+    ram.storeWord(0U, fil::stm32g4::FdcanMessageRam::txFifoOffset + 8U, 0xffU);
+    writeWord(sender, fil::stm32g4::FdcanPeripheral::txbarOffset, 0x7U);
+    EXPECT_EQ(bus.queuedTransmissions(), 3U) << "pending requests do not resubmit buffers";
+
+    fil::devices::CanFrame first;
+    first.id = 0x123U;
+    first.dlc = 1U;
+    const auto duration = fil::devices::classicCanDurationNs(first, 500'000U);
+    ASSERT_TRUE(duration);
+    static_cast<void>(loop.runDueEvents(duration.value()));
+    ASSERT_EQ(received, std::vector<std::uint8_t>({0U}));
+    const auto status = readWord(sender, fil::stm32g4::FdcanPeripheral::txfqsOffset);
+    EXPECT_EQ(status & 0x7U, 1U);
+    EXPECT_EQ((status >> 8U) & 0x3U, 1U);
+    EXPECT_EQ((status >> 16U) & 0x3U, 0U);
+    EXPECT_EQ(status & (1U << 21U), 0U);
+    EXPECT_EQ(readWord(sender, 0x0c8U), 0x6U);
+
+    ram.storeWord(0U, fil::stm32g4::FdcanMessageRam::txFifoOffset + 8U, 3U);
+    writeWord(sender, fil::stm32g4::FdcanPeripheral::txbarOffset, 1U);
+    EXPECT_EQ(readWord(sender, fil::stm32g4::FdcanPeripheral::txfqsOffset) & 0x7U, 0U);
+    static_cast<void>(loop.runDueEvents(2'000'000U));
+    EXPECT_EQ(received, std::vector<std::uint8_t>({0U, 1U, 2U, 3U}));
+    EXPECT_EQ(bus.queuedTransmissions(), 0U);
+    EXPECT_EQ(readWord(sender, 0x0c8U), 0U);
+    EXPECT_EQ(readWord(sender, fil::stm32g4::FdcanPeripheral::txfqsOffset) & 0x7U, 3U);
+}
+
+TEST(FdcanTest, TimedTransmitQueueReportsOccupiedSlots) {
+    fil::sim::EventLoop loop;
+    fil::stm32g4::FdcanMessageRam ram;
+    fil::devices::VirtualCanBus bus("timed", 500'000U,
+        fil::devices::VirtualCanBus::DeliveryMode::timed, 8U);
+    bus.setEventLoop(&loop);
+    fil::stm32g4::FdcanPeripheral sender(1U, ram, &loop);
+    ASSERT_TRUE(sender.attachBus(bus, "sender"));
+    writeWord(sender, fil::stm32g4::FdcanPeripheral::cccrOffset, 0U);
+    writeWord(sender, 0x0c0U, 1U << 24U);
+    for (std::uint32_t buffer = 0U; buffer < 3U; ++buffer) {
+        const auto status = readWord(sender, fil::stm32g4::FdcanPeripheral::txfqsOffset);
+        ASSERT_EQ((status >> 16U) & 0x3U, buffer);
+        EXPECT_EQ(status & 0x3ffU, 0U) << "FIFO-only fields stay zero in queue mode";
+        const auto offset = fil::stm32g4::FdcanMessageRam::txFifoOffset
+            + buffer * fil::stm32g4::FdcanMessageRam::txFifoElementSize;
+        ram.storeWord(0U, offset, 0x123U << 18U);
+        writeWord(sender, fil::stm32g4::FdcanPeripheral::txbarOffset, 1U << buffer);
+    }
+    EXPECT_NE(readWord(sender, fil::stm32g4::FdcanPeripheral::txfqsOffset) & (1U << 21U), 0U);
+    static_cast<void>(loop.runDueEvents(2'000'000U));
+    EXPECT_EQ(readWord(sender, fil::stm32g4::FdcanPeripheral::txfqsOffset) & (1U << 21U), 0U);
+    EXPECT_EQ(readWord(sender, 0x0c8U), 0U);
+}
+
+TEST(FdcanTest, InvalidTransmitFrameReleasesOwnership) {
+    fil::stm32g4::FdcanMessageRam ram;
+    fil::stm32g4::FdcanPeripheral sender(1U, ram);
+    writeWord(sender, fil::stm32g4::FdcanPeripheral::cccrOffset, 0U);
+    const auto offset = fil::stm32g4::FdcanMessageRam::txFifoOffset;
+    ram.storeWord(0U, offset + 4U, 15U << 16U); // Classic CAN cannot use this DLC.
+    writeWord(sender, fil::stm32g4::FdcanPeripheral::txbarOffset, 1U);
+    EXPECT_EQ(readWord(sender, 0x0c8U), 0U);
+    EXPECT_EQ(readWord(sender, fil::stm32g4::FdcanPeripheral::txfqsOffset) & 0x7U, 3U);
+}
+
 TEST(FdcanTest, TimedAdmissionFailureClearsTransmitOwnership) {
     fil::sim::EventLoop loop;
     fil::stm32g4::FdcanMessageRam ram;
@@ -206,6 +300,28 @@ TEST(FdcanTest, TimedAdmissionFailureClearsTransmitOwnership) {
     EXPECT_NE(readWord(sender, fil::stm32g4::FdcanPeripheral::irOffset)
               & (1U << 21U), 0U);
     EXPECT_EQ(bus.queuedTransmissions(), 0U);
+    EXPECT_EQ(readWord(sender, fil::stm32g4::FdcanPeripheral::txfqsOffset) & 0x7U, 3U);
+}
+
+TEST(FdcanTest, TimedQueueSaturationReleasesOnlyRejectedSlot) {
+    fil::sim::EventLoop loop;
+    fil::stm32g4::FdcanMessageRam ram;
+    fil::devices::VirtualCanBus bus("timed", 500'000U,
+        fil::devices::VirtualCanBus::DeliveryMode::timed, 1U);
+    bus.setEventLoop(&loop);
+    fil::stm32g4::FdcanPeripheral sender(1U, ram, &loop);
+    ASSERT_TRUE(sender.attachBus(bus, "sender"));
+    writeWord(sender, fil::stm32g4::FdcanPeripheral::cccrOffset, 0U);
+    writeWord(sender, fil::stm32g4::FdcanPeripheral::txbarOffset, 0x3U);
+    EXPECT_EQ(bus.queuedTransmissions(), 1U);
+    EXPECT_EQ(readWord(sender, 0x0c8U), 1U);
+    EXPECT_EQ(readWord(sender, fil::stm32g4::FdcanPeripheral::txfqsOffset) & 0x7U, 2U);
+    EXPECT_EQ(readWord(sender, fil::stm32g4::FdcanPeripheral::txfqsOffset) & (1U << 21U), 0U);
+    EXPECT_NE(readWord(sender, fil::stm32g4::FdcanPeripheral::irOffset) & (1U << 21U), 0U);
+    static_cast<void>(loop.runDueEvents(1'000'000U));
+    EXPECT_EQ(readWord(sender, 0x0c8U), 0U);
+    EXPECT_EQ(readWord(sender, fil::stm32g4::FdcanPeripheral::txfqsOffset) & 0x7U, 3U);
+    EXPECT_EQ(readWord(sender, fil::stm32g4::FdcanPeripheral::txbtoOffset), 1U);
 }
 
 TEST(FdcanTest, TracesBoundedReceiveFifoDrops) {

@@ -73,11 +73,14 @@ FIFO acknowledgement frees entries; full/lost and overwrite behavior follow the
 modeled register subset. Enabled peripheral interrupt sources drive the selected
 NVIC interrupt lines through `IR`, `IE`, `ILS`, and `ILE`.
 
-TX requests snapshot message-RAM contents on submission. In timed mode, `TXBRP`
-remains pending until EOF; completion then updates `TXBTO`, FIFO indices, and
-completion interrupts. Later message-RAM writes do not alter the queued payload.
-Admission or scheduling failures clear pending ownership and report a controller
-protocol error rather than claiming successful transmission.
+TX requests snapshot message-RAM contents and reserve a TX slot on submission.
+`TXFQS` reflects occupied slots, advances the put index, and reports full when all
+three slots are pending. Repeated `TXBAR` requests for a pending buffer are ignored.
+In timed mode, `TXBRP` remains pending until EOF; completion then releases the slot
+and updates `TXBTO`, FIFO status, and completion interrupts. Later message-RAM writes
+do not alter the queued payload. Invalid frames and admission or scheduling
+failures clear pending ownership and report a controller protocol error rather
+than claiming successful transmission.
 
 Reset or sender detach cancels its pending work and immediately aborts its
 in-flight frame without delivery. The bus becomes available again and restores
@@ -130,9 +133,15 @@ Representative tests include:
 - `CanBusTest.TimedEqualIdTieUsesStableAdmissionOrder`
 - `CanBusTest.TimedArbitrationKeepsExternalInjectionOrder`
 - `CanBusTest.NewlyEligibleSenderAdvancesFutureArbitrationFrontier`
+- `CanBusTest.SofCancellationCannotCompleteReplacementAtStaleEof`
+- `CanBusTest.ReceiveTraceMayDetachItsReceiver`
 - `CanBusTest.TimedQueueCarriesFractionalBitTimeRemainder`
 - `FdcanTest.TimedTransmissionDefersCompletionAndResetCancels`
+- `FdcanTest.TimedTransmitFifoReservesSlotsAndIgnoresPendingRequests`
+- `FdcanTest.TimedTransmitQueueReportsOccupiedSlots`
+- `FdcanTest.InvalidTransmitFrameReleasesOwnership`
 - `FdcanTest.TimedAdmissionFailureClearsTransmitOwnership`
+- `FdcanTest.TimedQueueSaturationReleasesOnlyRejectedSlot`
 - `FdcanTest.TracesBoundedReceiveFifoDrops`
 
 Coverage is synthetic, not exhaustive across all frame encodings or execution

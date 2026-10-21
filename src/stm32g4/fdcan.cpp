@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <stdexcept>
 #include <utility>
@@ -434,11 +435,13 @@ bool FdcanPeripheral::transmitBuffer(const std::uint32_t buffer_index) {
         }
     }
 
+    const std::uint32_t buffer_bit = 1U << buffer_index;
     if (!devices::validate(frame)) {
+        setRegister(txbrp, registerValue(txbrp) & ~buffer_bit);
+        updateTxFifoStatus();
         setInterruptFlags(interrupt_protocol_arbitration_error);
         return false;
     }
-    const std::uint32_t buffer_bit = 1U << buffer_index;
     if (bus_ != nullptr) {
         Result<void> sent;
         const auto completion = [this, buffer_index, frame](const std::uint64_t, const bool success) {
@@ -475,8 +478,6 @@ void FdcanPeripheral::completeTransmission(const std::uint32_t buffer_index,
     if ((registerValue(txbrp) & buffer_bit) == 0U) return; // canceled/reset ownership
     setRegister(txbrp, registerValue(txbrp) & ~buffer_bit);
     setRegister(txbto, registerValue(txbto) | buffer_bit);
-    tx_get_index_ = static_cast<std::uint8_t>((buffer_index + 1U) % FdcanMessageRam::txFifoElementCount);
-    tx_put_index_ = tx_get_index_;
     updateTxFifoStatus();
     if ((registerValue(txbtie) & buffer_bit) != 0U) setInterruptFlags(interruptTransmissionComplete);
     const std::string_view tx_trace_type = bus_ != nullptr
@@ -519,12 +520,29 @@ void FdcanPeripheral::updateRxFifo0Status() noexcept {
 }
 
 void FdcanPeripheral::updateTxFifoStatus() noexcept {
+    const std::uint32_t pending = registerValue(txbrp) & tx_buffer_mask;
+    const std::uint32_t free = FdcanMessageRam::txFifoElementCount
+        - static_cast<std::uint32_t>(std::popcount(pending));
+    if (free != 0U) {
+        while ((pending & (1U << tx_put_index_)) != 0U) {
+            tx_put_index_ = static_cast<std::uint8_t>(
+                (tx_put_index_ + 1U) % FdcanMessageRam::txFifoElementCount);
+        }
+    }
+    if (pending == 0U) {
+        tx_get_index_ = tx_put_index_;
+    } else {
+        while ((pending & (1U << tx_get_index_)) == 0U) {
+            tx_get_index_ = static_cast<std::uint8_t>(
+                (tx_get_index_ + 1U) % FdcanMessageRam::txFifoElementCount);
+        }
+    }
     const bool queue_mode = (registerValue(txbc) & (1U << 24U)) != 0U;
     std::uint32_t status = static_cast<std::uint32_t>(tx_put_index_) << 16U;
     if (!queue_mode) {
-        status |=
-            FdcanMessageRam::txFifoElementCount | (static_cast<std::uint32_t>(tx_get_index_) << 8U);
+        status |= free | (static_cast<std::uint32_t>(tx_get_index_) << 8U);
     }
+    if (free == 0U) status |= 1U << 21U;
     setRegister(txfqs, status);
 }
 
@@ -636,10 +654,15 @@ void FdcanPeripheral::storeRegister(const std::uint32_t word_offset, const std::
         }
         for (std::uint32_t buffer = 0; buffer < FdcanMessageRam::txFifoElementCount; ++buffer) {
             const std::uint32_t buffer_bit = 1U << buffer;
-            if ((requests & buffer_bit) == 0U) {
+            const std::uint32_t pending = registerValue(txbrp);
+            if ((requests & buffer_bit) == 0U || (pending & buffer_bit) != 0U) {
                 continue;
             }
-            setRegister(txbrp, registerValue(txbrp) | buffer_bit);
+            if (pending == 0U) tx_get_index_ = static_cast<std::uint8_t>(buffer);
+            setRegister(txbrp, pending | buffer_bit);
+            tx_put_index_ = static_cast<std::uint8_t>(
+                (buffer + 1U) % FdcanMessageRam::txFifoElementCount);
+            updateTxFifoStatus();
             setRegister(txbto, registerValue(txbto) & ~buffer_bit);
             static_cast<void>(transmitBuffer(buffer));
         }

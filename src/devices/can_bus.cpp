@@ -199,7 +199,9 @@ void VirtualCanBus::trace(
     const CanFrame& frame
 ) {
     if (trace_callback_) {
-        trace_callback_(CanTraceRecord{direction, time_ns, next_sequence_++, node, frame});
+        // Keep the active sink alive if it replaces itself reentrantly.
+        const auto callback = trace_callback_;
+        callback(CanTraceRecord{direction, time_ns, next_sequence_++, node, frame});
     } else {
         ++next_sequence_;
     }
@@ -225,7 +227,8 @@ void VirtualCanBus::deliver(
         // A previous callback may have detached and destroyed this receiver.
         if (find(delivery.id) == nullptr) continue;
         trace(CanTraceRecord::Direction::receive, time_ns, delivery.name, frame);
-        delivery.receive(frame, time_ns);
+        // The receive trace is also user code and may detach this receiver.
+        if (find(delivery.id) != nullptr) delivery.receive(frame, time_ns);
     }
 }
 
@@ -370,10 +373,13 @@ void VirtualCanBus::arbitrate() {
     }
     in_flight_fraction_before_start_ = prior_fraction;
     next_start_ns_ = start + frame_duration + intermission;
-    trace(CanTraceRecord::Direction::transmit, start, in_flight_->sender_name, in_flight_->frame);
+    // Publish the EOF event before invoking user code: a SOF observer may
+    // cancel this sender and schedule a different arbitration event. Nothing
+    // after the trace may overwrite that replacement event.
     auto owner = event_loop_->useOwner(sim::shared_event_owner);
     timed_event_id_ = event_loop_->scheduleAt(start + frame_duration,
                                                [this] { completeInFlight(); });
+    trace(CanTraceRecord::Direction::transmit, start, in_flight_->sender_name, in_flight_->frame);
 }
 
 void VirtualCanBus::completeInFlight() {

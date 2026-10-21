@@ -143,6 +143,71 @@ TEST(CanBusTest, DetachingSenderCancelsItsInFlightFrame) {
     EXPECT_EQ(bus.queuedTransmissions(), 0U);
 }
 
+TEST(CanBusTest, SofCancellationCannotCompleteReplacementAtStaleEof) {
+    for (const bool detach : {false, true}) {
+        SCOPED_TRACE(detach);
+        fil::sim::EventLoop loop;
+        fil::devices::VirtualCanBus bus("timed", 7U,
+            fil::devices::VirtualCanBus::DeliveryMode::timed);
+        bus.setEventLoop(&loop);
+        const auto a = bus.attach("a", false, [](const auto&, auto) {});
+        const auto b = bus.attach("b", false, [](const auto&, auto) {});
+        ASSERT_TRUE(a && b);
+        std::vector<std::uint64_t> received;
+        ASSERT_TRUE(bus.attach("receiver", false,
+            [&](const auto&, auto time) { received.push_back(time); }));
+        fil::devices::CanFrame short_frame; short_frame.id = 0x123U;
+        fil::devices::CanFrame long_frame; long_frame.id = 0x300U; long_frame.dlc = 8U;
+        const auto short_bits = fil::devices::classicCanStuffedFrameBits(short_frame);
+        const auto long_bits = fil::devices::classicCanStuffedFrameBits(long_frame);
+        ASSERT_TRUE(short_bits && long_bits);
+        const auto stale_eof = short_bits.value() * 1'000'000'000ULL / 7U;
+        const auto expected_eof = long_bits.value() * 1'000'000'000ULL / 7U;
+        ASSERT_GT(expected_eof, stale_eof);
+        std::uint32_t canceled_completions = 0U;
+        std::vector<std::uint64_t> completions;
+        bus.setTraceCallback([&](const auto& record) {
+            if (record.direction == fil::devices::CanTraceRecord::Direction::transmit
+                && record.node == "a") {
+                if (detach) bus.detach(a.value());
+                else bus.cancelSender(a.value());
+                // Replacing the active sink must not destroy its callable mid-call.
+                bus.setTraceCallback({});
+                EXPECT_EQ(record.frame.id, short_frame.id);
+            }
+        });
+        ASSERT_TRUE(bus.send(a.value(), short_frame, 0U,
+            [&](auto, bool) { ++canceled_completions; }));
+        ASSERT_TRUE(bus.send(b.value(), long_frame, 0U,
+            [&](auto time, bool ok) { EXPECT_TRUE(ok); completions.push_back(time); }));
+        static_cast<void>(loop.runDueEvents(stale_eof));
+        EXPECT_TRUE(received.empty());
+        EXPECT_TRUE(completions.empty());
+        EXPECT_EQ(bus.queuedTransmissions(), 1U);
+        EXPECT_EQ(loop.pending(), 1U);
+        static_cast<void>(loop.runDueEvents(expected_eof));
+        EXPECT_EQ(received, (std::vector<std::uint64_t>{expected_eof}));
+        EXPECT_EQ(completions, (std::vector<std::uint64_t>{expected_eof}));
+        EXPECT_EQ(canceled_completions, 0U);
+        EXPECT_EQ(bus.queuedTransmissions(), 0U);
+        EXPECT_EQ(loop.pending(), 0U);
+    }
+}
+
+TEST(CanBusTest, ReceiveTraceMayDetachItsReceiver) {
+    fil::devices::VirtualCanBus bus("immediate");
+    std::uint32_t received = 0U;
+    const auto receiver = bus.attach("receiver", false,
+        [&](const auto&, auto) { ++received; });
+    ASSERT_TRUE(receiver);
+    bus.setTraceCallback([&](const auto& record) {
+        if (record.direction == fil::devices::CanTraceRecord::Direction::receive)
+            bus.detach(receiver.value());
+    });
+    ASSERT_TRUE(bus.inject({}, 0U));
+    EXPECT_EQ(received, 0U);
+}
+
 TEST(CanBusTest, TimedArbitrationUsesSenderHeadsAndStandardFormatPriority) {
     fil::sim::EventLoop loop;
     fil::devices::VirtualCanBus bus("arb", 500'000U,
