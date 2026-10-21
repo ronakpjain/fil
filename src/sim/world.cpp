@@ -133,8 +133,12 @@ Result<void> World::initialize(const bool strict_mmio) {
         auto entry = std::make_unique<BusEntry>();
         entry->name = bus_config.name;
         entry->bus = std::make_unique<devices::VirtualCanBus>(
-            bus_config.name, bus_config.bitrate
+            bus_config.name, bus_config.bitrate,
+            bus_config.timed_delivery ? devices::VirtualCanBus::DeliveryMode::timed
+                                     : devices::VirtualCanBus::DeliveryMode::immediate,
+            bus_config.queue_capacity
         );
+        entry->bus->setEventLoop(bus_config.timed_delivery ? &event_loop_ : nullptr);
         entry->bus->setTraceCallback(
             [this, bus_name = bus_config.name](const devices::CanTraceRecord& record) {
                 CanTraceFrame frame;
@@ -145,14 +149,24 @@ Result<void> World::initialize(const bool strict_mmio) {
                 frame.dlc = record.frame.dlc;
                 const std::size_t length = devices::dlcToLength(record.frame.dlc);
                 frame.data.assign(record.frame.data.begin(), record.frame.data.begin() + length);
-                static_cast<void>(trace_.recordCanFrame(
-                    record.time_ns,
-                    bus_name + "/" + record.node,
-                    record.direction == devices::CanTraceRecord::Direction::transmit,
-                    frame,
-                    bus_name,
-                    record.node
-                ));
+                if (record.direction == devices::CanTraceRecord::Direction::rejected) {
+                    static_cast<void>(trace_.record(
+                        record.time_ns, bus_name + "/" + record.node, "can_tx_rejected",
+                        {{"id", std::to_string(record.frame.id)},
+                         {"dlc", std::to_string(record.frame.dlc)},
+                         {"reason", "queue_or_timing_rejection"},
+                         {"bus", bus_name}, {"node", record.node}}
+                    ));
+                } else {
+                    static_cast<void>(trace_.recordCanFrame(
+                        record.time_ns,
+                        bus_name + "/" + record.node,
+                        record.direction == devices::CanTraceRecord::Direction::transmit,
+                        frame,
+                        bus_name,
+                        record.node
+                    ));
+                }
             }
         );
         buses_.push_back(std::move(entry));

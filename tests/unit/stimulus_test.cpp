@@ -311,7 +311,7 @@ TEST(StimulusTest, SchedulesCanGpioAdcAndUsartInputs) {
     ASSERT_TRUE(board->memory().write32(0x40021088U, 2U << 28U));
 
     const auto result = world.value()->eventLoop().runDueEvents(9'000'000U);
-    EXPECT_EQ(result.events_executed, 7U);
+    EXPECT_EQ(result.events_executed, 12U);
     EXPECT_TRUE(usart->hasRxData());
 
     bool gpio_input_high = false;

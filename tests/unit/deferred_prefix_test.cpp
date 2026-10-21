@@ -563,7 +563,10 @@ TEST(DeferredPrefixTest, SingleStepPreservesDivideLatency) {
 TEST(DeferredPrefixTest, SynchronousCanAtHiddenCompletionPreservesBoardOrder) {
     for (const bool receiver_first : {false, true}) {
         DeferredNetwork files;
-        const auto config = files.config(receiver_first);
+        auto config = files.config(receiver_first);
+        // This test specifically exercises the synchronous compatibility path;
+        // timed wire behavior is covered by the bus/FDCAN arbitration tests.
+        config.buses[0].timed_delivery = false;
         auto reference = fil::sim::World::load(config, true);
         auto candidate = fil::sim::World::load(config, true);
         ASSERT_TRUE(reference);

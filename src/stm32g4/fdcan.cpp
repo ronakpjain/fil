@@ -246,7 +246,10 @@ Result<void> FdcanPeripheral::attachBus(devices::VirtualCanBus& bus, std::string
 
 void FdcanPeripheral::detachBus() noexcept {
     if (bus_ != nullptr && bus_node_id_ != 0U) {
+        bus_->cancelSender(bus_node_id_);
         bus_->detach(bus_node_id_);
+        setRegister(txbrp, 0U);
+        updateTxFifoStatus();
     }
     bus_ = nullptr;
     bus_node_id_ = 0;
@@ -344,6 +347,9 @@ bool FdcanPeripheral::receiveFrame(const devices::CanFrame& frame, const std::ui
         if ((registerValue(rxgfc) & rx_fifo0_overwrite) == 0U) {
             updateRxFifo0Status();
             setInterruptFlags(interruptRxFifo0Full | interruptRxFifo0Lost);
+            if (tracePasses("can_rx_drop")) traceEvent("can_rx_drop", {
+                {"id", std::to_string(frame.id)}, {"reason", "fifo_full"},
+            });
             return false;
         }
         rx_get_index_ = static_cast<std::uint8_t>((static_cast<std::uint32_t>(rx_get_index_) + 1U) %
@@ -389,6 +395,9 @@ bool FdcanPeripheral::receiveFrame(const devices::CanFrame& frame, const std::ui
     }
     if (overwritten) {
         flags |= interruptRxFifo0Lost;
+        if (tracePasses("can_rx_drop")) traceEvent("can_rx_drop", {
+            {"id", std::to_string(frame.id)}, {"reason", "fifo_overwrite"},
+        });
     }
     setInterruptFlags(flags);
     if (tracePasses("can_rx")) traceEvent("can_rx", {
@@ -429,36 +438,55 @@ bool FdcanPeripheral::transmitBuffer(const std::uint32_t buffer_index) {
         setInterruptFlags(interrupt_protocol_arbitration_error);
         return false;
     }
+    const std::uint32_t buffer_bit = 1U << buffer_index;
     if (bus_ != nullptr) {
         Result<void> sent;
+        const auto completion = [this, buffer_index, frame](const std::uint64_t, const bool success) {
+            if (success) {
+                completeTransmission(buffer_index, frame);
+            } else {
+                const std::uint32_t bit = 1U << buffer_index;
+                setRegister(txbrp, registerValue(txbrp) & ~bit);
+                updateTxFifoStatus();
+                setInterruptFlags(interrupt_protocol_arbitration_error);
+            }
+        };
         if (sim::EventLoop* const loop = eventLoop()) {
             auto shared_scope = loop->useOwner(sim::shared_event_owner);
-            sent = bus_->send(bus_node_id_, frame, currentTime());
+            sent = bus_->send(bus_node_id_, frame, currentTime(), completion);
         } else {
-            sent = bus_->send(bus_node_id_, frame, currentTime());
+            sent = bus_->send(bus_node_id_, frame, currentTime(), completion);
         }
         if (!sent) {
+            setRegister(txbrp, registerValue(txbrp) & ~buffer_bit);
+            updateTxFifoStatus();
             setInterruptFlags(interrupt_protocol_arbitration_error);
             return false;
         }
     }
 
+    if (bus_ == nullptr) completeTransmission(buffer_index, frame);
+    return true;
+}
+
+void FdcanPeripheral::completeTransmission(const std::uint32_t buffer_index,
+                                            const devices::CanFrame& frame) {
     const std::uint32_t buffer_bit = 1U << buffer_index;
+    if ((registerValue(txbrp) & buffer_bit) == 0U) return; // canceled/reset ownership
     setRegister(txbrp, registerValue(txbrp) & ~buffer_bit);
     setRegister(txbto, registerValue(txbto) | buffer_bit);
-    tx_get_index_ =
-        static_cast<std::uint8_t>((buffer_index + 1U) % FdcanMessageRam::txFifoElementCount);
+    tx_get_index_ = static_cast<std::uint8_t>((buffer_index + 1U) % FdcanMessageRam::txFifoElementCount);
     tx_put_index_ = tx_get_index_;
     updateTxFifoStatus();
-    if ((registerValue(txbtie) & buffer_bit) != 0U) {
-        setInterruptFlags(interruptTransmissionComplete);
-    }
-    if (tracePasses("can_tx")) traceEvent("can_tx", {
-                             {"id", std::to_string(frame.id)},
-                             {"dlc", std::to_string(frame.dlc)},
-                             {"length", std::to_string(payload_length)},
-                         });
-    return true;
+    if ((registerValue(txbtie) & buffer_bit) != 0U) setInterruptFlags(interruptTransmissionComplete);
+    const std::string_view tx_trace_type = bus_ != nullptr
+        && bus_->deliveryMode() == devices::VirtualCanBus::DeliveryMode::timed
+        ? "can_tx_complete" : "can_tx";
+    if (tracePasses(tx_trace_type)) traceEvent(std::string(tx_trace_type), {
+        {"id", std::to_string(frame.id)},
+        {"dlc", std::to_string(frame.dlc)},
+        {"length", std::to_string(devices::dlcToLength(frame.dlc))},
+    });
 }
 
 void FdcanPeripheral::acknowledgeRxFifo0(const std::uint32_t acknowledged_index) {
@@ -626,6 +654,7 @@ void FdcanPeripheral::storeRegister(const std::uint32_t word_offset, const std::
 }
 
 void FdcanPeripheral::onReset() {
+    if (bus_ != nullptr && bus_node_id_ != 0U) bus_->cancelSender(bus_node_id_);
     rx_fill_level_ = 0;
     rx_get_index_ = 0;
     rx_put_index_ = 0;

@@ -16,6 +16,8 @@
 #include <vector>
 #include <utility>
 
+namespace fil::sim { class EventLoop; }
+
 namespace fil::devices {
 
 /** @brief One normalized classic CAN or CAN-FD data frame. */
@@ -37,9 +39,16 @@ struct CanFrame {
 /** @brief Validates identifier, frame-format, and DLC relationships. */
 [[nodiscard]] Result<void> validate(const CanFrame& frame);
 
+/** @brief Classic-CAN stuffed bit count from SOF through EOF (excludes intermission). */
+[[nodiscard]] Result<std::uint32_t> classicCanStuffedFrameBits(const CanFrame& frame);
+
+/** @brief Classic-CAN wire occupancy in nanoseconds, including 3-bit intermission. */
+[[nodiscard]] Result<std::uint64_t> classicCanDurationNs(const CanFrame& frame,
+                                                         std::uint32_t bitrate);
+
 /** @brief Stable record emitted for bus transmission and node reception. */
 struct CanTraceRecord {
-    enum class Direction { transmit, receive } direction{Direction::transmit}; ///< Record kind.
+    enum class Direction { transmit, receive, rejected } direction{Direction::transmit}; ///< Record kind.
     std::uint64_t time_ns{0};  ///< Deterministic simulated timestamp.
     std::uint64_t sequence{0}; ///< Monotonic tie-break sequence.
     std::string node;           ///< Sending or receiving node name.
@@ -47,21 +56,34 @@ struct CanTraceRecord {
 };
 
 /**
- * @brief Synchronous deterministic broadcast medium shared by MCU instances.
+ * @brief Deterministic broadcast medium shared by MCU instances.
  *
- * Nodes receive frames in attachment order. Delivery takes a snapshot of the
- * current callback list, so a callback may safely detach itself or another
- * node without invalidating the in-progress broadcast.
+ * Immediate mode broadcasts synchronously; timed mode arbitrates sender-head
+ * requests on the associated event loop. Nodes receive frames in attachment order. The
+ * delivery callback snapshot is revalidated before invocation, so detached
+ * nodes are not called through stale references.
  */
 class VirtualCanBus {
 public:
+    enum class DeliveryMode { immediate, timed, timed_fifo = timed }; // timed_fifo is a source-compatibility alias.
+    using CompletionCallback = std::function<void(std::uint64_t, bool)>;
     using NodeId = std::uint64_t; ///< Opaque attachment identifier.
     using ReceiveCallback = std::function<void(const CanFrame&, std::uint64_t)>;
     using TraceCallback = std::function<void(const CanTraceRecord&)>;
     using DeliveryBarrier = std::function<void(std::uint64_t)>;
 
-    /** @brief Creates a named bus with an informational nominal bit rate. */
-    explicit VirtualCanBus(std::string name, std::uint32_t bitrate = 500000U);
+    /** @brief Creates a bus; immediate delivery is the compatibility default. */
+    explicit VirtualCanBus(std::string name, std::uint32_t bitrate = 500000U,
+                           DeliveryMode mode = DeliveryMode::immediate,
+                           std::size_t queue_capacity = 256U);
+    ~VirtualCanBus();
+    VirtualCanBus(const VirtualCanBus&) = delete;
+    VirtualCanBus& operator=(const VirtualCanBus&) = delete;
+
+    /** @brief Associates the world's event loop for timed delivery. */
+    void setEventLoop(sim::EventLoop* loop) noexcept { event_loop_ = loop; }
+    /** @brief Cancels queued and in-flight transmissions owned by an attachment. */
+    void cancelSender(NodeId sender) noexcept;
 
     /** @brief Attaches one uniquely named receive callback. */
     [[nodiscard]] Result<NodeId> attach(
@@ -74,10 +96,12 @@ public:
     void detach(NodeId id) noexcept;
 
     /** @brief Broadcasts a frame from an attached node. */
-    [[nodiscard]] Result<void> send(NodeId sender, const CanFrame& frame, std::uint64_t time_ns);
+    [[nodiscard]] Result<void> send(NodeId sender, const CanFrame& frame, std::uint64_t time_ns,
+                                    CompletionCallback completion = {});
 
     /** @brief Injects an external frame into every attached node. */
-    [[nodiscard]] Result<void> inject(const CanFrame& frame, std::uint64_t time_ns);
+    [[nodiscard]] Result<void> inject(const CanFrame& frame, std::uint64_t time_ns,
+                                      CompletionCallback completion = {});
 
     /** @brief Sets an optional synchronous trace sink. */
     void setTraceCallback(TraceCallback callback) { trace_callback_ = std::move(callback); }
@@ -90,6 +114,9 @@ public:
     [[nodiscard]] std::string_view name() const noexcept { return name_; }
     [[nodiscard]] std::uint32_t bitrate() const noexcept { return bitrate_; }
     [[nodiscard]] std::size_t nodeCount() const noexcept { return nodes_.size(); }
+    [[nodiscard]] DeliveryMode deliveryMode() const noexcept { return mode_; }
+    [[nodiscard]] std::size_t queueCapacity() const noexcept { return queue_capacity_; }
+    [[nodiscard]] std::size_t queuedTransmissions() const noexcept { return pending_.size() + (in_flight_ ? 1U : 0U); }
 
 private:
     struct Node {
@@ -99,7 +126,20 @@ private:
         ReceiveCallback receive;
     };
 
+    struct Transmission {
+        CanFrame frame;
+        std::optional<NodeId> sender;
+        std::string sender_name;
+        std::uint64_t requested_ns{0};
+        std::uint64_t sequence{0};
+        CompletionCallback completion;
+    };
+
     [[nodiscard]] Node* find(NodeId id) noexcept;
+    [[nodiscard]] Result<void> submit(Transmission transmission);
+    void scheduleArbitration();
+    void arbitrate();
+    void completeInFlight();
     void trace(CanTraceRecord::Direction direction, std::uint64_t time_ns, const std::string& node, const CanFrame& frame);
     void deliver(const CanFrame& frame, std::uint64_t time_ns, std::optional<NodeId> sender);
 
@@ -110,6 +150,16 @@ private:
     std::vector<Node> nodes_;
     TraceCallback trace_callback_;
     DeliveryBarrier delivery_barrier_;
+    DeliveryMode mode_{DeliveryMode::immediate};
+    std::size_t queue_capacity_{256U};
+    sim::EventLoop* event_loop_{nullptr};
+    std::vector<Transmission> pending_;
+    std::optional<Transmission> in_flight_;
+    std::uint64_t next_start_ns_{0};
+    std::uint64_t fractional_numerator_{0};
+    std::uint64_t in_flight_fraction_before_start_{0};
+    std::uint64_t next_transmission_sequence_{0};
+    std::uint64_t timed_event_id_{0};
 };
 
 } // namespace fil::devices

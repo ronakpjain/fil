@@ -66,21 +66,28 @@ public:
     [[nodiscard]] std::filesystem::path writeNetwork(
         const std::vector<std::filesystem::path>& boards,
         const std::filesystem::path& stimulus = {},
-        const bool include_nested_bus = false
+        const bool include_nested_bus = false,
+        const bool timed = true,
+        const std::uint32_t queue_capacity = 256U
     ) const {
         std::vector<std::filesystem::path> stimuli;
         if (!stimulus.empty()) stimuli.push_back(stimulus);
-        return writeNetworkWithStimuli(boards, stimuli, include_nested_bus);
+        return writeNetworkWithStimuli(boards, stimuli, include_nested_bus, timed, queue_capacity);
     }
 
     [[nodiscard]] std::filesystem::path writeNetworkWithStimuli(
         const std::vector<std::filesystem::path>& boards,
         const std::vector<std::filesystem::path>& stimuli,
-        const bool include_nested_bus = false
+        const bool include_nested_bus = false,
+        const bool timed = true,
+        const std::uint32_t queue_capacity = 256U
     ) const {
         std::ostringstream json;
         json << "{\n  \"schema_version\": 1,\n  \"name\": \"fixture-network\",\n"
-             << "  \"buses\": {\"vehicle\": {\"type\": \"can\", \"bitrate\": 500000}";
+             << "  \"buses\": {\"vehicle\": {\"type\": \"can\", \"bitrate\": 500000";
+        if (timed) json << ", \"timing\": \"timed\", \"queue_capacity\": "
+                        << queue_capacity;
+        json << "}";
         if (include_nested_bus) json << ", \"vehicle/sub\": {\"type\": \"can\", \"bitrate\": 500000}";
         json << "},\n  \"boards\": [";
         for (std::size_t index = 0; index < boards.size(); ++index) {
@@ -158,6 +165,29 @@ TEST(WorldTest, LoadsSharedCanFabric) {
     const auto* bus = world.value()->canBus("vehicle");
     EXPECT_TRUE(bus != nullptr && bus->nodeCount() == 2U)
         << "attaches both FDCAN nodes to the shared bus";
+}
+
+TEST(WorldTest, TimedBusUsesWorldSharedEventLoop) {
+    TempWorldConfigs files;
+    auto network = files.network({files.writeBoard("timed-world.json", "timed-world")});
+    network.buses[0].timed_delivery = true;
+    auto world = fil::sim::World::load(network);
+    ASSERT_TRUE(world);
+    auto* bus = world.value()->canBus("vehicle");
+    ASSERT_NE(bus, nullptr);
+    std::vector<std::uint64_t> deliveries;
+    ASSERT_TRUE(bus->attach("observer", false,
+        [&](const auto&, const auto at) { deliveries.push_back(at); }));
+    fil::devices::CanFrame frame;
+    frame.id = 0x123U;
+    ASSERT_TRUE(bus->inject(frame, world.value()->eventLoop().now()));
+    EXPECT_TRUE(deliveries.empty());
+    auto duration = fil::devices::classicCanDurationNs(frame, bus->bitrate());
+    ASSERT_TRUE(duration);
+    const std::uint64_t delivery_time = duration.value() - 6'000U;
+    static_cast<void>(world.value()->eventLoop().runDueEvents(delivery_time));
+    ASSERT_EQ(deliveries.size(), 1U);
+    EXPECT_EQ(deliveries[0], delivery_time);
 }
 
 TEST(WorldTest, DispatchesBoardsInFixedOrder) {
@@ -397,7 +427,8 @@ TEST(WorldTest, ServeNetworkRequiresAnExplicitSupportedTransport) {
 
 TEST(WorldTest, ServeNetworkUsesBinaryStdioFramesForControlsAndTraces) {
     TempWorldConfigs files;
-    const auto network_path = files.writeNetwork({files.writeBoard("serve.json", "serve")});
+    const auto network_path = files.writeNetwork(
+        {files.writeBoard("serve.json", "serve")}, {}, false, false);
     const std::string path = network_path.string();
 
     std::vector<std::uint8_t> request_bytes;
@@ -477,24 +508,83 @@ TEST(WorldTest, ServeNetworkUsesBinaryStdioFramesForControlsAndTraces) {
         frames.push_back(std::move(*next.value()));
     }
     ASSERT_TRUE(decoder.finish());
-    ASSERT_EQ(frames.size(), 8U);
+    ASSERT_EQ(frames.size(), 7U);
     EXPECT_EQ(frames[0].kind, fil::cli::network_protocol::MessageKind::hello);
-    EXPECT_EQ(frames[1].kind, fil::cli::network_protocol::MessageKind::trace);
-    EXPECT_EQ(frames[1].request_id, 0U);
+    // Queue acceptance is acknowledged synchronously; no wire/RX trace exists
+    // until the event loop advances the queued transmission.
     for (std::size_t index = 0U; index < 5U; ++index) {
-        EXPECT_EQ(frames[index + 2U].kind, fil::cli::network_protocol::MessageKind::reply);
-        EXPECT_EQ(frames[index + 2U].request_id, index + 1U);
+        EXPECT_EQ(frames[index + 1U].kind, fil::cli::network_protocol::MessageKind::reply);
+        EXPECT_EQ(frames[index + 1U].request_id, index + 1U);
     }
     const auto replyStatus = [](const fil::cli::network_protocol::Frame& frame) {
         return static_cast<std::uint16_t>(frame.payload[0U])
             | static_cast<std::uint16_t>(static_cast<std::uint16_t>(frame.payload[1U]) << 8U);
     };
+    EXPECT_EQ(replyStatus(frames[1]), 0U);
     EXPECT_EQ(replyStatus(frames[2]), 0U);
     EXPECT_EQ(replyStatus(frames[3]), 0U);
-    EXPECT_EQ(replyStatus(frames[4]), 0U);
-    EXPECT_EQ(replyStatus(frames[5]), 2U);
-    EXPECT_EQ(replyStatus(frames[6]), 0U);
-    EXPECT_EQ(frames[7].kind, fil::cli::network_protocol::MessageKind::end);
+    EXPECT_EQ(replyStatus(frames[4]), 2U);
+    EXPECT_EQ(replyStatus(frames[5]), 0U);
+    EXPECT_EQ(frames[6].kind, fil::cli::network_protocol::MessageKind::end);
+}
+
+TEST(WorldTest, ServeNetworkReportsTimedCanQueueFullStatus) {
+    TempWorldConfigs files;
+    const auto network_path = files.writeNetwork(
+        {files.writeBoard("serve-queue.json", "serve-queue")}, {}, false, true, 1U);
+    const std::string path = network_path.string();
+    const auto appendString = [](std::vector<std::uint8_t>& payload, const std::string_view value) {
+        payload.push_back(static_cast<std::uint8_t>(value.size() & 0xffU));
+        payload.push_back(static_cast<std::uint8_t>((value.size() >> 8U) & 0xffU));
+        for (const char byte : value) payload.push_back(static_cast<std::uint8_t>(byte));
+    };
+    std::vector<std::uint8_t> requests;
+    for (std::uint32_t id = 1U; id <= 3U; ++id) {
+        std::vector<std::uint8_t> payload;
+        appendString(payload, "vehicle");
+        for (unsigned i = 0; i < 4U; ++i) payload.push_back(static_cast<std::uint8_t>(0x23U >> (8U * i)));
+        payload.insert(payload.end(), {0U, 0U});
+        std::ostringstream encoded(std::ios::out | std::ios::binary);
+        ASSERT_TRUE(fil::cli::network_protocol::writeFrame(encoded,
+            {fil::cli::network_protocol::MessageKind::can_inject, id, std::move(payload)}));
+        for (const char byte : encoded.str()) requests.push_back(static_cast<std::uint8_t>(byte));
+    }
+    std::ostringstream stop(std::ios::out | std::ios::binary);
+    ASSERT_TRUE(fil::cli::network_protocol::writeFrame(stop,
+        {fil::cli::network_protocol::MessageKind::stop, 4U, {}}));
+    for (const char byte : stop.str()) requests.push_back(static_cast<std::uint8_t>(byte));
+
+    ScopedStdinPipe input;
+    ASSERT_TRUE(input.redirect(requests));
+    const std::string_view args[]{"serve-network", path, "--transport", "stdio",
+                                  "--no-wall-pacing"};
+    std::ostringstream output(std::ios::out | std::ios::binary);
+    std::ostringstream errors;
+    EXPECT_EQ(fil::cli::run(args, output, errors), fil::cli::ExitCode::success);
+
+    std::vector<std::uint8_t> bytes;
+    for (const char byte : output.str()) bytes.push_back(static_cast<std::uint8_t>(byte));
+    fil::cli::network_protocol::FrameDecoder decoder;
+    ASSERT_TRUE(decoder.append(bytes));
+    std::vector<fil::cli::network_protocol::Frame> frames;
+    for (;;) {
+        auto next = decoder.next();
+        ASSERT_TRUE(next);
+        if (!next.value()) break;
+        frames.push_back(std::move(*next.value()));
+    }
+    std::vector<std::uint16_t> statuses;
+    for (const auto& frame : frames) {
+        if (frame.kind != fil::cli::network_protocol::MessageKind::reply) continue;
+        ASSERT_GE(frame.payload.size(), 2U);
+        statuses.push_back(static_cast<std::uint16_t>(frame.payload[0])
+            | static_cast<std::uint16_t>(static_cast<std::uint16_t>(frame.payload[1]) << 8U));
+    }
+    ASSERT_EQ(statuses.size(), 4U);
+    EXPECT_EQ(statuses[0], 0U);
+    EXPECT_EQ(statuses[1], 4U);
+    EXPECT_EQ(statuses[2], 4U);
+    EXPECT_EQ(statuses[3], 0U);
 }
 
 TEST(WorldTest, ServeNetworkStopsOnCleanUnlimitedStdioEof) {
@@ -569,6 +659,7 @@ TEST(WorldTest, CanOutputTraceCarriesExactBusAndFirmwareOrigin) {
     frame.dlc = 1U;
     frame.data[0] = 1U;
     ASSERT_TRUE(bus->send(sender.value(), frame, 0U).hasValue());
+    static_cast<void>(world.value()->eventLoop().runDueEvents(1'000'000U));
     const auto found = std::find_if(world.value()->trace().records().begin(),
         world.value()->trace().records().end(), [](const fil::sim::TraceRecord& record) {
             if (record.type != "can_tx") return false;

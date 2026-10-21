@@ -97,8 +97,14 @@ preserves any separately latched pending interrupt.
 
 Board configuration supplies deterministic GPIO levels, USART input/output, ADC
 sources, and SPI devices. ADC inputs are sampled at simulated conversion-completion
-time. `VirtualCanBus` validates classic CAN and CAN-FD frames and delivers them in
-attachment order. CLI CAN injection uses the same event loop.
+time. `VirtualCanBus` validates classic CAN and CAN-FD frames. Its default
+`timed` mode admits bounded sender queues and schedules classic-CAN arbitration/SOF/EOF and
+intermission boundaries on the shared event loop; firmware TX completion is
+reported only at EOF. Explicit `immediate` mode delivers synchronously in
+attachment order. The timed model arbitrates sender-head frames by the classic CAN identifier
+arbitration field, rejects CAN-FD timing, and leaves same-ID error/retry and
+ACK/error behavior idealized. See
+[bitrate-aware CAN delivery](can_bitrate_delivery.md).
 
 See [STM32G4 peripheral coverage](stm32g4_peripheral_coverage.md) for modeled
 semantics and intentional gaps.

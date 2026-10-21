@@ -19,7 +19,7 @@ inline constexpr std::size_t header_size = 16U;
 inline constexpr std::uint32_t maximum_payload_size = 64U * 1024U;
 inline constexpr std::size_t maximum_buffered_size =
     static_cast<std::size_t>(maximum_payload_size) + header_size + 4096U;
-inline constexpr std::uint8_t protocol_version = 1U;
+inline constexpr std::uint8_t protocol_version = 2U;
 
 enum class MessageKind : std::uint8_t {
     can_inject = 0x01U,

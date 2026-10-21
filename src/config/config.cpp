@@ -977,7 +977,8 @@ Result<NetworkConfig> loadNetworkConfig(const std::filesystem::path& path) {
     for (const auto& [bus_name, definition] : *buses.value()) {
         auto bus = requireObject(*definition, source_path.value(), "CAN bus '" + bus_name + "'");
         if (!bus) return bus.error();
-        auto bus_unknown = rejectUnknown(*bus.value(), source_path.value(), {"type", "bitrate"});
+        auto bus_unknown = rejectUnknown(*bus.value(), source_path.value(),
+                                         {"type", "bitrate", "timing", "queue_capacity"});
         if (!bus_unknown) return bus_unknown.error();
         auto type = requireString(*bus.value(), source_path.value(), "type");
         if (!type) return type.error();
@@ -991,6 +992,23 @@ Result<NetworkConfig> loadNetworkConfig(const std::filesystem::path& path) {
                 return configError(source_path.value(), "CAN bus bitrate must be a nonzero 32-bit value");
             }
             bus_config.bitrate = static_cast<std::uint32_t>(parsed.value());
+        }
+        if (const JsonValue* timing = find(*bus.value(), "timing")) {
+            auto parsed = stringValue(*timing, source_path.value(), bus_name + ".timing");
+            if (!parsed) return parsed.error();
+            if (parsed.value() == "immediate") bus_config.timed_delivery = false;
+            else if (parsed.value() == "timed" || parsed.value() == "timed_fifo")
+                bus_config.timed_delivery = true;
+            else return configError(source_path.value(),
+                                    "CAN bus timing must be 'immediate' or 'timed'");
+        }
+        if (const JsonValue* capacity = find(*bus.value(), "queue_capacity")) {
+            auto parsed = numericValue(*capacity, source_path.value(), bus_name + ".queue_capacity");
+            if (!parsed) return parsed.error();
+            if (parsed.value() == 0U || parsed.value() > std::numeric_limits<std::uint32_t>::max()) {
+                return configError(source_path.value(), "CAN queue_capacity must be a nonzero 32-bit value");
+            }
+            bus_config.queue_capacity = static_cast<std::uint32_t>(parsed.value());
         }
         config.buses.push_back(std::move(bus_config));
     }
@@ -1057,7 +1075,9 @@ std::string normalize(const NetworkConfig& config) {
            << "source: " << config.source_path.string() << '\n'
            << "buses: " << config.buses.size() << '\n';
     for (const CanBusConfig& bus : config.buses) {
-        output << "bus: " << bus.name << " bitrate=" << bus.bitrate << '\n';
+        output << "bus: " << bus.name << " bitrate=" << bus.bitrate
+               << " timing=" << (bus.timed_delivery ? "timed" : "immediate")
+               << " queue_capacity=" << bus.queue_capacity << '\n';
     }
     output << "boards: " << config.board_paths.size() << '\n';
     for (const auto& board : config.board_paths) output << "board: " << board.string() << '\n';

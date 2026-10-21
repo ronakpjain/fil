@@ -219,6 +219,7 @@ private:
 
     [[nodiscard]] FilterDecision filter(const devices::CanFrame& frame) const noexcept;
     [[nodiscard]] bool transmitBuffer(std::uint32_t buffer_index);
+    void completeTransmission(std::uint32_t buffer_index, const devices::CanFrame& frame);
     void acknowledgeRxFifo0(std::uint32_t acknowledged_index);
     void updateRxFifo0Status() noexcept;
     void updateTxFifoStatus() noexcept;

@@ -22,7 +22,7 @@ std::vector<std::uint8_t> encodedFrame(const Frame& frame) {
 TEST(NetworkProtocolTest, EncodesFixedHeaderInLittleEndian) {
     const Frame frame{MessageKind::can_inject, 0x12345678U, {0xaaU, 0x00U}};
     const std::vector<std::uint8_t> expected{
-        'F', 'I', 'L', 'N', 1U, 1U, 0U, 0U,
+        'F', 'I', 'L', 'N', 2U, 1U, 0U, 0U,
         2U, 0U, 0U, 0U, 0x78U, 0x56U, 0x34U, 0x12U,
         0xaaU, 0x00U,
     };
@@ -79,7 +79,7 @@ TEST(NetworkProtocolTest, RejectsInvalidHeadersAndOversizedPayloads) {
     for (const std::size_t index : {0U, 4U, 6U, 8U}) {
         auto malformed = encoded;
         if (index == 0U) malformed[0U] = 'X';
-        else if (index == 4U) malformed[4U] = 2U;
+        else if (index == 4U) malformed[4U] = 1U;
         else if (index == 6U) malformed[6U] = 1U;
         else malformed[8U] = 1U; // A non-empty length with no payload is incomplete, not invalid.
         FrameDecoder decoder;

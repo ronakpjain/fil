@@ -123,7 +123,7 @@ TEST(ConfigTest, LoadsNetworkConfig) {
         R"({
   "schema_version":1,
   "name":"vehicle",
-  "buses":{"vehicle":{"type":"can","bitrate":500000}},
+  "buses":{"vehicle":{"type":"can","bitrate":500000,"timing":"timed_fifo","queue_capacity":8}},
   "stimuli":["stimuli/startup.json"],
   "boards":["boards/a.json","boards/b.json"]
 })"
@@ -131,6 +131,10 @@ TEST(ConfigTest, LoadsNetworkConfig) {
     const auto network = fil::config::loadNetworkConfig(network_path);
     EXPECT_TRUE(network && network.value().buses.size() == 1) << "loads network CAN bus";
     EXPECT_TRUE(network && network.value().buses[0].bitrate == 500000U) << "loads network bitrate";
+    EXPECT_TRUE(network && network.value().buses[0].timed_delivery
+                && network.value().buses[0].queue_capacity == 8U)
+        << "loads timed FIFO mode and bounded capacity";
+    EXPECT_NE(fil::config::normalize(network.value()).find("timing=timed"), std::string::npos);
     EXPECT_TRUE(network && network.value().board_paths[1] ==
                                (files.root() / "boards/b.json").lexically_normal())
         << "resolves network board paths against network config";
@@ -138,6 +142,24 @@ TEST(ConfigTest, LoadsNetworkConfig) {
                 network.value().stimulus_paths[0] ==
                     (files.root() / "stimuli/startup.json").lexically_normal())
         << "resolves network stimulus-script paths against network config";
+    const auto default_path = files.write("default-network.json", R"({
+  "schema_version":1,"name":"default","buses":{"bus":{"type":"can"}},
+  "boards":["boards/a.json"]
+})");
+    const auto default_network = fil::config::loadNetworkConfig(default_path);
+    ASSERT_TRUE(default_network);
+    EXPECT_TRUE(default_network.value().buses[0].timed_delivery);
+    EXPECT_EQ(default_network.value().buses[0].queue_capacity, 256U);
+    EXPECT_NE(fil::config::normalize(default_network.value()).find("timing=timed"),
+              std::string::npos);
+    const auto immediate_path = files.write("immediate-network.json", R"({
+  "schema_version":1,"name":"immediate","buses":{"bus":{"type":"can","timing":"immediate"}},
+  "boards":["boards/a.json"]
+})");
+    const auto immediate = fil::config::loadNetworkConfig(immediate_path);
+    ASSERT_TRUE(immediate);
+    EXPECT_FALSE(immediate.value().buses[0].timed_delivery);
+    EXPECT_NE(fil::config::normalize(immediate.value()).find("timing=immediate"), std::string::npos);
 }
 
 /// @brief Verifies strict schema and JSON failures.

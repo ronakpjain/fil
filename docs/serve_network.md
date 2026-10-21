@@ -1,8 +1,9 @@
 # Binary network service
 
 `fil serve-network NETWORK --transport stdio` serves a live network to another
-process over standard input and standard output. Version 1 supports only the
-`stdio` transport. It is the binary counterpart to the human-facing
+process over standard input and standard output. Version 2 supports only the
+`stdio` transport. Version 2 adds the explicit queue-full reply status; clients
+must reject unsupported versions rather than interpreting it as another status. It is the binary counterpart to the human-facing
 [`watch-network`](watch_network.md): both run the same paced, sliced network
 monitor and support CAN, ADC, GPIO, and stop controls, but `serve-network` emits
 only protocol frames on stdout. Diagnostics and rejected-request explanations go
@@ -31,10 +32,10 @@ that can disable capsules.
 The protocol is a byte stream. Each frame begins with this 16-byte header;
 integers are explicitly encoded little-endian, with no native-struct padding:
 
-| Offset | Size | Field | Version 1 value / meaning |
+| Offset | Size | Field | Version 2 value / meaning |
 |---:|---:|---|---|
 | 0 | 4 | Magic | ASCII `FILN` |
-| 4 | 1 | Version | `1` |
+| 4 | 1 | Version | `2` |
 | 5 | 1 | Kind | Message kind from the tables below |
 | 6 | 2 | Flags | Must be zero |
 | 8 | 4 | Payload length | Bytes following the header, at most 65,536 |
@@ -48,7 +49,8 @@ no terminator. Numeric payload fields use the same little-endian convention.
 
 Request IDs must be nonzero and should be unique among outstanding requests.
 Requests are applied in wire order at network slice boundaries. A successful
-reply's timestamp is the simulated time at which the operation took effect.
+reply's timestamp is the simulated time at which the operation took effect; for
+`CAN_INJECT` in timed mode this is queue admission, not frame delivery.
 Trace events synchronously caused by a request can be sent before that request's
 reply.
 
@@ -71,7 +73,7 @@ For example, a `CAN_INJECT` request with ID `0x123`, bus `vehicle`, request ID
 and other multibyte values shown in wire order):
 
 ```text
-46 49 4c 4e 01 01 00 00 11 00 00 00 01 00 00 00
+46 49 4c 4e 02 01 00 00 11 00 00 00 01 00 00 00
 07 00 76 65 68 69 63 6c 65 23 01 00 00 00 02 de ad
 ```
 
@@ -90,7 +92,14 @@ drive. `STOP` acknowledges and then ends the session, equivalent to `quit` in
 | `0x83` | `END` | `0` | `u64 final_time_ns`; `u8 reason`; `u8 process_exit_code`; diagnostic string |
 
 Reply status values are `0` success, `1` invalid request/payload, `2` unknown bus,
-board, or peripheral, and `3` unsupported message kind. A failed semantic request
+board, or peripheral, `3` unsupported message kind, and `4` queue full. For a
+`CAN_INJECT` queue-full reply, the frame was not admitted; retry the same request
+with the same payload after simulation has advanced and a later request can be
+admitted. Do not retry a successful reply: success means queue admission, not wire
+completion, ACK, or receiver FIFO acceptance. Its `applied_time_ns` is the
+admission timestamp. Timed virtual-bus `can_tx` trace events are timestamped at
+SOF and `can_rx` records at EOF/delivery; FDCAN's separate `can_tx_complete`
+event is timestamped at EOF. A failed semantic request
 gets a `REPLY`, is reported on stderr, and does not stop the service. Trace fields
 remain ordered strings, as in the JSONL trace contract; `sequence` gaps are
 possible when trace types are filtered.

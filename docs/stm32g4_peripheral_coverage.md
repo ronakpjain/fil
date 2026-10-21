@@ -274,7 +274,7 @@ reference-verified here**.
 The CLI option `--inject-can BUS[@TIME_MS]:ID:HEXDATA` schedules an external frame
 on the shared event loop and may be repeated. A missing `@TIME_MS` means time zero.
 
-The configured bitrate is informational. The bus does not model arbitration priority, simultaneous transmit, serialization delay, physical errors, termination, or load.
+Network buses default to timed classic-CAN arbitration at the configured bitrate. At each deferred shared-event arbitration point, only each sender's oldest request competes; identifier arbitration compares standard/extended arbitration fields dominant-zero first. External injection is one FIFO sender stream. Equal arbitration fields use stable admission sequence, not a physical same-ID collision model. Timed CAN-FD is unsupported; ACK failures, retransmission, physical errors, termination, and load are not modeled. Explicit `timing: "immediate"` retains synchronous attachment-order delivery.
 
 ## Interpreting unknown MMIO
 

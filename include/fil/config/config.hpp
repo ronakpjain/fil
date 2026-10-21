@@ -109,7 +109,9 @@ struct BoardConfig {
 /** @brief One deterministic CAN bus declared by a network configuration. */
 struct CanBusConfig {
     std::string name;              ///< Stable network-local bus name.
-    std::uint32_t bitrate{500000}; ///< Informational nominal bit rate.
+    std::uint32_t bitrate{500000}; ///< Nominal bit rate used by timed delivery.
+    bool timed_delivery{true};     ///< Arbitrate classic frames through the shared event loop.
+    std::uint32_t queue_capacity{256}; ///< Maximum pending plus in-flight frames.
 };
 
 /** @brief Multiple boards and buses run in one shared simulation world. */

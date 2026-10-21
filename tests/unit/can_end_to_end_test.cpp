@@ -32,7 +32,7 @@ public:
         fil::config::NetworkConfig config;
         config.name = "can-end-to-end";
         config.source_path = directory_.root() / "network.json";
-        config.buses.push_back({"vehicle", 500000U});
+        config.buses.push_back({"vehicle", 500000U, false});
         config.board_paths.push_back(board_path_);
         return config;
     }

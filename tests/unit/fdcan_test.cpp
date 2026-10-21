@@ -1,8 +1,10 @@
 #include "fil/stm32g4/fdcan.hpp"
 #include "fil/mem/memory_bus.hpp"
+#include "fil/sim/event_loop.hpp"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <vector>
@@ -141,6 +143,84 @@ TEST(FdcanTest, TransmitsAndReceivesThroughMessageRam) {
     writeWord(receiver, fil::stm32g4::FdcanPeripheral::rxf0aOffset, 0U);
     EXPECT_TRUE((readWord(receiver, fil::stm32g4::FdcanPeripheral::rxf0sOffset) & 0x0fU) == 0U)
         << "RXF0A releases the acknowledged FIFO element";
+}
+
+TEST(FdcanTest, TimedTransmissionDefersCompletionAndResetCancels) {
+    fil::sim::EventLoop loop;
+    fil::stm32g4::FdcanMessageRam ram;
+    fil::devices::VirtualCanBus bus("timed", 500'000U,
+        fil::devices::VirtualCanBus::DeliveryMode::timed, 4U);
+    bus.setEventLoop(&loop);
+    fil::stm32g4::FdcanPeripheral sender(1U, ram, &loop);
+    fil::stm32g4::FdcanPeripheral receiver(2U, ram, &loop);
+    ASSERT_TRUE(sender.attachBus(bus, "sender"));
+    ASSERT_TRUE(receiver.attachBus(bus, "receiver"));
+    writeWord(sender, fil::stm32g4::FdcanPeripheral::cccrOffset, 0U);
+    writeWord(receiver, fil::stm32g4::FdcanPeripheral::cccrOffset, 0U);
+    const auto offset = fil::stm32g4::FdcanMessageRam::txFifoOffset;
+    ram.storeWord(0U, offset, 0x123U << 18U);
+    ram.storeWord(0U, offset + 4U, 1U << 16U);
+    ram.storeWord(0U, offset + 8U, 0x000000a5U);
+    writeWord(sender, fil::stm32g4::FdcanPeripheral::txbarOffset, 1U);
+    ram.storeWord(0U, offset + 8U, 0x0000005aU); // TX owns a snapshot after submission.
+    EXPECT_EQ(readWord(sender, 0x0c8U) & 1U, 1U); // TXBRP remains set
+    EXPECT_EQ(readWord(sender, fil::stm32g4::FdcanPeripheral::txbtoOffset) & 1U, 0U);
+    EXPECT_EQ(readWord(receiver, fil::stm32g4::FdcanPeripheral::rxf0sOffset) & 0xfU, 0U);
+    fil::devices::CanFrame timed_frame;
+    timed_frame.id = 0x123U;
+    timed_frame.dlc = 1U;
+    timed_frame.data[0] = 0xa5U;
+    const auto duration = fil::devices::classicCanDurationNs(timed_frame, 500'000U);
+    ASSERT_TRUE(duration);
+    static_cast<void>(loop.runDueEvents(duration.value()));
+    EXPECT_EQ(readWord(sender, 0x0c8U) & 1U, 0U);
+    EXPECT_EQ(readWord(sender, fil::stm32g4::FdcanPeripheral::txbtoOffset) & 1U, 1U);
+    EXPECT_EQ(readWord(receiver, fil::stm32g4::FdcanPeripheral::rxf0sOffset) & 0xfU, 1U);
+    EXPECT_EQ(ram.loadWord(1U, fil::stm32g4::FdcanMessageRam::rxFifo0Offset + 8U) & 0xffU,
+              0xa5U);
+
+    sender.reset();
+    ram.storeWord(0U, offset, 0x124U << 18U);
+    writeWord(sender, fil::stm32g4::FdcanPeripheral::cccrOffset, 0U);
+    writeWord(sender, fil::stm32g4::FdcanPeripheral::txbarOffset, 1U);
+    sender.reset();
+    static_cast<void>(loop.runDueEvents(loop.now() + 1'000'000U));
+    EXPECT_EQ(readWord(sender, fil::stm32g4::FdcanPeripheral::txbtoOffset) & 1U, 0U);
+    EXPECT_EQ(readWord(receiver, fil::stm32g4::FdcanPeripheral::rxf0sOffset) & 0xfU, 1U);
+}
+
+TEST(FdcanTest, TimedAdmissionFailureClearsTransmitOwnership) {
+    fil::sim::EventLoop loop;
+    fil::stm32g4::FdcanMessageRam ram;
+    fil::devices::VirtualCanBus bus("zero", 0U,
+        fil::devices::VirtualCanBus::DeliveryMode::timed, 4U);
+    bus.setEventLoop(&loop);
+    fil::stm32g4::FdcanPeripheral sender(1U, ram, &loop);
+    ASSERT_TRUE(sender.attachBus(bus, "sender"));
+    writeWord(sender, fil::stm32g4::FdcanPeripheral::cccrOffset, 0U);
+    const auto offset = fil::stm32g4::FdcanMessageRam::txFifoOffset;
+    ram.storeWord(0U, offset, 0x123U << 18U);
+    ram.storeWord(0U, offset + 4U, 0U);
+    writeWord(sender, fil::stm32g4::FdcanPeripheral::txbarOffset, 1U);
+    EXPECT_EQ(readWord(sender, 0x0c8U) & 1U, 0U);
+    EXPECT_NE(readWord(sender, fil::stm32g4::FdcanPeripheral::irOffset)
+              & (1U << 21U), 0U);
+    EXPECT_EQ(bus.queuedTransmissions(), 0U);
+}
+
+TEST(FdcanTest, TracesBoundedReceiveFifoDrops) {
+    fil::sim::TraceRecorder trace;
+    fil::stm32g4::FdcanMessageRam ram;
+    fil::stm32g4::FdcanPeripheral controller(1U, ram, nullptr, &trace);
+    writeWord(controller, fil::stm32g4::FdcanPeripheral::cccrOffset, 0U);
+    fil::devices::CanFrame frame;
+    frame.id = 0x123U;
+    for (std::uint64_t time = 0; time < 4U; ++time) {
+        static_cast<void>(controller.receiveFrame(frame, time));
+    }
+    const auto dropped = std::count_if(trace.records().begin(), trace.records().end(),
+        [](const auto& record) { return record.type == "can_rx_drop"; });
+    EXPECT_EQ(dropped, 1U);
 }
 
 TEST(FdcanTest, FiltersAgainstThePerMessageRamLists) {

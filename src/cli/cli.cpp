@@ -348,6 +348,7 @@ enum class ProtocolReplyStatus : std::uint16_t {
     invalid_request = 1U,
     unknown_target = 2U,
     unsupported_message = 3U,
+    queue_full = 4U,
 };
 
 enum class ProtocolEndReason : std::uint8_t {
@@ -1515,7 +1516,9 @@ ExitCode networkMonitorCommand(
                     } else {
                         const auto injected = bus->inject(frame, world.value()->eventLoop().now());
                         if (!injected) {
-                            status = ProtocolReplyStatus::invalid_request;
+                            status = injected.error().message == "CAN transmit queue full"
+                                ? ProtocolReplyStatus::queue_full
+                                : ProtocolReplyStatus::invalid_request;
                             message = injected.error().message;
                         }
                     }
