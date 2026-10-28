@@ -1777,10 +1777,6 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
     TimedJitStepOutcome timed;  // arrays are uninitialized; only [0, count) is used
     auto& out = timed.execution;
     std::uint32_t total_cycles = 0U;
-    std::uint32_t last_pc = entry_pc;
-    std::uint32_t last_raw = slot.raws[0];
-    std::uint8_t last_size = slot.sizes[0];
-    bool last_suppress = false;
     const auto execution_count = static_cast<std::uint8_t>(
         std::min<std::size_t>(max_instructions, slot.count));
     // Only total_instruction_cycles entries [0, count) are observed by callers;
@@ -1943,11 +1939,6 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
                 out.sizes[i] = slot.sizes[i];
             }
             out.count = first_cached;
-            const auto last = static_cast<std::uint8_t>(first_cached - 1U);
-            last_pc = slot.pcs[last];
-            last_raw = slot.raws[last];
-            last_size = slot.sizes[last];
-            last_suppress = slot.suppress_obs[last];
     }
 
     for (std::uint8_t i = first_cached; i < cached_limit; ++i) {
@@ -2047,10 +2038,6 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
         out.pcs[out.count] = pc;
         out.sizes[out.count] = size;
         ++out.count;
-        last_pc = pc;
-        last_raw = slot.raws[i];
-        last_size = size;
-        last_suppress = slot.suppress_obs[i];
 
         // Branches and PC-loading handlers terminate at the actual PC change;
         // pending EXC_RETURN is also produced only by a terminating PC op.
@@ -2062,14 +2049,18 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
         return std::nullopt;
     }
     slot.decline_streak = 0U;
+    // Native and cached execution both retire a contiguous leading prefix.
+    // Read its final diagnostic metadata once, rather than carrying four
+    // overwritten values (and their register pressure) through every handler.
+    const auto last = static_cast<std::uint8_t>(out.count - 1U);
     auto& result = out.result;
     result.reason = StopReason::step_complete;
-    result.instruction_address = last_pc;
-    result.raw = last_raw;
-    result.instruction_size = last_size;
+    result.instruction_address = slot.pcs[last];
+    result.raw = slot.raws[last];
+    result.instruction_size = slot.sizes[last];
     result.instructions = out.count;
     result.cycles = static_cast<std::uint16_t>(total_cycles);
-    result.suppress_loop_observation = last_suppress;
+    result.suppress_loop_observation = slot.suppress_obs[last];
     ++jit_stats_.block_executions;
     jit_stats_.block_instructions += out.count;
     return timed;

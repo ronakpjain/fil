@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -457,6 +458,48 @@ TEST(JitTest, BudgetedReversiblePreparedOpsMatchInterpreterAndExactFetchCosts) {
     EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()));
     EXPECT_EQ(bus.read32(ram_base + 0x45U).value(),
               oracle.read32(ram_base + 0x45U).value());
+}
+
+TEST(JitTest, ReversibleFinalMetadataMatchesEveryRetiredPrefixAndMemoryDecline) {
+    for (const bool decline_memory : {false, true}) {
+        for (std::size_t limit = 1U; limit <= 6U; ++limit) {
+            SCOPED_TRACE(decline_memory);
+            SCOPED_TRACE(limit);
+            auto bus = basicBus();
+            auto oracle = basicBus();
+            const auto code = halfwords({0xF04FU, 0x0001U, 0xBF00U, 0x2102U,
+                0x681AU, 0xF101U, 0x0103U, 0x6059U, 0xBF00U});
+            ASSERT_TRUE(bus.loadBytes(flash_base, code));
+            ASSERT_TRUE(oracle.loadBytes(flash_base, code));
+            bus.setReversibleRamOnly(true);
+            bus.setAllMmioTrapping(true);
+            fil::cpu::CortexM4 cpu(bus), reference(oracle);
+            prepare(cpu); prepare(reference);
+            cpu.state().r[3] = reference.state().r[3] = decline_memory ? 0x40000000U : ram_base;
+            for (unsigned warm = 0U; warm < 70U; ++warm)
+                static_cast<void>(cpu.prepareJitBlock(true));
+            fil::cpu::CortexM4::ReversibleCycleBudget budget;
+            budget.remaining_cycles = 100U;
+            const auto result = cpu.tryStepBudgetedReversibleJitBlock(limit, budget);
+            ASSERT_TRUE(result);
+            const auto expected_count = decline_memory ? std::min(limit, std::size_t{3U}) : limit;
+            ASSERT_EQ(result->execution.count, expected_count);
+            fil::cpu::FastStepResult last;
+            std::uint32_t cycles = 0U;
+            for (std::size_t i = 0U; i < expected_count; ++i) {
+                last = reference.stepFast();
+                ASSERT_EQ(last.reason, fil::cpu::StopReason::step_complete);
+                cycles += last.cycles;
+            }
+            EXPECT_EQ(result->execution.result.instruction_address, last.instruction_address);
+            EXPECT_EQ(result->execution.result.raw, last.raw);
+            EXPECT_EQ(result->execution.result.instruction_size, last.instruction_size);
+            EXPECT_EQ(result->execution.result.suppress_loop_observation, last.suppress_loop_observation);
+            EXPECT_EQ(result->execution.result.instructions, expected_count);
+            EXPECT_EQ(result->execution.result.cycles, cycles);
+            EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()));
+        }
+    }
 }
 
 TEST(JitTest, BudgetedReversiblePreparedMemoryDeclineRestoresSpeculativeState) {
