@@ -31,10 +31,16 @@ see the [README](../README.md) and `make help` for building.
 ## Event-loop overhead
 
 Relative scheduling and relative clock advancement avoid redundant recursive
-mutex acquisitions. Public operations remain serialized, and dispatch retains
-the recursive lock through callbacks so reentrant scheduling preserves ordering.
-This is an overhead reduction, not a realtime guarantee; measure it on the
-actual workload with a freshly trained matching PGO profile.
+mutex acquisitions. During a serial `World::run`, an exclusive event-loop lease
+holds the recursive mutex once; same-thread operations on that loop skip
+relocking. Nested callbacks retain deterministic ordering, and mutex-protected
+operations on other threads wait until the run returns. Outside a lease, those
+operations retain ordinary locking. Owner-context scopes remain serial-only;
+this does not enable concurrent or reentrant World mutation. Leases are
+non-movable, unwind on exceptions, must nest in LIFO order, and must not outlive
+the loop implementation. This is an overhead reduction, not a realtime
+guarantee; measure it on the actual workload with a freshly trained matching
+PGO profile.
 
 ## Execution optimizations
 

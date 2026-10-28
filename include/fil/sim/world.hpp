@@ -102,7 +102,13 @@ public:
     World(const World&) = delete;
     World& operator=(const World&) = delete;
 
-    /** @brief Runs boards concurrently on one deterministic virtual-time clock. */
+    /**
+     * @brief Runs independent board timelines on the deterministic serial scheduler.
+     *
+     * Holds the event loop's exclusive lease until return, including exception
+     * unwinding. Mutex-protected event-loop calls on other threads wait for the
+     * run to finish. Concurrent or reentrant World mutation is unsupported.
+     */
     [[nodiscard]] Result<WorldRunResult> run(const WorldRunOptions& options);
 
     [[nodiscard]] const config::NetworkConfig& config() const noexcept { return config_; }

@@ -284,6 +284,9 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
     }
     const bool deferred_enabled = options.enable_ram_capsules;
 
+    // World execution is serial, and callbacks may re-enter the public loop API.
+    // Keep other threads serialized while eliding recursive relocks on this thread.
+    auto event_loop_exclusive = event_loop_.useExclusiveExecution();
     WorldRunResult output;
     output.start_time_ns = event_loop_.now();
     output.end_time_ns = output.start_time_ns;

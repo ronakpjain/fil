@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <limits>
+#include <mutex>
 
 namespace fil::stm32g4 { class AdcPeripheral; }
 
@@ -55,6 +56,30 @@ public:
     using EventObservation = fil::sim::EventObservation;
     using ObservationBarrier = fil::sim::ObservationBarrier;
 
+    /**
+     * @brief Holds exclusive access while same-thread EventLoop calls elide relocking.
+     *
+     * Scopes are non-movable and must be destroyed in LIFO order. The loop's
+     * implementation must outlive the scope. Mutex-protected operations on
+     * other threads block until the outermost scope is released; owner-context
+     * operations remain serial-only.
+     */
+    class ExclusiveScope {
+    public:
+        ~ExclusiveScope() noexcept;
+        ExclusiveScope(const ExclusiveScope&) = delete;
+        ExclusiveScope& operator=(const ExclusiveScope&) = delete;
+        ExclusiveScope(ExclusiveScope&&) = delete;
+        ExclusiveScope& operator=(ExclusiveScope&&) = delete;
+
+    private:
+        friend class EventLoop;
+        explicit ExclusiveScope(EventLoop& loop);
+        std::recursive_mutex* mutex_{nullptr};
+        void* impl_{nullptr};
+        void* previous_{nullptr};
+    };
+
     /** @brief RAII scope inherited by events scheduled within one board lane. */
     class OwnerScope {
     public:
@@ -82,6 +107,9 @@ public:
 
     /** @brief Makes subsequently scheduled events inherit a board or shared owner. */
     [[nodiscard]] OwnerScope useOwner(EventOwner owner) noexcept;
+
+    /** @brief Acquires an exclusive execution lease for this thread and loop. */
+    [[nodiscard]] ExclusiveScope useExclusiveExecution();
 
     /** @brief Gets the owner inherited by newly scheduled events. */
     [[nodiscard]] EventOwner activeOwner() const noexcept;

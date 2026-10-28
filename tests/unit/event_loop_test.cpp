@@ -3,13 +3,16 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -33,6 +36,128 @@ TEST(EventLoopTest, OrdersEventsDeterministically) {
     const auto second = loop.advanceBy(10);
     EXPECT_TRUE(second.events_executed == 1 && order.back() == 3)
         << "event loop advances relative time";
+}
+
+TEST(EventLoopTest, ExclusiveExecutionSupportsNestedPublicCallsAndPreservesBehavior) {
+    fil::sim::EventLoop loop;
+    std::vector<int> order;
+    std::uint32_t callbacks = 0U;
+    const auto canceled = loop.scheduleAt(8U, [&] { ++callbacks; });
+    {
+        auto exclusive = loop.useExclusiveExecution();
+        EXPECT_EQ(loop.now(), 0U);
+        EXPECT_TRUE(loop.cancel(canceled));
+        static_cast<void>(loop.scheduleAt(3U, [&] {
+            ++callbacks;
+            order.push_back(1);
+            EXPECT_EQ(loop.now(), 3U);
+            static_cast<void>(loop.scheduleAfter(0U, [&] {
+                ++callbacks;
+                order.push_back(2);
+            }));
+        }));
+        const auto run = loop.runDueEvents(3U);
+        EXPECT_EQ(run.events_executed, 2U);
+        EXPECT_EQ(loop.now(), 3U);
+        EXPECT_EQ(loop.pending(), 0U);
+    }
+    EXPECT_EQ(callbacks, 2U);
+    EXPECT_EQ(order, (std::vector<int>{1, 2}));
+    EXPECT_EQ(loop.now(), 3U);
+}
+
+TEST(EventLoopTest, ExclusiveExecutionNestedScopesRestorePriorLoop) {
+    fil::sim::EventLoop first;
+    fil::sim::EventLoop second;
+    {
+        auto outer = first.useExclusiveExecution();
+        {
+            auto same = first.useExclusiveExecution();
+            static_cast<void>(first.scheduleAfter(1U, [] {}));
+        }
+        {
+            auto other = second.useExclusiveExecution();
+            static_cast<void>(second.scheduleAfter(1U, [] {}));
+            // Calls on the first loop must relock while the second loop is current.
+            EXPECT_EQ(first.pending(), 1U);
+        }
+        static_cast<void>(first.scheduleAfter(1U, [] {}));
+        EXPECT_EQ(first.pending(), 2U);
+    }
+    EXPECT_EQ(first.pending(), 2U);
+    EXPECT_EQ(second.pending(), 1U);
+}
+
+TEST(EventLoopTest, ExclusiveExecutionFollowsAnImplementationMovedToAnotherLoop) {
+    fil::sim::EventLoop original;
+    std::optional<fil::sim::EventLoop> destination;
+    {
+        auto exclusive = original.useExclusiveExecution();
+        destination.emplace(std::move(original));
+        static_cast<void>(destination->scheduleAfter(1U, [] {}));
+        EXPECT_EQ(destination->runDueEvents(1U).events_executed, 1U);
+    }
+    // The implementation survives its lease even though its original wrapper
+    // no longer owns it. Queries after release must use ordinary locking again.
+    EXPECT_EQ(destination->now(), 1U);
+}
+
+TEST(EventLoopTest, ExclusiveExecutionExceptionUnwindReleasesLease) {
+    fil::sim::EventLoop loop;
+    EXPECT_THROW(([&] {
+        auto exclusive = loop.useExclusiveExecution();
+        static_cast<void>(loop.scheduleAfter(0U, [] {}));
+        throw std::runtime_error("unwind");
+    }()), std::runtime_error);
+    EXPECT_EQ(loop.pending(), 1U);
+}
+
+TEST(EventLoopTest, StandaloneExecutionStillSerializesOtherThreadScheduling) {
+    fil::sim::EventLoop loop;
+    std::atomic<bool> callback_entered{false};
+    std::atomic<bool> release_callback{false};
+    std::atomic<bool> attempted{false};
+    std::atomic<bool> completed{false};
+    static_cast<void>(loop.scheduleAt(0U, [&] {
+        callback_entered.store(true, std::memory_order_release);
+        while (!release_callback.load(std::memory_order_acquire)) std::this_thread::yield();
+    }));
+    std::thread runner([&] { static_cast<void>(loop.runDueEvents(0U)); });
+    while (!callback_entered.load(std::memory_order_acquire)) std::this_thread::yield();
+    std::thread scheduler([&] {
+        attempted.store(true, std::memory_order_release);
+        static_cast<void>(loop.scheduleAfter(0U, [] {}));
+        completed.store(true, std::memory_order_release);
+    });
+    while (!attempted.load(std::memory_order_acquire)) std::this_thread::yield();
+    EXPECT_FALSE(completed.load(std::memory_order_acquire));
+    release_callback.store(true, std::memory_order_release);
+    runner.join();
+    scheduler.join();
+    EXPECT_TRUE(completed.load(std::memory_order_acquire));
+    EXPECT_EQ(loop.pending(), 1U);
+}
+
+TEST(EventLoopTest, ExclusiveExecutionBlocksOtherThreadsUntilReleased) {
+    fil::sim::EventLoop loop;
+    std::atomic<bool> attempted{false};
+    std::atomic<bool> completed{false};
+    std::thread worker;
+    {
+        auto exclusive = loop.useExclusiveExecution();
+        worker = std::thread([&] {
+            attempted.store(true, std::memory_order_release);
+            static_cast<void>(loop.scheduleAfter(0U, [] {}));
+            completed.store(true, std::memory_order_release);
+        });
+        while (!attempted.load(std::memory_order_acquire)) std::this_thread::yield();
+        // The worker has announced its attempt while this scope owns the mutex.
+        EXPECT_FALSE(completed.load(std::memory_order_acquire));
+        EXPECT_EQ(loop.pending(), 0U);
+    }
+    worker.join();
+    EXPECT_TRUE(completed.load(std::memory_order_acquire));
+    EXPECT_EQ(loop.pending(), 1U);
 }
 
 TEST(EventLoopTest, AdvanceByMatchesRunningDueEventsAtTheEquivalentDeadline) {

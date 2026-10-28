@@ -48,8 +48,15 @@ struct EventLoop::Impl {
     std::unordered_map<EventId, EventPtr> live_events;
     std::unordered_map<EventOwner, SimTimeNs> owner_now;
 
+    static Impl*& exclusiveImpl() noexcept {
+        static thread_local Impl* current = nullptr;
+        return current;
+    }
+
     struct Lock {
-        explicit Lock(Impl& impl) : lock(impl.mutex) {}
+        explicit Lock(Impl& impl) : lock(impl.mutex, std::defer_lock) {
+            if (exclusiveImpl() != &impl) lock.lock();
+        }
         std::unique_lock<std::recursive_mutex> lock;
     };
 
@@ -222,6 +229,23 @@ EventLoop::EventLoop(const std::size_t maximum_same_time_events)
 EventLoop::~EventLoop() = default;
 EventLoop::EventLoop(EventLoop&&) noexcept = default;
 EventLoop& EventLoop::operator=(EventLoop&&) noexcept = default;
+
+EventLoop::ExclusiveScope::ExclusiveScope(EventLoop& loop)
+    : mutex_(&loop.impl_->mutex), impl_(loop.impl_.get()),
+      previous_(Impl::exclusiveImpl()) {
+    mutex_->lock();
+    Impl::exclusiveImpl() = loop.impl_.get();
+}
+
+EventLoop::ExclusiveScope::~ExclusiveScope() noexcept {
+    if (impl_ == nullptr) return;
+    Impl::exclusiveImpl() = static_cast<Impl*>(previous_);
+    mutex_->unlock();
+}
+
+EventLoop::ExclusiveScope EventLoop::useExclusiveExecution() {
+    return ExclusiveScope(*this);
+}
 
 EventLoop::OwnerScope::OwnerScope(EventLoop& loop, const EventOwner owner) noexcept
     : loop_(&loop), previous_(loop.impl_->currentOwner()) {
