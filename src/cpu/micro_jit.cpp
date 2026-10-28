@@ -1440,8 +1440,12 @@ struct MicroJit::Impl {
     }
 
     void* append(const void* data, std::size_t bytes, std::string& error, std::size_t& out_bytes) {
+        // UBSan's indirect-function check probes the eight bytes before an
+        // entry point. Keep a mapped, zero metadata prefix (not a compiler
+        // function signature), including for the first kernel in the arena.
+        constexpr std::size_t probe_prefix = 16U;
         const std::size_t aligned = (bytes + 15U) & ~15U;
-        if (used + aligned > capacity) {
+        if (used + probe_prefix + aligned > capacity) {
             error = "micro-jit arena exhausted";
             // The arena was made writable before emission; restore RX so
             // previously compiled kernels stay executable after we decline.
@@ -1451,10 +1455,11 @@ struct MicroJit::Impl {
             }
             return nullptr;
         }
-        std::uint8_t* slot = base + used;
+        std::memset(base + used, 0, probe_prefix);
+        std::uint8_t* slot = base + used + probe_prefix;
         std::memcpy(slot, data, bytes);
         if (aligned > bytes) std::memset(slot + bytes, 0, aligned - bytes);
-        used += aligned;
+        used += probe_prefix + aligned;
         out_bytes = aligned;
         return slot;
     }

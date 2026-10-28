@@ -15,6 +15,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <random>
 #include <string>
@@ -115,6 +116,29 @@ bool runMicro(const std::vector<std::uint16_t>& code, const CpuState& initial,
     const std::size_t retired = static_cast<std::size_t>(fn(&final_out, block.ops.size()) & 0xffffffffU);
     EXPECT_EQ(retired, block.ops.size());
     return true;
+}
+
+TEST(MicroJitEmitterTest, NativeEntriesHaveReadableZeroFunctionProbePrefix) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no micro-jit emitter on this host";
+    std::string error;
+    auto jit = MicroJit::create(error);
+    ASSERT_TRUE(jit) << error;
+    for (const std::uint16_t instruction : {std::uint16_t{0x2001U}, std::uint16_t{0x2002U}}) {
+        const auto sources = decodeProgram({instruction, 0xBF00U});
+        MicroBlock block;
+        ASSERT_TRUE(fil::cpu::buildMicroBlock({sources.data(), sources.size()}, block).ok);
+        const auto function = jit->compile(block, error);
+        ASSERT_NE(function, nullptr) << error;
+        std::uint64_t probe = ~std::uint64_t{0U};
+        const auto address = reinterpret_cast<std::uintptr_t>(function);
+        std::memcpy(&probe, reinterpret_cast<const void*>(address - sizeof(probe)), sizeof(probe));
+        EXPECT_EQ(probe, 0U);
+        CpuState state{};
+        state.r[15] = kFlash;
+        const auto retired = function(&state, block.ops.size()) & 0xffffffffU;
+        EXPECT_EQ(retired, 2U);
+        EXPECT_EQ(state.r[0], instruction & 0xffU);
+    }
 }
 
 void expectSameState(const CpuState& a, const CpuState& b) {
