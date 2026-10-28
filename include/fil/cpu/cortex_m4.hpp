@@ -485,6 +485,15 @@ private:
         ldr_word_gpr,
         str_word_gpr,
     };
+    enum class ReversibleFast : std::uint8_t {
+        none,
+        mov_imm,
+        mov_reg,
+        add_imm,
+        sub_imm,
+        ldr_word,
+        str_word,
+    };
     struct JitBlockEntry {
         std::uint64_t generation{0};
         std::uint32_t pc{0};
@@ -503,6 +512,8 @@ private:
         std::array<std::uint16_t, JitStepOutcome::max_block> base_cycles{};
         std::array<bool, JitStepOutcome::max_block> divide_form{};
         std::array<JitFast, JitStepOutcome::max_block> fast{};
+        // Compact, portable dispatch for hot unconditional reversible ops.
+        std::array<ReversibleFast, JitStepOutcome::max_block> reversible_fast{};
         std::array<bool, JitStepOutcome::max_block> is_memory{};
         std::array<bool, JitStepOutcome::max_block> is_terminator{};
         std::array<std::uint16_t, JitStepOutcome::max_block> branch_penalty{};
@@ -569,6 +580,8 @@ private:
     [[nodiscard]] std::optional<DecodedInstruction> fetchDecode(
         std::uint32_t pc, std::uint32_t& raw_out, std::uint8_t& size_out);
     [[nodiscard]] static JitFast classifyJitFast(const DecodedInstruction& op) noexcept;
+    [[nodiscard]] static ReversibleFast classifyReversibleFast(
+        const DecodedInstruction& op, JitFast fast) noexcept;
 };
 
 /** @brief Stable lowercase name for diagnostics and tests. */

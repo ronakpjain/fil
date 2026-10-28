@@ -351,6 +351,110 @@ TEST(JitTest, ReversibleTimedBlockReturnsCommittedPrefixOnDecline) {
         << "reversible store restriction refuses executable RAM writes";
 }
 
+TEST(JitTest, BudgetedReversiblePreparedOpsMatchInterpreterAndExactFetchCosts) {
+    auto bus = basicBus();
+    auto oracle = basicBus();
+    const auto code = halfwords({
+        0x4600U,             // mov r0,r0 (no flags, destination/source alias)
+        0xF04FU, 0x0207U,    // mov.w r2,#7 (no flags)
+        0xF103U, 0x0301U,    // add.w r3,r3,#1 (destination/source alias)
+        0xF1A5U, 0x0501U,    // sub.w r5,r5,#1 (destination/source alias)
+        0x684EU,             // ldr r6,[r1,#4]
+        0x604EU,             // str r6,[r1,#4]
+        0xBF00U});
+    ASSERT_TRUE(bus.loadBytes(flash_base, code).hasValue());
+    ASSERT_TRUE(oracle.loadBytes(flash_base, code).hasValue());
+    bus.setReversibleRamOnly(true);
+    oracle.setReversibleRamOnly(true);
+    bus.setAllMmioTrapping(true);
+    oracle.setAllMmioTrapping(true);
+    fil::cpu::CortexM4 cpu(bus), reference(oracle);
+    prepare(cpu); prepare(reference);
+    // The prepared word handlers must retain the bus's supported unaligned
+    // access behavior as well as ordinary aligned RAM semantics.
+    cpu.state().r[1] = reference.state().r[1] = ram_base + 0x41U;
+    cpu.state().r[3] = reference.state().r[3] = 99U;
+    cpu.state().r[5] = reference.state().r[5] = 101U;
+    ASSERT_TRUE(bus.write32(ram_base + 0x45U, 0x12345678U,
+        {fil::mem::AccessType::data_write, flash_base}));
+    ASSERT_TRUE(oracle.write32(ram_base + 0x45U, 0x12345678U,
+        {fil::mem::AccessType::data_write, flash_base}));
+    for (unsigned i = 0U; i < 70U; ++i) {
+        static_cast<void>(cpu.prepareJitBlock(true));
+    }
+
+    FakeFetchStalls stalls{3U, 1U};
+    fil::cpu::CortexM4::ReversibleCycleBudget budget{};
+    budget.remaining_cycles = 100U;
+    budget.fetch_stall = fakeFetchStall;
+    budget.context = &stalls;
+    const auto result = cpu.tryStepBudgetedReversibleJitBlock(6U, budget);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->execution.count, 6U);
+    EXPECT_EQ(cpu.state().r[2], 7U);
+    std::uint32_t expected_pipeline_cycles = 0U;
+    std::uint32_t expected_charged_cycles = 0U;
+    std::uint32_t fetch_end = 0U;
+    for (std::size_t i = 0U; i < result->execution.count; ++i) {
+        const auto step = reference.stepFast();
+        ASSERT_EQ(step.reason, fil::cpu::StopReason::step_complete);
+        expected_pipeline_cycles += step.cycles;
+        const bool sequential = i != 0U;
+        const auto stall = fakeFetchStall(&stalls, step.instruction_address, sequential);
+        expected_charged_cycles += step.cycles + stall;
+        EXPECT_EQ(result->instruction_cycles[i], step.cycles);
+        EXPECT_EQ(budget.total_instruction_cycles[i], step.cycles + stall);
+        fetch_end = step.instruction_address + step.instruction_size;
+    }
+    EXPECT_EQ(result->execution.result.cycles, expected_pipeline_cycles);
+    EXPECT_EQ(budget.remaining_cycles, 100U - expected_charged_cycles);
+    EXPECT_EQ(budget.fetch_end, fetch_end);
+    EXPECT_TRUE(budget.have_fetch);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()));
+    EXPECT_EQ(bus.read32(ram_base + 0x45U).value(),
+              oracle.read32(ram_base + 0x45U).value());
+}
+
+TEST(JitTest, BudgetedReversiblePreparedMemoryDeclineRestoresSpeculativeState) {
+    const auto check_decline = [](const std::uint16_t instruction,
+                                  const std::uint32_t address) {
+        auto bus = basicBus();
+        ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({instruction, 0xBF00U})).hasValue());
+        ASSERT_TRUE(bus.mapRam(ram_base + 0x1000U, 256U,
+            "jit-reversible-executable", true).hasValue());
+        bus.setReversibleRamOnly(true);
+        bus.setAllMmioTrapping(true);
+        fil::cpu::CortexM4 cpu(bus);
+        prepare(cpu);
+        cpu.state().r[0] = 0xCAFEBABEU;
+        cpu.state().r[1] = address;
+        cpu.state().instruction_address = flash_base - 2U;
+        for (unsigned i = 0U; i < 70U; ++i) {
+            static_cast<void>(cpu.prepareJitBlock(true));
+        }
+        fil::cpu::CortexM4::ReversibleCycleBudget budget{};
+        budget.remaining_cycles = 50U;
+        const auto before = cpu.state();
+        const auto generation = bus.executionGeneration();
+        const auto result = cpu.tryStepBudgetedReversibleJitBlock(2U, budget);
+        EXPECT_FALSE(result) << "address=0x" << std::hex << address;
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), before));
+        EXPECT_EQ(budget.remaining_cycles, 50U);
+        EXPECT_FALSE(budget.have_fetch);
+        EXPECT_EQ(bus.executionGeneration(), generation);
+    };
+    // LDR declines only when no backed bytes exist; read-only flash is valid.
+    for (const std::uint32_t address : {0x40000000U, 0x50000000U}) {
+        check_decline(0x6848U, address); // ldr r0,[r1,#4]
+    }
+    // STR additionally declines read-only and out-of-range backed-memory writes.
+    for (const std::uint32_t address : {
+             0x40000000U, 0x50000000U, flash_base, ram_base + 0xffU,
+             ram_base + 0x1000U}) {
+        check_decline(0x6048U, address); // str r0,[r1,#4]
+    }
+}
+
 TEST(JitTest, BudgetedReversibleFailedConditionalCannotOverrunNativePrefix) {
     auto bus = basicBus();
     // nop; bne +0 (failed with Z set); movs r0,#1; movs r1,#2

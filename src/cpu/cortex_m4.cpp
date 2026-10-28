@@ -97,6 +97,28 @@ inline std::uint32_t jitAdd(CpuState& state, const std::uint32_t left,
 
 } // namespace
 
+CortexM4::ReversibleFast CortexM4::classifyReversibleFast(
+    const DecodedInstruction& op, const JitFast fast) noexcept {
+    if (op.condition != Condition::al || op.set_flags) return ReversibleFast::none;
+    switch (fast) {
+    case JitFast::mov_imm:
+        return op.rd < 13U ? ReversibleFast::mov_imm : ReversibleFast::none;
+    case JitFast::mov_reg:
+        return op.rd < 13U && op.rm < 13U
+                && op.shift_type == ShiftType::lsl && op.shift_amount == 0U
+            ? ReversibleFast::mov_reg : ReversibleFast::none;
+    case JitFast::add_imm:
+        return op.kind == InstrKind::add && op.rd < 13U && op.rn < 13U
+            ? ReversibleFast::add_imm : ReversibleFast::none;
+    case JitFast::sub_imm:
+        return op.kind == InstrKind::sub && op.rd < 13U && op.rn < 13U
+            ? ReversibleFast::sub_imm : ReversibleFast::none;
+    case JitFast::ldr_word_gpr: return ReversibleFast::ldr_word;
+    case JitFast::str_word_gpr: return ReversibleFast::str_word;
+    default: return ReversibleFast::none;
+    }
+}
+
 CortexM4::JitFast CortexM4::classifyJitFast(const DecodedInstruction& op) noexcept {
     // Inlined handlers are condition-agnostic: both dispatch sites evaluate
     // the condition first (failed conditions retire for 1 cycle without
@@ -1445,6 +1467,8 @@ bool CortexM4::prepareJitBlock(const bool allow_single) {
         fresh.divide_form[fresh.count] = div;
         fresh.base_cycles[fresh.count] = decoded_cache.base_cycles;
         fresh.fast[fresh.count] = static_cast<JitFast>(decoded_cache.jit_fast);
+        fresh.reversible_fast[fresh.count] = classifyReversibleFast(
+            *decoded, fresh.fast[fresh.count]);
         const bool touches_memory = boundary == JitBoundary::memory_may_trap
             || decoded->kind == InstrKind::ldr || decoded->kind == InstrKind::ldm
             || decoded->kind == InstrKind::pop;
@@ -1941,9 +1965,11 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
         const std::uint8_t size = slot.sizes[i];
         // Determine the actual condition/cost and conservative admission cost
         // before installing speculative PC state or touching RAM.
-        const bool condition_passed = op.condition == Condition::al
+        const ReversibleFast prepared_fast = slot.reversible_fast[i];
+        const bool compact = prepared_fast != ReversibleFast::none;
+        const bool condition_passed = compact || op.condition == Condition::al
             || conditionPasses(op.condition, state_.xpsr);
-        std::uint16_t cycles = condition_passed
+        std::uint16_t cycles = compact ? slot.base_cycles[i] : condition_passed
             ? slot.divide_form[i]
                 ? divideCycles(state_.readRegister(op.rm)) : slot.base_cycles[i]
             : 1U;
@@ -1955,7 +1981,7 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
         // takenBranchPenalty() deliberately has a generic default and must not
         // be applied to ordinary non-control ALU/memory instructions.
         const std::uint32_t worst_cycles = static_cast<std::uint32_t>(cycles)
-            + (condition_passed ? slot.branch_penalty[i] : 0U)
+            + (condition_passed && !compact ? slot.branch_penalty[i] : 0U)
             + fetch_stall;
         if (budget && (worst_cycles > budget->remaining_cycles
             || worst_cycles > std::numeric_limits<std::uint16_t>::max())) break;
@@ -1965,9 +1991,38 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
         state_.r[15] = pc + size;
         bool handled = true;
         if (condition_passed) {
-            // DIV's cost was sampled above before any potentially aliasing
-            // destination write. Declines leave only speculative PC fields.
-            handled = executeJitFast(op, fast, pc);
+            // These unconditional forms were classified at block preparation,
+            // so they skip the general fast-handler switch and per-op decode
+            // decisions. Backed-memory helpers retain the same guard, journal,
+            // footprint, and access-PC behavior as executeJitFast.
+            switch (prepared_fast) {
+            case ReversibleFast::mov_imm:
+                state_.r[op.rd] = op.imm;
+                break;
+            case ReversibleFast::mov_reg:
+                state_.r[op.rd] = state_.r[op.rm];
+                break;
+            case ReversibleFast::add_imm:
+                state_.r[op.rd] = state_.r[op.rn] + op.imm;
+                break;
+            case ReversibleFast::sub_imm:
+                state_.r[op.rd] = state_.r[op.rn] - op.imm;
+                break;
+            case ReversibleFast::ldr_word: {
+                std::uint32_t value = 0U;
+                handled = memory_.tryFastRead32(state_.r[op.rn] + op.imm,
+                    value, {mem::AccessType::data_read, pc});
+                if (handled) state_.r[op.rd] = value;
+                break;
+            }
+            case ReversibleFast::str_word:
+                handled = memory_.tryFastWrite32(state_.r[op.rn] + op.imm,
+                    state_.r[op.rd], {mem::AccessType::data_write, pc});
+                break;
+            case ReversibleFast::none:
+                handled = executeJitFast(op, fast, pc);
+                break;
+            }
         }
         if (!handled) {
             state_.r[15] = pc;
