@@ -351,6 +351,50 @@ TEST(JitTest, ReversibleTimedBlockReturnsCommittedPrefixOnDecline) {
         << "reversible store restriction refuses executable RAM writes";
 }
 
+TEST(JitTest, FixedFetchTimingMatchesCallbackForEveryCycleBudget) {
+    for (std::uint64_t credit = 0U; credit <= 18U; ++credit) {
+        SCOPED_TRACE(credit);
+        auto left = basicBus();
+        auto right = basicBus();
+        const auto code = halfwords({0xF04FU, 0x0001U, 0xF100U, 0x0002U, 0xBF00U});
+        ASSERT_TRUE(left.loadBytes(flash_base, code));
+        ASSERT_TRUE(right.loadBytes(flash_base, code));
+        left.setReversibleRamOnly(true); left.setAllMmioTrapping(true);
+        right.setReversibleRamOnly(true); right.setAllMmioTrapping(true);
+        fil::cpu::CortexM4 snapshot(left), callback(right);
+        prepare(snapshot); prepare(callback);
+        for (unsigned i = 0U; i < 70U; ++i) {
+            static_cast<void>(snapshot.prepareJitBlock(true));
+            static_cast<void>(callback.prepareJitBlock(true));
+        }
+        fil::cpu::CortexM4::ReversibleCycleBudget a, b;
+        a.remaining_cycles = b.remaining_cycles = credit;
+        a.fetch_timing = {flash_base, flash_base + 0x10000U, 0U, 0U, 4U, 0U};
+        b.fetch_stall = +[](const void*, std::uint32_t pc, bool sequential) -> std::uint16_t {
+            return !sequential && pc >= flash_base && pc < flash_base + 0x10000U ? 4U : 0U;
+        };
+        const auto x = snapshot.tryStepBudgetedReversibleJitBlock(3U, a);
+        const auto y = callback.tryStepBudgetedReversibleJitBlock(3U, b);
+        ASSERT_EQ(x.has_value(), y.has_value());
+        if (x) {
+            EXPECT_EQ(x->execution.count, y->execution.count);
+            EXPECT_EQ(x->execution.result.cycles, y->execution.result.cycles);
+            for (std::size_t i = 0U; i < x->execution.count; ++i) {
+                EXPECT_EQ(x->instruction_cycles[i], y->instruction_cycles[i]);
+                EXPECT_EQ(a.total_instruction_cycles[i], b.total_instruction_cycles[i]);
+            }
+        }
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(snapshot.state(), callback.state()));
+        EXPECT_EQ(a.remaining_cycles, b.remaining_cycles);
+        EXPECT_EQ(a.have_fetch, b.have_fetch);
+        EXPECT_EQ(a.fetch_end, b.fetch_end);
+    }
+    fil::cpu::CortexM4::ReversibleCycleBudget override;
+    override.fetch_timing.nonsequential_stall = 15U;
+    override.fetch_stall = +[](const void*, std::uint32_t, bool) -> std::uint16_t { return 7U; };
+    EXPECT_EQ(override.fetchStallCycles(flash_base, false), 7U);
+}
+
 TEST(JitTest, BudgetedReversiblePreparedOpsMatchInterpreterAndExactFetchCosts) {
     auto bus = basicBus();
     auto oracle = basicBus();

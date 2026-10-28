@@ -1,4 +1,5 @@
 #include "fil/cortexm/system_control.hpp"
+#include "fil/cpu/cortex_m4.hpp"
 #include "fil/mem/memory_bus.hpp"
 #include "fil/stm32g4/peripheral.hpp"
 #include "fil/stm32g4/stm32g4.hpp"
@@ -7,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -36,6 +38,40 @@ void attachEraseToMemory(
             return memory.loadBytes(page_base, erasedPage(page_size));
         }
     );
+}
+
+TEST(FlashTimingTest, ReversibleFetchSnapshotMatchesLiveTimingAtEveryBoundary) {
+    fil::stm32g4::FlashPeripheral flash;
+    for (const auto [base, size] :
+         {std::pair{0x08100000U, 8192U}, std::pair{0U, 8192U}, std::pair{0x08000000U, 0U},
+          std::pair{0xffffe000U, 8192U}, std::pair{0xfffffff0U, 32U}}) {
+        flash.setEraseGeometry(base, 4096U, size);
+        for (std::uint32_t latency = 0U; latency < 16U; ++latency) {
+            for (std::uint32_t art = 0U; art < 4U; ++art) {
+                ASSERT_TRUE(flash.write(0U, fil::mem::AccessSize::word, latency | (art << 8U),
+                                        write_context));
+                fil::cpu::CortexM4::ReversibleCycleBudget budget;
+                const auto wait = static_cast<std::uint16_t>(flash.waitStates());
+                budget.fetch_timing = {
+                    flash.flashBase(),
+                    flash.flashBase() + flash.bankSize(),
+                    0U,
+                    flash.bankSize(),
+                    wait,
+                    static_cast<std::uint16_t>(
+                        (flash.prefetchEnabled() || flash.instructionCacheEnabled()) ? 0U : wait)};
+                for (const auto pc :
+                     {0U, 8191U, 8192U, 0x080fffffU, 0x08100000U, 0x08101fffU, 0x08102000U,
+                      0x20000000U, 0xffffffffU, base, base + size, size}) {
+                    for (const bool sequential : {false, true}) {
+                        EXPECT_EQ(budget.fetchStallCycles(pc, sequential),
+                                  flash.fetchStallCycles(pc, sequential))
+                            << "pc=" << pc << " latency=" << latency << " art=" << art;
+                    }
+                }
+            }
+        }
+    }
 }
 
 void unlockFlash(fil::stm32g4::FlashPeripheral& flash) {

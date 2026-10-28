@@ -602,17 +602,16 @@ Board::buildIdempotentPeriodCertificate(
     bool valid = endpoint_footprint.complete;
     std::uint64_t total_cycles = 0U;
     const auto& flash = peripherals_->flash();
-    struct Timing { const stm32g4::FlashPeripheral* flash; } timing{&flash};
+    // This budget is consumed under the all-MMIO-trapping reversible guard,
+    // without event callbacks; neither ACR nor flash geometry can change.
     cpu::CortexM4::ReversibleCycleBudget budget{};
     budget.remaining_cycles = std::numeric_limits<std::uint64_t>::max();
-    budget.context = &timing;
     budget.have_fetch = endpoint_have_fetch;
     budget.fetch_end = endpoint_fetch_end;
-    budget.fetch_stall = +[](const void* context, const std::uint32_t pc, const bool sequential) {
-        const auto& value = *static_cast<const Timing*>(context);
-        if (value.flash->waitStates() == 0U) return std::uint16_t{0U};
-        return static_cast<std::uint16_t>(value.flash->fetchStallCycles(pc, sequential));
-    };
+    const auto wait = static_cast<std::uint16_t>(flash.waitStates());
+    budget.fetch_timing = {flash.flashBase(), flash.flashBase() + flash.bankSize(),
+        0U, flash.bankSize(), wait,
+        static_cast<std::uint16_t>((flash.prefetchEnabled() || flash.instructionCacheEnabled()) ? 0U : wait)};
     {
         ReversibleMemoryGuard guard(memory_);
         mem::MemoryBus::StoreFootprintScope store_footprints(memory_);
@@ -996,23 +995,15 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
     }
     // Cache hits need neither the flash timing snapshot nor the speculative
     // budget (including its per-instruction arrays). Initialize only on a miss.
-    struct FetchTiming {
-        const stm32g4::FlashPeripheral* flash;
-        std::uint16_t wait;
-        bool art_hit;
-    };
-    const FetchTiming fetch_timing{&flash, static_cast<std::uint16_t>(flash.waitStates()),
-        flash.prefetchEnabled() || flash.instructionCacheEnabled()};
+    // MMIO and event barriers end this span before timing can change.
     cpu::CortexM4::ReversibleCycleBudget budget;
     budget.remaining_cycles = cycle_credit;
-    budget.context = &fetch_timing;
     budget.have_fetch = prefix.entry_have_fetch;
     budget.fetch_end = prefix.entry_fetch_end;
-    budget.fetch_stall = +[](const void* context, const std::uint32_t pc, const bool sequential) {
-        const auto& timing = *static_cast<const FetchTiming*>(context);
-        if (timing.wait == 0U || (sequential && timing.art_hit)) return std::uint16_t{0U};
-        return timing.flash->isFlashAddress(pc) ? timing.wait : std::uint16_t{0U};
-    };
+    const auto wait = static_cast<std::uint16_t>(flash.waitStates());
+    budget.fetch_timing = {flash.flashBase(), flash.flashBase() + flash.bankSize(),
+        0U, flash.bankSize(), wait,
+        static_cast<std::uint16_t>((flash.prefetchEnabled() || flash.instructionCacheEnabled()) ? 0U : wait)};
     // The ordinary reversible-evaluation metadata remains fixed-capacity;
     // only a validated period certificate can admit the larger compressed span.
     limit = std::min(limit, ReversibleRamPrefix::max_instructions);

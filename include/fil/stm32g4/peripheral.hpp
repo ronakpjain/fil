@@ -286,6 +286,10 @@ public:
         return 4U;
     }
 
+    /** @brief Address geometry for stable fetch-timing snapshots. */
+    [[nodiscard]] std::uint32_t flashBase() const noexcept { return flash_base_; }
+    [[nodiscard]] std::uint32_t bankSize() const noexcept { return bank_size_; }
+
     /** @brief True for flash bank bytes and the boot alias. */
     [[nodiscard]] bool isFlashAddress(std::uint32_t address) const noexcept {
         if (address >= flash_base_ && address < flash_base_ + bank_size_) return true;

@@ -268,10 +268,36 @@ public:
         std::uint64_t remaining_cycles{0U};
         FetchStallCallback fetch_stall{nullptr};
         const void* context{nullptr};
+        /** Callback-free timing snapshot for two half-open address ranges.
+         * Callers may use this only while timing configuration is stable.
+         * A non-null callback takes precedence over this snapshot. */
+        struct FetchTiming {
+            std::uint32_t begin{0U};
+            std::uint32_t end{0U};
+            std::uint32_t alias_begin{0U};
+            std::uint32_t alias_end{0U};
+            std::uint16_t nonsequential_stall{0U};
+            std::uint16_t sequential_stall{0U};
+
+            [[nodiscard]] std::uint16_t stall(
+                std::uint32_t pc, bool sequential) const noexcept {
+                const auto cycles = sequential ? sequential_stall : nonsequential_stall;
+                if (cycles == 0U) return 0U;
+                return ((pc >= begin && pc < end)
+                    || (pc >= alias_begin && pc < alias_end)) ? cycles : 0U;
+            }
+        };
+
+        [[nodiscard]] std::uint16_t fetchStallCycles(
+            std::uint32_t pc, bool sequential) const {
+            return fetch_stall ? fetch_stall(context, pc, sequential)
+                : fetch_timing.stall(pc, sequential);
+        }
         bool have_fetch{false};
         std::uint32_t fetch_end{0U};
         std::array<std::uint16_t, JitStepOutcome::max_block>
             total_instruction_cycles{};
+        FetchTiming fetch_timing{};
     };
 
     /**

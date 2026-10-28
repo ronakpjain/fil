@@ -1660,8 +1660,7 @@ bool CortexM4::peekReversibleBlockHeadDeclines(
             ? divideCycles(state_.readRegister(op.rm)) : slot.base_cycles[0])
         : 1U;
     const bool sequential_fetch = budget.have_fetch && slot.pcs[0] == budget.fetch_end;
-    const std::uint16_t fetch_stall = budget.fetch_stall
-        ? budget.fetch_stall(budget.context, slot.pcs[0], sequential_fetch) : 0U;
+    const std::uint16_t fetch_stall = budget.fetchStallCycles(slot.pcs[0], sequential_fetch);
     const std::uint32_t worst_cycles = static_cast<std::uint32_t>(cycles)
         + (condition_passed ? slot.branch_penalty[0] : 0U) + fetch_stall;
     if (worst_cycles > budget.remaining_cycles
@@ -1729,8 +1728,7 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::tryStepItScalarFallback(
     if (!safe_it && !safe_alu) return std::nullopt;
 
     const bool sequential = budget && budget->have_fetch && pc == budget->fetch_end;
-    const std::uint16_t stall = budget && budget->fetch_stall
-        ? budget->fetch_stall(budget->context, pc, sequential) : 0U;
+    const std::uint16_t stall = budget ? budget->fetchStallCycles(pc, sequential) : 0U;
     // For IT-controlled ops use the unconditional maximum decode cost. This
     // deliberately admits fewer operations near the horizon rather than
     // risk executing before knowing the exact IT predicate/cost.
@@ -1812,8 +1810,7 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
                     if (planned_pc != pc) break;
                     const auto base = slot.base_cycles[planned];
                     const bool sequential = staged.have_fetch && pc == staged.fetch_end;
-                    const auto stall = staged.fetch_stall
-                        ? staged.fetch_stall(staged.context, pc, sequential) : 0U;
+                    const auto stall = staged.fetchStallCycles(pc, sequential);
                     // Conservative admission like micro: the taken refill is
                     // charged upfront; the actual below keeps only real costs.
                     const auto worst = static_cast<std::uint32_t>(base)
@@ -1975,8 +1972,8 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
             : 1U;
         const bool sequential_fetch = budget && budget->have_fetch
             && pc == budget->fetch_end;
-        const std::uint16_t fetch_stall = budget && budget->fetch_stall
-            ? budget->fetch_stall(budget->context, pc, sequential_fetch) : 0U;
+        const std::uint16_t fetch_stall = budget
+            ? budget->fetchStallCycles(pc, sequential_fetch) : 0U;
         // Preparation precomputed a refill bound only for PC-changing forms;
         // takenBranchPenalty() deliberately has a generic default and must not
         // be applied to ordinary non-control ALU/memory instructions.
