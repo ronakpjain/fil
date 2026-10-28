@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <functional>
 #include <memory>
 #include <stdexcept>
@@ -32,6 +33,49 @@ TEST(EventLoopTest, OrdersEventsDeterministically) {
     const auto second = loop.advanceBy(10);
     EXPECT_TRUE(second.events_executed == 1 && order.back() == 3)
         << "event loop advances relative time";
+}
+
+TEST(EventLoopTest, AdvanceByMatchesRunningDueEventsAtTheEquivalentDeadline) {
+    fil::sim::EventLoop advanced;
+    fil::sim::EventLoop absolute;
+    std::vector<std::int32_t> advanced_order;
+    std::vector<std::int32_t> absolute_order;
+    for (auto* loop : {&advanced, &absolute}) {
+        auto& order = loop == &advanced ? advanced_order : absolute_order;
+        static_cast<void>(loop->scheduleAt(3U, [&order] { order.push_back(1); }));
+        static_cast<void>(loop->scheduleAt(8U, [&order] { order.push_back(2); }));
+    }
+    static_cast<void>(advanced.runDueEvents(5U));
+    static_cast<void>(absolute.runDueEvents(5U));
+    const auto relative_result = advanced.advanceBy(4U);
+    const auto absolute_result = absolute.runDueEvents(9U);
+    EXPECT_EQ(relative_result.events_executed, absolute_result.events_executed);
+    EXPECT_EQ(relative_result.same_time_limit_hit, absolute_result.same_time_limit_hit);
+    EXPECT_EQ(relative_result.stopped_at, absolute_result.stopped_at);
+    EXPECT_EQ(relative_result.local_owner_mask, absolute_result.local_owner_mask);
+    EXPECT_EQ(relative_result.shared_event_executed, absolute_result.shared_event_executed);
+    EXPECT_EQ(advanced_order, absolute_order);
+    EXPECT_EQ(advanced.pending(), absolute.pending());
+}
+
+TEST(EventLoopTest, AdvanceByRejectsClockOverflow) {
+    fil::sim::EventLoop loop;
+    static_cast<void>(loop.runDueEvents(std::numeric_limits<fil::sim::SimTimeNs>::max()));
+    EXPECT_THROW(static_cast<void>(loop.advanceBy(1U)), std::overflow_error);
+    EXPECT_EQ(loop.now(), std::numeric_limits<fil::sim::SimTimeNs>::max());
+}
+
+TEST(EventLoopTest, AdvanceByCallbackCanScheduleZeroDelayEvents) {
+    fil::sim::EventLoop loop;
+    std::vector<std::int32_t> order;
+    static_cast<void>(loop.scheduleAt(4U, [&] {
+        order.push_back(1);
+        static_cast<void>(loop.scheduleAfter(0U, [&] { order.push_back(2); }));
+    }));
+    const auto result = loop.advanceBy(4U);
+    EXPECT_EQ(result.events_executed, 2U);
+    EXPECT_EQ(order, (std::vector<std::int32_t>{1, 2}));
+    EXPECT_EQ(loop.now(), 4U);
 }
 
 TEST(EventLoopTest, TracksLocalAndSharedEventOwnership) {

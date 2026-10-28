@@ -28,6 +28,14 @@ tracing and spin detection off for throughput; keep wall pacing on for
 interactive monitoring. See [CLI options](options.md) for runtime controls and defaults;
 see the [README](../README.md) and `make help` for building.
 
+## Event-loop overhead
+
+Relative scheduling and relative clock advancement avoid redundant recursive
+mutex acquisitions. Public operations remain serialized, and dispatch retains
+the recursive lock through callbacks so reentrant scheduling preserves ordering.
+This is an overhead reduction, not a realtime guarantee; measure it on the
+actual workload with a freshly trained matching PGO profile.
+
 ## Execution optimizations
 
 | Mechanism | Behavior |

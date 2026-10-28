@@ -131,6 +131,45 @@ struct EventLoop::Impl {
         return id;
     }
 
+    EventRunResult runDueEventsLocked(const SimTimeNs deadline) {
+        if (deadline < shared_now) {
+            throw std::invalid_argument("cannot run the simulation clock backwards");
+        }
+
+        EventRunResult result{0, false, shared_now};
+        SimTimeNs counted_time = 0U;
+        std::size_t events_at_counted_time = 0U;
+
+        for (;;) {
+            discardDeadGlobalFront();
+            if (events.empty() || events.top()->at > deadline) {
+                shared_now = deadline;
+                // Owner clocks are clamped to the shared clock on read
+                // (see timeFor), so no per-frontier map walk is needed here.
+                result.stopped_at = deadline;
+                return result;
+            }
+
+            const EventPtr event = events.top();
+            const SimTimeNs next_time = event->at;
+            if (events_at_counted_time == 0U || next_time != counted_time) {
+                counted_time = next_time;
+                events_at_counted_time = 0U;
+            }
+            if (events_at_counted_time >= maximum_same_time_events) {
+                shared_now = next_time;
+                result.same_time_limit_hit = true;
+                result.stopped_at = next_time;
+                return result;
+            }
+
+            events.pop();
+            shared_now = event->at;
+            ++events_at_counted_time;
+            invoke(event, result);
+        }
+    }
+
     void invoke(const EventPtr& event, EventRunResult& result) {
         setTime(event->owner, event->at);
         markOwner(result, event->owner);
@@ -205,11 +244,12 @@ EventOwner EventLoop::activeOwner() const noexcept {
 }
 
 EventId EventLoop::scheduleAfter(const SimTimeNs delta, EventCallback callback) {
-    const SimTimeNs current = now();
+    Impl::Lock lock(*impl_);
+    const SimTimeNs current = impl_->timeFor(impl_->currentOwner());
     if (delta > std::numeric_limits<SimTimeNs>::max() - current) {
         throw std::overflow_error("simulation event time overflow");
     }
-    return scheduleAt(current + delta, std::move(callback));
+    return impl_->schedule(current + delta, std::move(callback));
 }
 
 EventId EventLoop::scheduleAt(const SimTimeNs at, EventCallback callback) {
@@ -238,42 +278,7 @@ bool EventLoop::cancel(const EventId id) noexcept {
 
 EventRunResult EventLoop::runDueEvents(const SimTimeNs deadline) {
     Impl::Lock lock(*impl_);
-    if (deadline < impl_->shared_now) {
-        throw std::invalid_argument("cannot run the simulation clock backwards");
-    }
-
-    EventRunResult result{0, false, impl_->shared_now};
-    SimTimeNs counted_time = 0U;
-    std::size_t events_at_counted_time = 0U;
-
-    for (;;) {
-        impl_->discardDeadGlobalFront();
-        if (impl_->events.empty() || impl_->events.top()->at > deadline) {
-            impl_->shared_now = deadline;
-            // Owner clocks are clamped to the shared clock on read
-            // (see timeFor), so no per-frontier map walk is needed here.
-            result.stopped_at = deadline;
-            return result;
-        }
-
-        const Impl::EventPtr event = impl_->events.top();
-        const SimTimeNs next_time = event->at;
-        if (events_at_counted_time == 0U || next_time != counted_time) {
-            counted_time = next_time;
-            events_at_counted_time = 0U;
-        }
-        if (events_at_counted_time >= impl_->maximum_same_time_events) {
-            impl_->shared_now = next_time;
-            result.same_time_limit_hit = true;
-            result.stopped_at = next_time;
-            return result;
-        }
-
-        impl_->events.pop();
-        impl_->shared_now = event->at;
-        ++events_at_counted_time;
-        impl_->invoke(event, result);
-    }
+    return impl_->runDueEventsLocked(deadline);
 }
 
 EventRunResult EventLoop::runOwnedEvents(
@@ -320,7 +325,7 @@ EventRunResult EventLoop::advanceBy(const SimTimeNs delta) {
     if (delta > std::numeric_limits<SimTimeNs>::max() - impl_->shared_now) {
         throw std::overflow_error("simulation clock overflow");
     }
-    return runDueEvents(impl_->shared_now + delta);
+    return impl_->runDueEventsLocked(impl_->shared_now + delta);
 }
 
 void EventLoop::clear() noexcept {
