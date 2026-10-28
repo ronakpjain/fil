@@ -46,7 +46,7 @@ This document describes the decoder and executor currently in this repository. I
 
 ## CPU and exception semantics
 
-The core implements architectural PC reads, Thumb-target validation, APSR N/Z/C/V updates, IT state, MSP/PSP selection, PRIMASK/BASEPRI/FAULTMASK masking, and deterministic fetch/data bus faults. FP state is stored as S0-S31; D0-D15 memory transfers alias adjacent S-register bits. Every instruction currently costs one cycle.
+The core implements architectural PC reads, Thumb-target validation, APSR N/Z/C/V updates, IT state, MSP/PSP selection, PRIMASK/BASEPRI/FAULTMASK masking, and deterministic fetch/data bus faults. FP state is stored as S0-S31; D0-D15 memory transfers alias adjacent S-register bits. Instruction-class costs, taken-branch refill, and board-level flash-fetch stalls determine charged cycles; see the [timing model](real_timing_audit.md).
 
 At board level, SVC enters exception 11, pending SysTick/PendSV/NVIC exceptions vector through VTOR, and `BX`, `POP`, or `LDM` with a recognized EXC_RETURN restores a frame. Basic integer frames and extended frames containing S0-S15 plus FPSCR are unit covered. `CONTROL.FPCA` is claimed automatically on FP register-file access when `FPCCR.ASPEN` is set (reset leaves `FPCCR` clear, matching silicon; firmware opts in explicitly). With `FPCCR.LSPEN`, entry reserves the FP area and defers pushing until handler code first touches the FP file (`VMRS` excluded), and returns skip the unread area; a nested entry while one reservation is pending stacks eagerly. Lazy multi-level nesting beyond that, `FPCCR.LSPACT` reads, and FPU gating via `CPACR` are not modeled. FreeRTOS-style manual S16-S31 transfers are covered separately by VSTM/VLDM.
 
@@ -66,7 +66,7 @@ CTest setup and standalone validation workflow.
 - `WFI`, `WFE`, and `SEV` do not currently suspend the CPU or maintain an event latch.
 - `DMB`, `DSB`, and `ISB` are no-ops because execution and device callbacks are single-threaded and ordered.
 - `BKPT` stops the emulator instead of entering DebugMonitor.
-- Instructions take one cycle regardless of data, branch direction, memory target, or pipeline effects.
+- Timing is approximate rather than cycle-accurate. Instruction-class costs and flash-fetch stalls are modeled, but data-memory target latency, bus contention, and complete pipeline/cache effects are not.
 - CPACR is modeled as system-control state, but the interpreter does not currently gate FP instructions on FPU enable.
 - Scalar FP arithmetic uses the host's IEEE-754 `float` operations. FPSCR rounding modes, exception enables/status, flush-to-zero, default-NaN mode, signaling-NaN distinctions, and NaN payload preservation are not modeled. Finite in-range `VCVT` results truncate toward zero; unsigned out-of-range values clamp, while signed invalid/out-of-range conversion produces `0x80000000`.
 - Division-by-zero trapping, unaligned-access trapping through CCR, and privilege checks for special-register operations are not enforced.

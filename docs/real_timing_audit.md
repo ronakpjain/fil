@@ -8,6 +8,24 @@
 
 The board adds flash-fetch stalls according to the configured `FLASH_ACR` latency and simplified prefetch/instruction-cache behavior. Sequential fetches can hit a modeled fetch row; discontinuities can pay the configured wait states. Non-flash execution has no flash-fetch stall. The board caches clock/flash state and invalidates it when the underlying configuration changes. These approximations are informed by ARM DDI0439C and STM32G4 RM0440/DS12288; they do not model every silicon contention or cache effect.
 
+## Load/store timing at high clock rates
+
+Scalar integer loads and stores have a two-cycle base cost; doubleword transfers
+have a three-cycle base cost, and integer multi-register transfers cost one plus
+the register count. These instruction-class costs are separate from instruction
+fetch stalls. Data accesses currently do not add target-specific SRAM, flash, or
+MMIO latency, APB bridge delays, or bus-arbitration contention.
+
+RM0440 §4.3.3, Table 19 requires four flash wait states (five CPU cycles) at
+170 MHz in voltage Range 1 boost mode. That is a flash latency requirement, not
+a four-cycle surcharge on every load or store. Section 4.3.4 distinguishes ICode
+instruction fetches from DCode literal reads, which can stall the pipeline and
+benefit from a separate ART data cache. The bus topology in §§2.1.1–2.1.5 also
+distinguishes SRAM/peripheral paths and arbitration. These sections alone do not
+establish a universal fixed data-access penalty. Target-specific refinements
+need additional latency evidence and tests that avoid double-counting fetch
+stalls; changing the clock must not arbitrarily inflate instruction CPI.
+
 ## Simulated time and performance
 
 `Board::accountCycles()` converts charged cycles at the current modeled system clock to nanoseconds while retaining the fractional remainder. Different clock settings and instruction mixes therefore change how many instructions execute in a fixed simulated duration. Loop batching carries the proven iteration's cycle cost forward without dispatching each instruction, provided clock and flash state remain stable for the proof.
