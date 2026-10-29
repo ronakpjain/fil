@@ -43,12 +43,29 @@ TEST(NativeIrTest, MixedWordMemoryDoesNotChangePureLowering) {
     EXPECT_FALSE(fil::cpu::buildMicroBlock(sources, pure).ok);
 }
 
+TEST(NativeIrTest, LiteralAndStackPointerLoadsLowerSafely) {
+    const auto literal = narrow(0x4803U, 0x08000002U);
+    fil::cpu::NativeInst inst;
+    ASSERT_TRUE(fil::cpu::tryLowerNativeInst(literal, inst).ok);
+    EXPECT_TRUE(inst.absolute);
+    EXPECT_EQ(inst.absolute_address, 0x08000010U);
+    auto stack = narrow(0x9d01U, 0x08000004U);
+    ASSERT_TRUE(fil::cpu::tryLowerNativeInst(stack, inst).ok);
+    EXPECT_EQ(inst.rn, 13U);
+    EXPECT_FALSE(inst.absolute);
+    const auto negative = fil::cpu::decode32(0xf85fU, 0x0004U);
+    ASSERT_TRUE(negative);
+    ASSERT_TRUE(fil::cpu::tryLowerNativeInst({*negative, 0x08000008U, 4U}, inst).ok);
+    EXPECT_TRUE(inst.absolute);
+    EXPECT_EQ(inst.absolute_address, 0x08000008U);
+}
+
 TEST(NativeIrTest, MemoryDeclinesUnsafeShapesWithoutChangingOutput) {
     const auto valid = narrow(0x684aU, 0x08000000U);
     for (unsigned variant = 0U; variant != 11U; ++variant) {
         auto source = valid;
         switch (variant) {
-        case 0U: source.decoded.rn = 13U; break;
+        case 0U: source.decoded.rn = 15U; break;
         case 1U: source.decoded.rd = 15U; break;
         case 2U: source.decoded.writeback = true; break;
         case 3U: source.decoded.index = false; break;

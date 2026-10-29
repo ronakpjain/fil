@@ -21,8 +21,22 @@ MicroLowerResult tryLowerNativeInst(const MicroSource& source, NativeInst& out) 
         return {false, MicroLowerReason::bad_size, "invalid memory instruction width"};
     if ((source.pc & 1U) != 0U)
         return {false, MicroLowerReason::bad_pc, "thumb pc must be even"};
-    if (d.rd >= 13U || d.rn >= 13U)
-        return {false, MicroLowerReason::bad_register, "memory operands must be r0-r12"};
+    const bool literal = d.kind == InstrKind::ldr && d.form == OperandForm::literal;
+    if (d.rd >= 13U || (!literal && d.rn > 13U))
+        return {false, MicroLowerReason::bad_register, "memory destination must be r0-r12; base may be SP"};
+    if (literal) {
+        if (d.rn != 15U || !d.index || d.writeback || d.set_flags || d.rm != 0U || d.ra != 0U
+            || d.register_list != 0U || d.shift_amount != 0U || d.shift_type != ShiftType::lsl || d.fp_double
+            || d.branch_offset != 0 || d.immediate_carry_valid || d.immediate_carry)
+            return {false, MicroLowerReason::bad_shape, "unsupported literal load shape"};
+        inst.kind = NativeOp::load_word;
+        inst.rd = d.rd;
+        inst.absolute = true;
+        const auto base = (source.pc + 4U) & ~std::uint32_t{3U};
+        inst.absolute_address = d.add ? base + d.imm : base - d.imm;
+        out = inst;
+        return {true, MicroLowerReason::ok, {}};
+    }
     if (d.form != OperandForm::immediate || !d.index || !d.add || d.writeback
         || d.set_flags || d.rm != 0U || d.ra != 0U || d.register_list != 0U
         || d.shift_amount != 0U || d.shift_type != ShiftType::lsl || d.fp_double

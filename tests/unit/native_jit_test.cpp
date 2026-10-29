@@ -1,4 +1,5 @@
 #include "fil/cpu/micro_jit.hpp"
+#include "fil/cpu/decoder.hpp"
 #include "fil/cpu/native_execution.hpp"
 #include "fil/cpu/native_ir.hpp"
 
@@ -9,6 +10,86 @@
 
 namespace {
 using namespace fil::cpu;
+
+TEST(NativeJitTest, DecodedLiteralAndStackAccessesMatchExactEveryPrefix) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
+    constexpr std::uint32_t flash = 0x08000000U, ram = 0x20000000U;
+    const std::array<std::uint16_t, 4> words{0x4903U, 0x9a01U, 0x600aU, 0xbf00U};
+    std::array<std::uint8_t, 32> image{};
+    std::array<MicroSource, 4> sources;
+    for (std::size_t i = 0U; i < words.size(); ++i) {
+        image[2U * i] = static_cast<std::uint8_t>(words[i]);
+        image[2U * i + 1U] = static_cast<std::uint8_t>(words[i] >> 8U);
+        const auto decoded = decode16(words[i]);
+        ASSERT_TRUE(decoded);
+        sources[i] = {*decoded, flash + static_cast<std::uint32_t>(2U * i), 2U};
+    }
+    for (unsigned i = 0U; i < 4U; ++i)
+        image[16U + i] = static_cast<std::uint8_t>(ram >> (8U * i));
+    NativeBlock block;
+    ASSERT_TRUE(buildNativeBlock(sources, block).ok);
+    std::string error;
+    auto jit = MicroJit::create(error);
+    ASSERT_TRUE(jit);
+    const auto function = jit->compileNative(block, error);
+    ASSERT_NE(function, nullptr) << error;
+    const std::array<std::uint32_t, 4> costs{2U, 2U, 2U, 1U};
+    for (std::uint32_t limit = 0U; limit <= words.size(); ++limit) {
+        fil::mem::MemoryBus bus, oracle;
+        for (auto* memory : {&bus, &oracle}) {
+            ASSERT_TRUE(memory->mapRom(flash, image.size(), "flash"));
+            ASSERT_TRUE(memory->mapRam(ram, 64U, "ram"));
+            ASSERT_TRUE(memory->loadBytes(flash, image));
+            ASSERT_TRUE(memory->write32(ram + 20U, 0xcafebabeU));
+        }
+        CpuState state;
+        state.r[15] = flash;
+        state.instruction_address = flash;
+        state.r[13] = state.msp = ram + 16U;
+        state.xpsr = xpsr_t | xpsr_n | xpsr_c | xpsr_q;
+        CortexM4 reference(oracle);
+        reference.state() = state;
+        NativeExecutionContext context{&state, &bus, limit, 100U};
+        context.charged_cycles = costs.data();
+        context.charged_cycles_count = costs.size();
+        function(&context);
+        for (std::uint32_t i = 0U; i < limit; ++i)
+            ASSERT_EQ(reference.stepFast().reason, StopReason::step_complete);
+        ASSERT_EQ(context.retired_count, limit);
+        EXPECT_TRUE(bitwiseEqual(state, reference.state()));
+        EXPECT_EQ(bus.read32(ram).value(), oracle.read32(ram).value());
+        EXPECT_EQ(bus.readFootprint().words, oracle.readFootprint().words);
+    }
+}
+
+TEST(NativeJitTest, StartupShapesDoNotPreventSteadyStateCompilation) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
+    std::string error;
+    auto jit = MicroJit::create(error);
+    ASSERT_TRUE(jit);
+    NativeFunction first = nullptr;
+    NativeBlock initial;
+    for (std::uint32_t i = 0U; i < 256U; ++i) {
+        NativeBlock block;
+        block.entry_pc = 0x08004000U + i * 2U;
+        NativeInst nop;
+        nop.pc = nop.integer.pc = block.entry_pc;
+        nop.size = nop.integer.size = 2U;
+        block.ops.push_back(nop);
+        const auto function = jit->compileNative(block, error);
+        ASSERT_NE(function, nullptr) << i << ": " << error;
+        if (i == 0U) { first = function; initial = block; }
+    }
+    EXPECT_EQ(jit->compileNative(initial, error), first);
+    CpuState state;
+    fil::mem::MemoryBus memory;
+    const std::array<std::uint32_t, 1> cost{1U};
+    NativeExecutionContext context{&state, &memory, 1U, 1U};
+    context.charged_cycles = cost.data(); context.charged_cycles_count = 1U;
+    first(&context);
+    EXPECT_EQ(context.retired_count, 1U);
+    EXPECT_EQ(state.r[15], initial.entry_pc + 2U);
+}
 
 TEST(NativeJitTest, RejectsMalformedDirectIrBeforeEmission) {
     if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";

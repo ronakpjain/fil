@@ -1550,7 +1550,7 @@ namespace {
         CpuState& state = *context->cpu_state;
         std::uint32_t loaded = 0U;
         const std::uint32_t address = op.kind == NativeOp::integer ? 0U
-            : state.r[op.rn] + op.offset;
+            : op.absolute ? op.absolute_address : state.r[op.rn] + op.offset;
         if (op.kind == NativeOp::load_word
             && !nativeRead32(context, op.pc, address, &loaded)) {
             context->failing_instruction_pc = op.pc;
@@ -1594,7 +1594,8 @@ bool sameNativeBlock(const NativeBlock& a, const NativeBlock& b) noexcept {
     for (std::size_t i = 0; i < a.ops.size(); ++i) {
         const auto& x = a.ops[i]; const auto& y = b.ops[i];
         if (x.kind != y.kind || x.pc != y.pc || x.size != y.size || x.rd != y.rd
-            || x.rn != y.rn || x.offset != y.offset
+            || x.rn != y.rn || x.offset != y.offset || x.absolute != y.absolute
+            || x.absolute_address != y.absolute_address
             || (x.kind == NativeOp::integer && !sameMicroInst(x.integer, y.integer))) return false;
     }
     return true;
@@ -1883,7 +1884,8 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
             error = "native-jit: branch or malformed op declined";
             return nullptr;
         }
-        if (op.kind != NativeOp::integer && (op.rd >= 13U || op.rn >= 13U)) {
+        if (op.kind != NativeOp::integer
+            && (op.rd >= 13U || (!op.absolute && op.rn > 13U))) {
             error = "native-jit: invalid memory register";
             return nullptr;
         }
@@ -1893,7 +1895,10 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
         if (sameNativeBlock(entry.block, block)) return entry.function;
     // Native cache entries also own the AArch64 fallback's embedded block
     // descriptor. Never evict one while its callable code may remain in use.
-    constexpr std::size_t kNativeCacheEntries = 128U;
+    // Startup alone exceeds 128 shapes on the real network. Keep a bounded
+    // descriptor set large enough for steady-state kernels as well; executable
+    // storage is independently bounded by the arena.
+    constexpr std::size_t kNativeCacheEntries = 1024U;
     if (impl_->native_cache.size() >= kNativeCacheEntries) {
         error = "native-jit: bounded native cache full";
         return nullptr;
@@ -1961,9 +1966,12 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
                 return nullptr;
             }
         } else {
-            loadGuest(e, kScratch, cpu_offsets, op.rn);
-            if (op.offset != 0U) e.aluRImm(0U, kScratch, op.offset);
-            e.movRR(kAddr, kScratch);
+            if (op.absolute) e.movR32Imm(kAddr, op.absolute_address);
+            else {
+                loadGuest(e, kScratch, cpu_offsets, op.rn);
+                if (op.offset != 0U) e.aluRImm(0U, kScratch, op.offset);
+                e.movRR(kAddr, kScratch);
+            }
             if (op.kind == NativeOp::store_word) loadGuest(e, kValue, cpu_offsets, op.rd);
             // Preserve guest NZCV/retained xPSR across the C ABI helper.
             e.movRR(3U, kNzcv); e.movRR(15U, kRetain);

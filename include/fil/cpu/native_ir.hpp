@@ -18,6 +18,8 @@ struct NativeInst {
     std::uint8_t size{0};
     std::uint8_t rd{0};
     std::uint8_t rn{0};
+    std::uint32_t absolute_address{0};
+    bool absolute{false};
 };
 
 struct NativeBlock {
@@ -28,9 +30,10 @@ struct NativeBlock {
     bool has_memory{false};
 };
 
-/** Only unconditional positive immediate word accesses to r0-r12 are admitted;
- * PC/SP operands, writeback, predication and multi-access instructions decline.
- * On failure, the output is unchanged.
+/** Unconditional word accesses with r0-r12 data registers are admitted.
+ * Immediate bases may be r0-r13 (SP is read-only); literal loads normalize
+ * aligned PC-relative addresses. Other PC operands, writeback, predication and
+ * multi-access instructions decline. On failure, the output is unchanged.
  */
 [[nodiscard]] MicroLowerResult tryLowerNativeInst(const MicroSource& source, NativeInst& out) noexcept;
 [[nodiscard]] MicroLowerResult buildNativeBlock(std::span<const MicroSource> sources, NativeBlock& out) noexcept;
