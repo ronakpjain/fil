@@ -1,19 +1,5 @@
 # Performance
 
-## Measuring throughput
-
-Throughput is simulated seconds divided by host wall seconds. Compare only runs that reach the simulated-time deadline, not the instruction limit.
-
-Keep firmware, build, PGO profile, host power mode, tracing, ADC decimation, stdin conditions, and CLI options fixed. Alternate run order and compare median wall times. Include initialization and JIT compilation.
-
-The timing model includes instruction costs, branch penalties, and flash fetch stalls; it is not cycle-accurate silicon timing.
-
-Profile the real network before changing execution paths. On macOS, run the
-network unpaced with tracing off and collect `sample PID 5 1 -file profile.txt`
-while it is running; on Linux, use an available sampling profiler such as
-`perf`. Sampling identifies hot paths but perturbs wall time, so collect
-throughput measurements separately with the benchmark helper.
-
 ## Recommended defaults
 
 Use Release with supported IPO, automatic JIT, eligible guarded network RAM
@@ -38,9 +24,7 @@ operations on other threads wait until the run returns. Outside a lease, those
 operations retain ordinary locking. Owner-context scopes remain serial-only;
 this does not enable concurrent or reentrant World mutation. Leases are
 non-movable, unwind on exceptions, must nest in LIFO order, and must not outlive
-the loop implementation. This is an overhead reduction, not a realtime
-guarantee; measure it on the actual workload with a freshly trained matching
-PGO profile.
+the loop implementation. This reduces host synchronization overhead without changing simulated timing.
 
 ## Execution optimizations
 
@@ -70,8 +54,7 @@ time accounting. Verdicts are cached for the kernel's lifetime, including across
 decoded-block eviction, so dispatch contains no host-clock sampling. Host timing
 can change optimization choices but must not change guest-visible results.
 The `micro_admitted`, `micro_rejected`, and `micro_admission_cost_ns` diagnostics
-report distinct-kernel decisions and total calibration cost; benchmark timings
-must include that startup cost.
+report distinct-kernel decisions and total calibration cost.
 
 JIT is automatic when available, but does not guarantee a speedup. Synchronized network bursts may use different per-lane instruction counts only when every lane reaches the same exact simulated-time frontier. Multi-instruction prefixes stop before memory/MMIO, and event, deadline, and SysTick boundaries gate admission; mismatched work falls back to exact single-instruction dispatch. General asynchronous network dispatch also remains single-instruction: another lane may schedule a shared event that was not visible when a block's horizon was checked.
 
@@ -81,7 +64,7 @@ JIT is automatic when available, but does not guarantee a speedup. Synchronized 
 make BUILD_DIR=build-release BUILD_TYPE=Release IPO=ON test
 ```
 
-- IPO/LTO is enabled when supported. Debug and sanitizer builds are not throughput baselines.
+- IPO/LTO is enabled when supported. Debug and sanitizer builds retain extra diagnostic overhead.
 - Makefile builds default to `NATIVE=ON`, selecting a supported host CPU flag
   (`-march=native`, or `-mcpu=native` where supported). Use `NATIVE=OFF` for
   portable binaries. Cross-compilation skips host tuning; unsupported compilers
@@ -100,11 +83,11 @@ The target cleans old PGO outputs, builds, trains, merges profiles, rebuilds wit
 - Use matching `PGO_CXX` and `LLVM_PROFDATA` versions.
 - Retrain after material code, firmware, or toolchain changes.
 - Match the scheduling mode too. Plain `run-network` uses the validated fast
-  path; leave it unadorned unless measuring an experimental mode. ADC
+  path; leave it unadorned to retain that mode. ADC
   decimation 1 retains every conversion.
 - Individual stages: `pgo-generate`, `pgo-train`, `pgo-merge`, `pgo-use`, `pgo-test`.
 
-### Host-tuned PGO build (local throughput)
+### Host-tuned PGO build
 
 Makefile builds target the host CPU by default, including both PGO profile
 generation and profile use. PGO itself remains opt-in; plain `make` does not
@@ -115,44 +98,13 @@ make pgo JOBS=6 CTEST_JOBS=4 \
   PGO_GENERATE_BUILD_DIR=build-runtime-pgo-generate \
   PGO_BUILD_DIR=build-runtime-native \
   NATIVE=ON \
-  PGO_TRAIN_ARGS='run-network configs/networks/per_vehicle.json --duration-ms 3000 --max-instructions 150000000 --quantum 1024 --strict-mmio --adc-decimation 1'
-
-tools/bench_full_network.sh --binary build-runtime-native/fil \
-  --duration-ms 10000 --reps 3
+  PGO_TRAIN_ARGS='run-network configs/networks/per_vehicle.json --duration-ms 3000 --max-instructions 3000000000 --quantum 1024 --strict-mmio --adc-decimation 1'
 ```
 
 `make pgo` replaces the selected PGO build directories. Host-tuned binaries may
 require CPU features unavailable on other machines; use `NATIVE=OFF` for
 distribution. Neither PGO nor host tuning changes ADC fidelity or simulated
 instruction timing.
-
-A local x86-64 measurement with Clang 23, ADC decimation 1, and all six boards
-reaching 10 simulated seconds gave a median of 9.530 wall seconds (1.049×
-realtime), versus 13.833 seconds for plain Release with IPO. These are three
-alternating runs per binary with matching counters and final PCs, including
-startup. This is a build-configuration comparison, not a code-only speedup or a
-realtime guarantee on other hosts. Rebenchmark after source or firmware changes;
-the margin above realtime is small.
-
-## Network comparison
-
-Build the target firmware before measuring its configured network. Firmware
-compiler optimization is a workload change, not an emulator-only speedup;
-compare FIL binaries on identical ELFs and clock settings.
-
-ADC common `CCR.CKMODE` selects each group's synchronous clock division.
-Correct clock modeling is distinct from ADC decimation: every conversion,
-DMA transfer, and interrupt at the configured rate is retained. Results from
-different firmware clocks or older ADC clock models are not matched baselines.
-
-```bash
-/usr/bin/time -p ./build-release/fil run-network configs/networks/per_vehicle.json \
-  --duration-ms 5000 --max-instructions 250000000 --quantum 1024 --strict-mmio --adc-decimation 1
-```
-
-Record wall time, stop reason, simulated time, instruction/cycle counts, and JIT diagnostics. Increase the instruction limit if necessary.
-
-With JIT enabled (the default), `run` and `run-network` report per-board `jit:` diagnostics. The line retains the `micro_*`, `block_*`, and `single_*` counters; generated-code counts do not imply a speedup. Do not discard guest-visible differences when comparing summaries.
 
 ### Scheduling and guarded RAM capsules
 
@@ -192,45 +144,20 @@ rather than inspecting or resuming potentially speculative state.
 
 A bounded, immutable period certificate can avoid execution and replay for naturally recurring spans whose RAM bytes remain unchanged after every instruction, including idempotent stores. Compilation records each CPU/fetch endpoint and charged cycle cost. Reuse requires a matching CPU phase, historical execution/clock/FLASH generations, complete canonical RAM read-and-store footprints, usable journal history, and an unchanged restoration token. A different fetch predecessor adjusts only the first instruction's ART stall; later fetch endpoints follow the certificate. Unrelated external RAM changes may remain compatible; changed inputs, journal rewinds, reset, and transaction restoration reject reuse. Cached repeating spans use compressed periodic timing rather than filling one metadata entry per instruction. They admit up to 4096 logical instructions, bounded by event, SysTick, deadline, and representable cycle budgets; uncached speculative work retains the 64-instruction limit. Timing accessors and binary-search cuts reconstruct the selected period phase without modifying RAM and charge cycles once using the admission's original timing fraction. A boundary that cuts an admission retains its valid leading instructions instead of discarding the whole cached span. This does not omit ADC conversions, DMA, interrupts, or observation barriers. JIT diagnostics describe actual handler work, not the logical instructions represented by a cached period. The `memoized_prefixes`, `memoized_instructions`, and per-board `memoized_ram` diagnostics report certificate admissions; admitted instructions may be cut by a later barrier, so these counters are not committed instruction totals. This path uses cached handlers and does not compile RAM kernels. Capsule eligibility remains guarded: audited local ADC observations may be crossed only when provider/wiring, interrupt hooks, DMA identity, and the next directly backed RAM transfer satisfy the checks. Custom callbacks and unsupported DMA remain global observation barriers. Concurrency or reentrant mutation of a running World is unsupported; after a run throws, discard that World rather than inspecting or resuming potentially speculative state.
 
-The full-network benchmark helper measures the automatic execution path. A
-repeatable benchmark includes startup, checks all six boards reach the deadline,
-and exits unsuccessfully when median throughput is not above realtime:
-
-```bash
-tools/bench_full_network.sh --binary build-pgo/fil --reps 3
-```
-
-For sustained before/after comparisons, pass distinct baseline and candidate
-builds with `--reference-binary path/to/reference/fil` and use an appropriate
-longer duration. The helper alternates binary run order and checks matching
-counters and final board PCs; it does not compare interpreter and experimental
-CLI modes. Keep compiler flags and firmware identical and train PGO for each
-source version. Clean-rebuild profile-use objects when replacing a profile in
-place; mixed old/new profile summaries can break ThinLTO.
-
-For longer matched comparisons, use the same helper with an explicit duration.
-The instruction budget scales with duration; every board must still reach the
-deadline. Add `--min-throughput 1.2` to require at least 1.2 simulated seconds per
-host wall second, including initialization. The threshold uses the unrounded
-median ratio rather than the displayed value.
-Keep ADC decimation 1 for full-fidelity comparisons. Retrain PGO for each source
-version; an old profile is not a matched baseline.
-
 ## ADC decimation
 
 `--adc-decimation N` keeps one of every N continuous-mode scans (1–1024; default 1). Skipped scans omit normal register, DMA, interrupt, and sample-recording effects. Single-shot conversions are not skipped.
 
-**Decimation changes firmware-visible behavior.** Keep N fixed when comparing execution optimizations.
+**Decimation changes firmware-visible behavior.** Keep N at 1 for full fidelity.
 
 ## Validation
 
 ```bash
 make BUILD_DIR=build-release BUILD_TYPE=Release test
-make BUILD_DIR=build-release BUILD_TYPE=Release benchmark BENCH_REPS=3
 ```
 
 Differential tests cover cached execution, MMIO restart, code invalidation, execution caps, timing, events, and scheduling, including quantum handling when completion timestamps saturate.
 
 RAM-prefix tests compare every interruption cut, rotated period phases, CPU/RAM/timer state, input changes, and historical code/clock/FLASH invalidation. Memory-proof tests cover every touched word in unaligned/wide reads and idempotent stores, alias canonicalization, disabled tracking, and journal sequence reuse after rollback. Declining reversible handlers must preserve their entire entry CPU state.
 
-Tests provide regression evidence, not proof for every firmware. Synthetic smoke benchmarks do not establish six-board network throughput; wall-time measurements are not correctness tests.
+Tests provide regression evidence, not proof for every firmware.
