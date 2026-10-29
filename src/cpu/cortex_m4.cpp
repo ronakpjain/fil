@@ -1827,16 +1827,16 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
         std::array<std::uint32_t, JitStepOutcome::max_block> charges;
         const auto limit = std::min(execution_count, slot.native_prefix_count);
         std::uint8_t planned = 0U;
-        std::uint64_t remaining = budget->remaining_cycles;
         bool have_fetch = budget->have_fetch;
         auto fetch_end = budget->fetch_end;
         for (; planned < limit; ++planned) {
             const auto pc = slot.pcs[planned];
             const auto charged = static_cast<std::uint32_t>(slot.base_cycles[planned])
                 + budget->fetchStallCycles(pc, have_fetch && pc == fetch_end);
-            if (charged > remaining || charged > std::numeric_limits<std::uint16_t>::max()) break;
+            // The native kernel enforces the cycle credit before each op.
+            // Do not run a duplicate admission-budget pass on the host.
+            if (charged > std::numeric_limits<std::uint16_t>::max()) break;
             charges[planned] = charged;
-            remaining -= charged;
             have_fetch = true;
             fetch_end = pc + slot.sizes[planned];
         }
@@ -1868,6 +1868,8 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
             jit_stats_.native_instructions += first_cached;
             if (context.exit_reason == NativeExitReason::helper_declined) {
                 ++jit_stats_.native_declines;
+                cached_limit = first_cached;
+            } else if (context.exit_reason == NativeExitReason::cycle_limit) {
                 cached_limit = first_cached;
             }
         } else {
