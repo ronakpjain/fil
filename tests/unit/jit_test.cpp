@@ -502,6 +502,70 @@ TEST(JitTest, ReversibleFinalMetadataMatchesEveryRetiredPrefixAndMemoryDecline) 
     }
 }
 
+TEST(JitTest, MixedNativeReversibleMatchesCachedAtEveryBudgetAndDecline) {
+    std::uint64_t native_total = 0U;
+    for (const bool decline : {false, true}) {
+        for (std::size_t limit = 1U; limit <= 6U; ++limit) {
+            for (const auto credit : {0U, 1U, 2U, 3U, 5U, 7U, 11U, 100U}) {
+                SCOPED_TRACE(decline);
+                SCOPED_TRACE(limit);
+                SCOPED_TRACE(credit);
+                auto memory = basicBus();
+                auto cached_memory = basicBus();
+                const auto code = halfwords({0x2007U, 0x6008U, 0x681aU,
+                    0x3201U, 0x604aU, 0xbf00U, 0xe7feU});
+                ASSERT_TRUE(memory.loadBytes(flash_base, code));
+                ASSERT_TRUE(cached_memory.loadBytes(flash_base, code));
+                fil::cpu::CortexM4 native(memory), cached(cached_memory);
+                native.setNativeMemoryJitEnabled(true);
+                cached.setNativeMemoryJitEnabled(false);
+                for (auto* cpu : {&native, &cached}) {
+                    prepare(*cpu);
+                    cpu->state().r[1] = ram_base;
+                    cpu->state().r[3] = decline ? 0x40000000U : ram_base;
+                    cpu->state().xpsr = 0x39000000U;
+                    for (unsigned i = 0U; i < 70U; ++i)
+                        static_cast<void>(cpu->prepareJitBlock(true));
+                }
+                memory.setReversibleRamOnly(true);
+                memory.setAllMmioTrapping(true);
+                cached_memory.setReversibleRamOnly(true);
+                cached_memory.setAllMmioTrapping(true);
+                fil::cpu::CortexM4::ReversibleCycleBudget a, b;
+                a.remaining_cycles = b.remaining_cycles = credit;
+                a.fetch_timing = b.fetch_timing = {flash_base, flash_base + 256U,
+                    0U, 0U, 3U, 1U};
+                const auto expected = cached.tryStepBudgetedReversibleJitBlock(limit, b);
+                const auto actual = native.tryStepBudgetedReversibleJitBlock(limit, a);
+                ASSERT_EQ(actual.has_value(), expected.has_value());
+                EXPECT_TRUE(fil::cpu::bitwiseEqual(native.state(), cached.state()));
+                EXPECT_EQ(memory.read32(ram_base).value(), cached_memory.read32(ram_base).value());
+                EXPECT_EQ(memory.read32(ram_base + 4U).value(), cached_memory.read32(ram_base + 4U).value());
+                EXPECT_EQ(a.remaining_cycles, b.remaining_cycles);
+                EXPECT_EQ(a.have_fetch, b.have_fetch);
+                EXPECT_EQ(a.fetch_end, b.fetch_end);
+                EXPECT_EQ(memory.readFootprint().words, cached_memory.readFootprint().words);
+                EXPECT_EQ(memory.sideEffectCheckpoint().mutation_sequence,
+                    cached_memory.sideEffectCheckpoint().mutation_sequence);
+                if (actual) {
+                    ASSERT_EQ(actual->execution.count, expected->execution.count);
+                    EXPECT_EQ(actual->execution.result.cycles, expected->execution.result.cycles);
+                    for (std::size_t i = 0U; i < actual->execution.count; ++i) {
+                        EXPECT_EQ(actual->instruction_cycles[i], expected->instruction_cycles[i]);
+                        EXPECT_EQ(a.total_instruction_cycles[i], b.total_instruction_cycles[i]);
+                    }
+                }
+                native_total += native.nativeMemoryInstructions();
+            }
+        }
+    }
+#if defined(__x86_64__) && defined(FIL_ENABLE_MICRO_JIT) && FIL_ENABLE_MICRO_JIT
+    EXPECT_GT(native_total, 0U) << "differential test must exercise the mixed native backend";
+#else
+    static_cast<void>(native_total); // Unsupported mixed backends retain exact cached execution.
+#endif
+}
+
 TEST(JitTest, BudgetedReversiblePreparedMemoryDeclineRestoresSpeculativeState) {
     const auto check_decline = [](const std::uint16_t instruction,
                                   const std::uint32_t address) {

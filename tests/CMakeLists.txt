@@ -22,6 +22,8 @@ add_executable(fil_tests
     unit/jit_test.cpp
     unit/micro_jit_test.cpp
     unit/micro_jit_ir_test.cpp
+    unit/native_execution_test.cpp
+    unit/native_jit_test.cpp
     unit/memory_bus_test.cpp
     unit/network_protocol_test.cpp
     unit/peripheral_test.cpp

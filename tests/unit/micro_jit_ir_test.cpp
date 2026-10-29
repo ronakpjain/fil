@@ -1,6 +1,7 @@
 #include "fil/cpu/decoder.hpp"
 #include "fil/cpu/micro_jit_ir.hpp"
 #include "fil/cpu/micro_jit.hpp"
+#include "fil/cpu/native_ir.hpp"
 
 #include <gtest/gtest.h>
 
@@ -18,6 +19,81 @@ MicroSource narrow(std::uint16_t raw, std::uint32_t pc) {
     auto decoded = fil::cpu::decode16(raw);
     EXPECT_TRUE(decoded.has_value()) << std::hex << raw;
     return MicroSource{decoded.value_or(fil::cpu::DecodedInstruction{}), pc, 2U};
+}
+
+TEST(NativeIrTest, MixedWordMemoryDoesNotChangePureLowering) {
+    const std::vector<MicroSource> sources{
+        narrow(0x2001U, 0x08000000U), // movs r0, #1
+        narrow(0x6048U, 0x08000002U), // str r0, [r1, #4]
+        narrow(0x684aU, 0x08000004U), // ldr r2, [r1, #4]
+    };
+    fil::cpu::NativeBlock block;
+    ASSERT_TRUE(fil::cpu::buildNativeBlock(sources, block).ok);
+    ASSERT_EQ(block.ops.size(), 3U);
+    EXPECT_TRUE(block.has_memory);
+    EXPECT_FALSE(block.ends_with_branch);
+    EXPECT_EQ(block.ops[0].kind, fil::cpu::NativeOp::integer);
+    EXPECT_EQ(block.ops[1].kind, fil::cpu::NativeOp::store_word);
+    EXPECT_EQ(block.ops[1].rn, 1U);
+    EXPECT_EQ(block.ops[1].rd, 0U);
+    EXPECT_EQ(block.ops[1].offset, 4U);
+    EXPECT_EQ(block.ops[2].kind, fil::cpu::NativeOp::load_word);
+    EXPECT_EQ(block.ops[2].rd, 2U);
+    MicroBlock pure;
+    EXPECT_FALSE(fil::cpu::buildMicroBlock(sources, pure).ok);
+}
+
+TEST(NativeIrTest, MemoryDeclinesUnsafeShapesWithoutChangingOutput) {
+    const auto valid = narrow(0x684aU, 0x08000000U);
+    for (unsigned variant = 0U; variant != 11U; ++variant) {
+        auto source = valid;
+        switch (variant) {
+        case 0U: source.decoded.rn = 13U; break;
+        case 1U: source.decoded.rd = 15U; break;
+        case 2U: source.decoded.writeback = true; break;
+        case 3U: source.decoded.index = false; break;
+        case 4U: source.decoded.add = false; break;
+        case 5U: source.decoded.condition = fil::cpu::Condition::eq; break;
+        case 6U: source.decoded.form = fil::cpu::OperandForm::register_value; break;
+        case 7U: source.decoded.set_flags = true; break;
+        case 8U: source.decoded.is_32bit = true; break;
+        case 9U: source.pc |= 1U; break;
+        case 10U: source.decoded.shift_amount = 1U; break;
+        }
+        fil::cpu::NativeInst out;
+        out.pc = 0x1234U;
+        out.kind = fil::cpu::NativeOp::store_word;
+        EXPECT_FALSE(fil::cpu::tryLowerNativeInst(source, out).ok) << variant;
+        EXPECT_EQ(out.pc, 0x1234U);
+        EXPECT_EQ(out.kind, fil::cpu::NativeOp::store_word);
+    }
+}
+
+TEST(NativeIrTest, ConditionalControlFlowMustTerminateTheBlock) {
+    for (const auto raw : {0xd000U, 0xb100U, 0xb900U}) {
+        std::vector<MicroSource> sources{narrow(0x2001U, 0x08000000U),
+            narrow(static_cast<std::uint16_t>(raw), 0x08000002U),
+            narrow(0x684aU, 0x08000004U)};
+        fil::cpu::NativeBlock block;
+        EXPECT_EQ(fil::cpu::buildNativeBlock(sources, block).reason,
+            fil::cpu::MicroLowerReason::branch_not_terminal);
+        sources.pop_back();
+        ASSERT_TRUE(fil::cpu::buildNativeBlock(sources, block).ok);
+        EXPECT_TRUE(block.ends_with_branch);
+    }
+}
+
+TEST(NativeIrTest, RejectsDiscontinuityAndNonterminalBranchAtomically) {
+    fil::cpu::NativeBlock out;
+    out.entry_pc = 0x1234U;
+    std::vector<MicroSource> sources{
+        narrow(0x2001U, 0x08000000U), narrow(0x684aU, 0x08000004U)};
+    EXPECT_FALSE(fil::cpu::buildNativeBlock(sources, out).ok);
+    EXPECT_EQ(out.entry_pc, 0x1234U);
+    sources = {narrow(0xe000U, 0x08000000U), narrow(0x684aU, 0x08000002U)};
+    EXPECT_EQ(fil::cpu::buildNativeBlock(sources, out).reason,
+        fil::cpu::MicroLowerReason::branch_not_terminal);
+    EXPECT_EQ(out.entry_pc, 0x1234U);
 }
 
 TEST(MicroJitIrTest, LowersMovAddSubAndBranch) {

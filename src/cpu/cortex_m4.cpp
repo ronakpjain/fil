@@ -3,6 +3,8 @@
 #include "fil/cpu/decoder.hpp"
 #include "fil/cpu/jit.hpp"
 #include "fil/cpu/micro_jit_ir.hpp"
+#include "fil/cpu/native_ir.hpp"
+#include "fil/cpu/native_execution.hpp"
 #include "fil/elf/elf_loader.hpp"
 #include "fil/mem/memory_bus.hpp"
 
@@ -16,6 +18,7 @@
 #include <limits>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <vector>
 
 namespace fil::cpu {
@@ -402,7 +405,38 @@ bool CortexM4::ensureMicroJit() {
     return micro_jit_ != nullptr;
 }
 
+void CortexM4::prepareNativeBlock(JitBlockEntry& entry) {
+    if (!native_memory_jit_enabled_ || entry.count < 2U || !MicroJit::hostSupported()) return;
+    std::array<MicroSource, JitStepOutcome::max_block> sources;
+    std::uint8_t count = 0U;
+    bool has_memory = false;
+    for (; count < entry.count; ++count) {
+        sources[count] = {entry.ops[count], entry.pcs[count], entry.sizes[count]};
+        NativeInst inst;
+        if (!tryLowerNativeInst(sources[count], inst).ok) break;
+        // This first mixed backend has no control-flow exits. Existing pure
+        // stencils and checked handlers retain every branch form.
+        if (inst.kind == NativeOp::integer
+            && (inst.integer.op == MicroOp::b || inst.integer.op == MicroOp::bl
+                || inst.integer.op == MicroOp::b_cond || inst.integer.op == MicroOp::cbz
+                || inst.integer.op == MicroOp::cbnz)) break;
+        has_memory |= inst.kind != NativeOp::integer;
+    }
+    if (count < 2U || !has_memory) return;
+    NativeBlock block;
+    if (!buildNativeBlock({sources.data(), count}, block).ok || !ensureMicroJit()) return;
+    std::string error;
+    const auto before = micro_jit_->compilations();
+    const auto function = micro_jit_->compileNative(block, error);
+    jit_stats_.native_compilations += micro_jit_->compilations() - before;
+    if (function) {
+        entry.native_function = function;
+        entry.native_prefix_count = count;
+    }
+}
+
 void CortexM4::prepareMicroBlock(JitBlockEntry& entry) {
+    prepareNativeBlock(entry);
     entry.micro_attempted = true;
     entry.micro_prefix_count = 0U;
     if (!MicroJit::hostSupported() || entry.count < 2U) return;
@@ -466,6 +500,9 @@ bool CortexM4::admitMicroBlock(const JitBlockEntry& entry,
     } restore{state_, slot, jit_stats_, state_, slot, jit_stats_};
     slot = entry;
     slot.valid = true;
+    // Pure-kernel calibration must compare its own backend against handlers,
+    // never a separately compiled mixed kernel or its progress counters.
+    slot.native_function = nullptr;
     slot.micro_prefix_count = prefix;
     const auto input = [&](const std::size_t round) {
         state_ = restore.saved;
@@ -1783,6 +1820,60 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
     // preserve the unused suffix instead of zero-filling the whole array.
     std::uint8_t first_cached = 0U;
     std::uint8_t cached_limit = execution_count;
+    if (native_memory_jit_enabled_ && slot.native_function && budget
+        && budget->fetch_stall == nullptr && state_.it_state == 0U) {
+        // Callback-free timing is stable throughout the capsule. Plan only
+        // immutable costs; checked native helpers decide memory eligibility.
+        std::array<std::uint32_t, JitStepOutcome::max_block> charges;
+        const auto limit = std::min(execution_count, slot.native_prefix_count);
+        std::uint8_t planned = 0U;
+        std::uint64_t remaining = budget->remaining_cycles;
+        bool have_fetch = budget->have_fetch;
+        auto fetch_end = budget->fetch_end;
+        for (; planned < limit; ++planned) {
+            const auto pc = slot.pcs[planned];
+            const auto charged = static_cast<std::uint32_t>(slot.base_cycles[planned])
+                + budget->fetchStallCycles(pc, have_fetch && pc == fetch_end);
+            if (charged > remaining || charged > std::numeric_limits<std::uint16_t>::max()) break;
+            charges[planned] = charged;
+            remaining -= charged;
+            have_fetch = true;
+            fetch_end = pc + slot.sizes[planned];
+        }
+        if (planned != 0U) {
+            NativeExecutionContext context;
+            context.cpu_state = &state_;
+            context.memory_bus = &memory_;
+            context.instruction_limit = planned;
+            context.cycle_limit = budget->remaining_cycles;
+            context.charged_cycles = charges.data();
+            context.charged_cycles_count = planned;
+            slot.native_function(&context);
+            if (context.retired_count > planned) {
+                // Native stores may already have committed: never pretend this
+                // is a clean decline and execute the same stores a second time.
+                throw std::logic_error("native reversible kernel exceeded its prefix");
+            }
+            first_cached = static_cast<std::uint8_t>(context.retired_count);
+            for (std::uint8_t i = 0U; i < first_cached; ++i) {
+                timed.instruction_cycles[i] = slot.base_cycles[i];
+                budget->total_instruction_cycles[i] = static_cast<std::uint16_t>(charges[i]);
+                budget->remaining_cycles -= charges[i];
+                budget->have_fetch = true;
+                budget->fetch_end = slot.pcs[i] + slot.sizes[i];
+                total_cycles += slot.base_cycles[i];
+                if (slot.is_memory[i]) out.memory_free = false;
+            }
+            ++jit_stats_.native_executions;
+            jit_stats_.native_instructions += first_cached;
+            if (context.exit_reason == NativeExitReason::helper_declined) {
+                ++jit_stats_.native_declines;
+                cached_limit = first_cached;
+            }
+        } else {
+            cached_limit = 0U;
+        }
+    }
     // Bespoke stencil prefix: serves budgeted and trusted reversible paths
     // with the same commit contract as cached handlers (direct commit, no traps).
     // FilIR admits no memory/system/FP ops, so the memory guard and rollback
@@ -1974,8 +2065,12 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
         if (budget && (worst_cycles > budget->remaining_cycles
             || worst_cycles > std::numeric_limits<std::uint16_t>::max())) break;
 
-        const std::uint32_t previous_instruction_address = state_.instruction_address;
-        state_.instruction_address = pc;
+        // Compact reversible handlers neither read architectural PC nor need
+        // instruction_address while executing. Defer that metadata store until
+        // commit, avoiding a load/save/restore pair on the common integer path.
+        const std::uint32_t previous_instruction_address = compact
+            ? 0U : state_.instruction_address;
+        if (!compact) state_.instruction_address = pc;
         state_.r[15] = pc + size;
         bool handled = true;
         if (condition_passed) {
@@ -2014,12 +2109,13 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
         }
         if (!handled) {
             state_.r[15] = pc;
-            state_.instruction_address = previous_instruction_address;
+            if (!compact) state_.instruction_address = previous_instruction_address;
             if (out.count == 0U && slot.decline_streak < 2U) {
                 ++slot.decline_streak;
             }
             break;
         }
+        if (compact) state_.instruction_address = pc;
         if (condition_passed && state_.r[15] != pc + size) {
             cycles = static_cast<std::uint16_t>(cycles + slot.branch_penalty[i]);
         }

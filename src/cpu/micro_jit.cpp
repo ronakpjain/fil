@@ -1,8 +1,9 @@
-// Bespoke FilIR stencil emitter.
+// Bespoke FilIR stencil emitters.
 //
-// AArch64 only; other hosts compile to a stub whose hostSupported() is
-// false so every site keeps its cached-handler behavior with no CLI or
-// build churn. Guest regs map to host regs for the whole block:
+// The pure micro-block backend emits AArch64 or x86_64 stencils. The mixed
+// native backend emits integer/memory stencils on x86_64 and uses its C++
+// trampoline on AArch64; other hosts compile to a stub. Guest regs map to
+// host regs for the whole pure block:
 //
 //   x0         CpuState* (preserved)
 //   w2..w14    guest r0..r12
@@ -22,11 +23,14 @@
 
 #include "fil/cpu/cortex_m4.hpp"
 #include "fil/cpu/micro_jit_ir.hpp"
+#include "fil/cpu/native_ir.hpp"
+#include "fil/cpu/native_execution.hpp"
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <iterator>
 #include <mutex>
 #include <vector>
@@ -748,9 +752,11 @@ public:
         const auto disp32 = static_cast<std::int32_t>(disp);
         if (disp32 >= -128 && disp32 <= 127 && ((base & 7U) != 5U)) {
             u8(modrm(1U, reg, base));
+            if ((base & 7U) == 4U) u8(0x24U); // SIB: no index, base=rsp
             u8(static_cast<std::uint8_t>(disp32));
         } else {
             u8(modrm(2U, reg, base));
+            if ((base & 7U) == 4U) u8(0x24U); // SIB: no index, base=rsp
             u32(disp);
         }
     }
@@ -768,6 +774,32 @@ public:
         u8(static_cast<std::uint8_t>(0x58U | (r & 7U)));
     }
     void ret() { u8(0xC3U); }
+    void callReg(std::uint32_t r) { prefixRex(false, 2U, r); u8(0xFFU); u8(modrm(3U, 2U, r)); }
+    void movR64Imm(std::uint32_t dst, std::uint64_t imm) {
+        u8(rex(true, false, (dst & 8U) != 0U));
+        u8(static_cast<std::uint8_t>(0xB8U | (dst & 7U)));
+        for (unsigned i = 0; i < 8U; ++i) u8(static_cast<std::uint8_t>(imm >> (i * 8U)));
+    }
+    void leaR64(std::uint32_t dst, std::uint32_t base, std::uint32_t disp) {
+        u8(rex(true, (dst & 8U) != 0U, (base & 8U) != 0U)); u8(0x8DU); mem(dst, base & 7U, disp);
+    }
+    void movR64M(std::uint32_t dst, std::uint32_t base, std::uint32_t disp) {
+        u8(rex(true, (dst & 8U) != 0U, (base & 8U) != 0U)); u8(0x8BU); mem(dst, base & 7U, disp);
+    }
+    void movM64R(std::uint32_t base, std::uint32_t disp, std::uint32_t src) {
+        u8(rex(true, (src & 8U) != 0U, (base & 8U) != 0U)); u8(0x89U); mem(src, base & 7U, disp);
+    }
+    void cmpR64M(std::uint32_t reg, std::uint32_t base, std::uint32_t disp) {
+        u8(rex(true, (reg & 8U) != 0U, (base & 8U) != 0U)); u8(0x3BU); mem(reg, base & 7U, disp);
+    }
+    void addR64R64(std::uint32_t dst, std::uint32_t src) {
+        u8(rex(true, (src & 8U) != 0U, (dst & 8U) != 0U)); u8(0x01U); u8(modrm(3U, src, dst));
+    }
+    void addR64Imm8(std::uint32_t reg, std::uint8_t imm) {
+        u8(rex(true, false, (reg & 8U) != 0U)); u8(0x83U); u8(modrm(3U, 0U, reg)); u8(imm);
+    }
+    void subRsp16() { u8(0x48U); u8(0x83U); u8(0xECU); u8(16U); }
+    void addRsp16() { u8(0x48U); u8(0x83U); u8(0xC4U); u8(16U); }
     // mov r64, r64.
     void movRR64(std::uint32_t dst, std::uint32_t src) {
         u8(rex(true, (dst & 8U) != 0U, (src & 8U) != 0U));
@@ -1415,6 +1447,8 @@ struct MicroJit::Impl {
 
     std::mutex mutex;
     std::vector<CacheEntry> cache;
+    struct NativeCacheEntry { NativeBlock block; NativeFunction function{nullptr}; };
+    std::deque<NativeCacheEntry> native_cache;
     std::uint8_t* base{nullptr};
     std::size_t capacity{0};
     std::size_t used{0};
@@ -1488,6 +1522,85 @@ struct MicroJit::Impl {
     }
 #endif
 };
+
+namespace {
+
+[[maybe_unused]] void executeNativeBlock(NativeExecutionContext* context, const NativeBlock* block) noexcept {
+    if (block == nullptr || context == nullptr || context->cpu_state == nullptr) return;
+    context->retired_count = 0U;
+    context->exit_reason = NativeExitReason::none;
+    for (std::size_t i = 0; i < block->ops.size(); ++i) {
+        const auto& op = block->ops[i];
+        context->current_instruction_pc = op.pc;
+        if (context->retired_count >= context->instruction_limit) {
+            context->exit_reason = NativeExitReason::instruction_limit;
+            break;
+        }
+        if (context->charged_cycles == nullptr || i >= context->charged_cycles_count) {
+            context->failing_instruction_pc = op.pc;
+            context->exit_reason = NativeExitReason::unsupported_instruction;
+            break;
+        }
+        const std::uint64_t cost = context->charged_cycles[i];
+        if (context->retired_cycles > context->cycle_limit
+            || cost > context->cycle_limit - context->retired_cycles) {
+            context->exit_reason = NativeExitReason::cycle_limit;
+            break;
+        }
+        CpuState& state = *context->cpu_state;
+        std::uint32_t loaded = 0U;
+        const std::uint32_t address = op.kind == NativeOp::integer ? 0U
+            : state.r[op.rn] + op.offset;
+        if (op.kind == NativeOp::load_word
+            && !nativeRead32(context, op.pc, address, &loaded)) {
+            context->failing_instruction_pc = op.pc;
+            context->exit_reason = NativeExitReason::helper_declined;
+            break;
+        }
+        if (op.kind == NativeOp::store_word
+            && !nativeWrite32(context, op.pc, address, state.r[op.rd])) {
+            context->failing_instruction_pc = op.pc;
+            context->exit_reason = NativeExitReason::helper_declined;
+            break;
+        }
+        if (op.kind == NativeOp::integer) {
+            MicroBlock one;
+            one.entry_pc = op.pc;
+            one.ops.push_back(op.integer);
+            MicroCpu guest;
+            for (std::size_t r = 0; r < guest.r.size(); ++r) guest.r[r] = state.r[r];
+            guest.lr = state.r[14];
+            guest.pc = state.r[15];
+            guest.xpsr = state.xpsr;
+            (void)interpretMicroBlock(one, guest, 1U);
+            for (std::size_t r = 0; r < guest.r.size(); ++r) state.r[r] = guest.r[r];
+            state.r[14] = guest.lr;
+            state.xpsr = guest.xpsr;
+        } else if (op.kind == NativeOp::load_word) {
+            state.r[op.rd] = loaded;
+        }
+        state.instruction_address = op.pc;
+        state.r[15] = op.pc + op.size;
+        context->retired_cycles += cost;
+        ++context->retired_count;
+    }
+    if (context->exit_reason == NativeExitReason::none
+        && context->retired_count == block->ops.size())
+        context->exit_reason = NativeExitReason::none;
+}
+
+bool sameNativeBlock(const NativeBlock& a, const NativeBlock& b) noexcept {
+    if (a.entry_pc != b.entry_pc || a.ops.size() != b.ops.size()) return false;
+    for (std::size_t i = 0; i < a.ops.size(); ++i) {
+        const auto& x = a.ops[i]; const auto& y = b.ops[i];
+        if (x.kind != y.kind || x.pc != y.pc || x.size != y.size || x.rd != y.rd
+            || x.rn != y.rn || x.offset != y.offset
+            || (x.kind == NativeOp::integer && !sameMicroInst(x.integer, y.integer))) return false;
+    }
+    return true;
+}
+
+} // namespace
 
 MicroJit::~MicroJit() = default;
 
@@ -1732,6 +1845,208 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
 #else
     (void)block;
     error = "micro-jit unsupported on this host";
+    return nullptr;
+#endif
+}
+
+NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& error) {
+#if defined(FIL_ENABLE_MICRO_JIT) && FIL_ENABLE_MICRO_JIT && defined(FIL_MICRO_JIT_NATIVE)
+    if (block.ops.empty() || block.ops.size() > NativeBlock::max_ops) {
+        error = "native-jit: invalid block size";
+        return nullptr;
+    }
+    auto expected_pc = block.entry_pc;
+    for (std::size_t i = 0; i < block.ops.size(); ++i) {
+        const auto& op = block.ops[i];
+        if (op.pc != expected_pc
+            || (op.kind != NativeOp::integer && op.kind != NativeOp::load_word
+                && op.kind != NativeOp::store_word)) {
+            error = "native-jit: invalid opcode or discontinuous block";
+            return nullptr;
+        }
+        expected_pc += op.size;
+        if (op.kind == NativeOp::integer
+            && (op.integer.pc != op.pc || op.integer.size != op.size
+                || op.integer.rd >= 13U || op.integer.rn >= 13U || op.integer.rm >= 13U
+                || op.integer.condition != Condition::al
+                || static_cast<unsigned>(op.integer.op) > static_cast<unsigned>(MicroOp::rrx)
+                || static_cast<unsigned>(op.integer.shift) > static_cast<unsigned>(ShiftType::rrx)
+                || (op.integer.shift_immediate && op.integer.shift_amount > 32U))) {
+            error = "native-jit: invalid integer operands or metadata";
+            return nullptr;
+        }
+        if ((op.size != 2U && op.size != 4U) || (op.pc & 1U) != 0U
+            || (op.kind == NativeOp::integer
+                && (op.integer.op == MicroOp::b || op.integer.op == MicroOp::bl
+                    || op.integer.op == MicroOp::b_cond || op.integer.op == MicroOp::cbz
+                    || op.integer.op == MicroOp::cbnz))) {
+            error = "native-jit: branch or malformed op declined";
+            return nullptr;
+        }
+        if (op.kind != NativeOp::integer && (op.rd >= 13U || op.rn >= 13U)) {
+            error = "native-jit: invalid memory register";
+            return nullptr;
+        }
+    }
+    std::lock_guard lock(impl_->mutex);
+    for (const auto& entry : impl_->native_cache)
+        if (sameNativeBlock(entry.block, block)) return entry.function;
+    // Native cache entries also own the AArch64 fallback's embedded block
+    // descriptor. Never evict one while its callable code may remain in use.
+    constexpr std::size_t kNativeCacheEntries = 128U;
+    if (impl_->native_cache.size() >= kNativeCacheEntries) {
+        error = "native-jit: bounded native cache full";
+        return nullptr;
+    }
+    impl_->native_cache.emplace_back();
+    auto& entry = impl_->native_cache.back();
+    entry.block = block;
+    std::vector<std::uint8_t> code;
+#if defined(FIL_MICRO_JIT_X86_64) && !defined(_WIN32)
+    using namespace x86detail;
+    const Offsets cpu_offsets{static_cast<std::uint32_t>(offsetof(CpuState, r)),
+        static_cast<std::uint32_t>(offsetof(CpuState, xpsr)),
+        static_cast<std::uint32_t>(offsetof(CpuState, instruction_address))};
+    const auto ctx_off = [](std::size_t value) { return static_cast<std::uint32_t>(value); };
+    constexpr std::uint32_t kCtx = 13U, kCosts = 14U, kCpu = 12U;
+    constexpr std::uint32_t kScratch = 0U, kAddr = 2U, kValue = 1U;
+    constexpr auto kRetired = ctx_off(offsetof(NativeExecutionContext, retired_count));
+    constexpr auto kLimit = ctx_off(offsetof(NativeExecutionContext, instruction_limit));
+    constexpr auto kCycles = ctx_off(offsetof(NativeExecutionContext, retired_cycles));
+    constexpr auto kCycleLimit = ctx_off(offsetof(NativeExecutionContext, cycle_limit));
+    constexpr auto kCurrent = ctx_off(offsetof(NativeExecutionContext, current_instruction_pc));
+    constexpr auto kFailing = ctx_off(offsetof(NativeExecutionContext, failing_instruction_pc));
+    constexpr auto kReason = ctx_off(offsetof(NativeExecutionContext, exit_reason));
+    constexpr auto kChargedCount = ctx_off(offsetof(NativeExecutionContext, charged_cycles_count));
+    X86Emitter e;
+    const auto instruction_exit = e.makeLabel();
+    const auto cycle_exit = e.makeLabel();
+    const auto helper_exit = e.makeLabel();
+    const auto unsupported_exit = e.makeLabel();
+    const auto finish = e.makeLabel();
+    // Save all used callee-saved registers. Five pushes align RSP to 16 bytes
+    // at call sites; the 16-byte scratch slot holds nativeRead32's output.
+    e.pushReg(3U); e.pushReg(12U); e.pushReg(13U); e.pushReg(14U); e.pushReg(15U);
+    e.subRsp16();
+    e.movR64M(kCpu, 7U, ctx_off(offsetof(NativeExecutionContext, cpu_state)));
+    e.movRR64(kCtx, 7U);
+    e.movR64M(kCosts, 7U, ctx_off(offsetof(NativeExecutionContext, charged_cycles)));
+    e.movRR64(7U, kCpu);
+    e.movM32Imm(kCtx, kRetired, 0U);
+    e.movM32Imm(kCtx, kReason, static_cast<std::uint32_t>(NativeExitReason::none));
+    e.testRR(kCosts, kCosts);
+    e.jcc(4U, unsupported_exit);
+    e.movR32M(kRetain, 7U, cpu_offsets.xpsr);
+    e.movRR(kNzcv, kRetain);
+    e.aluRImm(4U, kRetain, ~(kFlagN | kFlagZ | kFlagC | kFlagV));
+    e.aluRImm(4U, kNzcv, kFlagN | kFlagZ | kFlagC | kFlagV);
+    for (std::size_t i = 0; i < block.ops.size(); ++i) {
+        const auto& op = block.ops[i];
+        e.movM32Imm(kCtx, kCurrent, op.pc);
+        e.movR32M(kScratch, kCtx, kRetired);
+        e.aluRM(7U, kScratch, kCtx, kLimit);
+        e.jcc(3U, instruction_exit); // retired >= limit
+        e.movR32M(kScratch, kCtx, kChargedCount);
+        e.cmpR32Imm(kScratch, static_cast<std::uint32_t>(i + 1U));
+        e.jcc(2U, unsupported_exit);
+        e.movR32M(kAddr, kCosts, static_cast<std::uint32_t>(i * sizeof(std::uint32_t)));
+        e.movR64M(kScratch, kCtx, kCycles);
+        e.addR64R64(kScratch, kAddr);
+        e.jcc(2U, cycle_exit); // carry: cycle sum overflow
+        e.cmpR64M(kScratch, kCtx, kCycleLimit);
+        e.jcc(7U, cycle_exit);
+        if (op.kind == NativeOp::integer) {
+            if (!emitX86Op(e, cpu_offsets, op.integer, error)) {
+                impl_->native_cache.pop_back();
+                return nullptr;
+            }
+        } else {
+            loadGuest(e, kScratch, cpu_offsets, op.rn);
+            if (op.offset != 0U) e.aluRImm(0U, kScratch, op.offset);
+            e.movRR(kAddr, kScratch);
+            if (op.kind == NativeOp::store_word) loadGuest(e, kValue, cpu_offsets, op.rd);
+            // Preserve guest NZCV/retained xPSR across the C ABI helper.
+            e.movRR(3U, kNzcv); e.movRR(15U, kRetain);
+            e.movRR64(7U, kCtx); // RDI = helper context
+            e.movR32Imm(6U, op.pc); // RSI = instruction PC
+            e.movRR(kEdx, kAddr);
+            if (op.kind == NativeOp::load_word) e.leaR64(1U, 4U, 0U); // RCX = [RSP]
+            const auto helper = op.kind == NativeOp::load_word
+                ? reinterpret_cast<std::uintptr_t>(&nativeRead32)
+                : reinterpret_cast<std::uintptr_t>(&nativeWrite32);
+            e.movR64Imm(kEax, static_cast<std::uint64_t>(helper));
+            e.callReg(kEax);
+            e.movRR(kNzcv, 3U); e.movRR(kRetain, 15U);
+            e.movRR64(7U, kCpu);
+            // SysV guarantees only AL for a bool return, not the upper EAX bits.
+            e.u8(0x84U); e.u8(0xc0U); // test al, al
+            e.jcc(4U, helper_exit);
+            if (op.kind == NativeOp::load_word) {
+                e.movR32M(kScratch, 4U, 0U);
+                storeGuest(e, cpu_offsets, op.rd, kScratch);
+            }
+        }
+        // Per-op architectural commit: no write-back of any unrelated state.
+        e.movRR(kScratch, kRetain);
+        e.aluRR(1U, kScratch, kNzcv);
+        e.movM32R(kCpu, cpu_offsets.xpsr, kScratch);
+        e.movM32Imm(kCpu, cpu_offsets.r + 60U, op.pc + op.size);
+        e.movM32Imm(kCpu, cpu_offsets.addr, op.pc);
+        e.movR64M(kScratch, kCtx, kCycles);
+        e.movR32M(kAddr, kCosts, static_cast<std::uint32_t>(i * sizeof(std::uint32_t)));
+        e.addR64R64(kScratch, kAddr);
+        e.movM64R(kCtx, kCycles, kScratch);
+        e.movM32Imm(kCtx, kRetired, static_cast<std::uint32_t>(i + 1U));
+    }
+    e.jmp(finish);
+    const auto emitExit = [&](std::size_t label, NativeExitReason reason) {
+        e.bindLabel(label);
+        e.movM32Imm(kCtx, kReason, static_cast<std::uint32_t>(reason));
+        if (reason == NativeExitReason::helper_declined
+            || reason == NativeExitReason::unsupported_instruction) {
+            e.movR32M(kScratch, kCtx, kCurrent);
+            e.movM32R(kCtx, kFailing, kScratch);
+        }
+        e.jmp(finish);
+    };
+    emitExit(instruction_exit, NativeExitReason::instruction_limit);
+    emitExit(cycle_exit, NativeExitReason::cycle_limit);
+    emitExit(helper_exit, NativeExitReason::helper_declined);
+    emitExit(unsupported_exit, NativeExitReason::unsupported_instruction);
+    e.bindLabel(finish);
+    e.addRsp16(); e.popReg(15U); e.popReg(14U); e.popReg(13U); e.popReg(12U); e.popReg(3U); e.ret();
+    if (!e.patchBranches(error)) { impl_->native_cache.pop_back(); return nullptr; }
+    code = std::move(e.code);
+#elif defined(FIL_MICRO_JIT_AARCH64)
+    const auto block_ptr = reinterpret_cast<std::uintptr_t>(&entry.block);
+    const auto runner_ptr = reinterpret_cast<std::uintptr_t>(&executeNativeBlock);
+    const std::uint32_t words[] = {0x58000081U, 0x580000B0U, 0xD61F0200U};
+    code.resize(32U, 0U);
+    std::memcpy(code.data(), words, sizeof(words));
+    std::memcpy(code.data() + 16U, &block_ptr, sizeof(block_ptr));
+    std::memcpy(code.data() + 24U, &runner_ptr, sizeof(runner_ptr));
+#else
+    error = "native-jit: host ABI unsupported";
+    impl_->native_cache.pop_back();
+    return nullptr;
+#endif
+    if (!impl_->makeWritable(error)) {
+        impl_->native_cache.pop_back();
+        return nullptr;
+    }
+    std::size_t bytes = 0U;
+    void* slot = impl_->append(code.data(), code.size(), error, bytes);
+    if (slot == nullptr || !impl_->seal(slot, bytes, error)) {
+        impl_->native_cache.pop_back();
+        return nullptr;
+    }
+    std::memcpy(&entry.function, &slot, sizeof(entry.function));
+    ++compilations_;
+    bytes_emitted_ += bytes;
+    return entry.function;
+#else
+    (void)block;
+    error = "native-jit unsupported on this host";
     return nullptr;
 #endif
 }

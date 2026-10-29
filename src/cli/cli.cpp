@@ -629,6 +629,10 @@ void printJitStats(std::ostream& out, const cpu::CortexM4& cpu, const std::strin
         << " micro_executions=" << stats.micro_executions
         << " micro_instructions=" << stats.micro_instructions
         << " micro_failures=" << stats.micro_compilation_failures
+        << " native_compilations=" << stats.native_compilations
+        << " native_executions=" << stats.native_executions
+        << " native_instructions=" << stats.native_instructions
+        << " native_declines=" << stats.native_declines
         << " micro_compile_cost_ns=" << stats.micro_compile_cost_ns
         << " micro_admitted=" << stats.micro_admitted
         << " micro_rejected=" << stats.micro_rejected

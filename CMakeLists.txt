@@ -153,7 +153,9 @@ add_library(fil_core STATIC
     src/cpu/execute.cpp
     src/cpu/jit.cpp
     src/cpu/micro_jit.cpp
+    src/cpu/native_execution.cpp
     src/cpu/micro_jit_ir.cpp
+    src/cpu/native_ir.cpp
     src/cortexm/exceptions.cpp
     src/cortexm/system_control.cpp
     src/devices/can_bus.cpp

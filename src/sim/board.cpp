@@ -767,13 +767,14 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
     // the complete period has changed since its last successful validation.
     if (idempotent_period_cache_) {
         const auto& cert = *idempotent_period_cache_;
-        bool valid = cert.count != 0U
+        const bool compatible = cert.count != 0U
             && restoration_generation == cert.restoration_generation
             && restoration_generation == period_validation_restoration_generation_
             && memory_.ramInputsCompatibleSince(period_validation_checkpoint_, cert.full_footprint)
             && prefix.execution_generation == cert.execution_generation
             && frequency == cert.clock_hz
             && prefix.flash_generation == cert.flash_acr_generation;
+        bool valid = compatible;
         std::size_t phase = 0U;
         if (valid) {
             valid = false;
@@ -787,7 +788,10 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
             }
         }
         if (!valid) {
-            idempotent_period_cache_.reset();
+            // A different CPU phase is a lookup miss, not invalidation. Keep
+            // the immutable certificate through temporary excursions; its
+            // inputs and generation guards must still pass on every lookup.
+            if (!compatible) idempotent_period_cache_.reset();
         } else {
             const bool compressed = frequency <= nanoseconds_per_second;
             std::size_t admission_limit = std::min<std::size_t>(limit,

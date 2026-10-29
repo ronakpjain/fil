@@ -416,8 +416,18 @@ public:
         std::uint64_t micro_admitted{0};
         std::uint64_t micro_rejected{0};
         std::uint64_t micro_admission_cost_ns{0};
+        std::uint64_t native_compilations{0};
+        std::uint64_t native_executions{0};
+        std::uint64_t native_instructions{0};
+        std::uint64_t native_declines{0};
     };
     [[nodiscard]] JitStats jitStats() const noexcept { return jit_stats_; }
+
+    /** Mixed native reversible execution can be disabled for differential validation. */
+    void setNativeMemoryJitEnabled(bool enabled) noexcept { native_memory_jit_enabled_ = enabled; }
+    [[nodiscard]] std::uint64_t nativeMemoryInstructions() const noexcept {
+        return jit_stats_.native_instructions;
+    }
     /**
      * @brief Provides FPCCR (ASPEN) reads for automatic CONTROL.FPCA maintenance.
      * May remain unset (unit tests); FP ownership tracking then assumes ASPEN.
@@ -528,6 +538,8 @@ private:
         bool attempted{false};
         /// Bespoke stencil kernel for the leading FilIR prefix (count in
         /// micro_prefix_count); the suffix keeps existing handlers.
+        NativeFunction native_function{nullptr};
+        std::uint8_t native_prefix_count{0U};
         MicroFunction micro_function{nullptr};
         std::uint8_t micro_prefix_count{0U};
         bool micro_attempted{false};
@@ -578,6 +590,7 @@ private:
     std::unique_ptr<std::array<JitBlockEntry, jit_block_entries>> jit_blocks_;
     std::array<std::uint16_t, jit_block_entries> jit_hot_{};
     JitStats jit_stats_{};
+    bool native_memory_jit_enabled_{true};
     static constexpr std::uint16_t jit_compile_threshold = 50U;
     std::unique_ptr<MicroJit> micro_jit_;
     std::string micro_jit_error_;
@@ -585,6 +598,7 @@ private:
     std::unordered_map<MicroFunction, bool> micro_admission_cache_;
     [[nodiscard]] bool ensureMicroJit();
     void prepareMicroBlock(JitBlockEntry& entry);
+    void prepareNativeBlock(JitBlockEntry& entry);
     [[nodiscard]] bool admitMicroBlock(const JitBlockEntry& entry,
         MicroFunction function, std::uint8_t prefix);
     // Total cycle overcharge when failed conditional branches in a retired

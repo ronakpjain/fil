@@ -290,6 +290,25 @@ TEST(BoardTest, IdempotentPeriodCacheReusesNonzeroPeriodPhase) {
                                        exact.value()->cpu().state()));
 }
 
+TEST(BoardTest, CachedPeriodSurvivesTemporaryCpuPhaseMiss) {
+    auto loaded = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(loaded);
+    auto& board = *loaded.value();
+    ASSERT_TRUE(warmIdempotentPeriodCache(board));
+    const auto entry = board.cpu().state();
+    board.cpu().state().r[0] ^= 0x12345678U;
+    const auto excursion = board.prepareReversibleRamPrefix(2U);
+    ASSERT_TRUE(excursion);
+    EXPECT_EQ(excursion->memoized_count, 0U);
+    static_cast<void>(board.materializeReversibleRamPrefix(*excursion, excursion->count));
+    board.cpu().state() = entry;
+    const auto returned = board.prepareReversibleRamPrefix(12U);
+    ASSERT_TRUE(returned);
+    EXPECT_EQ(returned->memoized_count, 12U)
+        << "a state-only miss must not discard a still-valid immutable certificate";
+    static_cast<void>(board.materializeReversibleRamPrefix(*returned, returned->count));
+}
+
 TEST(BoardTest, CachedPeriodCutsDoNotUseSpeculativeRollbackSnapshot) {
     for (const std::size_t cut : {1U, 5U, 12U}) {
         auto exact = fil::sim::Board::load(fixtureBoard());

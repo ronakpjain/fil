@@ -35,12 +35,16 @@ namespace fil::cpu {
 
 struct CpuState;
 struct MicroBlock;
+struct NativeBlock;
+struct NativeExecutionContext;
 
 /** Block kernel with scheduler prefix limits: executes while data and
  *  the limit allow. Returns retired count in the low 32 bits and a
  *  failed-conditional-branch mask (bit i = op i was b_cond with a failed
  *  condition, charged 1 cycle rather than its base cost) in the high 32. */
 using MicroFunction = std::uint64_t (*)(CpuState*, std::size_t);
+/** Native reversible stencil: commits a precise prefix and publishes exit state. */
+using NativeFunction = void (*)(NativeExecutionContext*);
 
 /** Paired host timings for kernel admission. Require a 10% median saving and
  *  wins in at least four of five alternating-order samples; ties decline. */
@@ -61,6 +65,9 @@ public:
 
     /** Compiles a block; returns nullptr (with error set) on decline/failure. */
     [[nodiscard]] MicroFunction compile(const MicroBlock& block, std::string& error);
+
+    /** Compiles straight-line integer/word-memory ops; branches decline. */
+    [[nodiscard]] NativeFunction compileNative(const NativeBlock& block, std::string& error);
 
     [[nodiscard]] std::uint64_t compilations() const noexcept { return compilations_; }
     [[nodiscard]] std::uint64_t bytesEmitted() const noexcept { return bytes_emitted_; }
