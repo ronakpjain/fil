@@ -1114,7 +1114,7 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
     // The same path also makes every chained block cut replayable.
     if (speculative.count != prefix.count || boundary_cut) {
         restore_entry();
-        ReversibleRamPrefix::ReversibleExecution replayed{};
+        ReversibleRamPrefix::ReversibleExecution replayed;
         ReversibleMemoryGuard guard(memory_);
         while (replayed.count < prefix.count) {
             const std::size_t request = std::min<std::size_t>(
@@ -1360,7 +1360,7 @@ Board::ConcurrentStepResult Board::materializeReversibleRamPrefix(
     }
     prefix.entry_state.restore(cpu_->state());
     memory_.restoreReadFootprint(prefix.entry_read_footprint);
-    ReversibleRamPrefix::ReversibleExecution replayed{};
+    ReversibleRamPrefix::ReversibleExecution replayed;
     {
         ReversibleMemoryGuard guard(memory_);
         while (replayed.count < count) {

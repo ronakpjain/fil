@@ -146,9 +146,12 @@ public:
         static constexpr std::size_t max_instructions = 64U;
         struct ReversibleExecution {
             cpu::FastStepResult result{};
-            std::array<std::uint32_t, max_instructions> pcs{};
-            std::array<std::uint8_t, max_instructions> sizes{};
-            std::array<std::uint16_t, max_instructions> instruction_cycles{};
+            // Metadata is live only in [0, count); admission and replay fill
+            // each live entry before publishing it. Avoid clearing the unused
+            // suffix for every speculative capsule and replay.
+            std::array<std::uint32_t, max_instructions> pcs;
+            std::array<std::uint8_t, max_instructions> sizes;
+            std::array<std::uint16_t, max_instructions> instruction_cycles;
             std::uint8_t count{0U};
         };
         // FP instructions are excluded from the capsule, so copying the FP
@@ -198,7 +201,7 @@ public:
         mem::MemoryBus::SideEffectCheckpoint memory_checkpoint{};
         mem::MemoryBus::SideEffectCheckpoint evaluated_checkpoint{};
         mem::MemoryBus::ReadFootprint entry_read_footprint{};
-        ReversibleExecution evaluated{};
+        ReversibleExecution evaluated;
         std::uint8_t folded_instructions{0U};
         bool entry_have_fetch{false};
         std::uint32_t entry_fetch_end{0};
