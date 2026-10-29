@@ -1011,6 +1011,13 @@ bool MemoryBus::ramInputsCompatibleSince(
          sequence <= mutation_sequence_; ++sequence) {
         const BackedMutation& first = mutation_journal_[(sequence - 1U) % mutation_journal_capacity];
         if (first.sequence != sequence) return false;
+        const Region* const region = find(first.address);
+        if (region == nullptr || region->info.kind == RegionKind::mmio
+            || region->info.kind == RegionKind::alias) return false;
+        // Journal identity and backing are still checked for every mutation.
+        // Only footprint candidates need earliest-old-value reconstruction;
+        // unrelated bytes cannot affect this immutable certificate.
+        if (!footprintContains(footprint, first.address)) continue;
         bool first_for_address = true;
         for (std::uint64_t prior = checkpoint.mutation_sequence + 1U;
              prior < sequence; ++prior) {
@@ -1023,12 +1030,8 @@ bool MemoryBus::ramInputsCompatibleSince(
         }
         if (!first_for_address) continue;
 
-        const Region* const region = find(first.address);
-        if (region == nullptr || region->info.kind == RegionKind::mmio
-            || region->info.kind == RegionKind::alias) return false;
         const std::size_t offset = first.address - region->info.base;
-        if (region->bytes[offset] != first.old_value
-            && footprintContains(footprint, first.address)) return false;
+        if (region->bytes[offset] != first.old_value) return false;
     }
     return true;
 }
