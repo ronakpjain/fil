@@ -13,6 +13,21 @@ namespace {
 
 constexpr std::uint32_t maximum_alias_depth = 8;
 
+constexpr std::uint32_t mixFootprintWord(std::uint32_t value) noexcept {
+    value ^= value >> 16U;
+    value *= 0x7feb352dU;
+    value ^= value >> 15U;
+    value *= 0x846ca68bU;
+    value ^= value >> 16U;
+    return value;
+}
+
+constexpr std::array<std::uint8_t, 2> footprintBitIndices(const std::uint32_t address) noexcept {
+    const std::uint32_t word = address >> 2U;
+    return {static_cast<std::uint8_t>(mixFootprintWord(word) & 0xffU),
+        static_cast<std::uint8_t>(mixFootprintWord(word ^ 0x9e3779b9U) & 0xffU)};
+}
+
 /** @brief Checks a nonempty target range without 32-bit wraparound. */
 bool validRange(const std::uint32_t base, const std::uint32_t size) {
     return size != 0 && base <= std::numeric_limits<std::uint32_t>::max() - (size - 1U);
@@ -837,12 +852,8 @@ bool MemoryBus::isMmioDeviceRange(
 void MemoryBus::addReadFootprint(
     ReadFootprint& footprint, const std::uint32_t address
 ) noexcept {
-    const std::uint32_t word = address >> 2U;
-    const std::uint32_t first = word * 0x9e3779b1U;
-    const std::uint32_t second = (word ^ (word >> 16U)) * 0x85ebca6bU;
-    constexpr std::size_t bit_count = ReadFootprint::word_count * 64U;
-    for (const std::uint32_t mixed : {first, second}) {
-        const std::size_t bit = mixed & (bit_count - 1U);
+    static_assert(ReadFootprint::word_count * 64U == 256U);
+    for (const std::size_t bit : footprintBitIndices(address)) {
         footprint.words[bit >> 6U] |= std::uint64_t{1U} << (bit & 63U);
     }
 }
@@ -879,12 +890,8 @@ void MemoryBus::addStoreFootprint(
 bool MemoryBus::footprintContains(
     const ReadFootprint& footprint, const std::uint32_t address
 ) noexcept {
-    const std::uint32_t word = address >> 2U;
-    const std::uint32_t first = word * 0x9e3779b1U;
-    const std::uint32_t second = (word ^ (word >> 16U)) * 0x85ebca6bU;
-    constexpr std::size_t bit_count = ReadFootprint::word_count * 64U;
-    for (const std::uint32_t mixed : {first, second}) {
-        const std::size_t bit = mixed & (bit_count - 1U);
+    static_assert(ReadFootprint::word_count * 64U == 256U);
+    for (const std::size_t bit : footprintBitIndices(address)) {
         if ((footprint.words[bit >> 6U] & (std::uint64_t{1U} << (bit & 63U))) == 0U) {
             return false;
         }
@@ -987,11 +994,43 @@ bool MemoryBus::sideEffectsCompatibleSince(
 bool MemoryBus::ramInputsCompatibleSince(
     SideEffectCheckpoint checkpoint, const ReadFootprint& footprint
 ) const {
-    // This deliberately ignores MMIO changes only; callers must restrict it
-    // to previously certified MMIO-free idempotent spans, never transactions.
-    if (!footprint.complete || !read_footprint_tracking_ || !write_journal_tracking_) return false;
-    checkpoint.mmio_generation = mmio_generation_;
-    return sideEffectsCompatibleSince(checkpoint, footprint);
+    // Certificates describe a complete read union store footprint for a
+    // per-instruction RAM-neutral period. Writes outside that set cannot affect
+    // replay; inside-footprint bytes must still equal their earliest old value.
+    // This specialized predicate intentionally ignores only MMIO generations;
+    // transaction validation remains strict in sideEffectsCompatibleSince().
+    if (checkpoint.journal_generation != journal_generation_
+        || !footprint.complete || !read_footprint_tracking_ || !write_journal_tracking_
+        || checkpoint.mutation_sequence > mutation_sequence_
+        || mutation_sequence_ - checkpoint.mutation_sequence > mutation_journal_capacity) {
+        return false;
+    }
+    if (checkpoint.mutation_sequence == mutation_sequence_) return true;
+
+    for (std::uint64_t sequence = checkpoint.mutation_sequence + 1U;
+         sequence <= mutation_sequence_; ++sequence) {
+        const BackedMutation& first = mutation_journal_[(sequence - 1U) % mutation_journal_capacity];
+        if (first.sequence != sequence) return false;
+        bool first_for_address = true;
+        for (std::uint64_t prior = checkpoint.mutation_sequence + 1U;
+             prior < sequence; ++prior) {
+            const BackedMutation& previous = mutation_journal_[(prior - 1U) % mutation_journal_capacity];
+            if (previous.sequence != prior) return false;
+            if (previous.address == first.address) {
+                first_for_address = false;
+                break;
+            }
+        }
+        if (!first_for_address) continue;
+
+        const Region* const region = find(first.address);
+        if (region == nullptr || region->info.kind == RegionKind::mmio
+            || region->info.kind == RegionKind::alias) return false;
+        const std::size_t offset = first.address - region->info.base;
+        if (region->bytes[offset] != first.old_value
+            && footprintContains(footprint, first.address)) return false;
+    }
+    return true;
 }
 
 bool MemoryBus::canRestoreSideEffects(

@@ -916,8 +916,9 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
     const std::size_t first_slot = transition_bucket * transition_ways;
     for (std::size_t way = 0U; way < transition_ways; ++way) {
         const std::size_t slot = first_slot + way;
-        const auto cert = ram_neutral_transition_cache_[slot];
+        const auto& cert = ram_neutral_transition_cache_[slot];
         if (!cert || cert->count == 0U
+            || cert->entry.r[15] != prefix.entry_pc
             || !cert->entry.matches(cpu_->state())
             || cert->entry_have_fetch != prefix.entry_have_fetch
             || cert->entry_fetch_end != prefix.entry_fetch_end) continue;
@@ -1181,6 +1182,10 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
         bool valid = true;
         {
             ReversibleMemoryGuard guard(memory_);
+            // Skipped idempotent stores depend on their destination retaining
+            // its value, even when no load reads that address. Record store
+            // destinations along with reads before certifying each cut.
+            mem::MemoryBus::StoreFootprintScope store_footprints(memory_);
             for (std::size_t i = 0U; i < prefix.count; ++i) {
                 const auto step = cpu_->stepFast();
                 if (step.reason != cpu::StopReason::step_complete || step.instructions != 1U

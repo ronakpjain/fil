@@ -99,6 +99,59 @@ bool warmIdempotentPeriodCache(fil::sim::Board& board) {
     return true;
 }
 
+TEST(BoardTest, RamNeutralTransitionTracksUnreadIdempotentStoreDestinations) {
+    for (const bool cpu_origin : {false, true}) {
+        for (const std::size_t cut : {1U, 2U, 4U}) {
+            auto loaded = fil::sim::Board::load(fixtureBoard());
+            ASSERT_TRUE(loaded);
+            auto& board = *loaded.value();
+            const auto start = board.cpu().state().r[15];
+            constexpr std::uint32_t target = 0x20000080U;
+            constexpr std::uint32_t value = 0x12345678U;
+            ASSERT_TRUE(board.memory().write32(target, value));
+            const std::vector<std::uint8_t> code{
+                0x08U, 0x60U, // str r0, [r1] (destination never read)
+                0x01U, 0x32U, // adds r2, #1
+                0x00U, 0xbfU, 0x00U, 0xbfU,
+                0xfeU, 0xe7U};
+            ASSERT_TRUE(board.memory().loadBytes(start, code));
+            board.cpu().state().r[0] = value;
+            board.cpu().state().r[1] = target;
+            board.cpu().state().r[2] = 0U;
+            for (unsigned i = 0U; i < 64U; ++i)
+                static_cast<void>(board.cpu().prepareJitBlock(true));
+            const auto entry = board.cpu().state();
+            bool warmed = false;
+            for (unsigned i = 0U; i < 20U && !warmed; ++i) {
+                board.cpu().state() = entry;
+                const auto prefix = board.prepareReversibleRamPrefix(4U);
+                ASSERT_TRUE(prefix);
+                ASSERT_EQ(prefix->count, 4U);
+                warmed = prefix->transition_certificate != nullptr;
+                static_cast<void>(board.materializeReversibleRamPrefix(*prefix, 4U));
+            }
+            ASSERT_TRUE(warmed) << "fixture must build a transition, not a period";
+            board.cpu().state() = entry;
+            const auto hit = board.prepareReversibleRamPrefix(4U);
+            ASSERT_TRUE(hit && hit->transition_certificate);
+            ASSERT_EQ(hit->memoized_count, 4U);
+            static_cast<void>(board.materializeReversibleRamPrefix(*hit, 4U));
+            board.cpu().state() = entry;
+            const fil::mem::AccessContext context{fil::mem::AccessType::data_write,
+                cpu_origin ? start : 0U};
+            ASSERT_TRUE(board.memory().write32(target, 0x87654321U, context));
+            const auto changed = board.prepareReversibleRamPrefix(4U);
+            ASSERT_TRUE(changed);
+            EXPECT_EQ(changed->memoized_count, 0U)
+                << "store destination changes must invalidate skipped stores";
+            static_cast<void>(board.materializeReversibleRamPrefix(*changed, cut));
+            EXPECT_EQ(board.memory().read32(target).value(), value);
+            EXPECT_EQ(board.cpu().state().r[2], cut == 1U ? 0U : 1U);
+            EXPECT_EQ(board.cpu().state().r[15], start + 2U * cut);
+        }
+    }
+}
+
 bool installBranchingReversibleProgram(fil::sim::Board& board) {
     const std::uint32_t start = board.cpu().state().r[15];
     std::vector<std::uint8_t> code;

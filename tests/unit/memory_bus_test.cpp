@@ -271,7 +271,7 @@ TEST(MemoryBusTest, ValidatesRegionMaps) {
 TEST(MemoryBusTest, TracksReversibleLoopMemoryEffects) {
     fil::mem::MemoryBus bus;
     RecordingMmio device;
-    EXPECT_TRUE(bus.mapRam(0x20000000U, 16U, "ram").hasValue() &&
+    EXPECT_TRUE(bus.mapRam(0x20000000U, 0x1000U, "ram").hasValue() &&
                 bus.mapMmio(0x40000000U, 16U, device, "device").hasValue())
         << "maps checkpoint test regions";
 
@@ -306,6 +306,11 @@ TEST(MemoryBusTest, TracksReversibleLoopMemoryEffects) {
     ));
     EXPECT_TRUE(bus.sideEffectsCompatibleSince(external_checkpoint, footprint))
         << "ignores external writes outside a proven loop read footprint";
+    static_cast<void>(bus.write8(
+        0x20000400U, 0x55U, {fil::mem::AccessType::data_write, 0U}
+    ));
+    EXPECT_TRUE(bus.sideEffectsCompatibleSince(external_checkpoint, footprint))
+        << "a write 1 KiB from a read must not alias both Bloom footprint bits";
     static_cast<void>(bus.write8(
         0x20000000U, 0x44U, {fil::mem::AccessType::data_write, 0U}
     ));
@@ -633,6 +638,97 @@ TEST(MemoryBusTest, RamInputCompatibilityIsScopedAndDoesNotRelaxTransactionCheck
     EXPECT_FALSE(bus.sideEffectsCompatibleSince(mmio_checkpoint, footprint));
     EXPECT_FALSE(bus.sideEffectsRestoredSince(mmio_checkpoint));
     EXPECT_FALSE(bus.canRestoreSideEffects(mmio_checkpoint));
+}
+
+TEST(MemoryBusTest, RamInputCompatibilityUsesCompleteReadStoreUnionForAllOrigins) {
+    using fil::mem::AccessContext;
+    using fil::mem::AccessType;
+    using fil::mem::MemoryBus;
+    constexpr std::uint32_t base = 0x20000000U;
+    const AccessContext cpu_store{AccessType::data_write, 0x08000100U};
+    const AccessContext external_store{AccessType::data_write, 0U};
+
+    MemoryBus bus;
+    ASSERT_TRUE(bus.mapRam(base, 0x100U, "ram").hasValue());
+    MemoryBus::ReadFootprint footprint;
+    {
+        MemoryBus::StoreFootprintScope stores(bus);
+        ASSERT_TRUE(bus.read32(base, {AccessType::data_read, 0x08000100U}));
+        ASSERT_TRUE(bus.write8(base + 4U, 0U, cpu_store));
+        footprint = bus.takeReadFootprint();
+    }
+    ASSERT_TRUE(footprint.complete);
+
+    auto checkpoint = bus.sideEffectCheckpoint();
+    ASSERT_TRUE(bus.write8(base + 0x20U, 1U, cpu_store));
+    EXPECT_TRUE(bus.ramInputsCompatibleSince(checkpoint, footprint))
+        << "CPU writes outside the complete input/output footprint are irrelevant";
+    EXPECT_FALSE(bus.sideEffectsCompatibleSince(checkpoint, footprint))
+        << "transaction validation remains strict for CPU writes outside the footprint";
+
+    checkpoint = bus.sideEffectCheckpoint();
+    ASSERT_TRUE(bus.write8(base + 0x24U, 1U, external_store));
+    EXPECT_TRUE(bus.ramInputsCompatibleSince(checkpoint, footprint));
+
+    checkpoint = bus.sideEffectCheckpoint();
+    ASSERT_TRUE(bus.write8(base + 0x28U, 1U, cpu_store));
+    ASSERT_TRUE(bus.write8(base + 0x2cU, 1U, external_store));
+    EXPECT_TRUE(bus.ramInputsCompatibleSince(checkpoint, footprint))
+        << "mixed-origin mutations outside the footprint remain compatible";
+
+    checkpoint = bus.sideEffectCheckpoint();
+    ASSERT_TRUE(bus.write8(base, 1U, cpu_store));
+    ASSERT_TRUE(bus.write8(base, 0U, external_store));
+    EXPECT_TRUE(bus.ramInputsCompatibleSince(checkpoint, footprint))
+        << "net-restored in-footprint bytes compare against their earliest old value";
+
+    checkpoint = bus.sideEffectCheckpoint();
+    ASSERT_TRUE(bus.write8(base, 1U, cpu_store));
+    EXPECT_FALSE(bus.ramInputsCompatibleSince(checkpoint, footprint))
+        << "CPU writes changing a read byte invalidate a certificate";
+
+    checkpoint = bus.sideEffectCheckpoint();
+    ASSERT_TRUE(bus.write8(base + 4U, 1U, external_store));
+    EXPECT_FALSE(bus.ramInputsCompatibleSince(checkpoint, footprint))
+        << "the store-footprint union invalidates a changed output byte";
+
+    checkpoint = bus.sideEffectCheckpoint();
+    ASSERT_TRUE(bus.write8(base + 0x30U, 1U, cpu_store));
+    EXPECT_FALSE(bus.sideEffectsCompatibleSince(checkpoint, footprint))
+        << "specialized certificate validation does not relax transaction checks";
+
+    auto future_checkpoint = bus.sideEffectCheckpoint();
+    ++future_checkpoint.mutation_sequence;
+    EXPECT_FALSE(bus.ramInputsCompatibleSince(future_checkpoint, footprint));
+    auto incomplete = footprint;
+    incomplete.complete = false;
+    EXPECT_FALSE(bus.ramInputsCompatibleSince(bus.sideEffectCheckpoint(), incomplete));
+
+    MemoryBus disabled;
+    ASSERT_TRUE(disabled.mapRam(base, 16U, "ram").hasValue());
+    disabled.setReadFootprintTracking(false);
+    EXPECT_FALSE(disabled.ramInputsCompatibleSince(
+        disabled.sideEffectCheckpoint(), MemoryBus::ReadFootprint{}));
+
+    MemoryBus generation_changed;
+    ASSERT_TRUE(generation_changed.mapRam(base, 16U, "ram").hasValue());
+    const auto generation_checkpoint = generation_changed.sideEffectCheckpoint();
+    generation_changed.setWriteJournalTracking(false);
+    generation_changed.setWriteJournalTracking(true);
+    EXPECT_FALSE(generation_changed.ramInputsCompatibleSince(
+        generation_checkpoint, MemoryBus::ReadFootprint{}));
+
+    MemoryBus expired;
+    ASSERT_TRUE(expired.mapRam(base, 16U, "ram").hasValue());
+    auto expired_footprint = MemoryBus::ReadFootprint{};
+    ASSERT_TRUE(expired.read8(base, {AccessType::data_read, 0x08000100U}));
+    expired_footprint = expired.takeReadFootprint();
+    const auto old_checkpoint = expired.sideEffectCheckpoint();
+    for (std::size_t i = 0U; i < 8193U; ++i) {
+        ASSERT_TRUE(expired.write8(base + 8U, static_cast<std::uint8_t>((i & 1U) + 1U)));
+    }
+    EXPECT_FALSE(expired.ramInputsCompatibleSince(old_checkpoint, expired_footprint))
+        << "expired journal history fails closed even for outside-footprint writes";
 }
 
 TEST(MemoryBusTest, RestoreAdvancesMonotonicGeneration) {

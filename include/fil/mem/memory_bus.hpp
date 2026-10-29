@@ -437,12 +437,15 @@ public:
     ) const;
 
     /**
-     * @brief Checks RAM inputs with journal/read-footprint rules but ignores MMIO epoch changes.
+     * @brief Checks RAM inputs for a certified per-instruction RAM-neutral period.
      *
-     * Use ONLY for previously certified MMIO-free idempotent spans. This is
-     * not a transaction-validity or rollback predicate. The caller MUST capture
-     * restorationGeneration() with the checkpoint and require it to match before
-     * reuse: journal sequence numbers can repeat after a transactional rewind.
+     * The supplied footprint must be complete and cover the union of every RAM
+     * read and store performed by the certificate. Changed journaled bytes
+     * outside that set are compatible regardless of write origin; changed
+     * bytes inside it invalidate reuse. MMIO generations are ignored only here.
+     * This is not a transaction-validity or rollback predicate. The caller MUST
+     * capture restorationGeneration() with the checkpoint and require it to
+     * match before reuse: journal sequence numbers can repeat after a rewind.
      */
     [[nodiscard]] bool ramInputsCompatibleSince(
         SideEffectCheckpoint checkpoint, const ReadFootprint& footprint
