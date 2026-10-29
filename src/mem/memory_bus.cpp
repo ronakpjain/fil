@@ -13,19 +13,15 @@ namespace {
 
 constexpr std::uint32_t maximum_alias_depth = 8;
 
-constexpr std::uint32_t mixFootprintWord(std::uint32_t value) noexcept {
-    value ^= value >> 16U;
-    value *= 0x7feb352dU;
-    value ^= value >> 15U;
-    value *= 0x846ca68bU;
-    value ^= value >> 16U;
-    return value;
-}
-
 constexpr std::array<std::uint8_t, 2> footprintBitIndices(const std::uint32_t address) noexcept {
     const std::uint32_t word = address >> 2U;
-    return {static_cast<std::uint8_t>(mixFootprintWord(word) & 0xffU),
-        static_cast<std::uint8_t>(mixFootprintWord(word ^ 0x9e3779b9U) & 0xffU)};
+    // Multiplicative hashing uses the high bits: selecting low bits creates
+    // deterministic aliases for every 1 KiB of SRAM. Keep collection cheap
+    // enough for every guest memory access, rather than fully avalanching twice.
+    const auto first = word * 0x9e3779b1U;
+    const auto second = (word ^ (word >> 16U)) * 0x85ebca6bU;
+    return {static_cast<std::uint8_t>(first >> 24U),
+        static_cast<std::uint8_t>(second >> 24U)};
 }
 
 /** @brief Checks a nonempty target range without 32-bit wraparound. */
