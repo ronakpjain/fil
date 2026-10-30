@@ -690,6 +690,8 @@ private:
     [[nodiscard]] bool lazyConversionEligible() const noexcept;
     void startConversion();
     void completeConversion();
+    static void conversionEventThunk(void* context);
+    static void skippedScanEventThunk(void* context);
     /** @brief Landing handler for a jumped gap of count skipped scans. */
     void completeSkippedScans(std::uint32_t skipped);
     /** @brief Arms the next scan after a boundary, jumping skipped scans. */

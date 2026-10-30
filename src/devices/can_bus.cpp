@@ -295,6 +295,18 @@ std::vector<bool> arbitrationKey(const CanFrame& frame) {
 }
 } // namespace
 
+void VirtualCanBus::arbitrationEvent(void* context) {
+    auto* bus = static_cast<VirtualCanBus*>(context);
+    bus->timed_event_id_ = 0U;
+    bus->arbitrate();
+}
+
+void VirtualCanBus::completionEvent(void* context) {
+    auto* bus = static_cast<VirtualCanBus*>(context);
+    bus->timed_event_id_ = 0U;
+    bus->completeInFlight();
+}
+
 void VirtualCanBus::scheduleArbitration() {
     if (mode_ != DeliveryMode::timed || in_flight_ || pending_.empty()
         || event_loop_ == nullptr || timed_event_id_ != 0U) return;
@@ -312,10 +324,8 @@ void VirtualCanBus::scheduleArbitration() {
     }
     const std::uint64_t at = std::max({next_start_ns_, earliest, event_loop_->now()});
     auto owner = event_loop_->useOwner(sim::shared_event_owner);
-    timed_event_id_ = event_loop_->scheduleAt(at, [this] {
-        timed_event_id_ = 0U;
-        arbitrate();
-    });
+    timed_event_id_ = event_loop_->scheduleBuiltinAt(
+        at, {&VirtualCanBus::arbitrationEvent, this});
 }
 
 void VirtualCanBus::arbitrate() {
@@ -377,8 +387,8 @@ void VirtualCanBus::arbitrate() {
     // cancel this sender and schedule a different arbitration event. Nothing
     // after the trace may overwrite that replacement event.
     auto owner = event_loop_->useOwner(sim::shared_event_owner);
-    timed_event_id_ = event_loop_->scheduleAt(start + frame_duration,
-                                               [this] { completeInFlight(); });
+    timed_event_id_ = event_loop_->scheduleBuiltinAt(
+        start + frame_duration, {&VirtualCanBus::completionEvent, this});
     trace(CanTraceRecord::Direction::transmit, start, in_flight_->sender_name, in_flight_->frame);
 }
 

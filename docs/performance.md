@@ -32,7 +32,11 @@ the slot identity; a monotonically increasing event id validates the slot, so a
 reused slot cannot resurrect a cancelled predecessor. Scheduling, cancellation,
 and same-time reentry keep the reference order: timestamp first, then insertion
 sequence. The slot vector only grows to the maximum number of simultaneously
-pending events.
+pending events. Recurring device events (FDCAN arbitration/completion and ADC
+conversion/skipped-scan landing) use allocation-free built-in callbacks: the
+slot stores a function pointer and device context instead of constructing a
+`std::function`, and a scheduled-handle trampoline retires the handle identity
+before the device callback runs.
 
 ## Execution optimizations
 

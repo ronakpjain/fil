@@ -26,6 +26,19 @@ using EventId = std::uint64_t;
 /** @brief Callback executed by the deterministic event loop. */
 using EventCallback = std::function<void()>;
 
+/**
+ * @brief Allocation-free built-in callback for a known device slot.
+ *
+ * `context` must outlive the scheduled event. Built-ins are dispatched directly
+ * through `invoke`; no `std::function` object is constructed for them.
+ */
+struct BuiltinEvent {
+    void (*invoke)(void* context){nullptr};
+    void* context{nullptr};
+
+    [[nodiscard]] explicit operator bool() const noexcept { return invoke != nullptr; }
+};
+
 /** @brief Board lane responsible for an event, or the shared simulation domain. */
 using EventOwner = std::uint32_t;
 
@@ -120,6 +133,12 @@ public:
     /** @brief Schedules a callback at an absolute time no earlier than now. */
     [[nodiscard]] EventId scheduleAt(SimTimeNs at, EventCallback callback);
 
+    /** @brief Schedules an allocation-free built-in callback relative to now. */
+    [[nodiscard]] EventId scheduleBuiltinAfter(SimTimeNs delta, BuiltinEvent event);
+
+    /** @brief Schedules an allocation-free built-in callback at an absolute time. */
+    [[nodiscard]] EventId scheduleBuiltinAt(SimTimeNs at, BuiltinEvent event);
+
     /** @brief Cancels an event if it is still pending. */
     [[nodiscard]] bool cancel(EventId id) noexcept;
 
@@ -172,6 +191,9 @@ private:
     [[nodiscard]] EventId scheduleOwnerLocalAt(
         SimTimeNs at, EventCallback callback, std::function<bool()> locality_guard
     );
+    [[nodiscard]] EventId scheduleOwnerLocalBuiltinAt(
+        SimTimeNs at, BuiltinEvent event, std::function<bool()> locality_guard
+    );
 
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -195,6 +217,10 @@ public:
 
     [[nodiscard]] EventId scheduleAfter(SimTimeNs delta, EventCallback callback);
     [[nodiscard]] EventId scheduleAt(SimTimeNs at, EventCallback callback);
+    [[nodiscard]] EventId scheduleBuiltinAfter(SimTimeNs delta, BuiltinEvent event);
+    [[nodiscard]] EventId scheduleBuiltinAt(SimTimeNs at, BuiltinEvent event);
+    /** @brief Clears the pending identity before a built-in callback runs. */
+    void retireInvocation() noexcept { id_ = 0U; }
     void cancel() noexcept;
 
     [[nodiscard]] bool pending() const noexcept { return id_ != 0U; }
@@ -206,10 +232,19 @@ private:
     [[nodiscard]] EventId scheduleOwnerLocalAt(
         SimTimeNs at, EventCallback callback, std::function<bool()> locality_guard
     );
+    [[nodiscard]] EventId scheduleOwnerLocalBuiltinAt(
+        SimTimeNs at, BuiltinEvent event, std::function<bool()> locality_guard
+    );
     [[nodiscard]] EventCallback retireBefore(EventCallback callback);
 
     EventLoop* loop_{nullptr};
     EventId id_{0};
+    struct BuiltinBinding {
+        ScheduledEvent* handle{nullptr};
+        BuiltinEvent event{};
+    };
+    BuiltinBinding builtin_binding_{};
+    static void builtinTrampoline(void* context);
 };
 
 } // namespace fil::sim

@@ -203,6 +203,51 @@ TEST(EventLoopTest, AdvanceByCallbackCanScheduleZeroDelayEvents) {
     EXPECT_EQ(loop.now(), 4U);
 }
 
+struct BuiltinProbe {
+    int calls{0};
+    int tag{0};
+    std::vector<int>* order{nullptr};
+};
+
+void builtinProbe(void* context) {
+    auto* probe = static_cast<BuiltinProbe*>(context);
+    ++probe->calls;
+    probe->order->push_back(probe->tag);
+}
+
+TEST(EventLoopTest, BuiltinCallbacksDispatchDirectlyAndKeepReferenceOrder) {
+    fil::sim::EventLoop loop;
+    std::vector<int> order;
+    BuiltinProbe first{0, 1, &order};
+    BuiltinProbe second{0, 2, &order};
+    static_cast<void>(loop.scheduleBuiltinAt(4U, {&builtinProbe, &first}));
+    static_cast<void>(loop.scheduleAt(4U, [&] { order.push_back(3); }));
+    static_cast<void>(loop.scheduleBuiltinAt(4U, {&builtinProbe, &second}));
+    const auto result = loop.runDueEvents(4U);
+    EXPECT_EQ(result.events_executed, 3U);
+    EXPECT_EQ(order, (std::vector<int>{1, 3, 2}));
+    EXPECT_EQ(first.calls, 1);
+    EXPECT_EQ(second.calls, 1);
+    EXPECT_EQ(loop.pending(), 0U);
+}
+
+TEST(EventLoopTest, ScheduledBuiltinReplacementRetiresIdentityBeforeCallback) {
+    fil::sim::EventLoop loop;
+    std::vector<int> order;
+    BuiltinProbe first{0, 1, &order};
+    BuiltinProbe second{0, 2, &order};
+    fil::sim::ScheduledEvent handle(&loop);
+    static_cast<void>(handle.scheduleBuiltinAt(9U, {&builtinProbe, &first}));
+    EXPECT_TRUE(handle.pending());
+    static_cast<void>(handle.scheduleBuiltinAt(9U, {&builtinProbe, &second}));
+    EXPECT_TRUE(handle.pending());
+    static_cast<void>(loop.runDueEvents(9U));
+    EXPECT_EQ(order, (std::vector<int>{2}));
+    EXPECT_EQ(first.calls, 0);
+    EXPECT_EQ(second.calls, 1);
+    EXPECT_FALSE(handle.pending());
+}
+
 TEST(EventLoopTest, CancelledSlotsAreReusedWithoutResurrectingOldEvents) {
     fil::sim::EventLoop loop;
     std::vector<int> order;

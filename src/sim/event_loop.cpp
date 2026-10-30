@@ -26,6 +26,7 @@ struct EventLoop::Impl {
         std::uint64_t sequence{0};
         EventOwner owner{shared_event_owner};
         EventCallback callback;
+        BuiltinEvent builtin{};
         std::function<bool()> locality_guard;
         bool globally_observed{true};
         bool live{false};
@@ -142,6 +143,7 @@ struct EventLoop::Impl {
         Slot& slot = slots[index];
         slot.live = false;
         slot.callback = {};
+        slot.builtin = {};
         slot.locality_guard = {};
         free_slots.push_back(index);
     }
@@ -194,6 +196,40 @@ struct EventLoop::Impl {
         slot.sequence = next_sequence++;
         slot.owner = owner;
         slot.callback = std::move(callback);
+        slot.builtin = {};
+        slot.locality_guard = std::move(locality_guard);
+        slot.globally_observed = globally_observed;
+
+        const Entry entry{slot.at, slot.sequence, index, id};
+        events.push(entry);
+        if (globally_observed) globally_observed_events.push(entry);
+        auto& owner_queue = owner_events[owner];
+        discardDeadFront(owner_queue);
+        owner_queue.push(entry);
+        live_events.emplace(id, SlotRef{index, id});
+        return id;
+    }
+
+    EventId scheduleBuiltin(
+        const SimTimeNs at, const BuiltinEvent event,
+        std::function<bool()> locality_guard = {}
+    ) {
+        if (!event) throw std::invalid_argument("simulation built-in callback is empty");
+        if (at < timeFor(currentOwner())) {
+            throw std::invalid_argument("cannot schedule a simulation event in the past");
+        }
+        if (next_id == 0U) throw std::overflow_error("simulation event identifier space exhausted");
+        const EventId id = next_id++;
+        const EventOwner owner = currentOwner();
+        const bool globally_observed = !locality_guard || owner == shared_event_owner;
+        const std::uint32_t index = acquireSlot();
+        Slot& slot = slots[index];
+        slot.at = at;
+        slot.id = id;
+        slot.sequence = next_sequence++;
+        slot.owner = owner;
+        slot.callback = {};
+        slot.builtin = event;
         slot.locality_guard = std::move(locality_guard);
         slot.globally_observed = globally_observed;
 
@@ -254,6 +290,7 @@ struct EventLoop::Impl {
         // Move the callables out before the slot can be reused by a nested
         // schedule or by the observer itself.
         EventCallback callback = std::move(slot.callback);
+        const BuiltinEvent builtin = slot.builtin;
         std::function<bool()> locality_guard = std::move(slot.locality_guard);
         slot.live = false;
         live_events.erase(id);
@@ -291,7 +328,8 @@ struct EventLoop::Impl {
                     (*observer)(at, owner, EventObservation::global);
                 }
             }
-            callback();
+            if (builtin) builtin.invoke(builtin.context);
+            else callback();
         } catch (...) {
             setCurrentOwner(previous_owner);
             throw;
@@ -360,12 +398,34 @@ EventId EventLoop::scheduleAt(const SimTimeNs at, EventCallback callback) {
     return impl_->schedule(at, std::move(callback));
 }
 
+EventId EventLoop::scheduleBuiltinAfter(const SimTimeNs delta, const BuiltinEvent event) {
+    Impl::Lock lock(*impl_);
+    const SimTimeNs current = impl_->timeFor(impl_->currentOwner());
+    if (delta > std::numeric_limits<SimTimeNs>::max() - current) {
+        throw std::overflow_error("simulation event time overflow");
+    }
+    return impl_->scheduleBuiltin(current + delta, event);
+}
+
+EventId EventLoop::scheduleBuiltinAt(const SimTimeNs at, const BuiltinEvent event) {
+    Impl::Lock lock(*impl_);
+    return impl_->scheduleBuiltin(at, event);
+}
+
 EventId EventLoop::scheduleOwnerLocalAt(
     const SimTimeNs at, EventCallback callback, std::function<bool()> locality_guard
 ) {
     Impl::Lock lock(*impl_);
     if (!locality_guard) throw std::invalid_argument("owner-local event requires a locality guard");
     return impl_->schedule(at, std::move(callback), std::move(locality_guard));
+}
+
+EventId EventLoop::scheduleOwnerLocalBuiltinAt(
+    const SimTimeNs at, const BuiltinEvent event, std::function<bool()> locality_guard
+) {
+    Impl::Lock lock(*impl_);
+    if (!locality_guard) throw std::invalid_argument("owner-local event requires a locality guard");
+    return impl_->scheduleBuiltin(at, event, std::move(locality_guard));
 }
 
 bool EventLoop::cancel(const EventId id) noexcept {
@@ -445,6 +505,7 @@ void EventLoop::clear() noexcept {
     for (auto& slot : impl_->slots) {
         slot.live = false;
         slot.callback = {};
+        slot.builtin = {};
         slot.locality_guard = {};
     }
     impl_->free_slots.resize(impl_->slots.size());
@@ -553,6 +614,36 @@ EventId ScheduledEvent::scheduleAt(
     return id_;
 }
 
+void ScheduledEvent::builtinTrampoline(void* context) {
+    auto* binding = static_cast<BuiltinBinding*>(context);
+    binding->handle->retireInvocation();
+    if (binding->event) binding->event.invoke(binding->event.context);
+}
+
+EventId ScheduledEvent::scheduleBuiltinAfter(
+    const SimTimeNs delta, const BuiltinEvent event
+) {
+    if (!event) throw std::invalid_argument("scheduled built-in callback is empty");
+    cancel();
+    if (loop_ == nullptr) return 0U;
+    builtin_binding_ = BuiltinBinding{this, event};
+    id_ = loop_->scheduleBuiltinAfter(
+        delta, {&ScheduledEvent::builtinTrampoline, &builtin_binding_});
+    return id_;
+}
+
+EventId ScheduledEvent::scheduleBuiltinAt(
+    const SimTimeNs at, const BuiltinEvent event
+) {
+    if (!event) throw std::invalid_argument("scheduled built-in callback is empty");
+    cancel();
+    if (loop_ == nullptr) return 0U;
+    builtin_binding_ = BuiltinBinding{this, event};
+    id_ = loop_->scheduleBuiltinAt(
+        at, {&ScheduledEvent::builtinTrampoline, &builtin_binding_});
+    return id_;
+}
+
 EventId ScheduledEvent::scheduleOwnerLocalAt(
     const SimTimeNs at, EventCallback callback, std::function<bool()> locality_guard
 ) {
@@ -562,6 +653,19 @@ EventId ScheduledEvent::scheduleOwnerLocalAt(
     id_ = loop_->scheduleOwnerLocalAt(
         at, retireBefore(std::move(callback)), std::move(locality_guard)
     );
+    return id_;
+}
+
+EventId ScheduledEvent::scheduleOwnerLocalBuiltinAt(
+    const SimTimeNs at, const BuiltinEvent event, std::function<bool()> locality_guard
+) {
+    if (!event) throw std::invalid_argument("scheduled built-in callback is empty");
+    cancel();
+    if (loop_ == nullptr) return 0U;
+    builtin_binding_ = BuiltinBinding{this, event};
+    id_ = loop_->scheduleOwnerLocalBuiltinAt(
+        at, {&ScheduledEvent::builtinTrampoline, &builtin_binding_},
+        std::move(locality_guard));
     return id_;
 }
 

@@ -140,6 +140,8 @@ private:
     void scheduleArbitration();
     void arbitrate();
     void completeInFlight();
+    static void arbitrationEvent(void* context);
+    static void completionEvent(void* context);
     void trace(CanTraceRecord::Direction direction, std::uint64_t time_ns, const std::string& node, const CanFrame& frame);
     void deliver(const CanFrame& frame, std::uint64_t time_ns, std::optional<NodeId> sender);
 
