@@ -42,8 +42,10 @@ struct WorldRunOptions {
     bool enable_loop_batching{false}; ///< Alternative proven-loop scheduler; disables RAM capsules.
     bool enable_jit{true}; ///< Cached hot-path compilation; preserves lane boundaries.
     bool enable_ram_capsules{true}; ///< Guarded reversible RAM prefixes; incompatible modes fall back automatically.
-    bool stop_on_board_failure{true}; ///< Stop immediately instead of finishing other boards.
+    bool stop_on_board_failure{true}; ///< Stop on failure; parallel lanes finish their current window before stopping.
     std::uint32_t adc_decimation{1}; ///< Keep 1 of N continuous ADC scans on every board.
+    SimTimeNs cross_board_window_ns{1'000}; ///< Bounded-skew owner slices; zero selects exact reference scheduling.
+    bool enable_parallel_lanes{true}; ///< Eligible unobserved owner lanes run concurrently; false is a validation reference.
 };
 
 /** @brief Accumulated outcome for one board in a world run. */
@@ -63,6 +65,7 @@ struct WorldRunResult {
     std::uint64_t instructions{0}; ///< Sum executed by all boards in this invocation.
     std::uint64_t cycles{0}; ///< Sum consumed by all boards in this invocation.
     std::uint64_t rounds{0}; ///< Virtual-time frontiers at which one or more CPUs started work.
+    std::size_t parallel_lanes{0}; ///< Concurrent owner executors used (zero for serial scheduling).
     std::uint64_t dispatches{0}; ///< Total instruction and proven-loop batch dispatches.
     std::uint64_t exact_dispatches{0}; ///< Target instructions executed by the interpreter.
     std::uint64_t loop_batches{0}; ///< Proven-loop batches applied without interpretation.
@@ -136,6 +139,7 @@ private:
 
     explicit World(config::NetworkConfig config);
     [[nodiscard]] Result<void> initialize(bool strict_mmio);
+    [[nodiscard]] Result<WorldRunResult> runIndependent(const WorldRunOptions& options);
 
     config::NetworkConfig config_;
     EventLoop event_loop_;

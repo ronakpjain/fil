@@ -203,6 +203,7 @@ TEST(WorldTest, DispatchesBoardsInFixedOrder) {
     }
 
     fil::sim::WorldRunOptions options;
+    options.cross_board_window_ns = 0U;
     options.max_instructions_per_board = 10U;
     options.duration_ns = 0U;
     options.instruction_quantum = 1U;
@@ -280,6 +281,7 @@ TEST(WorldTest, EnforcesBudgetsAndValidatesTopology) {
     }
 
     fil::sim::WorldRunOptions options;
+    options.cross_board_window_ns = 0U;
     options.max_instructions_per_board = 2U;
     options.duration_ns = 0U;
     options.instruction_quantum = 1U;

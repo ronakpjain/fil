@@ -191,6 +191,8 @@ add_library(fil_core STATIC
     src/stm32g4/usart.cpp
     src/stm32g4/watchdog.cpp
 )
+find_package(Threads REQUIRED)
+target_link_libraries(fil_core PUBLIC Threads::Threads)
 target_include_directories(fil_core PUBLIC include)
 fil_set_project_options(fil_core)
 

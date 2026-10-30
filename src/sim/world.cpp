@@ -1,4 +1,5 @@
 #include "fil/sim/world.hpp"
+#include "lane_workers.hpp"
 
 #include "fil/common/numeric.hpp"
 #include "fil/devices/can_bus.hpp"
@@ -10,6 +11,8 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <thread>
+#include <tuple>
 #include <utility>
 
 namespace fil::sim {
@@ -68,6 +71,8 @@ void accumulate(
         aggregate.result.instructions, slice.instructions
     );
     aggregate.result.cycles = saturatingAdd(aggregate.result.cycles, slice.cycles);
+    aggregate.memoized_prefixes = saturatingAdd(aggregate.memoized_prefixes, slice.memoized_prefixes);
+    aggregate.memoized_instructions = saturatingAdd(aggregate.memoized_instructions, slice.memoized_instructions);
     aggregate.result.time_ns = slice.time_ns;
     aggregate.result.diagnostic = slice.diagnostic;
     aggregate.result.message = slice.message;
@@ -259,6 +264,166 @@ Result<void> World::initialize(const bool strict_mmio) {
     return {};
 }
 
+Result<WorldRunResult> World::runIndependent(const WorldRunOptions& options) {
+    auto exclusive = event_loop_.useExclusiveExecution();
+    WorldRunResult output;
+    output.start_time_ns = event_loop_.now(shared_event_owner);
+    const auto initial_callbacks = event_loop_.executedCallbacks();
+    output.end_time_ns = output.start_time_ns;
+    output.boards.resize(boards_.size());
+    std::vector<std::uint8_t> runnable(boards_.size(), options.max_instructions_per_board != 0U);
+    std::vector<std::uint8_t> lane_failed(boards_.size(), 0U);
+    std::vector<std::uint64_t> lane_dispatches(boards_.size(), 0U);
+    std::vector<devices::DeferredCanOutbox> outboxes(boards_.size());
+    devices::DeferredCanOutbox pending;
+    const bool parallel = options.enable_parallel_lanes && boards_.size() > 1U
+        && boards_.size() <= 64U && std::thread::hardware_concurrency() > 1U
+        && !trace_.enabled() && !trace_.hasObserver()
+        && !event_loop_.hasObservationBarrier();
+    std::vector<std::unique_ptr<mem::MemoryBus::TrackingScope>> tracking;
+    tracking.reserve(boards_.size());
+    for (const auto& entry : boards_) {
+        tracking.push_back(std::make_unique<mem::MemoryBus::TrackingScope>(
+            entry->board->memory(), true, true));
+    }
+    for (std::size_t i = 0; i < boards_.size(); ++i) {
+        initializeSnapshot(output.boards[i], *boards_[i]->board, output.start_time_ns);
+        boards_[i]->board->peripherals().setAdcDecimation(options.adc_decimation);
+    }
+    const auto deadline = options.duration_ns == 0U ? 0U
+        : saturatingAdd(output.start_time_ns, options.duration_ns);
+    bool failed = false;
+    auto now = output.start_time_ns;
+    auto end = now;
+    auto domains = parallel ? std::unique_ptr<EventLoop::LaneDomainsScope>(
+        new EventLoop::LaneDomainsScope(event_loop_.useLaneDomains(boards_.size()))) : nullptr;
+    const auto execute_lane = [&](const std::size_t i) {
+            auto owner = event_loop_.useOwner(static_cast<EventOwner>(i));
+            devices::DeferredCanScope communications(outboxes[i], static_cast<std::uint32_t>(i),
+                event_loop_, static_cast<EventOwner>(i));
+            auto local_now = event_loop_.now();
+            auto& board = *boards_[i]->board;
+            // Drain this owner's events only. No other lane, shared clock,
+            // CPU state, or speculative capsule is touched by local execution.
+            const auto events = event_loop_.runOwnedEvents(static_cast<EventOwner>(i), local_now);
+            if (events.same_time_limit_hit) throw std::runtime_error("owner event livelock");
+            local_now = event_loop_.now();
+            if (!runnable[i]) {
+                if (local_now < end) {
+                    const auto idle_events = event_loop_.runOwnedEvents(static_cast<EventOwner>(i), end);
+                    if (idle_events.same_time_limit_hit) throw std::runtime_error("owner event livelock");
+                }
+                return;
+            }
+            if (local_now >= end) return; // An in-flight instruction crossed the preceding window.
+            BoardRunOptions slice;
+            slice.max_instructions = options.max_instructions_per_board
+                - output.boards[i].result.instructions;
+            slice.duration_ns = end - local_now;
+            slice.enable_loop_batching = false;
+            slice.enable_jit = options.enable_jit;
+            slice.adc_decimation = options.adc_decimation;
+            auto result = board.runOwnerSlice(slice);
+            accumulate(output.boards[i], result);
+            ++lane_dispatches[i];
+            if (result.reason != BoardStopReason::time_budget) {
+                runnable[i] = false;
+                output.boards[i].terminal = result.reason != BoardStopReason::instruction_budget;
+                lane_failed[i] = !result.succeeded();
+            }
+    };
+    auto workers = parallel ? std::make_unique<detail::LaneWorkers>(boards_.size(),
+        [&](const std::size_t i) {
+            auto lane = event_loop_.useLaneDomain(static_cast<EventOwner>(i));
+            execute_lane(i);
+        }) : nullptr;
+    output.parallel_lanes = parallel ? boards_.size() : 0U;
+    const auto drain_shared = [&](const SimTimeNs at) {
+        const auto events = event_loop_.runSharedEvents(at);
+        if (events.same_time_limit_hit) throw std::runtime_error("shared event livelock");
+    };
+    for (;;) {
+        if (std::none_of(runnable.begin(), runnable.end(), [](auto value) { return value != 0U; })) break;
+        if (deadline != 0U && now >= deadline) break;
+        end = saturatingAdd(now, options.cross_board_window_ns);
+        if (deadline != 0U) end = std::min(end, deadline);
+        if (end == now) return argumentError("independent scheduler clock overflow");
+        ++output.rounds;
+        if (workers) {
+            workers->run(); // All lanes are parked before any shared mutation.
+        } else {
+            for (std::size_t i = 0; i < boards_.size(); ++i) {
+                execute_lane(i);
+                if (lane_failed[i] && options.stop_on_board_failure) break;
+            }
+        }
+        failed = std::any_of(lane_failed.begin(), lane_failed.end(), [](auto value) { return value != 0U; });
+        for (auto& outbox : outboxes) {
+            for (auto& command : outbox) pending.push_back(std::move(command));
+            outbox.clear();
+        }
+        std::stable_sort(pending.begin(), pending.end(), [](const auto& a, const auto& b) {
+            return std::tie(a.timestamp, a.board_index, a.lane_sequence)
+                < std::tie(b.timestamp, b.board_index, b.lane_sequence);
+        });
+        if (!workers && failed && options.stop_on_board_failure) break;
+        std::size_t consumed = 0U;
+        while (consumed < pending.size() && pending[consumed].timestamp <= end) {
+            const auto at = std::max(now, pending[consumed].timestamp);
+            drain_shared(at); // Earlier completions can release queue capacity.
+            do {
+                // Admission rejection is a device outcome, delivered by the
+                // command's completion; it is not a host/scheduler failure.
+                static_cast<void>(pending[consumed++].replay());
+            } while (consumed < pending.size() && pending[consumed].timestamp <= at);
+            drain_shared(at); // Same-time requests contend together.
+        }
+        pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(consumed));
+        drain_shared(end);
+        now = end;
+        output.end_time_ns = now;
+        if (failed && options.stop_on_board_failure) break;
+    }
+    workers.reset();
+    if (domains) domains->close(); // Fallible merge while all workers are joined.
+    domains.reset();
+    for (auto& command : pending) {
+        auto owner = event_loop_.useOwner(shared_event_owner);
+        const auto at = std::max(event_loop_.now(), command.timestamp);
+        static_cast<void>(event_loop_.scheduleAt(at, [command = std::move(command)]() mutable {
+            static_cast<void>(command.replay());
+        }));
+    }
+    output.event_callbacks = event_loop_.executedCallbacks() - initial_callbacks;
+    if (failed) output.reason = WorldStopReason::board_failure;
+    else if (deadline != 0U && now >= deadline) output.reason = WorldStopReason::time_budget;
+    else {
+        const bool budget = std::any_of(output.boards.begin(), output.boards.end(), [](const auto& entry) {
+            return entry.result.reason == BoardStopReason::instruction_budget;
+        });
+        output.reason = budget ? WorldStopReason::instruction_budget : WorldStopReason::all_boards_stopped;
+    }
+    for (std::size_t i = 0; i < boards_.size(); ++i) {
+        auto& result = output.boards[i].result;
+        if (runnable[i]) {
+            result.reason = failed && options.stop_on_board_failure
+                ? BoardStopReason::synchronization_required : BoardStopReason::time_budget;
+            result.message = failed && options.stop_on_board_failure
+                ? "world stopped after another board failed"
+                : "bounded-skew simulated-time budget exhausted";
+            result.time_ns = event_loop_.now(static_cast<EventOwner>(i));
+        }
+        boards_[i]->board->cpu().captureDiagnostic(result.diagnostic);
+        output.instructions += result.instructions;
+        output.cycles += result.cycles;
+        output.dispatches += lane_dispatches[i];
+        output.memoized_prefixes += output.boards[i].memoized_prefixes;
+        output.memoized_instructions += output.boards[i].memoized_instructions;
+    }
+    output.exact_dispatches = output.instructions;
+    return output;
+}
+
 Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
     // Run configuration is immutable for this invocation, including across
     // peripheral callbacks. Keep a non-aliased snapshot for the hot scheduler.
@@ -281,6 +446,10 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
     if (options.enable_ram_capsules
         && (!options.enable_jit || options.trace_instructions || options.detect_spin)) {
         return argumentError("RAM capsules require JIT without instruction tracing or spin detection");
+    }
+    if (options.cross_board_window_ns != 0U && !options.trace_instructions
+        && !options.detect_spin && !options.enable_loop_batching) {
+        return runIndependent(options);
     }
     const bool deferred_enabled = options.enable_ram_capsules;
 

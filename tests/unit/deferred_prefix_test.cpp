@@ -156,6 +156,7 @@ TEST(DeferredPrefixTest, LocalAdcEventsAndNestedGlobalObserversMatchExactExecuti
             static_cast<void>(world->eventLoop().scheduleAt(3201U, observe));
         }
         fil::sim::WorldRunOptions options;
+        options.cross_board_window_ns = 0U; // Exact scheduler regression reference.
         options.duration_ns = 10000U;
         options.max_instructions_per_board = 10000U;
         options.enable_loop_batching = false;
@@ -218,6 +219,7 @@ TEST(DeferredPrefixTest, PublicObserverReplacementCannotRemoveWorldMaterializati
             }));
     }
     fil::sim::WorldRunOptions options;
+    options.cross_board_window_ns = 0U;
     options.duration_ns = 10000U;
     options.max_instructions_per_board = 10000U;
     options.enable_loop_batching = false;
@@ -510,6 +512,7 @@ TEST(DeferredPrefixTest, FailureTruncatesOtherCapsulesBeforeDraining) {
                                        0x00U,0xbfU, 0x00U,0xbfU, 0xfeU,0xe7U});
             }
             fil::sim::WorldRunOptions options;
+            options.cross_board_window_ns = 0U;
             options.duration_ns = 10000U;
             options.max_instructions_per_board = 1000U;
             options.enable_loop_batching = false;
@@ -595,6 +598,7 @@ TEST(DeferredPrefixTest, SynchronousCanAtHiddenCompletionPreservesBoardOrder) {
                                  0xfeU,0xe7U});
         }
         fil::sim::WorldRunOptions options;
+        options.cross_board_window_ns = 0U; // Exact scheduler regression reference.
         options.duration_ns = 10000U;
         options.max_instructions_per_board = 1000U;
         options.enable_loop_batching = false;

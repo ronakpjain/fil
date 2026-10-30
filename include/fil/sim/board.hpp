@@ -67,6 +67,8 @@ struct BoardRunResult {
     SimTimeNs time_ns{0};
     cpu::DiagnosticSnapshot diagnostic;
     std::string message;
+    std::uint64_t memoized_prefixes{0}; ///< Validated local certificate hits.
+    std::uint64_t memoized_instructions{0}; ///< Logical instructions represented by those hits.
 
     /** @brief Whether the reason is a requested/normal execution boundary. */
     [[nodiscard]] bool succeeded() const noexcept;
@@ -301,6 +303,16 @@ public:
 
 private:
     friend class World;
+
+    // World-owned bounded-skew execution. Only this owner's events advance;
+    // shared communication is drained by World at window rendezvous.
+    [[nodiscard]] BoardRunResult runOwnerSlice(const BoardRunOptions& options);
+    [[nodiscard]] std::optional<cpu::FastStepResult> stepCommittedLocal(
+        std::size_t max_instructions, std::optional<SimTimeNs> deadline);
+    [[nodiscard]] std::optional<ConcurrentStepResult> stepMemoizedLocal(
+        std::size_t max_instructions, std::optional<SimTimeNs> deadline);
+    std::unique_ptr<ReversibleRamPrefix> local_prefix_;
+    bool owner_slice_active_{false};
 
     [[nodiscard]] static bool appendReversibleChunk(
         ReversibleRamPrefix::ReversibleExecution& aggregate,

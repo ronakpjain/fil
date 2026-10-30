@@ -1453,7 +1453,10 @@ Board::ConcurrentStepResult Board::materializeReversibleRamPrefix(
 
 SimTimeNs Board::advanceTime(const std::uint64_t cycles) {
     const SimTimeNs elapsed = accountCycles(cycles);
-    const auto events = event_loop_->advanceBy(elapsed);
+    const auto events = owner_slice_active_
+        ? event_loop_->runOwnedEvents(event_loop_->activeOwner(),
+            saturatingAdd(event_loop_->now(), elapsed))
+        : event_loop_->advanceBy(elapsed);
     if (events.same_time_limit_hit) {
         trace_->record(event_loop_->now(), config_.name, "event_livelock");
     }
@@ -1819,6 +1822,83 @@ BoardRunResult Board::cpuFailure(const cpu::RunResult& result) const {
     return board;
 }
 
+BoardRunResult Board::runOwnerSlice(const BoardRunOptions& options) {
+    struct Scope {
+        bool& active;
+        bool previous;
+        explicit Scope(bool& value) : active(value), previous(value) { active = true; }
+        ~Scope() { active = previous; }
+    } scope(owner_slice_active_);
+    if (options.max_instructions != 0U) {
+        if (auto boundary = settleInstructionBoundary()) {
+            BoardRunResult result;
+            result.reason = boundary->reason;
+            result.message = std::move(boundary->message);
+            result.time_ns = event_loop_->now();
+            cpu_->captureDiagnostic(result.diagnostic);
+            return result;
+        }
+    }
+    return run(options);
+}
+
+std::optional<Board::ConcurrentStepResult> Board::stepMemoizedLocal(
+    const std::size_t max_instructions, const std::optional<SimTimeNs> deadline) {
+    if (max_instructions < 2U || !memory_.writeJournalTracking() || blockBoundaryPending())
+        return std::nullopt;
+    if (!local_prefix_) local_prefix_ = std::make_unique<ReversibleRamPrefix>();
+    // FastStepResult carries a 16-bit aggregate charge. Bound even compressed
+    // certificates before admission; a full commit accounts these cycles once.
+    auto horizon = saturatingAdd(event_loop_->now(),
+        elapsedForCycles(std::numeric_limits<std::uint16_t>::max()));
+    if (deadline) horizon = std::min(horizon, *deadline);
+    if (!prepareReversibleRamPrefix(*local_prefix_, max_instructions, horizon, false, true))
+        return std::nullopt;
+    return materializeReversibleRamPrefix(*local_prefix_, local_prefix_->count);
+}
+
+std::optional<cpu::FastStepResult> Board::stepCommittedLocal(
+    const std::size_t max_instructions, const std::optional<SimTimeNs> deadline) {
+    if (max_instructions < 2U || blockBoundaryPending()) return std::nullopt;
+    const auto now = event_loop_->now();
+    const auto frequency = peripherals_->rcc().systemClockHz();
+    if (frequency == 0U || time_fraction_ >= frequency) return std::nullopt;
+    auto horizon = deadline;
+    if (const auto event = event_loop_->nextScheduledTime(event_loop_->activeOwner());
+        event && (!horizon || *event < *horizon)) horizon = event;
+    if (horizon && *horizon <= now) return std::nullopt;
+    const auto systick = system_->cyclesUntilSysTickInterrupt();
+    if (systick && *systick == 0U) return std::nullopt;
+    auto credit = systick ? *systick - 1U : std::numeric_limits<std::uint64_t>::max();
+    if (horizon && *horizon - now <= std::numeric_limits<std::uint64_t>::max() / frequency) {
+        const auto numerator = (*horizon - now) * frequency - 1U;
+        credit = std::min(credit, numerator >= time_fraction_
+            ? (numerator - time_fraction_) / nanoseconds_per_second : 0U);
+    }
+    credit = std::min<std::uint64_t>(credit, std::numeric_limits<std::uint16_t>::max());
+    if (credit == 0U) return std::nullopt;
+    cpu::CortexM4::ReversibleCycleBudget budget;
+    budget.remaining_cycles = credit;
+    budget.have_fetch = have_last_fetch_;
+    budget.fetch_end = last_fetch_end_;
+    const auto& flash = peripherals_->flash();
+    const auto wait = static_cast<std::uint16_t>(flash.waitStates());
+    budget.fetch_timing = {flash.flashBase(), flash.flashBase() + flash.bankSize(),
+        0U, flash.bankSize(), wait,
+        static_cast<std::uint16_t>((flash.prefetchEnabled() || flash.instructionCacheEnabled()) ? 0U : wait)};
+    // Reuse the checked RAM-only executor, not speculative admission: all
+    // effects commit once, with no journal, snapshot, restore, or replay.
+    // Traps prevent any MMIO or executable write inside the native span.
+    ReversibleMemoryGuard guard(memory_);
+    auto executed = cpu_->tryStepCommittedRamSpan(max_instructions, budget);
+    if (!executed || executed->instructions == 0U) return std::nullopt;
+    auto result = *executed;
+    result.cycles = static_cast<std::uint16_t>(credit - budget.remaining_cycles);
+    have_last_fetch_ = budget.have_fetch;
+    last_fetch_end_ = budget.fetch_end;
+    return result;
+}
+
 BoardRunResult Board::run(const BoardRunOptions& options) {
     // A standalone run owns the board and its event loop until it returns.
     // Hold one exclusive lease so every per-instruction clock/event query
@@ -1852,9 +1932,22 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
             || options.enable_loop_batching
             ? 1U : static_cast<std::size_t>(std::min<std::uint64_t>(
                 options.max_instructions - aggregate.instructions,
-                cpu::CortexM4::JitStepOutcome::max_block));
-        auto result = stepWithFetchTiming(jit_ok,
-            deadline == 0U ? std::nullopt : std::optional<SimTimeNs>{deadline}, jit_limit);
+                owner_slice_active_ ? cpu::NativeTracePlan::max_ops
+                                    : cpu::CortexM4::JitStepOutcome::max_block));
+        const auto limit_time = deadline == 0U
+            ? std::nullopt : std::optional<SimTimeNs>{deadline};
+        const auto memoized = owner_slice_active_ && jit_ok
+            ? stepMemoizedLocal(static_cast<std::size_t>(std::min<std::uint64_t>(
+                options.max_instructions - aggregate.instructions,
+                DeferredPurePrefix::max_memoized_instructions)), limit_time) : std::nullopt;
+        const auto committed = !memoized && owner_slice_active_ && jit_ok
+            ? stepCommittedLocal(jit_limit, limit_time) : std::nullopt;
+        auto result = memoized ? memoized->cpu_result : committed ? *committed
+            : stepWithFetchTiming(jit_ok, limit_time, owner_slice_active_ ? 1U : jit_limit);
+        if (memoized && local_prefix_->memoized_count != 0U) {
+            ++aggregate.memoized_prefixes;
+            aggregate.memoized_instructions += local_prefix_->memoized_count;
+        }
         aggregate.instructions += result.instructions;
         aggregate.cycles += result.cycles;
         aggregate.diagnostic.instruction_address = result.instruction_address;
@@ -1866,11 +1959,21 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
                 {{"pc", hex32(result.instruction_address)}, {"raw", hex32(result.raw)}}
             );
         }
-        static_cast<void>(advanceTime(result.cycles));
+        if (memoized) {
+            // Full certificate materialization already accounted CPU/SysTick
+            // cycles. Only advance the owner's event clock here.
+            const auto events = event_loop_->runOwnedEvents(event_loop_->activeOwner(),
+                saturatingAdd(event_loop_->now(), memoized->elapsed_ns));
+            if (events.same_time_limit_hit) throw std::runtime_error("owner event livelock");
+        } else {
+            static_cast<void>(advanceTime(result.cycles));
+        }
         if (result.reason != cpu::StopReason::step_complete) {
             BoardRunResult failure = cpuFailure(result);
             failure.instructions = aggregate.instructions;
             failure.cycles = aggregate.cycles;
+            failure.memoized_prefixes = aggregate.memoized_prefixes;
+            failure.memoized_instructions = aggregate.memoized_instructions;
             return failure;
         }
 

@@ -2,6 +2,7 @@
 #include "fil/sim/world.hpp"
 #include "fil/stm32g4/stm32g4.hpp"
 #include "../fixture_support.hpp"
+#include "../../src/sim/lane_workers.hpp"
 
 #include <cstdint>
 #include <gtest/gtest.h>
@@ -60,6 +61,7 @@ bool configureZeroWaitFixture(fil::sim::World& world) {
 
 fil::sim::WorldRunOptions runOptions(const fil::sim::SimTimeNs duration_ns) {
     fil::sim::WorldRunOptions options;
+    options.cross_board_window_ns = 0U; // These vectors specify exact cross-board timing.
     options.max_instructions_per_board = 10U;
     options.duration_ns = duration_ns;
     options.instruction_quantum = 7U;
@@ -984,6 +986,180 @@ TEST(WorldTimeTest, CompactExactSchedulerPreservesFailureDrainingAndBudgets) {
             }
         }
     }
+}
+
+TEST(WorldTimeTest, PersistentLaneWorkersJoinEveryWindowAndPropagateExceptions) {
+    std::vector<std::size_t> counts(3U, 0U);
+    bool fail = false;
+    fil::sim::detail::LaneWorkers workers(counts.size(), [&](const auto index) {
+        ++counts[index];
+        if (fail && index == 1U) throw std::runtime_error("lane failure");
+    });
+    for (std::size_t window = 0U; window < 10U; ++window) workers.run();
+    EXPECT_EQ(counts, (std::vector<std::size_t>{10U, 10U, 10U}));
+    fail = true;
+    EXPECT_THROW(workers.run(), std::runtime_error);
+    EXPECT_EQ(counts, (std::vector<std::size_t>{11U, 11U, 11U}));
+    fail = false;
+    workers.run();
+    EXPECT_EQ(counts, (std::vector<std::size_t>{12U, 12U, 12U}));
+}
+
+TEST(WorldTimeTest, ParallelOwnerWindowsMatchSerialOwnerExecution) {
+    TempWorldTimeConfigs files;
+    const auto alpha = files.writeBoard("alpha.json", "alpha");
+    const auto beta = files.writeBoard("beta.json", "beta");
+    auto parallel = fil::sim::World::load(files.network({alpha, beta}));
+    auto serial = fil::sim::World::load(files.network({alpha, beta}));
+    ASSERT_TRUE(parallel && serial);
+    for (auto* world : {parallel.value().get(), serial.value().get()}) {
+        ASSERT_TRUE(configureZeroWaitFixture(*world));
+        ASSERT_TRUE(configureSysTickIdleLoop(*world, "alpha", 3U));
+        ASSERT_TRUE(configureSysTickIdleLoop(*world, "beta", 7U));
+        world->setDiagnosticsEnabled(false);
+    }
+    auto options = runOptions(100'000U);
+    options.max_instructions_per_board = 10'001U;
+    options.cross_board_window_ns = 10'000U;
+    for (unsigned invocation = 0U; invocation < 3U; ++invocation) {
+        SCOPED_TRACE(invocation);
+        options.enable_parallel_lanes = true;
+        const auto actual = parallel.value()->run(options);
+        options.enable_parallel_lanes = false;
+        const auto expected = serial.value()->run(options);
+        ASSERT_TRUE(actual && expected);
+        if (std::thread::hardware_concurrency() > 1U) EXPECT_EQ(actual.value().parallel_lanes, 2U);
+        EXPECT_EQ(expected.value().parallel_lanes, 0U);
+        EXPECT_EQ(actual.value().instructions, expected.value().instructions);
+        EXPECT_EQ(actual.value().cycles, expected.value().cycles);
+        EXPECT_EQ(actual.value().event_callbacks, expected.value().event_callbacks);
+        EXPECT_EQ(actual.value().end_time_ns, expected.value().end_time_ns);
+        for (const auto name : {"alpha", "beta"}) {
+            EXPECT_TRUE(fil::cpu::bitwiseEqual(parallel.value()->board(name)->cpu().state(),
+                                              serial.value()->board(name)->cpu().state()));
+            EXPECT_EQ(parallel.value()->board(name)->eventLoop().now(name == std::string_view{"alpha"} ? 0U : 1U),
+                      serial.value()->board(name)->eventLoop().now(name == std::string_view{"alpha"} ? 0U : 1U));
+        }
+    }
+}
+
+TEST(WorldTimeTest, IndependentWindowsPreserveLocalInterruptsAndInstructionBudgets) {
+    TempWorldTimeConfigs files;
+    const auto alpha = files.writeBoard("alpha.json", "alpha");
+    const auto beta = files.writeBoard("beta.json", "beta");
+    for (const auto window : {1'000U, 10'000U}) {
+        SCOPED_TRACE(window);
+        auto independent = fil::sim::World::load(files.network({alpha, beta}));
+        auto reference = fil::sim::World::load(files.network({alpha, beta}));
+        ASSERT_TRUE(independent && reference);
+        for (auto* world : {independent.value().get(), reference.value().get()}) {
+            ASSERT_TRUE(configureZeroWaitFixture(*world));
+            ASSERT_TRUE(configureSysTickIdleLoop(*world, "alpha", 3U));
+            ASSERT_TRUE(configureSysTickIdleLoop(*world, "beta", 7U));
+        }
+        auto options = runOptions(100'000U);
+        options.max_instructions_per_board = 1'001U;
+        options.cross_board_window_ns = window;
+        const auto actual = independent.value()->run(options);
+        options.cross_board_window_ns = 0U;
+        options.enable_ram_capsules = false;
+        const auto expected = reference.value()->run(options);
+        ASSERT_TRUE(actual && expected);
+        EXPECT_EQ(actual.value().reason, expected.value().reason);
+        EXPECT_EQ(actual.value().instructions, expected.value().instructions);
+        EXPECT_EQ(actual.value().cycles, expected.value().cycles);
+        for (const auto name : {"alpha", "beta"}) {
+            EXPECT_TRUE(fil::cpu::bitwiseEqual(independent.value()->board(name)->cpu().state(),
+                                              reference.value()->board(name)->cpu().state()));
+            EXPECT_GT(independent.value()->board(name)->cpu().state().r[6], 0U);
+        }
+    }
+}
+
+TEST(WorldTimeTest, IndependentSliceServicesRendezvousInterruptBeforeForeground) {
+    TempWorldTimeConfigs files;
+    const auto alpha = files.writeBoard("alpha.json", "alpha");
+    auto world = fil::sim::World::load(files.network({alpha}));
+    ASSERT_TRUE(world);
+    ASSERT_TRUE(configureZeroWaitFixture(*world.value()));
+    ASSERT_TRUE(configureSysTickIdleLoop(*world.value(), "alpha", 3U));
+    auto& board = *world.value()->board("alpha");
+    ASSERT_TRUE(board.memory().write32(0xe000e010U, 0U)); // Only the rendezvous pends SysTick.
+    bool observed = false;
+    auto& loop = world.value()->eventLoop();
+    static_cast<void>(loop.scheduleAt(250U, [&] {
+        ASSERT_TRUE(board.memory().write32(0xe000ed04U, 1U << 26U));
+        auto owner = loop.useOwner(0U);
+        static_cast<void>(loop.scheduleAfter(1U, [&] {
+            observed = true;
+            EXPECT_EQ(board.cpu().state().ipsr(), 15U);
+            EXPECT_EQ(board.cpu().state().r[6], 1U);
+        }));
+    }));
+    auto options = runOptions(2'000U);
+    options.max_instructions_per_board = 100'000U;
+    options.cross_board_window_ns = 1'000U;
+    ASSERT_TRUE(world.value()->run(options));
+    EXPECT_TRUE(observed);
+}
+
+TEST(WorldTimeTest, IndependentFailureStopsBeforeLaterLanesAndSharedCallbacks) {
+    TempWorldTimeConfigs files;
+    const auto alpha = files.writeBoard("alpha.json", "alpha");
+    const auto beta = files.writeBoard("beta.json", "beta");
+    auto world = fil::sim::World::load(files.network({alpha, beta}));
+    ASSERT_TRUE(world);
+    ASSERT_TRUE(configureZeroWaitFixture(*world.value()));
+    auto& board = *world.value()->board("alpha");
+    const std::vector<std::uint8_t> udf{0x00U, 0xdeU};
+    ASSERT_TRUE(board.memory().loadBytes(board.cpu().state().r[15], udf));
+    const auto beta_before = world.value()->board("beta")->cpu().state();
+    bool called = false;
+    static_cast<void>(world.value()->eventLoop().scheduleAt(250U, [&] { called = true; }));
+    auto options = runOptions(10'000U);
+    options.cross_board_window_ns = 1'000U;
+    const auto result = world.value()->run(options);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result.value().reason, fil::sim::WorldStopReason::board_failure);
+    EXPECT_FALSE(called);
+    EXPECT_EQ(result.value().boards[1].result.instructions, 0U);
+    EXPECT_EQ(result.value().boards[1].result.reason, fil::sim::BoardStopReason::synchronization_required);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(beta_before, world.value()->board("beta")->cpu().state()));
+}
+
+TEST(WorldTimeTest, IndependentWindowsDeliverSharedEffectsAtNextRendezvous) {
+    TempWorldTimeConfigs files;
+    const auto alpha = files.writeBoard("alpha.json", "alpha");
+    auto world = fil::sim::World::load(files.network({alpha}));
+    ASSERT_TRUE(world);
+    ASSERT_TRUE(configureZeroWaitFixture(*world.value()));
+    ASSERT_TRUE(installIdleLoop(*world.value(), "alpha", 3U));
+    auto& loop = world.value()->eventLoop();
+    fil::sim::SimTimeNs observed_local = 0U;
+    fil::sim::SimTimeNs observed_shared = 0U;
+    static_cast<void>(loop.scheduleAt(250U, [&] {
+        observed_shared = loop.now();
+        observed_local = loop.now(0U);
+        world.value()->board("alpha")->cpu().state().r[7] = 42U;
+    }));
+    auto options = runOptions(2'000U);
+    options.max_instructions_per_board = 100'000U;
+    options.cross_board_window_ns = 1'000U;
+    const auto result = world.value()->run(options);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result.value().reason, fil::sim::WorldStopReason::time_budget);
+    EXPECT_EQ(result.value().end_time_ns, 2'000U);
+    EXPECT_EQ(observed_shared, 250U);
+    EXPECT_GE(observed_local, 1'000U);
+    EXPECT_LE(observed_local, 1'250U); // One window plus an ordinary in-flight branch.
+    EXPECT_EQ(world.value()->board("alpha")->cpu().state().r[7], 42U);
+    const auto before = world.value()->board("alpha")->cpu().state();
+    options.max_instructions_per_board = 0U;
+    const auto zero = world.value()->run(options);
+    ASSERT_TRUE(zero);
+    EXPECT_EQ(zero.value().instructions, 0U);
+    EXPECT_EQ(zero.value().reason, fil::sim::WorldStopReason::instruction_budget);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(before, world.value()->board("alpha")->cpu().state()));
 }
 
 } // namespace
