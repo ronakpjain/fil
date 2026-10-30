@@ -448,6 +448,144 @@ TEST(EventLoopTest, InsertionPrunesGloballyRetiredOwnerCallbacks) {
     }
 }
 
+TEST(EventLoopTest, SharedRendezvousLeavesOwnerClockAndCallbacksUntouched) {
+    fil::sim::EventLoop loop(2U);
+    constexpr auto shared = fil::sim::shared_event_owner;
+    std::vector<int> order;
+    {
+        auto owner = loop.useOwner(4U);
+        static_cast<void>(loop.scheduleAt(21U, [&] { order.push_back(4); }));
+    }
+    static_cast<void>(loop.runOwnedEvents(4U, 20U));
+    const auto canceled = loop.scheduleAt(3U, [&] { order.push_back(99); });
+    EXPECT_TRUE(loop.cancel(canceled));
+    static_cast<void>(loop.scheduleAt(5U, [&] {
+        order.push_back(1);
+        EXPECT_EQ(loop.now(4U), 20U);
+        {
+            auto owner = loop.useOwner(4U);
+            // Relative owner work is clamped to the owner's already-ahead clock.
+            static_cast<void>(loop.scheduleAfter(0U, [&] { order.push_back(3); }));
+            EXPECT_THROW(static_cast<void>(loop.scheduleAt(5U, [] {})), std::invalid_argument);
+        }
+        static_cast<void>(loop.scheduleAt(5U, [&] { order.push_back(2); }));
+    }));
+
+    const auto result = loop.runSharedEvents(5U);
+    EXPECT_EQ(result.events_executed, 2U);
+    EXPECT_TRUE(result.shared_event_executed);
+    EXPECT_EQ(order, (std::vector<int>{1, 2}));
+    EXPECT_EQ(loop.now(shared), 5U);
+    EXPECT_EQ(loop.now(4U), 20U);
+    EXPECT_EQ(loop.nextScheduledTime(4U), 20U);
+    EXPECT_EQ(loop.pending(), 2U);
+    EXPECT_EQ(loop.runOwnedEvents(4U, 21U).events_executed, 2U);
+    EXPECT_EQ(order, (std::vector<int>{1, 2, 3, 4}));
+    EXPECT_EQ(loop.now(4U), 21U);
+}
+
+TEST(EventLoopTest, SharedRendezvousReportsSameTimeLivelockWithoutRunningOwnerWork) {
+    fil::sim::EventLoop loop(2U);
+    std::uint32_t calls = 0U;
+    {
+        auto owner = loop.useOwner(1U);
+        static_cast<void>(loop.scheduleAt(0U, [&] { calls += 100U; }));
+    }
+    std::function<void()> repeat;
+    repeat = [&] {
+        ++calls;
+        static_cast<void>(loop.scheduleAfter(0U, repeat));
+    };
+    static_cast<void>(loop.scheduleAt(0U, repeat));
+    const auto result = loop.runSharedEvents(0U);
+    EXPECT_TRUE(result.same_time_limit_hit);
+    EXPECT_EQ(result.events_executed, 2U);
+    EXPECT_EQ(calls, 2U);
+    EXPECT_EQ(loop.now(1U), 0U);
+    EXPECT_EQ(loop.pending(), 2U);
+    loop.clear();
+}
+
+TEST(EventLoopTest, CountsOnlySuccessfullyDispatchedCallbacksAcrossDenseAndSparseOwners) {
+    for (const fil::sim::EventOwner owner : {0U, 63U, 64U, 1000U}) {
+        SCOPED_TRACE(owner);
+        fil::sim::EventLoop loop;
+        std::vector<int> order;
+        EXPECT_EQ(loop.executedCallbacks(), 0U);
+        const auto canceled = [&] {
+            auto scope = loop.useOwner(owner);
+            return loop.scheduleAt(4U, [&] { order.push_back(99); });
+        }();
+        EXPECT_TRUE(loop.cancel(canceled));
+        {
+            auto scope = loop.useOwner(owner);
+            static_cast<void>(loop.scheduleAt(5U, [&] {
+                order.push_back(1);
+                static_cast<void>(loop.scheduleAfter(0U, [&] { order.push_back(3); }));
+            }));
+            static_cast<void>(loop.scheduleAt(5U, [&] { order.push_back(2); }));
+        }
+        static_cast<void>(loop.scheduleAt(5U, [&] { order.push_back(4); }));
+
+        EXPECT_EQ(loop.runOwnedEvents(owner, 5U).events_executed, 3U);
+        EXPECT_EQ(loop.executedCallbacks(), 3U);
+        EXPECT_EQ(order, (std::vector<int>{1, 2, 3}));
+        EXPECT_EQ(loop.runSharedEvents(5U).events_executed, 1U);
+        EXPECT_EQ(loop.executedCallbacks(), 4U);
+        EXPECT_EQ(order, (std::vector<int>{1, 2, 3, 4}));
+    }
+
+    fil::sim::EventLoop throwing_loop;
+    static_cast<void>(throwing_loop.scheduleAt(1U, [] {
+        throw std::runtime_error("callback failed");
+    }));
+    EXPECT_THROW(static_cast<void>(throwing_loop.runDueEvents(1U)), std::runtime_error);
+    EXPECT_EQ(throwing_loop.executedCallbacks(), 0U);
+}
+
+TEST(EventLoopTest, OwnerRunRejectsReentrantDispatchButAllowsScheduling) {
+    fil::sim::EventLoop loop;
+    constexpr fil::sim::EventOwner owner_id = 2U;
+    std::vector<int> order;
+    {
+        auto owner = loop.useOwner(owner_id);
+        static_cast<void>(loop.scheduleAt(3U, [&] {
+            EXPECT_THROW(static_cast<void>(loop.runOwnedEvents(owner_id, 12U)), std::logic_error);
+            EXPECT_THROW(static_cast<void>(loop.runOwnedEvents(9U, 12U)), std::logic_error);
+            EXPECT_THROW(static_cast<void>(loop.runSharedEvents(12U)), std::logic_error);
+            EXPECT_THROW(static_cast<void>(loop.runDueEvents(12U)), std::logic_error);
+            EXPECT_THROW(static_cast<void>(loop.advanceBy(12U)), std::logic_error);
+            EXPECT_EQ(loop.now(owner_id), 3U);
+            const auto canceled = loop.scheduleAfter(20U, [&] { order.push_back(99); });
+            EXPECT_TRUE(loop.cancel(canceled));
+            static_cast<void>(loop.scheduleAfter(10U, [&] { order.push_back(1); }));
+        }));
+    }
+
+    const auto result = loop.runOwnedEvents(owner_id, 6U);
+    EXPECT_EQ(result.events_executed, 1U);
+    EXPECT_EQ(order, (std::vector<int>{}));
+    EXPECT_EQ(loop.now(owner_id), 6U);
+    EXPECT_EQ(loop.runOwnedEvents(owner_id, 13U).events_executed, 1U);
+    EXPECT_EQ(order, (std::vector<int>{1}));
+    EXPECT_EQ(loop.now(owner_id), 13U);
+}
+
+TEST(EventLoopTest, OwnerDispatchGuardUnwindsAfterCallbackException) {
+    fil::sim::EventLoop loop;
+    constexpr fil::sim::EventOwner owner_id = 5U;
+    {
+        auto owner = loop.useOwner(owner_id);
+        static_cast<void>(loop.scheduleAt(2U, [] {
+            throw std::runtime_error("owner callback failed");
+        }));
+    }
+    EXPECT_THROW(static_cast<void>(loop.runOwnedEvents(owner_id, 8U)), std::runtime_error);
+    EXPECT_EQ(loop.runDueEvents(0U).events_executed, 0U);
+    EXPECT_EQ(loop.runOwnedEvents(owner_id, 2U).events_executed, 0U);
+    EXPECT_EQ(loop.now(owner_id), 2U);
+}
+
 TEST(EventLoopTest, AdvancesOneOwnerIndependently) {
     fil::sim::EventLoop loop;
     std::vector<std::uint32_t> calls;

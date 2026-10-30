@@ -454,11 +454,14 @@ bool FdcanPeripheral::transmitBuffer(const std::uint32_t buffer_index) {
                 setInterruptFlags(interrupt_protocol_arbitration_error);
             }
         };
+        // Capture the submitting board's logical timestamp before entering the
+        // shared domain; loop->now() in shared scope is a different clock.
+        const sim::SimTimeNs request_time = currentTime();
         if (sim::EventLoop* const loop = eventLoop()) {
             auto shared_scope = loop->useOwner(sim::shared_event_owner);
-            sent = bus_->send(bus_node_id_, frame, currentTime(), completion);
+            sent = bus_->send(bus_node_id_, frame, request_time, completion);
         } else {
-            sent = bus_->send(bus_node_id_, frame, currentTime(), completion);
+            sent = bus_->send(bus_node_id_, frame, request_time, completion);
         }
         if (!sent) {
             setRegister(txbrp, registerValue(txbrp) & ~buffer_bit);

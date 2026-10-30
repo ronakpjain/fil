@@ -142,13 +142,34 @@ public:
     /** @brief Cancels an event if it is still pending. */
     [[nodiscard]] bool cancel(EventId id) noexcept;
 
-    /** @brief Runs all events due at or before the supplied global deadline. */
+    /** @brief Runs all due events; rejected while an owner-only run is dispatching. */
     [[nodiscard]] EventRunResult runDueEvents(SimTimeNs deadline);
 
-    /** @brief Runs only one owner's callbacks and advances that owner's local clock. */
+    /**
+     * @brief Runs only one owner's callbacks and advances that owner's local clock.
+     *
+     * Dispatch cannot be reentered from a callback: all nested owner runs, global
+     * runs, and relative advances throw std::logic_error. Callbacks may still
+     * schedule or cancel events and query clocks.
+     */
     [[nodiscard]] EventRunResult runOwnedEvents(EventOwner owner, SimTimeNs deadline);
 
-    /** @brief Advances by a relative duration and runs all newly due events. */
+    /**
+     * @brief Dispatches shared-domain callbacks through a rendezvous deadline.
+     *
+     * This is the bounded-skew scheduler's shared-event rendezvous: it consumes
+     * only callbacks owned by `shared_event_owner`, advances only the shared
+     * clock, and leaves local board clocks and owner callbacks untouched. Shared
+     * callbacks retain their scheduled logical timestamps even when physical
+     * dispatch is delayed until this rendezvous. Work they schedule into a
+     * board lane is constrained by that lane's current time (relative scheduling
+     * clamps to it; an earlier absolute timestamp is rejected). This is not an
+     * exact-causality guarantee; callers must drain board-owned callbacks before
+     * rendezvous so that no other execution path can invoke stale owner work.
+     */
+    [[nodiscard]] EventRunResult runSharedEvents(SimTimeNs deadline);
+
+    /** @brief Advances and runs due events; rejected during an owner-only run. */
     [[nodiscard]] EventRunResult advanceBy(SimTimeNs delta);
 
     /** @brief Removes every pending event without changing current time. */
@@ -162,6 +183,9 @@ public:
 
     /** @brief Gets the number of live, non-cancelled events. */
     [[nodiscard]] std::size_t pending() const noexcept;
+
+    /** @brief Gets the monotonically increasing count of successfully dispatched callbacks. */
+    [[nodiscard]] std::uint64_t executedCallbacks() const noexcept;
 
     /** @brief Gets the earliest live event timestamp across every owner queue. */
     [[nodiscard]] std::optional<SimTimeNs> nextScheduledTime();

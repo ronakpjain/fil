@@ -1,6 +1,7 @@
 #include "fil/sim/event_loop.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <mutex>
@@ -64,11 +65,16 @@ struct EventLoop::Impl {
     std::vector<std::uint32_t> free_slots;
     Queue events;
     Queue globally_observed_events;
+    static constexpr std::size_t dense_owner_count = 64U;
+    std::array<Queue, dense_owner_count> dense_owner_events;
     std::unordered_map<EventOwner, Queue> owner_events;
     std::shared_ptr<const ObservationBarrier> observation_barrier;
     ObservationBarrier scheduler_observation_barrier;
     std::unordered_map<EventId, SlotRef> live_events;
+    std::array<std::optional<SimTimeNs>, dense_owner_count> dense_owner_now;
     std::unordered_map<EventOwner, SimTimeNs> owner_now;
+    std::uint64_t executed_callbacks{0U};
+    bool owner_dispatch_active{false};
 
     static Impl*& exclusiveImpl() noexcept {
         static thread_local Impl* current = nullptr;
@@ -82,6 +88,21 @@ struct EventLoop::Impl {
         std::unique_lock<std::recursive_mutex> lock;
     };
 
+    struct OwnerDispatchGuard {
+        explicit OwnerDispatchGuard(Impl& implementation) : impl(implementation) {
+            if (impl.owner_dispatch_active) {
+                throw std::logic_error("cannot reenter event dispatch during an owner run");
+            }
+            impl.owner_dispatch_active = true;
+        }
+        ~OwnerDispatchGuard() { impl.owner_dispatch_active = false; }
+
+        OwnerDispatchGuard(const OwnerDispatchGuard&) = delete;
+        OwnerDispatchGuard& operator=(const OwnerDispatchGuard&) = delete;
+
+        Impl& impl;
+    };
+
     [[nodiscard]] EventOwner currentOwner() const noexcept {
         return serial_active_owner;
     }
@@ -92,6 +113,11 @@ struct EventLoop::Impl {
 
     [[nodiscard]] SimTimeNs timeFor(const EventOwner owner) const noexcept {
         if (owner == shared_event_owner) return shared_now;
+        if (owner < dense_owner_count) {
+            const auto& local_time = dense_owner_now[owner];
+            if (!local_time) return shared_now;
+            return std::max(*local_time, shared_now);
+        }
         const auto found = owner_now.find(owner);
         if (found == owner_now.end()) return shared_now;
         // Owner clocks never read behind the shared clock: runDueEvents used
@@ -105,8 +131,13 @@ struct EventLoop::Impl {
     }
 
     void setTime(const EventOwner owner, const SimTimeNs time) {
-        if (owner == shared_event_owner) shared_now = time;
-        else owner_now[owner] = time;
+        if (owner == shared_event_owner) {
+            shared_now = time;
+        } else if (owner < dense_owner_count) {
+            dense_owner_now[owner] = time;
+        } else {
+            owner_now[owner] = time;
+        }
     }
 
     [[nodiscard]] bool entryLive(const Entry& entry) const noexcept {
@@ -133,10 +164,20 @@ struct EventLoop::Impl {
     }
 
     [[nodiscard]] Queue* ownerQueue(const EventOwner owner) {
+        if (owner < dense_owner_count) {
+            Queue& queue = dense_owner_events[owner];
+            discardDeadFront(queue);
+            return &queue;
+        }
         const auto found = owner_events.find(owner);
         if (found == owner_events.end()) return nullptr;
         discardDeadFront(found->second);
         return &found->second;
+    }
+
+    [[nodiscard]] Queue& schedulingQueue(const EventOwner owner) {
+        if (owner < dense_owner_count) return dense_owner_events[owner];
+        return owner_events[owner];
     }
 
     void releaseSlot(const std::uint32_t index) noexcept {
@@ -195,7 +236,7 @@ struct EventLoop::Impl {
         const Entry entry{slot.at, slot.sequence, index, id};
         events.push(entry);
         if (globally_observed) globally_observed_events.push(entry);
-        auto& owner_queue = owner_events[owner];
+        Queue& owner_queue = schedulingQueue(owner);
         discardDeadFront(owner_queue);
         owner_queue.push(entry);
         live_events.emplace(id, SlotRef{index, id});
@@ -228,7 +269,7 @@ struct EventLoop::Impl {
         const Entry entry{slot.at, slot.sequence, index, id};
         events.push(entry);
         if (globally_observed) globally_observed_events.push(entry);
-        auto& owner_queue = owner_events[owner];
+        Queue& owner_queue = schedulingQueue(owner);
         discardDeadFront(owner_queue);
         owner_queue.push(entry);
         live_events.emplace(id, SlotRef{index, id});
@@ -322,6 +363,9 @@ struct EventLoop::Impl {
             }
             if (builtin) builtin.invoke(builtin.context);
             else callback();
+            if (executed_callbacks != std::numeric_limits<std::uint64_t>::max()) {
+                ++executed_callbacks;
+            }
         } catch (...) {
             setCurrentOwner(previous_owner);
             throw;
@@ -438,6 +482,9 @@ bool EventLoop::cancel(const EventId id) noexcept {
 
 EventRunResult EventLoop::runDueEvents(const SimTimeNs deadline) {
     Impl::Lock lock(*impl_);
+    if (impl_->owner_dispatch_active) {
+        throw std::logic_error("cannot run global events during an owner run");
+    }
     return impl_->runDueEventsLocked(deadline);
 }
 
@@ -445,6 +492,7 @@ EventRunResult EventLoop::runOwnedEvents(
     const EventOwner owner, const SimTimeNs deadline
 ) {
     Impl::Lock lock(*impl_);
+    Impl::OwnerDispatchGuard dispatch_guard(*impl_);
     const SimTimeNs current = impl_->timeFor(owner);
     if (deadline < current) {
         throw std::invalid_argument("cannot run an owner clock backwards");
@@ -480,8 +528,15 @@ EventRunResult EventLoop::runOwnedEvents(
     }
 }
 
+EventRunResult EventLoop::runSharedEvents(const SimTimeNs deadline) {
+    return runOwnedEvents(shared_event_owner, deadline);
+}
+
 EventRunResult EventLoop::advanceBy(const SimTimeNs delta) {
     Impl::Lock lock(*impl_);
+    if (impl_->owner_dispatch_active) {
+        throw std::logic_error("cannot advance global events during an owner run");
+    }
     if (delta > std::numeric_limits<SimTimeNs>::max() - impl_->shared_now) {
         throw std::overflow_error("simulation clock overflow");
     }
@@ -492,6 +547,7 @@ void EventLoop::clear() noexcept {
     Impl::Lock lock(*impl_);
     impl_->events = {};
     impl_->globally_observed_events = {};
+    for (auto& queue : impl_->dense_owner_events) queue = {};
     impl_->owner_events.clear();
     impl_->live_events.clear();
     for (auto& slot : impl_->slots) {
@@ -517,6 +573,11 @@ SimTimeNs EventLoop::now(const EventOwner owner) const noexcept {
 std::size_t EventLoop::pending() const noexcept {
     Impl::Lock lock(*impl_);
     return impl_->live_events.size();
+}
+
+std::uint64_t EventLoop::executedCallbacks() const noexcept {
+    Impl::Lock lock(*impl_);
+    return impl_->executed_callbacks;
 }
 
 std::optional<SimTimeNs> EventLoop::nextScheduledTime() {

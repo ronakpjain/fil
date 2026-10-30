@@ -189,6 +189,34 @@ TEST(FdcanTest, TimedTransmissionDefersCompletionAndResetCancels) {
     EXPECT_EQ(readWord(receiver, fil::stm32g4::FdcanPeripheral::rxf0sOffset) & 0xfU, 1U);
 }
 
+TEST(FdcanTest, TimedTransmitUsesAheadOwnerClockForSharedBusRequest) {
+    fil::sim::EventLoop loop;
+    fil::stm32g4::FdcanMessageRam ram;
+    fil::devices::VirtualCanBus bus("timed", 500'000U,
+        fil::devices::VirtualCanBus::DeliveryMode::timed, 4U);
+    bus.setEventLoop(&loop);
+    fil::stm32g4::FdcanPeripheral sender(1U, ram, &loop);
+    ASSERT_TRUE(sender.attachBus(bus, "sender"));
+    writeWord(sender, fil::stm32g4::FdcanPeripheral::cccrOffset, 0U);
+
+    constexpr fil::sim::EventOwner board_owner = 7U;
+    constexpr fil::sim::SimTimeNs board_time = 1'000'000U;
+    static_cast<void>(loop.runOwnedEvents(board_owner, board_time));
+    const auto offset = fil::stm32g4::FdcanMessageRam::txFifoOffset;
+    ram.storeWord(0U, offset, 0x123U << 18U);
+    ram.storeWord(0U, offset + 4U, 1U << 16U);
+    ram.storeWord(0U, offset + 8U, 0xa5U);
+    {
+        auto owner = loop.useOwner(board_owner);
+        writeWord(sender, fil::stm32g4::FdcanPeripheral::txbarOffset, 1U);
+    }
+
+    ASSERT_TRUE(loop.nextScheduledTime(fil::sim::shared_event_owner).has_value());
+    EXPECT_EQ(*loop.nextScheduledTime(fil::sim::shared_event_owner), board_time);
+    EXPECT_EQ(loop.now(board_owner), board_time);
+    EXPECT_EQ(loop.now(), 0U);
+}
+
 TEST(FdcanTest, TimedTransmitFifoReservesSlotsAndIgnoresPendingRequests) {
     fil::sim::EventLoop loop;
     fil::stm32g4::FdcanMessageRam ram;
