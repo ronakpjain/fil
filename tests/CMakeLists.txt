@@ -14,6 +14,7 @@ add_executable(fil_tests
     unit/elf_loader_test.cpp
     unit/event_loop_test.cpp
     unit/effect_summary_test.cpp
+    unit/forward_execution_test.cpp
     unit/exceptions_test.cpp
     unit/fdcan_test.cpp
     unit/crc_test.cpp

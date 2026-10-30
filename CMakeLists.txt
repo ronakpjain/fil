@@ -150,6 +150,7 @@ add_library(fil_core STATIC
     src/config/config.cpp
     src/cpu/cortex_m4.cpp
     src/cpu/effect_summary.cpp
+    src/cpu/forward_execution.cpp
     src/cpu/decoder.cpp
     src/cpu/execute.cpp
     src/cpu/jit.cpp
