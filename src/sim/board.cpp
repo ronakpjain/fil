@@ -1012,7 +1012,10 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
     // The ordinary reversible-evaluation metadata remains fixed-capacity;
     // only a validated period certificate can admit the larger compressed span.
     limit = std::min(limit, ReversibleRamPrefix::max_instructions);
-    ReversibleRamPrefix::ReversibleExecution speculative;
+    // The speculative pass writes per-instruction metadata straight into
+    // prefix.evaluated so a committed uncut span needs no second metadata copy;
+    // the cut-replay branch below overwrites it from `replayed` when needed.
+    auto& speculative = prefix.evaluated;
     speculative.count = 0U;
     speculative.result = cpu::FastStepResult{};
     bool stop = false;
@@ -1191,15 +1194,9 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
             prefix.evaluated.sizes[i] = replayed.sizes[i];
             prefix.evaluated.instruction_cycles[i] = replayed.instruction_cycles[i];
         }
-    } else {
-        prefix.evaluated.result = speculative.result;
-        prefix.evaluated.count = speculative.count;
-        for (std::size_t i = 0U; i < speculative.count; ++i) {
-            prefix.evaluated.pcs[i] = speculative.pcs[i];
-            prefix.evaluated.sizes[i] = speculative.sizes[i];
-            prefix.evaluated.instruction_cycles[i] = speculative.instruction_cycles[i];
-        }
     }
+    // Uncut path: `speculative` already aliases prefix.evaluated, so the
+    // executed metadata is in place and needs no further copying.
     prefix.evaluated_checkpoint = memory_.sideEffectCheckpoint();
 
     // Re-run a short RAM-neutral span to retain per-instruction CPU endpoints
