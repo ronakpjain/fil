@@ -1738,15 +1738,14 @@ void CortexM4::observeNativeTraceReturn(const std::uint32_t pc, const std::uint3
 }
 
 bool CortexM4::prepareNativeTrace(NativeTraceCacheEntry& entry) {
-    constexpr std::size_t trace_limit = 32U;
+    constexpr std::size_t trace_limit = NativeTracePlan::max_ops;
     std::vector<NativeTraceOp> sources;
     sources.reserve(trace_limit);
     std::uint32_t pc = entry.pc;
     bool has_memory_or_branch = false;
     for (std::size_t i = 0U; i < trace_limit; ++i) {
-        bool repeated = false;
-        for (const auto& previous : sources) repeated |= previous.pc == pc;
-        if (repeated) break; // Execute a loop traversal, never elide iterations.
+        // Repeated PCs are unrolled, not elided: each iteration still has
+        // its own instruction/cycle admission and conditional-edge guard.
         std::uint32_t raw = 0U;
         std::uint8_t size = 0U;
         const auto decoded = fetchDecode(pc, raw, size);
@@ -1838,8 +1837,12 @@ bool CortexM4::prepareNativeTrace(NativeTraceCacheEntry& entry) {
     return true;
 }
 
-std::optional<CortexM4::TimedJitStepOutcome> CortexM4::tryStepNativeTrace(
-    const std::size_t max_instructions, ReversibleCycleBudget& budget) {
+std::optional<FastStepResult> CortexM4::tryStepNativeTrace(
+    const std::size_t max_instructions, ReversibleCycleBudget& budget,
+    TimedJitStepOutcome* const detailed) {
+    // A callback is arbitrary (and may change its answer on every call), so
+    // it cannot safely participate in the snapshot-keyed charge cache.
+    if (budget.fetch_stall != nullptr) return std::nullopt;
     const auto pc = state_.r[15];
     if (!MicroJit::hostSupported() || state_.halted || !state_.thumb
         || (state_.xpsr & xpsr_t) == 0U || (pc & 1U) != 0U
@@ -1857,12 +1860,12 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::tryStepNativeTrace(
         ++entry.attempts;
         if (!prepareNativeTrace(entry)) return std::nullopt;
     }
-    return executeNativeTrace(entry, max_instructions, budget);
+    return executeNativeTrace(entry, max_instructions, budget, detailed);
 }
 
-std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeNativeTrace(
+std::optional<FastStepResult> CortexM4::executeNativeTrace(
     NativeTraceCacheEntry& entry, const std::size_t max_instructions,
-    ReversibleCycleBudget& budget) {
+    ReversibleCycleBudget& budget, TimedJitStepOutcome* const detailed) {
     const auto& plan = *entry.plan;
     if (plan.generation != memory_.executionGeneration() || plan.ops.empty()
         || plan.ops.front().pc != state_.r[15]) return std::nullopt;
@@ -1875,27 +1878,51 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeNativeTrace(
     };
     if (entry.first_declined && first_address() == entry.declined_address)
         return std::nullopt;
-    const auto limit = std::min({max_instructions, plan.ops.size(), JitStepOutcome::max_block});
-    std::array<std::uint32_t, JitStepOutcome::max_block> charges;
-    bool have_fetch = budget.have_fetch;
-    auto fetch_end = budget.fetch_end;
+    const auto limit = std::min({max_instructions, plan.ops.size(),
+        detailed != nullptr ? JitStepOutcome::max_block : NativeTracePlan::max_ops});
+    const bool first_sequential = budget.have_fetch
+        && plan.ops.front().pc == budget.fetch_end;
+    const auto& timing = budget.fetch_timing;
+    const auto same_timing = [&] {
+        const auto& cached = entry.charges_timing;
+        return cached.begin == timing.begin && cached.end == timing.end
+            && cached.alias_begin == timing.alias_begin && cached.alias_end == timing.alias_end
+            && cached.nonsequential_stall == timing.nonsequential_stall
+            && cached.sequential_stall == timing.sequential_stall;
+    };
+    if (!entry.charges_valid || entry.charges_first_sequential != first_sequential
+        || !same_timing()) {
+        bool have_fetch = first_sequential;
+        auto fetch_end = plan.ops.front().pc;
+        entry.charged_prefix[0] = 0U;
+        entry.execution_prefix[0] = 0U;
+        for (std::size_t i = 0U; i < plan.ops.size(); ++i) {
+            const auto& op = plan.ops[i];
+            const bool sequential = i == 0U ? first_sequential
+                : have_fetch && op.pc == fetch_end;
+            entry.charges[i] = static_cast<std::uint32_t>(op.execution_cycles)
+                + timing.stall(op.pc, sequential);
+            entry.charged_prefix[i + 1U] = entry.charged_prefix[i] + entry.charges[i];
+            entry.execution_prefix[i + 1U] = entry.execution_prefix[i] + op.execution_cycles;
+            have_fetch = true;
+            fetch_end = op.pc + op.size;
+        }
+        entry.charges_timing = timing;
+        entry.charges_first_sequential = first_sequential;
+        entry.charges_valid = true;
+    }
     std::size_t planned = 0U;
     for (; planned < limit; ++planned) {
-        const auto& op = plan.ops[planned];
-        const auto charged = static_cast<std::uint32_t>(op.execution_cycles)
-            + budget.fetchStallCycles(op.pc, have_fetch && op.pc == fetch_end);
-        if (charged > std::numeric_limits<std::uint16_t>::max()) break;
-        charges[planned] = charged;
-        have_fetch = true;
-        fetch_end = op.pc + op.size;
+        if (entry.charges[planned] > std::numeric_limits<std::uint16_t>::max()) break;
     }
     if (planned == 0U) return std::nullopt;
+    const auto* charges = entry.charges.data();
     NativeExecutionContext context;
     context.cpu_state = &state_;
     context.memory_bus = &memory_;
     context.instruction_limit = static_cast<std::uint32_t>(planned);
     context.cycle_limit = budget.remaining_cycles;
-    context.charged_cycles = charges.data();
+    context.charged_cycles = charges;
     context.charged_cycles_count = static_cast<std::uint32_t>(planned);
     plan.function(&context);
     if (context.retired_count > planned)
@@ -1909,6 +1936,7 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeNativeTrace(
         ++jit_stats_.trace_guard_mismatches;
         if (context.retired_count == 0U) {
             entry.plan.reset();
+            entry.charges_valid = false;
             entry.hot = 0U; // Relearn the actually retired checked successor.
             return std::nullopt;
         }
@@ -1921,57 +1949,81 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeNativeTrace(
         }
     }
     if (context.retired_count == 0U) return std::nullopt;
-    TimedJitStepOutcome timed;
-    auto& out = timed.execution;
-    std::uint32_t execution_cycles = 0U;
-    std::uint64_t charged_cycles = 0U;
-    for (std::size_t i = 0U; i < context.retired_count; ++i) {
-        const auto& op = plan.ops[i];
-        out.pcs[i] = op.pc;
-        out.sizes[i] = op.size;
-        timed.instruction_cycles[i] = op.execution_cycles;
-        budget.total_instruction_cycles[i] = static_cast<std::uint16_t>(charges[i]);
-        budget.remaining_cycles -= charges[i];
-        budget.have_fetch = true;
-        budget.fetch_end = op.pc + op.size;
-        execution_cycles += op.execution_cycles;
-        charged_cycles += charges[i];
-        if (op.decoded.kind == InstrKind::ldr || op.decoded.kind == InstrKind::str
-            || op.decoded.kind == InstrKind::push || op.decoded.kind == InstrKind::pop)
-            out.memory_free = false;
+    const auto execution_cycles = entry.execution_prefix[context.retired_count];
+    const auto charged_cycles = entry.charged_prefix[context.retired_count];
+    if (detailed != nullptr) {
+        for (std::size_t i = 0U; i < context.retired_count; ++i) {
+            const auto& op = plan.ops[i];
+            detailed->execution.pcs[i] = op.pc;
+            detailed->execution.sizes[i] = op.size;
+            detailed->instruction_cycles[i] = op.execution_cycles;
+            detailed->execution.memory_free &= op.decoded.kind != InstrKind::ldr
+                && op.decoded.kind != InstrKind::str && op.decoded.kind != InstrKind::push
+                && op.decoded.kind != InstrKind::pop;
+            budget.total_instruction_cycles[i] = static_cast<std::uint16_t>(charges[i]);
+        }
     }
     const auto& last = plan.ops[context.retired_count - 1U];
+    budget.remaining_cycles -= charged_cycles;
+    budget.have_fetch = true;
+    budget.fetch_end = last.pc + last.size;
     if (context.retired_cycles != charged_cycles || state_.r[15] != last.expected_next_pc
         || state_.instruction_address != last.pc)
         throw std::logic_error("native trace retirement metadata differs");
-    out.count = static_cast<std::uint8_t>(context.retired_count);
-    out.result.reason = StopReason::step_complete;
-    out.result.instruction_address = last.pc;
-    out.result.raw = last.raw;
-    out.result.instruction_size = last.size;
-    out.result.instructions = out.count;
-    out.result.cycles = static_cast<std::uint16_t>(execution_cycles);
-    out.result.suppress_loop_observation = last.decoded.kind == InstrKind::bl
+    FastStepResult result;
+    result.reason = StopReason::step_complete;
+    result.instruction_address = last.pc;
+    result.raw = last.raw;
+    result.instruction_size = last.size;
+    result.instructions = static_cast<std::uint32_t>(context.retired_count);
+    result.cycles = static_cast<std::uint16_t>(execution_cycles);
+    result.suppress_loop_observation = last.decoded.kind == InstrKind::bl
         || (last.decoded.kind == InstrKind::pop
             && (last.decoded.register_list & (std::uint16_t{1U} << 15U)) != 0U);
+    if (detailed != nullptr) {
+        detailed->execution.count = static_cast<std::uint8_t>(context.retired_count);
+        detailed->execution.result = result;
+    }
     ++jit_stats_.block_executions;
-    jit_stats_.block_instructions += out.count;
-    return timed;
+    jit_stats_.block_instructions += context.retired_count;
+    return result;
 }
 
 std::optional<CortexM4::TimedJitStepOutcome> CortexM4::tryStepBudgetedReversibleJitBlock(
     const std::size_t max_instructions, ReversibleCycleBudget& budget) {
+    return tryStepBudgetedReversibleJitBlockImpl(max_instructions, budget, true);
+}
+
+std::optional<CortexM4::TimedJitStepOutcome> CortexM4::tryStepBudgetedReversibleJitBlockImpl(
+    const std::size_t max_instructions, ReversibleCycleBudget& budget,
+    const bool try_native_trace) {
     if (max_instructions == 0U || !memory_.reversibleRamOnly()
         || !memory_.allMmioTrapping()) return std::nullopt;
     if (inItBlock(state_.it_state)) return tryStepItScalarFallback(&budget);
-    if (native_memory_jit_enabled_ && budget.fetch_stall == nullptr) {
-        if (auto trace = tryStepNativeTrace(max_instructions, budget)) return trace;
+    if (try_native_trace && native_memory_jit_enabled_ && budget.fetch_stall == nullptr) {
+        TimedJitStepOutcome detailed;
+        if (tryStepNativeTrace(max_instructions, budget, &detailed)) return detailed;
     }
     if (!prepareJitBlock(true)) {
         if (auto scalar = tryStepItScalarFallback(&budget)) return scalar;
         return std::nullopt;
     }
     return executeTrustedReversibleJitBlock(max_instructions, &budget);
+}
+
+std::optional<FastStepResult> CortexM4::tryStepCommittedRamSpan(
+    const std::size_t max_instructions, ReversibleCycleBudget& budget) {
+    if (max_instructions == 0U || !memory_.reversibleRamOnly()
+        || !memory_.allMmioTrapping()) return std::nullopt;
+    if (!inItBlock(state_.it_state) && native_memory_jit_enabled_) {
+        if (auto trace = tryStepNativeTrace(max_instructions, budget, nullptr)) return trace;
+    }
+    const auto per_instruction_cycles = budget.total_instruction_cycles;
+    const auto detailed = tryStepBudgetedReversibleJitBlockImpl(
+        max_instructions, budget, false);
+    budget.total_instruction_cycles = per_instruction_cycles;
+    if (!detailed) return std::nullopt;
+    return detailed->execution.result;
 }
 
 std::optional<CortexM4::TimedJitStepOutcome> CortexM4::tryStepItScalarFallback(

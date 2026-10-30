@@ -6,6 +6,7 @@
 
 #include "fil/cpu/instruction.hpp"
 #include "fil/cpu/micro_jit.hpp"
+#include "fil/cpu/native_trace.hpp"
 #include "fil/mem/address.hpp"
 
 #include <array>
@@ -339,6 +340,17 @@ public:
         std::size_t max_instructions, ReversibleCycleBudget& budget);
 
     /**
+     * @brief Executes a committed RAM-only span without materializing per-op metadata.
+     *
+     * Requires reversible non-executable RAM and trapping MMIO, like the
+     * reversible block API. The caller must ensure external timing/event state
+     * remains stable for the span. Debits exact CPU-plus-fetch cycles and updates
+     * fetch sequencing; per-instruction total-cycle slots are left untouched.
+     */
+    [[nodiscard]] std::optional<FastStepResult> tryStepCommittedRamSpan(
+        std::size_t max_instructions, ReversibleCycleBudget& budget);
+
+    /**
      * @brief Predicts, without executing or mutating state, whether a trusted
      * reversible block attempt at the current PC would execute no instruction.
      *
@@ -615,6 +627,12 @@ private:
         std::uint8_t hot{0U};
         std::uint8_t attempts{0U};
         bool first_declined{false};
+        bool charges_valid{false};
+        bool charges_first_sequential{false};
+        ReversibleCycleBudget::FetchTiming charges_timing{};
+        std::array<std::uint32_t, NativeTracePlan::max_ops> charges{};
+        std::array<std::uint32_t, NativeTracePlan::max_ops + 1U> charged_prefix{};
+        std::array<std::uint32_t, NativeTracePlan::max_ops + 1U> execution_prefix{};
     };
     struct NativeBranchProfile {
         std::uint64_t generation{0U};
@@ -630,11 +648,12 @@ private:
     void observeNativeTraceBranch(std::uint32_t pc, bool taken) noexcept;
     void observeNativeTraceReturn(std::uint32_t pc, std::uint32_t target) noexcept;
     [[nodiscard]] bool prepareNativeTrace(NativeTraceCacheEntry& entry);
-    [[nodiscard]] std::optional<TimedJitStepOutcome> tryStepNativeTrace(
-        std::size_t max_instructions, ReversibleCycleBudget& budget);
-    [[nodiscard]] std::optional<TimedJitStepOutcome> executeNativeTrace(
+    [[nodiscard]] std::optional<FastStepResult> tryStepNativeTrace(
+        std::size_t max_instructions, ReversibleCycleBudget& budget,
+        TimedJitStepOutcome* detailed);
+    [[nodiscard]] std::optional<FastStepResult> executeNativeTrace(
         NativeTraceCacheEntry& entry, std::size_t max_instructions,
-        ReversibleCycleBudget& budget);
+        ReversibleCycleBudget& budget, TimedJitStepOutcome* detailed);
     JitStats jit_stats_{};
     bool native_memory_jit_enabled_{true};
     static constexpr std::uint16_t jit_compile_threshold = 50U;
@@ -659,6 +678,8 @@ private:
         std::array<std::uint16_t, JitStepOutcome::max_block>* instruction_cycles = nullptr);
     [[nodiscard]] std::optional<TimedJitStepOutcome> executeTrustedReversibleJitBlock(
         std::size_t max_instructions, ReversibleCycleBudget* budget = nullptr);
+    [[nodiscard]] std::optional<TimedJitStepOutcome> tryStepBudgetedReversibleJitBlockImpl(
+        std::size_t max_instructions, ReversibleCycleBudget& budget, bool try_native_trace);
     [[nodiscard]] std::optional<TimedJitStepOutcome> tryStepItScalarFallback(
         ReversibleCycleBudget* budget);
     [[nodiscard]] bool executeJitFast(const DecodedInstruction& op, JitFast fast,
