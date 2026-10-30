@@ -684,6 +684,66 @@ TEST(JitTest, NativeStackCallTraceMatchesEveryCutAndArchitecturalStackMode) {
     EXPECT_GT(candidate.jitStats().trace_guard_mismatches, 0U);
 }
 
+TEST(JitTest, NativeTraceDeclinesCallbacksPendingStateAndStaleCodeGenerations) {
+    if (!fil::cpu::MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
+    const auto code = halfwords({0xbf00U, 0x6008U, 0x680aU, 0x3202U, 0x2a03U,
+        0xd102U, 0x3301U, 0x604bU, 0x684cU, 0xe7f5U});
+    auto bus = basicBus(), oracle = basicBus();
+    ASSERT_TRUE(bus.loadBytes(flash_base, code));
+    ASSERT_TRUE(oracle.loadBytes(flash_base, code));
+    bus.setReversibleRamOnly(true); bus.setAllMmioTrapping(true);
+    fil::cpu::CortexM4 candidate(bus), checked(oracle);
+    prepare(candidate); prepare(checked);
+    checked.setNativeMemoryJitEnabled(false);
+    candidate.state().r[0] = 1U; candidate.state().r[1] = ram_base;
+    for (unsigned i = 0U; i < 4000U && candidate.jitStats().trace_instructions == 0U; ++i) {
+        fil::cpu::CortexM4::ReversibleCycleBudget budget; budget.remaining_cycles = 1000U;
+        if (!candidate.tryStepBudgetedReversibleJitBlock(64U, budget))
+            ASSERT_EQ(candidate.stepFast().reason, fil::cpu::StopReason::step_complete);
+    }
+    ASSERT_GT(candidate.jitStats().trace_instructions, 0U);
+    const auto trace_calls = candidate.jitStats().trace_executions;
+    auto initial = candidate.state(); initial.r[15] = flash_base;
+    initial.instruction_address = flash_base + 64U; initial.r[0] = 1U;
+    for (unsigned invalid = 0U; invalid < 4U; ++invalid) {
+        candidate.state() = initial;
+        if (invalid == 0U) candidate.state().halted = true;
+        if (invalid == 1U) candidate.state().thumb = false;
+        if (invalid == 2U) candidate.state().pending_exception = 3U;
+        if (invalid == 3U) candidate.state().pending_exc_return = 0xfffffffdU;
+        const auto before = candidate.state();
+        fil::cpu::CortexM4::ReversibleCycleBudget budget; budget.remaining_cycles = 100U;
+        EXPECT_FALSE(candidate.tryStepBudgetedReversibleJitBlock(10U, budget));
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.state(), before));
+        EXPECT_EQ(budget.remaining_cycles, 100U);
+    }
+    candidate.state() = checked.state() = initial;
+    unsigned callbacks = 0U;
+    fil::cpu::CortexM4::ReversibleCycleBudget callback_budget;
+    callback_budget.remaining_cycles = 100U; callback_budget.context = &callbacks;
+    callback_budget.fetch_stall = [](const void* context, std::uint32_t, bool) -> std::uint16_t {
+        ++*static_cast<unsigned*>(const_cast<void*>(context)); return 0U;
+    };
+    const auto callback_result = candidate.tryStepBudgetedReversibleJitBlock(10U, callback_budget);
+    ASSERT_TRUE(callback_result);
+    EXPECT_EQ(callbacks, callback_result->execution.count);
+    for (unsigned i = 0U; i < callback_result->execution.count; ++i)
+        ASSERT_EQ(checked.stepFast().reason, fil::cpu::StopReason::step_complete);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.state(), checked.state()));
+    EXPECT_EQ(candidate.jitStats().trace_executions, trace_calls);
+    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0x2007U})));
+    ASSERT_TRUE(oracle.loadBytes(flash_base, halfwords({0x2007U})));
+    candidate.state() = checked.state() = initial;
+    fil::cpu::CortexM4::ReversibleCycleBudget changed; changed.remaining_cycles = 100U;
+    const auto result = candidate.tryStepBudgetedReversibleJitBlock(10U, changed);
+    ASSERT_TRUE(result);
+    for (unsigned i = 0U; i < result->execution.count; ++i)
+        ASSERT_EQ(checked.stepFast().reason, fil::cpu::StopReason::step_complete);
+    EXPECT_EQ(candidate.state().r[0], 7U);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.state(), checked.state()));
+    EXPECT_EQ(candidate.jitStats().trace_executions, trace_calls);
+}
+
 TEST(JitTest, NativeFirstMemoryDeclineRetriesOnlyAfterAddressChanges) {
     if (!fil::cpu::MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
     auto memory = basicBus();

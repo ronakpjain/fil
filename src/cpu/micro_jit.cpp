@@ -2203,10 +2203,9 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     const auto reason = off(offsetof(NativeExecutionContext, exit_reason));
     const auto charged_count = off(offsetof(NativeExecutionContext, charged_cycles_count));
     X86Emitter e;
-    const auto done = e.makeLabel(), instruction_exit = e.makeLabel();
-    const auto cycle_exit = e.makeLabel(), mismatch_exit = e.makeLabel();
-    const auto helper_exit = e.makeLabel(), unsupported_exit = e.makeLabel();
-    e.pushReg(3U); e.pushReg(12U); e.pushReg(13U); e.pushReg(14U); e.pushReg(15U); e.subRsp16();
+    const auto done = e.makeLabel();
+    e.pushReg(3U); e.pushReg(12U); e.pushReg(13U); e.pushReg(14U); e.pushReg(15U);
+    e.pushReg(5U); e.pushReg(10U); e.subRsp16();
     e.movRR64(ctx, 7U);
     e.cmpR64Imm8(ctx, 0U); e.jcc(4U, done);
     e.movR64M(cpu, ctx, off(offsetof(NativeExecutionContext, cpu_state)));
@@ -2214,38 +2213,39 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     e.movR64M(costs, ctx, off(offsetof(NativeExecutionContext, charged_cycles)));
     e.movRR64(7U, cpu);
     e.movM32Imm(ctx, retired, 0U); e.movM32Imm(ctx, reason, 0U);
+    e.movR64M(5U, ctx, cycle_count); // RBP is live retired-cycle accumulator.
     e.movR32M(kRetain, cpu, offsets.xpsr); e.movRR(kNzcv, kRetain);
     e.aluRImm(4U, kRetain, ~(kFlagN | kFlagZ | kFlagC | kFlagV));
     e.aluRImm(4U, kNzcv, kFlagN | kFlagZ | kFlagC | kFlagV);
-    const auto emitExit = [&](std::size_t label, NativeExitReason why, bool failed_pc) {
-        e.bindLabel(label); e.movM32Imm(ctx, reason, static_cast<std::uint32_t>(why));
-        if (failed_pc) { e.movR32M(kEax, ctx, current); e.movM32R(ctx, failing, kEax); }
-        e.jmp(done);
-    };
-    for (std::size_t i = 0; i < entry.plan.ops.size(); ++i) {
+    const std::size_t n = entry.plan.ops.size();
+    struct ExitLabels { std::size_t instruction, cycle, unsupported, mismatch, helper; };
+    std::vector<ExitLabels> exits; exits.reserve(n);
+    for (std::size_t i=0; i<n; ++i)
+        exits.push_back({e.makeLabel(),e.makeLabel(),e.makeLabel(),e.makeLabel(),e.makeLabel()});
+    const auto normal = e.makeLabel();
+    for (std::size_t i = 0; i < n; ++i) {
         const auto& op = entry.plan.ops[i];
         const auto& inst = op.native.integer;
-        e.movM32Imm(ctx, current, op.pc);
-        e.movR32M(kEax, ctx, retired); e.aluRM(7U, kEax, ctx, limit);
-        e.jcc(3U, instruction_exit);
-        e.movR32M(kEax, ctx, charged_count); e.cmpR32Imm(kEax, static_cast<std::uint32_t>(i + 1U));
-        e.jcc(2U, unsupported_exit);
-        e.cmpR64Imm8(costs, 0U); e.jcc(4U, unsupported_exit);
+        e.movR32M(kEax, ctx, limit); e.cmpR32Imm(kEax, static_cast<std::uint32_t>(i));
+        e.jcc(6U, exits[i].instruction); // i >= instruction_limit before all other admissions
+        e.movR32M(kEax, ctx, charged_count);
+        e.cmpR32Imm(kEax, static_cast<std::uint32_t>(i + 1U));
+        e.jcc(2U, exits[i].unsupported);
+        e.cmpR64Imm8(costs, 0U); e.jcc(4U, exits[i].unsupported);
         const auto conditional = inst.op == MicroOp::b_cond;
         if (conditional) {
             const auto actually_taken = e.makeLabel(), guard_done = e.makeLabel();
             if (!emitX86CondTaken(e, inst.condition, 0U, actually_taken, error)) {
                 impl_->trace_cache.pop_back(); return nullptr;
             }
-            if (op.expected_taken) e.jmp(mismatch_exit);
-            else e.jmp(guard_done);
+            if (op.expected_taken) e.jmp(exits[i].mismatch); else e.jmp(guard_done);
             e.bindLabel(actually_taken);
-            if (op.expected_taken) e.jmp(guard_done); else e.jmp(mismatch_exit);
+            if (op.expected_taken) e.jmp(guard_done); else e.jmp(exits[i].mismatch);
             e.bindLabel(guard_done);
         }
         e.movR32M(kEax, costs, static_cast<std::uint32_t>(i * sizeof(std::uint32_t)));
-        e.movR64M(kEdx, ctx, cycle_count); e.addR64R64(kEdx, kEax);
-        e.jcc(2U, cycle_exit); e.cmpR64M(kEdx, ctx, cycle_limit); e.jcc(7U, cycle_exit);
+        e.movRR64(kEdx, 5U); e.addR64R64(kEdx, kEax);
+        e.jcc(2U, exits[i].cycle); e.cmpR64M(kEdx, ctx, cycle_limit); e.jcc(7U, exits[i].cycle);
         if (inst.op == MicroOp::bl) e.movM32Imm(kState, offsets.r + 56U, (op.pc + op.size) | 1U);
         if (op.decoded.kind == InstrKind::push || op.decoded.kind == InstrKind::pop) {
             e.movM32R(4U, 0U, kNzcv); e.movM32R(4U, 4U, kRetain);
@@ -2256,61 +2256,66 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
             e.movR64Imm(kEax, reinterpret_cast<std::uintptr_t>(&nativeStackTransfer)); e.callReg(kEax);
             e.movR32M(kNzcv, 4U, 0U); e.movR32M(kRetain, 4U, 4U); e.movRR64(7U, cpu);
             e.cmpR32Imm(kEax, static_cast<std::uint32_t>(NativeStackResult::branch_mismatch));
-            e.jcc(4U, mismatch_exit);
-            e.testRR(kEax, kEax); e.jcc(5U, helper_exit);
-        } else if (conditional || inst.op == MicroOp::b || inst.op == MicroOp::bl) {
-            // Branch instructions have no data operation; the edge was checked above.
-        } else if (op.native.kind == NativeOp::integer) {
-            if (!emitX86Op(e, offsets, inst, error)) {
-                impl_->trace_cache.pop_back(); return nullptr;
-            }
-        } else {
-            const auto& m = op.native;
-            constexpr std::uint32_t addrreg = 2U, valuereg = 1U;
+            e.jcc(4U, exits[i].mismatch);
+            e.testRR(kEax, kEax); e.jcc(5U, exits[i].helper);
+        } else if (!(conditional || inst.op == MicroOp::b || inst.op == MicroOp::bl)
+                   && op.native.kind == NativeOp::integer) {
+            if (!emitX86Op(e, offsets, inst, error)) { impl_->trace_cache.pop_back(); return nullptr; }
+        } else if (!(conditional || inst.op == MicroOp::b || inst.op == MicroOp::bl)) {
+            const auto& m = op.native; constexpr std::uint32_t addrreg = 2U, valuereg = 1U;
             if (m.absolute) e.movR32Imm(addrreg, m.absolute_address);
             else {
                 if (m.rn == 13U) {
-                    const auto use_msp = e.makeLabel(), have_sp = e.makeLabel();
-                    e.movR32M(kEax, cpu, offsets.xpsr); e.aluRImm(4U, kEax, xpsr_ipsr_mask);
-                    e.jcc(5U, use_msp);
-                    e.movR32M(kEax, cpu, off(offsetof(CpuState, control)));
-                    e.aluRImm(4U, kEax, 2U); e.jcc(4U, use_msp);
-                    e.movR32M(kEax, cpu, off(offsetof(CpuState, psp)));
-                    e.jmp(have_sp); e.bindLabel(use_msp);
-                    e.movR32M(kEax, cpu, off(offsetof(CpuState, msp)));
-                    e.bindLabel(have_sp);
-                } else loadGuest(e, kEax, offsets, m.rn);
-                if (m.offset != 0U) e.aluRImm(0U, kEax, m.offset);
-                e.movRR(addrreg, kEax);
+                    const auto use_msp=e.makeLabel(), have_sp=e.makeLabel();
+                    e.movR32M(kEax,cpu,offsets.xpsr); e.aluRImm(4U,kEax,xpsr_ipsr_mask); e.jcc(5U,use_msp);
+                    e.movR32M(kEax,cpu,off(offsetof(CpuState,control))); e.aluRImm(4U,kEax,2U); e.jcc(4U,use_msp);
+                    e.movR32M(kEax,cpu,off(offsetof(CpuState,psp))); e.jmp(have_sp); e.bindLabel(use_msp);
+                    e.movR32M(kEax,cpu,off(offsetof(CpuState,msp))); e.bindLabel(have_sp);
+                } else loadGuest(e,kEax,offsets,m.rn);
+                if (m.offset != 0U) e.aluRImm(0U,kEax,m.offset);
+                e.movRR(addrreg,kEax);
             }
-            if (m.kind == NativeOp::store_word) loadGuest(e, valuereg, offsets, m.rd);
-            e.movRR(3U, kNzcv); e.movRR(15U, kRetain);
-            e.movRR64(7U, ctx); e.movR32Imm(6U, op.pc); e.movRR(kEdx, addrreg);
-            if (m.kind == NativeOp::load_word) e.leaR64(1U, 4U, 0U);
-            const auto helper = m.kind == NativeOp::load_word
-                ? reinterpret_cast<std::uintptr_t>(&nativeRead32)
-                : reinterpret_cast<std::uintptr_t>(&nativeWrite32);
-            e.movR64Imm(kEax, helper); e.callReg(kEax);
-            e.movRR(kNzcv, 3U); e.movRR(kRetain, 15U); e.movRR64(7U, cpu);
-            e.u8(0x84U); e.u8(0xc0U); e.jcc(4U, helper_exit); // decline: no retirement
-            if (m.kind == NativeOp::load_word) {
-                e.movR32M(kEax, 4U, 0U); storeGuest(e, offsets, m.rd, kEax);
-            }
+            if (m.kind == NativeOp::store_word) loadGuest(e,valuereg,offsets,m.rd);
+            e.movRR(3U,kNzcv); e.movRR(15U,kRetain); e.movRR64(7U,ctx); e.movR32Imm(6U,op.pc); e.movRR(kEdx,addrreg);
+            if (m.kind == NativeOp::load_word) e.leaR64(1U,4U,0U);
+            const auto helper = m.kind == NativeOp::load_word ? reinterpret_cast<std::uintptr_t>(&nativeRead32) : reinterpret_cast<std::uintptr_t>(&nativeWrite32);
+            e.movR64Imm(kEax,helper); e.callReg(kEax);
+            e.movRR(kNzcv,3U); e.movRR(kRetain,15U); e.movRR64(7U,cpu);
+            e.u8(0x84U); e.u8(0xc0U); e.jcc(4U,exits[i].helper);
+            if (m.kind == NativeOp::load_word) { e.movR32M(kEax,4U,0U); storeGuest(e,offsets,m.rd,kEax); }
         }
-        e.movRR(kEax, kRetain); e.aluRR(1U, kEax, kNzcv); e.movM32R(kState, offsets.xpsr, kEax);
-        e.movM32Imm(kState, offsets.r + 60U, op.expected_next_pc);
-        e.movM32Imm(kState, offsets.addr, op.pc);
-        e.movR64M(kEdx, ctx, cycle_count); e.movR32M(kEax, costs, static_cast<std::uint32_t>(i * 4U));
-        e.addR64R64(kEdx, kEax); e.movM64R(ctx, cycle_count, kEdx);
-        e.movM32Imm(ctx, retired, static_cast<std::uint32_t>(i + 1U));
+        // Only the live cycle accumulator advances here. RAM-only helpers
+        // consume explicit PCs and no pending NZCV/PC/progress metadata; the
+        // selected exit stub publishes the exact committed prefix once.
+        e.movR32M(kEax,costs,static_cast<std::uint32_t>(i*4U)); e.addR64R64(5U,kEax);
     }
-    e.jmp(done);
-    emitExit(instruction_exit, NativeExitReason::instruction_limit, false);
-    emitExit(cycle_exit, NativeExitReason::cycle_limit, false);
-    emitExit(mismatch_exit, NativeExitReason::branch_mismatch, true);
-    emitExit(helper_exit, NativeExitReason::helper_declined, true);
-    emitExit(unsupported_exit, NativeExitReason::unsupported_instruction, true);
-    e.bindLabel(done); e.addRsp16(); e.popReg(15U); e.popReg(14U); e.popReg(13U); e.popReg(12U); e.popReg(3U); e.ret();
+    e.jmp(normal);
+    const auto publish = [&](std::size_t i, NativeExitReason why, bool failed) {
+        e.movM32Imm(ctx,retired,static_cast<std::uint32_t>(i)); e.movM64R(ctx,cycle_count,5U);
+        e.movM32Imm(ctx,current,entry.plan.ops[i].pc);
+        if (failed) e.movM32Imm(ctx,failing,entry.plan.ops[i].pc);
+        if (i != 0U) {
+            const auto& prev=entry.plan.ops[i-1U];
+            e.movRR(kEax,kRetain); e.aluRR(1U,kEax,kNzcv); e.movM32R(kState,offsets.xpsr,kEax);
+            e.movM32Imm(kState,offsets.r+60U,prev.expected_next_pc); e.movM32Imm(kState,offsets.addr,prev.pc);
+        }
+        e.movM32Imm(ctx,reason,static_cast<std::uint32_t>(why)); e.jmp(done);
+    };
+    for (std::size_t i=0;i<n;++i) {
+        e.bindLabel(exits[i].instruction); publish(i,NativeExitReason::instruction_limit,false);
+        e.bindLabel(exits[i].cycle); publish(i,NativeExitReason::cycle_limit,false);
+        e.bindLabel(exits[i].unsupported); publish(i,NativeExitReason::unsupported_instruction,true);
+        e.bindLabel(exits[i].mismatch); publish(i,NativeExitReason::branch_mismatch,true);
+        e.bindLabel(exits[i].helper); publish(i,NativeExitReason::helper_declined,true);
+    }
+    e.bindLabel(normal);
+    e.movM32Imm(ctx,retired,static_cast<std::uint32_t>(n)); e.movM64R(ctx,cycle_count,5U);
+    e.movM32Imm(ctx,current,entry.plan.ops.back().pc);
+    e.movRR(kEax,kRetain); e.aluRR(1U,kEax,kNzcv); e.movM32R(kState,offsets.xpsr,kEax);
+    e.movM32Imm(kState,offsets.r+60U,entry.plan.ops.back().expected_next_pc);
+    e.movM32Imm(kState,offsets.addr,entry.plan.ops.back().pc);
+    e.movM32Imm(ctx,reason,static_cast<std::uint32_t>(NativeExitReason::none)); e.jmp(done);
+    e.bindLabel(done); e.addRsp16(); e.popReg(10U); e.popReg(5U); e.popReg(15U); e.popReg(14U); e.popReg(13U); e.popReg(12U); e.popReg(3U); e.ret();
     if (!e.patchBranches(error)) { impl_->trace_cache.pop_back(); return nullptr; }
     code = std::move(e.code);
 #elif defined(FIL_MICRO_JIT_AARCH64)

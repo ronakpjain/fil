@@ -2,7 +2,6 @@
 #include "fil/cpu/decoder.hpp"
 #include "fil/cpu/native_execution.hpp"
 #include "fil/cpu/native_ir.hpp"
-#include "fil/cpu/native_stack.hpp"
 #include "fil/cpu/native_trace.hpp"
 
 #include <gtest/gtest.h>
@@ -389,10 +388,10 @@ TEST(NativeJitTest, TraceValidationRejectsBadEdgesAndOverlongWithoutMutatingOutp
 TEST(NativeJitTest, EmittedStackReturnTraceMatchesPortableFallbackAtEveryBoundary) {
     if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
     constexpr std::uint32_t pc = 0x08015000U, ram = 0x20000000U;
-    const std::array<std::uint16_t, 4> words{0xb501U, 0x2009U, 0xbd01U, 0xbf00U};
-    const std::array<std::uint32_t, 4> pcs{pc, pc + 2U, pc + 4U, pc + 16U};
-    const std::array<std::uint32_t, 4> costs{3U, 1U, 5U, 1U};
-    std::array<NativeTraceOp, 4> ops;
+    const std::array<std::uint16_t, 5> words{0xb501U, 0x2009U, 0xbd01U, 0x2200U, 0x680bU};
+    const std::array<std::uint32_t, 5> pcs{pc, pc + 2U, pc + 4U, pc + 16U, pc + 18U};
+    const std::array<std::uint32_t, 5> costs{3U, 1U, 5U, 1U, 2U};
+    std::array<NativeTraceOp, 5> ops;
     for (std::size_t i = 0U; i < ops.size(); ++i) {
         const auto decoded = decode16(words[i]); ASSERT_TRUE(decoded);
         ops[i].decoded = *decoded; ops[i].raw = decoded->raw;
@@ -407,13 +406,15 @@ TEST(NativeJitTest, EmittedStackReturnTraceMatchesPortableFallbackAtEveryBoundar
     const auto fn = jit->compileNativeTrace(plan, error); ASSERT_NE(fn, nullptr) << error;
     for (unsigned mode = 0U; mode < 3U; ++mode) {
         for (const bool mismatch : {false, true}) {
+            for (const bool bad_address : {false, true})
             for (std::uint32_t limit = 0U; limit <= ops.size(); ++limit) {
-                for (std::uint64_t credit = 0U; credit <= 10U; ++credit) {
+                for (std::uint64_t credit = 0U; credit <= 12U; ++credit) {
                     fil::mem::MemoryBus memory, oracle;
                     ASSERT_TRUE(memory.mapRam(ram, 128U, "stack"));
                     ASSERT_TRUE(oracle.mapRam(ram, 128U, "stack"));
                     CpuState state;
                     state.r[0] = 0x11223344U; state.r[14] = pc + (mismatch ? 19U : 17U);
+                    state.r[1] = bad_address ? 0x40000000U : ram;
                     state.r[15] = pc; state.instruction_address = pc + 64U;
                     state.msp = ram + 64U; state.psp = ram + 96U; state.r[13] = ram + 32U;
                     state.control = mode == 0U ? 0U : 2U;
@@ -434,9 +435,11 @@ TEST(NativeJitTest, EmittedStackReturnTraceMatchesPortableFallbackAtEveryBoundar
                     EXPECT_EQ(memory.readFootprint().words, oracle.readFootprint().words);
                     EXPECT_EQ(memory.read32(stack).value(), oracle.read32(stack).value());
                     EXPECT_EQ(memory.read32(stack + 4U).value(), oracle.read32(stack + 4U).value());
-                    if (!mismatch && limit == 4U && credit == 10U) {
-                        EXPECT_EQ(context.retired_count, 4U);
-                        EXPECT_EQ(state.r[15], pc + 18U);
+                    EXPECT_EQ(context.current_instruction_pc, expected.current_instruction_pc);
+                    if (!mismatch && !bad_address && limit == 5U && credit == 12U) {
+                        EXPECT_EQ(context.retired_count, 5U);
+                        EXPECT_EQ(state.r[15], pc + 20U);
+                        EXPECT_NE(state.xpsr & xpsr_z, 0U);
                         EXPECT_EQ(state.r[0], 0x11223344U);
                         EXPECT_EQ(state.readRegister(13U), stack + 8U);
                     }
@@ -444,6 +447,113 @@ TEST(NativeJitTest, EmittedStackReturnTraceMatchesPortableFallbackAtEveryBoundar
             }
         }
     }
+}
+
+TEST(NativeJitTest, DeferredMetadataAndLiveCyclesMatchOracleAcrossExitMatrix) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
+    constexpr std::uint32_t pc = 0x08016000U, ram = 0x20000000U;
+    const auto movs = decode16(0x2000U); // MOVS r0,#0 establishes Z
+    const auto load = decode16(0x6811U); // LDR r1,[r2]
+    const auto beq = decode16(0xd000U);
+    ASSERT_TRUE(movs); ASSERT_TRUE(load); ASSERT_TRUE(beq);
+    std::array<NativeTraceOp, 3> ops{};
+    ops[0].decoded=*movs; ops[0].raw=0x2000U; ops[0].pc=pc;
+    ops[0].size=2U; ops[0].execution_cycles=2U; ops[0].expected_next_pc=pc+2U;
+    ops[1].decoded=*load; ops[1].raw=0x6811U; ops[1].pc=pc+2U;
+    ops[1].size=2U; ops[1].execution_cycles=3U; ops[1].expected_next_pc=pc+4U;
+    ops[2].decoded=*beq; ops[2].raw=0xd000U; ops[2].pc=pc+4U;
+    ops[2].size=2U; ops[2].execution_cycles=1U; ops[2].expected_taken=true;
+    ops[2].expected_next_pc=pc+8U;
+    NativeTracePlan plan; std::string error;
+    ASSERT_TRUE(buildNativeTrace(ops,plan,error)) << error;
+    auto jit=MicroJit::create(error); ASSERT_TRUE(jit);
+    const auto fn=jit->compileNativeTrace(plan,error); ASSERT_NE(fn,nullptr) << error;
+    const std::array<std::uint32_t,3> costs{2U,3U,1U};
+    constexpr std::array<std::uint64_t,4> initial_values{0U,5U,UINT64_MAX-1U,UINT64_MAX};
+    constexpr std::array<std::uint64_t,5> budgets{0U,4U,5U,6U,UINT64_MAX};
+    for (bool bad_address : {false,true}) for (std::uint32_t limit=0;limit<=3U;++limit)
+    for (const std::uint64_t initial_cycles : initial_values)
+    for (const std::uint64_t budget : budgets) {
+        fil::mem::MemoryBus memory, oracle;
+        ASSERT_TRUE(memory.mapRam(ram,16U,"ram")); ASSERT_TRUE(oracle.mapRam(ram,16U,"ram"));
+        ASSERT_TRUE(memory.write32(ram+4U,0xdecafbadU)); ASSERT_TRUE(oracle.write32(ram+4U,0xdecafbadU));
+        CpuState state; state.r[15]=0xfeed0010U; state.instruction_address=0xfeed0020U;
+        state.xpsr=xpsr_t|xpsr_n|xpsr_c|xpsr_q|0x00030000U; state.r[2]=bad_address?0x40000000U:ram+4U;
+        CpuState reference=state;
+        NativeExecutionContext actual{&state,&memory,limit,budget};
+        NativeExecutionContext expected{&reference,&oracle,limit,budget};
+        actual.retired_count=expected.retired_count=77U;
+        actual.current_instruction_pc=expected.current_instruction_pc=0xaaaa5555U;
+        actual.failing_instruction_pc=expected.failing_instruction_pc=0xbbbb6666U;
+        actual.exit_reason=expected.exit_reason=NativeExitReason::control_flow;
+        actual.fetch_cycles=expected.fetch_cycles=19U;
+        actual.retired_cycles=expected.retired_cycles=initial_cycles;
+        actual.charged_cycles=expected.charged_cycles=costs.data();
+        actual.charged_cycles_count=expected.charged_cycles_count=costs.size();
+        interpretNativeTrace(plan,expected); fn(&actual);
+        EXPECT_EQ(actual.retired_count,expected.retired_count);
+        EXPECT_EQ(actual.retired_cycles,expected.retired_cycles);
+        EXPECT_EQ(actual.current_instruction_pc,expected.current_instruction_pc);
+        EXPECT_EQ(actual.failing_instruction_pc,expected.failing_instruction_pc);
+        EXPECT_EQ(actual.exit_reason,expected.exit_reason);
+        EXPECT_EQ(actual.fetch_cycles,expected.fetch_cycles);
+        EXPECT_EQ(actual.instruction_limit,expected.instruction_limit);
+        EXPECT_EQ(actual.cycle_limit,expected.cycle_limit);
+        EXPECT_EQ(actual.charged_cycles,expected.charged_cycles);
+        EXPECT_EQ(actual.charged_cycles_count,expected.charged_cycles_count);
+        EXPECT_EQ(actual.cpu_state,&state); EXPECT_EQ(actual.memory_bus,&memory);
+        EXPECT_TRUE(bitwiseEqual(state,reference));
+        EXPECT_EQ(memory.readFootprint().words,oracle.readFootprint().words);
+        EXPECT_EQ(memory.mutationSequence(),oracle.mutationSequence());
+    }
+}
+
+TEST(NativeJitTest, TracePreservesSysVCalleeSavedRegistersAcrossStackHelpers) {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32)
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
+    constexpr std::uint32_t pc = 0x08017000U, ram = 0x20000000U;
+    const auto push = decode16(0xb501U), pop = decode16(0xbd01U);
+    ASSERT_TRUE(push); ASSERT_TRUE(pop);
+    std::array<NativeTraceOp, 2> ops;
+    ops[0].decoded = *push; ops[0].raw = push->raw; ops[0].pc = pc;
+    ops[0].size = 2U; ops[0].execution_cycles = 3U; ops[0].expected_next_pc = pc + 2U;
+    ops[1].decoded = *pop; ops[1].raw = pop->raw; ops[1].pc = pc + 2U;
+    ops[1].size = 2U; ops[1].execution_cycles = 5U;
+    ops[1].expected_next_pc = pc + 16U; ops[1].expected_taken = true;
+    NativeTracePlan plan; std::string error;
+    ASSERT_TRUE(buildNativeTrace(ops, plan, error)) << error;
+    auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    auto function = jit->compileNativeTrace(plan, error); ASSERT_NE(function, nullptr) << error;
+    fil::mem::MemoryBus memory; ASSERT_TRUE(memory.mapRam(ram, 64U, "stack"));
+    CpuState state; state.r[0] = 123U; state.r[14] = pc + 17U;
+    state.r[15] = pc; state.r[13] = state.msp = ram + 32U;
+    const std::array<std::uint32_t, 2> costs{3U, 5U};
+    NativeExecutionContext context{&state, &memory, 2U, 8U};
+    context.charged_cycles = costs.data(); context.charged_cycles_count = costs.size();
+    std::array<std::uint64_t, 6> observed{};
+    auto* argument = &context;
+    // Six register saves plus the saved output pointer and padding preserve
+    // 16-byte call-site alignment. Restore the compiler's own frame/registers.
+    asm volatile(
+        "push %%rbp\n\tpush %%rbx\n\tpush %%r12\n\tpush %%r13\n\tpush %%r14\n\tpush %%r15\n\t"
+        "push %%rdx\n\tsub $8, %%rsp\n\t"
+        "movabs $0x1122334455667788, %%rbp\n\tmovabs $0x1122334455667788, %%rbx\n\t"
+        "movabs $0x1122334455667788, %%r12\n\tmovabs $0x1122334455667788, %%r13\n\t"
+        "movabs $0x1122334455667788, %%r14\n\tmovabs $0x1122334455667788, %%r15\n\t"
+        "call *%%rax\n\tadd $8, %%rsp\n\tpop %%rdx\n\t"
+        "mov %%rbp, 0(%%rdx)\n\tmov %%rbx, 8(%%rdx)\n\tmov %%r12, 16(%%rdx)\n\t"
+        "mov %%r13, 24(%%rdx)\n\tmov %%r14, 32(%%rdx)\n\tmov %%r15, 40(%%rdx)\n\t"
+        "pop %%r15\n\tpop %%r14\n\tpop %%r13\n\tpop %%r12\n\tpop %%rbx\n\tpop %%rbp"
+        : "+a"(function), "+D"(argument)
+        : "d"(observed.data())
+        : "rcx", "rsi", "r8", "r9", "r10", "r11", "cc", "memory");
+    for (const auto value : observed) EXPECT_EQ(value, 0x1122334455667788ULL);
+    EXPECT_EQ(context.retired_count, 2U);
+    EXPECT_EQ(context.retired_cycles, 8U);
+    EXPECT_EQ(state.r[15], pc + 16U);
+#else
+    GTEST_SKIP() << "SysV x86-64 ABI harness";
+#endif
 }
 
 TEST(NativeJitTest, NullTraceInputsDeclineWithoutHostDereferenceOrRetirement) {

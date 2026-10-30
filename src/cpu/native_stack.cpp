@@ -1,6 +1,5 @@
 #include "fil/cpu/native_stack.hpp"
 #include <array>
-#include <limits>
 
 namespace fil::cpu {
 NativeStackResult nativeStackTransfer(NativeExecutionContext* c, std::uint32_t pc,
