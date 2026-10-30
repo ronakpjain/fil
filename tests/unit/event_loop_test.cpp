@@ -586,6 +586,263 @@ TEST(EventLoopTest, OwnerDispatchGuardUnwindsAfterCallbackException) {
     EXPECT_EQ(loop.now(owner_id), 2U);
 }
 
+TEST(EventLoopTest, LaneDomainsRunConcurrentlyPreserveHandlesAndReturnToExactMode) {
+    fil::sim::EventLoop loop;
+    ASSERT_EQ(loop.runOwnedEvents(0U, 10U).stopped_at, 10U);
+    ASSERT_EQ(loop.runOwnedEvents(1U, 15U).stopped_at, 15U);
+
+    std::vector<int> first_order;
+    std::vector<int> second_order;
+    std::vector<int> exact_order;
+    fil::sim::ScheduledEvent canceled_handle(&loop);
+    fil::sim::ScheduledEvent builtin_handle(&loop);
+    BuiltinProbe builtin{0, 2, &second_order};
+    {
+        auto owner = loop.useOwner(0U);
+        static_cast<void>(canceled_handle.scheduleAt(14U, [&] { first_order.push_back(99); }));
+    }
+    {
+        auto owner = loop.useOwner(1U);
+        static_cast<void>(builtin_handle.scheduleBuiltinAt(18U, {&builtinProbe, &builtin}));
+    }
+    const auto migrated_id = canceled_handle.id();
+
+    {
+        auto domains = loop.useLaneDomains(2U);
+        std::atomic<unsigned> ready{0U};
+        std::atomic<bool> start{false};
+        auto root_exclusive = loop.useExclusiveExecution();
+        std::thread first([&] {
+            auto lane = loop.useLaneDomain(0U);
+            auto exclusive = loop.useExclusiveExecution();
+            ready.fetch_add(1U, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            EXPECT_EQ(loop.now(0U), 10U);
+            EXPECT_THROW(static_cast<void>(loop.now(1U)), std::logic_error);
+            canceled_handle.cancel();
+            EXPECT_EQ(canceled_handle.id(), 0U);
+            {
+                auto owner = loop.useOwner(0U);
+                static_cast<void>(loop.scheduleAt(12U, [&] { first_order.push_back(1); }));
+            }
+            EXPECT_EQ(loop.runOwnedEvents(0U, 12U).events_executed, 1U);
+            EXPECT_EQ(loop.now(0U), 12U);
+        });
+        std::thread second([&] {
+            auto lane = loop.useLaneDomain(1U);
+            auto exclusive = loop.useExclusiveExecution();
+            ready.fetch_add(1U, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            EXPECT_EQ(loop.now(1U), 15U);
+            EXPECT_THROW(static_cast<void>(loop.runDueEvents(100U)), std::logic_error);
+            EXPECT_THROW(static_cast<void>(loop.runSharedEvents(100U)), std::logic_error);
+            EXPECT_THROW(static_cast<void>(loop.scheduleAfter(1U, [] {})), std::logic_error);
+            EXPECT_EQ(loop.runOwnedEvents(1U, 18U).events_executed, 1U);
+            EXPECT_EQ(loop.now(1U), 18U);
+        });
+        while (ready.load(std::memory_order_acquire) != 2U) std::this_thread::yield();
+        // The coordinator holds the root lease while workers use only their
+        // private lane mutexes and still make progress.
+        start.store(true, std::memory_order_release);
+        first.join();
+        second.join();
+        EXPECT_EQ(loop.pending(), 0U);
+        EXPECT_EQ(loop.executedCallbacks(), 2U);
+        domains.close();
+    }
+
+    EXPECT_FALSE(canceled_handle.pending());
+    EXPECT_FALSE(builtin_handle.pending());
+    EXPECT_EQ(builtin.calls, 1);
+    EXPECT_EQ(first_order, (std::vector<int>{1}));
+    EXPECT_EQ(second_order, (std::vector<int>{2}));
+    EXPECT_EQ(loop.now(0U), 12U);
+    EXPECT_EQ(loop.now(1U), 18U);
+    EXPECT_TRUE(loop.cancel(migrated_id) == false);
+    {
+        auto owner = loop.useOwner(0U);
+        static_cast<void>(loop.scheduleAt(13U, [&] { exact_order.push_back(3); }));
+    }
+    EXPECT_EQ(loop.runOwnedEvents(0U, 13U).events_executed, 1U);
+    EXPECT_EQ(exact_order, (std::vector<int>{3}));
+
+    // A subsequent session gets fresh sequence/ID ranges and migrates the
+    // newly scheduled event back to the ordinary serial queues on exit.
+    {
+        auto owner = loop.useOwner(0U);
+        static_cast<void>(loop.scheduleAt(14U, [&] {
+            exact_order.push_back(4);
+            EXPECT_EQ(loop.now(), 14U);
+        }));
+    }
+    {
+        auto domains = loop.useLaneDomains(2U);
+        EXPECT_EQ(loop.runOwnedEvents(0U, 14U).events_executed, 1U);
+        std::thread worker([&] {
+            auto lane = loop.useLaneDomain(0U);
+            EXPECT_EQ(loop.runOwnedEvents(0U, 14U).events_executed, 0U);
+        });
+        worker.join();
+        domains.close();
+    }
+    EXPECT_EQ(loop.now(0U), 14U);
+    EXPECT_EQ(exact_order, (std::vector<int>{3, 4}));
+}
+
+TEST(EventLoopTest, OrdinaryConcurrentSchedulingSerializesOwnerContextSafely) {
+    fil::sim::EventLoop loop;
+    std::atomic<unsigned> ready{0U};
+    std::atomic<bool> start{false};
+    std::atomic<unsigned> calls{0U};
+    auto worker = [&] {
+        ready.fetch_add(1U, std::memory_order_release);
+        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+        for (unsigned i = 0U; i < 100U; ++i) {
+            static_cast<void>(loop.scheduleAfter(0U, [&] {
+                calls.fetch_add(1U, std::memory_order_relaxed);
+            }));
+        }
+    };
+    std::thread first(worker);
+    std::thread second(worker);
+    while (ready.load(std::memory_order_acquire) != 2U) std::this_thread::yield();
+    start.store(true, std::memory_order_release);
+    first.join();
+    second.join();
+    EXPECT_EQ(loop.pending(), 200U);
+    EXPECT_EQ(loop.runDueEvents(0U).events_executed, 200U);
+    EXPECT_EQ(calls.load(std::memory_order_relaxed), 200U);
+}
+
+TEST(EventLoopTest, RepeatedDomainCloseKeepsPendingCallbackAndIdentity) {
+    fil::sim::EventLoop loop;
+    std::uint32_t calls = 0U;
+    fil::sim::ScheduledEvent handle(&loop);
+    {
+        auto owner = loop.useOwner(0U);
+        static_cast<void>(handle.scheduleAt(50U, [&] { ++calls; }));
+    }
+    const auto original_id = handle.id();
+    for (unsigned iteration = 0U; iteration < 100U; ++iteration) {
+        auto domains = loop.useLaneDomains(1U);
+        EXPECT_EQ(loop.pending(), 1U);
+        EXPECT_EQ(handle.id(), original_id);
+        EXPECT_EQ(loop.nextScheduledTime(0U), 50U);
+        domains.close();
+        EXPECT_EQ(loop.pending(), 1U);
+        EXPECT_EQ(handle.id(), original_id);
+        EXPECT_EQ(loop.nextScheduledTime(0U), 50U);
+    }
+    EXPECT_EQ(loop.runOwnedEvents(0U, 50U).events_executed, 1U);
+    EXPECT_EQ(calls, 1U);
+    EXPECT_FALSE(handle.pending());
+}
+
+TEST(EventLoopTest, LaneDomainCloseFailureIsRetryableAndWorkerExceptionUnwinds) {
+    fil::sim::EventLoop loop;
+    std::uint32_t calls = 0U;
+    {
+        auto owner = loop.useOwner(0U);
+        static_cast<void>(loop.scheduleAt(5U, [&] { ++calls; }));
+    }
+    {
+        auto domains = loop.useLaneDomains(1U);
+        std::atomic<bool> entered{false};
+        std::atomic<bool> leave{false};
+        std::thread worker([&] {
+            auto lane = loop.useLaneDomain(0U);
+            entered.store(true, std::memory_order_release);
+            while (!leave.load(std::memory_order_acquire)) std::this_thread::yield();
+        });
+        while (!entered.load(std::memory_order_acquire)) std::this_thread::yield();
+        EXPECT_THROW(domains.close(), std::logic_error);
+        leave.store(true, std::memory_order_release);
+        worker.join();
+        EXPECT_EQ(loop.pending(), 1U) << "failed close leaves the pending callback intact";
+        domains.close();
+    }
+    EXPECT_EQ(loop.runOwnedEvents(0U, 5U).events_executed, 1U);
+    EXPECT_EQ(calls, 1U);
+
+    fil::sim::EventLoop throwing_loop;
+    {
+        auto owner = throwing_loop.useOwner(0U);
+        static_cast<void>(throwing_loop.scheduleAt(7U, [] {
+            throw std::runtime_error("lane callback failed");
+        }));
+    }
+    std::atomic<bool> caught{false};
+    {
+        auto domains = throwing_loop.useLaneDomains(1U);
+        std::thread worker([&] {
+            auto lane = throwing_loop.useLaneDomain(0U);
+            try {
+                static_cast<void>(throwing_loop.runOwnedEvents(0U, 7U));
+            } catch (const std::runtime_error&) {
+                caught.store(true, std::memory_order_release);
+            }
+        });
+        worker.join();
+        domains.close();
+    }
+    EXPECT_TRUE(caught.load(std::memory_order_acquire));
+    EXPECT_EQ(throwing_loop.now(0U), 7U);
+    EXPECT_EQ(throwing_loop.executedCallbacks(), 0U);
+}
+
+TEST(EventLoopTest, LaneDomainDestructorOrphansAndLaterRecoversPendingEvents) {
+    fil::sim::EventLoop loop;
+    std::uint32_t calls = 0U;
+    {
+        auto owner = loop.useOwner(0U);
+        static_cast<void>(loop.scheduleAt(9U, [&] { ++calls; }));
+    }
+    std::atomic<bool> entered{false};
+    std::atomic<bool> leave{false};
+    std::thread worker;
+    {
+        auto domains = loop.useLaneDomains(1U);
+        worker = std::thread([&] {
+            auto lane = loop.useLaneDomain(0U);
+            entered.store(true, std::memory_order_release);
+            while (!leave.load(std::memory_order_acquire)) std::this_thread::yield();
+        });
+        while (!entered.load(std::memory_order_acquire)) std::this_thread::yield();
+        // Destruction cannot merge while a worker is active; it leaves the
+        // domain state orphaned rather than discarding callbacks or terminating.
+    }
+    leave.store(true, std::memory_order_release);
+    worker.join();
+    EXPECT_EQ(loop.pending(), 1U);
+    EXPECT_EQ(loop.runOwnedEvents(0U, 9U).events_executed, 1U);
+    EXPECT_EQ(calls, 1U);
+}
+
+TEST(EventLoopTest, LaneDomainsRejectCrossOwnerAndUnboundWorkerOperations) {
+    fil::sim::EventLoop loop;
+    std::atomic<bool> rejected{false};
+    {
+        auto domains = loop.useLaneDomains(2U);
+        std::thread worker([&] {
+            try {
+                static_cast<void>(loop.pending());
+            } catch (const std::logic_error&) {
+                rejected.store(true, std::memory_order_release);
+            }
+            auto lane = loop.useLaneDomain(0U);
+            EXPECT_THROW(static_cast<void>(loop.runOwnedEvents(1U, 0U)), std::logic_error);
+            EXPECT_THROW(static_cast<void>(loop.nextScheduledTime(1U)), std::logic_error);
+            {
+                auto shared = loop.useOwner(fil::sim::shared_event_owner);
+                EXPECT_THROW(static_cast<void>(loop.scheduleAt(0U, [] {})), std::logic_error);
+            }
+        });
+        worker.join();
+    }
+    EXPECT_TRUE(rejected.load(std::memory_order_acquire));
+    EXPECT_EQ(loop.pending(), 0U);
+}
+
 TEST(EventLoopTest, AdvancesOneOwnerIndependently) {
     fil::sim::EventLoop loop;
     std::vector<std::uint32_t> calls;

@@ -44,6 +44,12 @@ using EventOwner = std::uint32_t;
 
 /** @brief Classification reported immediately before an event callback. */
 enum class EventObservation { global, owner_local };
+/**
+ * @brief Observer invoked before event callbacks.
+ *
+ * During lane-domain execution, independent lane observers may be invoked
+ * concurrently; shared observer state must therefore be thread-safe.
+ */
 using ObservationBarrier = std::function<void(SimTimeNs, EventOwner, EventObservation)>;
 
 /** @brief Owner used by CAN and other cross-board events. */
@@ -93,6 +99,49 @@ public:
         void* previous_{nullptr};
     };
 
+    /**
+     * @brief Session that migrates board-owner queues to private lane domains.
+     *
+     * Owner lanes are limited to [0, 64). The coordinator may use root/shared
+     * operations only while all workers are parked; root global dispatch is not
+     * available during the session. Each owner may have only one worker at a
+     * time. The EventLoop must not be moved or destroyed while this scope exists.
+     * Workers and their LaneDomainScopes must finish before this scope is destroyed.
+     */
+    class LaneDomainsScope {
+    public:
+        ~LaneDomainsScope() noexcept;
+        /** @brief Transactionally merges all lanes; may throw without losing events. */
+        void close();
+        LaneDomainsScope(const LaneDomainsScope&) = delete;
+        LaneDomainsScope& operator=(const LaneDomainsScope&) = delete;
+        LaneDomainsScope(LaneDomainsScope&&) = delete;
+        LaneDomainsScope& operator=(LaneDomainsScope&&) = delete;
+
+    private:
+        friend class EventLoop;
+        LaneDomainsScope(EventLoop& loop, std::size_t owner_count);
+        EventLoop* loop_{nullptr};
+    };
+
+    /** @brief Binds this thread's facade calls to exactly one lane domain. */
+    class LaneDomainScope {
+    public:
+        ~LaneDomainScope() noexcept;
+        LaneDomainScope(const LaneDomainScope&) = delete;
+        LaneDomainScope& operator=(const LaneDomainScope&) = delete;
+        LaneDomainScope(LaneDomainScope&&) = delete;
+        LaneDomainScope& operator=(LaneDomainScope&&) = delete;
+
+    private:
+        friend class EventLoop;
+        LaneDomainScope(EventLoop& loop, EventOwner owner);
+        EventLoop* loop_{nullptr};
+        void* previous_loop_{nullptr};
+        void* previous_impl_{nullptr};
+        EventOwner owner_{shared_event_owner};
+    };
+
     /** @brief RAII scope inherited by events scheduled within one board lane. */
     class OwnerScope {
     public:
@@ -104,8 +153,8 @@ public:
 
     private:
         friend class EventLoop;
-        OwnerScope(EventLoop& loop, EventOwner owner) noexcept;
-        EventLoop* loop_{nullptr};
+        OwnerScope(EventLoop& loop, EventOwner owner);
+        void* impl_{nullptr};
         EventOwner previous_{shared_event_owner};
     };
 
@@ -118,14 +167,20 @@ public:
     EventLoop(EventLoop&&) noexcept;
     EventLoop& operator=(EventLoop&&) noexcept;
 
+    /** @brief Migrates owner lanes [0, owner_count) into private domains until scope exit. */
+    [[nodiscard]] LaneDomainsScope useLaneDomains(std::size_t owner_count);
+
+    /** @brief Binds this thread to one active private lane domain. */
+    [[nodiscard]] LaneDomainScope useLaneDomain(EventOwner owner);
+
     /** @brief Makes subsequently scheduled events inherit a board or shared owner. */
-    [[nodiscard]] OwnerScope useOwner(EventOwner owner) noexcept;
+    [[nodiscard]] OwnerScope useOwner(EventOwner owner);
 
     /** @brief Acquires an exclusive execution lease for this thread and loop. */
     [[nodiscard]] ExclusiveScope useExclusiveExecution();
 
     /** @brief Gets the owner inherited by newly scheduled events. */
-    [[nodiscard]] EventOwner activeOwner() const noexcept;
+    [[nodiscard]] EventOwner activeOwner() const;
 
     /** @brief Schedules a callback relative to the current simulation time. */
     [[nodiscard]] EventId scheduleAfter(SimTimeNs delta, EventCallback callback);
@@ -140,7 +195,7 @@ public:
     [[nodiscard]] EventId scheduleBuiltinAt(SimTimeNs at, BuiltinEvent event);
 
     /** @brief Cancels an event if it is still pending. */
-    [[nodiscard]] bool cancel(EventId id) noexcept;
+    [[nodiscard]] bool cancel(EventId id);
 
     /** @brief Runs all due events; rejected while an owner-only run is dispatching. */
     [[nodiscard]] EventRunResult runDueEvents(SimTimeNs deadline);
@@ -173,25 +228,28 @@ public:
     [[nodiscard]] EventRunResult advanceBy(SimTimeNs delta);
 
     /** @brief Removes every pending event without changing current time. */
-    void clear() noexcept;
+    void clear();
 
     /** @brief Gets the active owner's clock, or the shared clock outside an owner scope. */
-    [[nodiscard]] SimTimeNs now() const noexcept;
+    [[nodiscard]] SimTimeNs now() const;
 
     /** @brief Gets one owner's local clock without changing scheduling context. */
-    [[nodiscard]] SimTimeNs now(EventOwner owner) const noexcept;
+    [[nodiscard]] SimTimeNs now(EventOwner owner) const;
 
     /** @brief Gets the number of live, non-cancelled events. */
-    [[nodiscard]] std::size_t pending() const noexcept;
+    [[nodiscard]] std::size_t pending() const;
 
     /** @brief Gets the monotonically increasing count of successfully dispatched callbacks. */
-    [[nodiscard]] std::uint64_t executedCallbacks() const noexcept;
+    [[nodiscard]] std::uint64_t executedCallbacks() const;
 
     /** @brief Gets the earliest live event timestamp across every owner queue. */
     [[nodiscard]] std::optional<SimTimeNs> nextScheduledTime();
 
     /** @brief Gets the earliest live timestamp for one board or the shared queue. */
     [[nodiscard]] std::optional<SimTimeNs> nextScheduledTime(EventOwner owner);
+
+    /** @brief Whether an external or scheduler observation barrier is installed. */
+    [[nodiscard]] bool hasObservationBarrier() const;
 
     /** @brief Replaces the observation barrier and returns the previous observer. */
     [[nodiscard]] ObservationBarrier exchangeObservationBarrier(ObservationBarrier barrier);
@@ -200,10 +258,10 @@ public:
     [[nodiscard]] std::optional<SimTimeNs> nextObservationTime(EventOwner owner);
 
     /** @brief Changes zero-delay livelock protection; zero disables callbacks. */
-    void setMaximumSameTimeEvents(std::size_t maximum) noexcept;
+    void setMaximumSameTimeEvents(std::size_t maximum);
 
     /** @brief Gets the current zero-delay callback limit. */
-    [[nodiscard]] std::size_t maximumSameTimeEvents() const noexcept;
+    [[nodiscard]] std::size_t maximumSameTimeEvents() const;
 
 private:
     friend class ScheduledEvent;
@@ -220,6 +278,13 @@ private:
     );
 
     struct Impl;
+    [[nodiscard]] Impl* resolvedImpl() const;
+    static EventLoop*& laneBindingLoop() noexcept;
+    static void*& laneBindingImpl() noexcept;
+    void beginLaneDomains(std::size_t owner_count);
+    void finishLaneDomains();
+    void orphanLaneDomains() noexcept;
+
     std::unique_ptr<Impl> impl_;
 };
 
