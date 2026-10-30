@@ -528,6 +528,12 @@ private:
     std::uint64_t cached_flash_acr_generation_{0};
     std::uint32_t cached_flash_ws_{0};
     bool cached_flash_art_hit_capable_{false};
+    /// Flash fetch-timing snapshot reused across owner-slice spans. Valid only
+    /// while ``flash_acr_generation`` matches; ACR writes change wait states,
+    /// prefetch, or the instruction cache, so any change rebuilds it.
+    cpu::CortexM4::ReversibleCycleBudget::FetchTiming cached_fetch_timing_{};
+    std::uint64_t cached_fetch_timing_generation_{0};
+    bool cached_fetch_timing_valid_{false};
     std::uint32_t last_fetch_end_{0};
     bool have_last_fetch_{false};
 };

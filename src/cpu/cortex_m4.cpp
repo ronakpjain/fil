@@ -1891,6 +1891,10 @@ std::optional<FastStepResult> CortexM4::executeNativeTrace(
     };
     if (entry.first_declined && first_address() == entry.declined_address)
         return std::nullopt;
+    // A trace that keeps declining cannot make progress here: fall back to the
+    // checked path instead of paying admission on every visit. Any successful
+    // retirement clears the streak, so genuine progress re-enables the trace.
+    if (entry.decline_streak >= native_decline_streak_limit) return std::nullopt;
     const auto limit = std::min({max_instructions, plan.ops.size(),
         detailed != nullptr ? static_cast<std::size_t>(entry.detailed_prefix_count)
                             : NativeTracePlan::max_ops});
@@ -1945,7 +1949,10 @@ std::optional<FastStepResult> CortexM4::executeNativeTrace(
     ++jit_stats_.trace_executions;
     jit_stats_.native_instructions += context.retired_count;
     jit_stats_.trace_instructions += context.retired_count;
-    if (context.retired_count != 0U) entry.first_declined = false;
+    if (context.retired_count != 0U) {
+        entry.first_declined = false;
+        entry.decline_streak = 0U;
+    }
     if (context.exit_reason == NativeExitReason::branch_mismatch) {
         ++jit_stats_.trace_guard_mismatches;
         if (context.retired_count == 0U) {
@@ -1957,6 +1964,9 @@ std::optional<FastStepResult> CortexM4::executeNativeTrace(
     } else if (context.exit_reason == NativeExitReason::helper_declined) {
         ++jit_stats_.native_declines;
         ++jit_stats_.trace_memory_declines;
+        if (entry.decline_streak != std::numeric_limits<std::uint8_t>::max()) {
+            ++entry.decline_streak;
+        }
         if (context.retired_count == 0U) {
             entry.first_declined = true;
             entry.declined_address = first_address();

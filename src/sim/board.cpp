@@ -218,6 +218,7 @@ Result<void> Board::reset() {
     cached_flash_ws_ = peripherals_->flash().waitStates();
     cached_flash_art_hit_capable_ = peripherals_->flash().prefetchEnabled()
         || peripherals_->flash().instructionCacheEnabled();
+    cached_fetch_timing_valid_ = false;
     have_last_fetch_ = false;
     last_fetch_end_ = 0U;
     return {};
@@ -1922,11 +1923,21 @@ std::optional<cpu::FastStepResult> Board::stepCommittedLocal(
     budget.remaining_cycles = credit;
     budget.have_fetch = have_last_fetch_;
     budget.fetch_end = last_fetch_end_;
+    // Cache the flash fetch-timing snapshot: it changes only on FLASH_ACR
+    // writes (tracked by acrGeneration), yet this span path is entered
+    // millions of times on event-heavy firmware.
     const auto& flash = peripherals_->flash();
-    const auto wait = static_cast<std::uint16_t>(flash.waitStates());
-    budget.fetch_timing = {flash.flashBase(), flash.flashBase() + flash.bankSize(),
-        0U, flash.bankSize(), wait,
-        static_cast<std::uint16_t>((flash.prefetchEnabled() || flash.instructionCacheEnabled()) ? 0U : wait)};
+    const auto timing_generation = flash.acrGeneration();
+    if (!cached_fetch_timing_valid_ || cached_fetch_timing_generation_ != timing_generation) {
+        const auto wait = static_cast<std::uint16_t>(flash.waitStates());
+        cached_fetch_timing_ = {flash.flashBase(), flash.flashBase() + flash.bankSize(),
+            0U, flash.bankSize(), wait,
+            static_cast<std::uint16_t>(
+                (flash.prefetchEnabled() || flash.instructionCacheEnabled()) ? 0U : wait)};
+        cached_fetch_timing_generation_ = timing_generation;
+        cached_fetch_timing_valid_ = true;
+    }
+    budget.fetch_timing = cached_fetch_timing_;
     // Reuse the checked RAM-only executor, not speculative admission: all
     // effects commit once, with no journal, snapshot, restore, or replay.
     // Traps prevent any MMIO or executable write inside the native span.
