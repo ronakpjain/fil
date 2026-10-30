@@ -1145,6 +1145,17 @@ void EventLoop::clear() {
 }
 
 SimTimeNs EventLoop::now() const {
+    // Lane fast path: a worker thread bound to its own shard owns that shard
+    // exclusively, so the clock read needs neither the coordinator gate nor the
+    // recursive-mutex bookkeeping. This runs millions of times per simulated
+    // second on event-dense firmware.
+    if (laneBindingLoop() == this) {
+        Impl* const bound = static_cast<Impl*>(laneBindingImpl());
+        if (bound != nullptr && bound->lane_domain) {
+            const EventOwner owner = bound->currentOwner();
+            if (owner == bound->lane_owner) return bound->timeFor(owner);
+        }
+    }
     Impl* state = resolvedImpl();
     Impl::CoordinatorGateGuard coordinator_gate(*state);
     if (state->lane_domain || !state->lane_domains_active) {
