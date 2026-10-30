@@ -60,7 +60,11 @@ enum class MicroOp : std::uint8_t {
     b_cond,
     cbz,
     cbnz,
+    extend,
 };
+
+/** Zero/sign extend width and signedness for MicroOp::extend. */
+enum class ExtendKind : std::uint8_t { uxtb, uxth, sxtb, sxth };
 
 /** Lowered guest instruction with normalized operands. */
 struct MicroInst {
@@ -78,6 +82,7 @@ struct MicroInst {
     bool carry{false};
     /// True for immediate-specified shifts (value=rm); else value=rn, amount=rm&0xff.
     bool shift_immediate{true};
+    ExtendKind extend_kind{ExtendKind::uxtb};
     std::int32_t branch_offset{0};
     std::uint32_t pc{0};
     std::uint8_t size{0};

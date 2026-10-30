@@ -275,6 +275,31 @@ MicroLowerResult tryLowerMicroInst(const MicroSource& source, MicroInst& out) no
         out = inst;
         return {true, MicroLowerReason::ok, {}};
     }
+    case InstrKind::uxtb:
+    case InstrKind::uxth:
+    case InstrKind::sxtb:
+    case InstrKind::sxth: {
+        // UXTB/UXTH/SXTB/SXTH: rotate the source right by the encoded amount,
+        // then zero/sign extend the low byte or halfword. No flags are set.
+        if (!coreReg(d.rd) || !coreReg(d.rm) || d.imm != 0U || d.ra != 0U
+            || d.register_list != 0U || d.writeback || d.fp_double
+            || d.branch_offset != 0 || d.immediate_carry_valid || d.immediate_carry
+            || (d.shift_amount != 0U && d.shift_type != ShiftType::ror)) {
+            return {false, MicroLowerReason::bad_shape, "extend shape"};
+        }
+        inst.op = MicroOp::extend;
+        inst.rd = d.rd;
+        inst.rm = d.rm;
+        inst.imm = d.shift_amount;
+        switch (d.kind) {
+        case InstrKind::uxtb: inst.extend_kind = ExtendKind::uxtb; break;
+        case InstrKind::uxth: inst.extend_kind = ExtendKind::uxth; break;
+        case InstrKind::sxtb: inst.extend_kind = ExtendKind::sxtb; break;
+        default: inst.extend_kind = ExtendKind::sxth; break;
+        }
+        out = inst;
+        return {true, MicroLowerReason::ok, {}};
+    }
     default:
         return {false, MicroLowerReason::unsupported_kind, "kind not in FilIR subset"};
     }
@@ -376,6 +401,22 @@ std::size_t interpretMicroOps(std::span<const MicroInst> ops, MicroCpu& cpu, std
         case MicroOp::cmn_reg: {
             AddResult r = addWithCarry(readOp(cpu, op.rn), readOp(cpu, op.rm), false);
             applyNzcv(cpu, r);
+            break;
+        }
+        case MicroOp::extend: {
+            const std::uint32_t rotated = op.imm == 0U
+                ? readOp(cpu, op.rm)
+                : std::rotr(readOp(cpu, op.rm), static_cast<std::int32_t>(op.imm));
+            const bool byte = op.extend_kind == ExtendKind::uxtb
+                || op.extend_kind == ExtendKind::sxtb;
+            const bool sign = op.extend_kind == ExtendKind::sxtb
+                || op.extend_kind == ExtendKind::sxth;
+            std::uint32_t value = byte ? rotated & 0xffU : rotated & 0xffffU;
+            const std::uint32_t sign_bit = byte ? 0x80U : 0x8000U;
+            if (sign && (value & sign_bit) != 0U) {
+                value |= byte ? 0xffffff00U : 0xffff0000U;
+            }
+            writeOp(cpu, op.rd, value);
             break;
         }
         case MicroOp::add_reg:

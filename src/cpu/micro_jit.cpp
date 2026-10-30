@@ -164,6 +164,10 @@ public:
     void ubfm(std::uint32_t rd, std::uint32_t rn, std::uint32_t immr, std::uint32_t imms) {
         emit(0x53000000U | ((immr & 31U) << 16U) | ((imms & 31U) << 10U) | ((rn & 31U) << 5U) | (rd & 31U));
     }
+    // SBFM 32-bit: sign-extending bitfield move (used for SXTB/SXTH).
+    void sbfm(std::uint32_t rd, std::uint32_t rn, std::uint32_t immr, std::uint32_t imms) {
+        emit(0x13000000U | ((immr & 31U) << 16U) | ((imms & 31U) << 10U) | ((rn & 31U) << 5U) | (rd & 31U));
+    }
     void ubfm64(std::uint32_t rd, std::uint32_t rn, std::uint32_t immr, std::uint32_t imms) {
         emit(0xD3400000U | ((immr & 63U) << 16U) | ((imms & 63U) << 10U) | ((rn & 31U) << 5U) | (rd & 31U));
     }
@@ -515,6 +519,18 @@ bool emitOp(Emitter& e, const MicroInst& op, std::string& error) {
         // ADDS XZR, rn, rm: NZCV only, no register writeback.
         e.addSubReg(1U, 31U, wn, wm);
         return true;
+    case MicroOp::extend: {
+        // UBFM/SBFM rotate the source right by immr then extract the low
+        // width bits, which is exactly UXTB/UXTH/SXTB/SXTH with ROR #n.
+        const std::uint32_t amount = op.imm & 31U;
+        const std::uint32_t width = (op.extend_kind == ExtendKind::uxtb
+            || op.extend_kind == ExtendKind::sxtb) ? 7U : 15U;
+        const bool signed_extend = op.extend_kind == ExtendKind::sxtb
+            || op.extend_kind == ExtendKind::sxth;
+        if (signed_extend) e.sbfm(wd, wm, amount, width);
+        else e.ubfm(wd, wm, amount, width);
+        return true;
+    }
     case MicroOp::add_reg:        
         e.addSubReg(op.set_flags ? 1U : 0U, wd, wn, wm);
         return true;
@@ -1180,6 +1196,25 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
         endAddSub(e, o, is_sub, 0U, false);
         return true;
     }
+    case MicroOp::extend: {
+        const bool byte = op.extend_kind == ExtendKind::uxtb
+            || op.extend_kind == ExtendKind::sxtb;
+        const bool sign = op.extend_kind == ExtendKind::sxtb
+            || op.extend_kind == ExtendKind::sxth;
+        loadGuest(e, kEax, o, op.rm);
+        if (op.imm != 0U) e.shImm(1U, kEax, static_cast<std::uint8_t>(op.imm & 31U)); // ror
+        if (sign) {
+            // Shift the target field to the top, then arithmetic-shift back to
+            // sign-extend (byte: 24, halfword: 16).
+            const std::uint8_t amount = byte ? 24U : 16U;
+            e.shImm(4U, kEax, amount); // shl
+            e.shImm(7U, kEax, amount); // sar
+        } else {
+            e.aluRImm(4U, kEax, byte ? 0xffU : 0xffffU); // and
+        }
+        storeGuest(e, o, op.rd, kEax);
+        return true;
+    }
     case MicroOp::add_reg:
     case MicroOp::sub_reg: {
         const bool is_sub = op.op == MicroOp::sub_reg;
@@ -1789,6 +1824,7 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
         case MicroOp::add_imm: case MicroOp::sub_imm: reads(op.rn); writes(op.rd); break;
         case MicroOp::cmp_imm: case MicroOp::cmn_imm: reads(op.rn); break;
         case MicroOp::cmp_reg: case MicroOp::cmn_reg: reads(op.rn); reads(op.rm); break;
+        case MicroOp::extend: reads(op.rm); writes(op.rd); break;
         case MicroOp::add_reg: case MicroOp::sub_reg:
         case MicroOp::and_reg: case MicroOp::orr_reg: case MicroOp::eor_reg: case MicroOp::bic_reg:
             reads(op.rn); reads(op.rm); writes(op.rd); break;
