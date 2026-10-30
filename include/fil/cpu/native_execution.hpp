@@ -56,5 +56,13 @@ struct NativeExecutionContext {
 [[nodiscard]] bool nativeWrite32(
     NativeExecutionContext* context, std::uint32_t instruction_pc,
     std::uint32_t address, std::uint32_t value) noexcept;
+/** @brief Nonthrowing byte load ABI; false declines without changing output/state. */
+[[nodiscard]] bool nativeRead8(
+    NativeExecutionContext* context, std::uint32_t instruction_pc,
+    std::uint32_t address, std::uint32_t* value_out) noexcept;
+/** @brief Reversible-only nonthrowing byte store; only non-executable RAM is accepted. */
+[[nodiscard]] bool nativeWrite8(
+    NativeExecutionContext* context, std::uint32_t instruction_pc,
+    std::uint32_t address, std::uint32_t value) noexcept;
 
 } // namespace fil::cpu

@@ -9,7 +9,10 @@ MicroLowerResult tryLowerNativeInst(const MicroSource& source, NativeInst& out) 
     inst.pc = source.pc;
     inst.size = source.size;
     const auto& d = source.decoded;
-    if (d.kind != InstrKind::ldr && d.kind != InstrKind::str) {
+    const bool is_load = d.kind == InstrKind::ldr || d.kind == InstrKind::ldrb;
+    const bool is_store = d.kind == InstrKind::str || d.kind == InstrKind::strb;
+    const bool byte_access = d.kind == InstrKind::ldrb || d.kind == InstrKind::strb;
+    if (!is_load && !is_store) {
         const auto result = tryLowerMicroInst(source, inst.integer);
         if (!result.ok) return result;
         out = inst;
@@ -21,7 +24,9 @@ MicroLowerResult tryLowerNativeInst(const MicroSource& source, NativeInst& out) 
         return {false, MicroLowerReason::bad_size, "invalid memory instruction width"};
     if ((source.pc & 1U) != 0U)
         return {false, MicroLowerReason::bad_pc, "thumb pc must be even"};
-    const bool literal = d.kind == InstrKind::ldr && d.form == OperandForm::literal;
+    // Literal (PC-relative) addressing is word-only; LDRB literal forms exist
+    // but stay on the checked path rather than widening the stencil contract.
+    const bool literal = is_load && !byte_access && d.form == OperandForm::literal;
     if (d.rd >= 13U || (!literal && d.rn > 13U))
         return {false, MicroLowerReason::bad_register, "memory destination must be r0-r12; base may be SP"};
     if (literal) {
@@ -42,7 +47,9 @@ MicroLowerResult tryLowerNativeInst(const MicroSource& source, NativeInst& out) 
         || d.shift_amount != 0U || d.shift_type != ShiftType::lsl || d.fp_double
         || d.branch_offset != 0 || d.immediate_carry_valid || d.immediate_carry)
         return {false, MicroLowerReason::bad_shape, "unsupported memory addressing shape"};
-    inst.kind = d.kind == InstrKind::ldr ? NativeOp::load_word : NativeOp::store_word;
+    inst.kind = byte_access
+        ? (is_load ? NativeOp::load_byte : NativeOp::store_byte)
+        : (is_load ? NativeOp::load_word : NativeOp::store_word);
     inst.rd = d.rd;
     inst.rn = d.rn;
     inst.offset = d.imm;

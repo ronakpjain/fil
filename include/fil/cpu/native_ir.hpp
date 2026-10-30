@@ -8,7 +8,7 @@ namespace fil::cpu {
  * proves instruction shape, never mapping, permissions, or RAM stability.
  * The existing pure MicroBlock ABI and its admission policy are unchanged.
  */
-enum class NativeOp : std::uint8_t { integer, load_word, store_word };
+enum class NativeOp : std::uint8_t { integer, load_word, store_word, load_byte, store_byte };
 
 struct NativeInst {
     NativeOp kind{NativeOp::integer};
