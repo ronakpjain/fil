@@ -2029,6 +2029,7 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::tryStepBudgetedReversible
         if (tryStepNativeTrace(max_instructions, budget, &detailed)) return detailed;
     }
     if (!prepareJitBlock(true)) {
+        ++jit_stats_.block_prepare_failed;
         if (auto scalar = tryStepItScalarFallback(&budget)) return scalar;
         return std::nullopt;
     }
@@ -2038,7 +2039,10 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::tryStepBudgetedReversible
 std::optional<FastStepResult> CortexM4::tryStepCommittedRamSpan(
     const std::size_t max_instructions, ReversibleCycleBudget& budget) {
     if (max_instructions == 0U || !memory_.reversibleRamOnly()
-        || !memory_.allMmioTrapping()) return std::nullopt;
+        || !memory_.allMmioTrapping()) {
+        ++jit_stats_.span_skip_env;
+        return std::nullopt;
+    }
     if (!inItBlock(state_.it_state) && native_memory_jit_enabled_) {
         if (auto trace = tryStepNativeTrace(max_instructions, budget, nullptr)) return trace;
     }
@@ -2127,6 +2131,7 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
         || state_.halted || !state_.thumb || (state_.xpsr & xpsr_t) == 0U
         || (entry_pc & 1U) != 0U || inItBlock(state_.it_state)
         || state_.pending_exception || state_.pending_exc_return) {
+        ++jit_stats_.block_decline_guard;
         return std::nullopt;
     }
 
@@ -2493,6 +2498,7 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
 
     if (out.count == 0U) {
         ++jit_stats_.fallbacks;
+        ++jit_stats_.block_decline_empty;
         return std::nullopt;
     }
     slot.decline_streak = 0U;

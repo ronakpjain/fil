@@ -1901,16 +1901,25 @@ std::optional<Board::ConcurrentStepResult> Board::stepMemoizedLocal(
 
 std::optional<cpu::FastStepResult> Board::stepCommittedLocal(
     const std::size_t max_instructions, const std::optional<SimTimeNs> deadline) {
-    if (max_instructions < 2U || blockBoundaryPending()) return std::nullopt;
+    if (max_instructions < 2U || blockBoundaryPending()) {
+        ++cpu_->mutableJitStats().span_skip_boundary;
+        return std::nullopt;
+    }
     const auto now = event_loop_->now();
     const auto frequency = peripherals_->rcc().systemClockHz();
     if (frequency == 0U || time_fraction_ >= frequency) return std::nullopt;
     auto horizon = deadline;
     if (const auto event = event_loop_->nextScheduledTime(event_loop_->activeOwner());
         event && (!horizon || *event < *horizon)) horizon = event;
-    if (horizon && *horizon <= now) return std::nullopt;
+    if (horizon && *horizon <= now) {
+        ++cpu_->mutableJitStats().span_skip_clock;
+        return std::nullopt;
+    }
     const auto systick = system_->cyclesUntilSysTickInterrupt();
-    if (systick && *systick == 0U) return std::nullopt;
+    if (systick && *systick == 0U) {
+        ++cpu_->mutableJitStats().span_skip_clock;
+        return std::nullopt;
+    }
     auto credit = systick ? *systick - 1U : std::numeric_limits<std::uint64_t>::max();
     if (horizon && *horizon - now <= std::numeric_limits<std::uint64_t>::max() / frequency) {
         const auto numerator = (*horizon - now) * frequency - 1U;
@@ -1918,7 +1927,10 @@ std::optional<cpu::FastStepResult> Board::stepCommittedLocal(
             ? (numerator - time_fraction_) / nanoseconds_per_second : 0U);
     }
     credit = std::min<std::uint64_t>(credit, std::numeric_limits<std::uint16_t>::max());
-    if (credit == 0U) return std::nullopt;
+    if (credit == 0U) {
+        ++cpu_->mutableJitStats().span_skip_credit;
+        return std::nullopt;
+    }
     cpu::CortexM4::ReversibleCycleBudget budget;
     budget.remaining_cycles = credit;
     budget.have_fetch = have_last_fetch_;

@@ -448,8 +448,22 @@ public:
         /// Stack-optimistic opportunity estimate, not a lane-admission proof.
         std::uint64_t trace_horizon_stack_local_ops{0};
         std::uint64_t trace_horizon_stack_shared{0};
+        /// Block attempt outcomes, split so throughput work can target the
+        /// dominant decline reason rather than guessing.
+        std::uint64_t block_decline_guard{0};   ///< entry PC/state/generation guard
+        std::uint64_t block_decline_empty{0};   ///< no instruction retired
+        std::uint64_t block_prepare_failed{0};  ///< prepareJitBlock produced no entry
+        std::uint64_t block_native_span_ok{0};  ///< committed span retired instructions
+        /// Committed-span outcome counters (Board::stepCommittedLocal).
+        std::uint64_t span_skip_boundary{0};
+        std::uint64_t span_skip_credit{0};
+        std::uint64_t span_skip_clock{0};
+        std::uint64_t span_skip_env{0};    ///< reversibleRamOnly/allMmioTrapping not set
+        std::uint64_t span_skip_retire{0}; ///< ran but retired nothing
     };
     [[nodiscard]] JitStats jitStats() const noexcept { return jit_stats_; }
+    /// Mutable stats accessor for the scheduler's own span diagnostics.
+    [[nodiscard]] JitStats& mutableJitStats() noexcept { return jit_stats_; }
 
     /** Mixed native reversible execution can be disabled for differential validation. */
     void setNativeMemoryJitEnabled(bool enabled) noexcept { native_memory_jit_enabled_ = enabled; }

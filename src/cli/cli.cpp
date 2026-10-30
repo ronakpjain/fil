@@ -655,6 +655,15 @@ void printJitStats(std::ostream& out, const cpu::CortexM4& cpu, const std::strin
         << " block_instructions=" << stats.block_instructions
         << " block_compilations=" << stats.compilations
         << " block_fallbacks=" << stats.fallbacks
+        << " block_decline_guard=" << stats.block_decline_guard
+        << " block_decline_empty=" << stats.block_decline_empty
+        << " block_prepare_failed=" << stats.block_prepare_failed
+        << " block_native_span_ok=" << stats.block_native_span_ok
+        << " span_skip_boundary=" << stats.span_skip_boundary
+        << " span_skip_clock=" << stats.span_skip_clock
+        << " span_skip_credit=" << stats.span_skip_credit
+        << " span_skip_env=" << stats.span_skip_env
+        << " span_skip_retire=" << stats.span_skip_retire
         << " single_fast=" << stats.single_fast
         << " single_generic=" << stats.single_generic
         << " block_generic=" << stats.block_generic
