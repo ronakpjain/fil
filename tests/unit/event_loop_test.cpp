@@ -203,6 +203,50 @@ TEST(EventLoopTest, AdvanceByCallbackCanScheduleZeroDelayEvents) {
     EXPECT_EQ(loop.now(), 4U);
 }
 
+TEST(EventLoopTest, CancelledSlotsAreReusedWithoutResurrectingOldEvents) {
+    fil::sim::EventLoop loop;
+    std::vector<int> order;
+    const auto cancelled = loop.scheduleAt(5U, [&] { order.push_back(1); });
+    EXPECT_TRUE(loop.cancel(cancelled));
+    // The replacement may reuse the slot of the cancelled event; the stale
+    // heap entry must not run it again or reorder the new event.
+    static_cast<void>(loop.scheduleAt(4U, [&] { order.push_back(2); }));
+    static_cast<void>(loop.scheduleAt(5U, [&] { order.push_back(3); }));
+    EXPECT_FALSE(loop.cancel(cancelled));
+    const auto result = loop.runDueEvents(5U);
+    EXPECT_EQ(result.events_executed, 2U);
+    EXPECT_EQ(order, (std::vector<int>{2, 3}));
+    EXPECT_EQ(loop.pending(), 0U);
+}
+
+TEST(EventLoopTest, ClearReturnsSlotsForReuseAndKeepsTheClock) {
+    fil::sim::EventLoop loop;
+    static_cast<void>(loop.scheduleAt(2U, [] {}));
+    static_cast<void>(loop.runDueEvents(2U));
+    EXPECT_EQ(loop.now(), 2U);
+    loop.clear();
+    EXPECT_EQ(loop.pending(), 0U);
+    EXPECT_FALSE(loop.nextScheduledTime().has_value());
+    std::vector<int> order;
+    static_cast<void>(loop.scheduleAt(2U, [&] { order.push_back(1); }));
+    static_cast<void>(loop.scheduleAt(3U, [&] { order.push_back(2); }));
+    EXPECT_EQ(loop.runDueEvents(3U).events_executed, 2U);
+    EXPECT_EQ(order, (std::vector<int>{1, 2}));
+}
+
+TEST(EventLoopTest, SameTimeReplacementKeepsQueueOrder) {
+    fil::sim::EventLoop loop;
+    std::vector<int> order;
+    static_cast<void>(loop.scheduleAt(7U, [&] { order.push_back(1); }));
+    fil::sim::ScheduledEvent handle(&loop);
+    static_cast<void>(handle.scheduleAt(7U, [&] { order.push_back(2); }));
+    // Replacing the handle's callback must not move an already scheduled
+    // earlier same-time event, even though the replacement reuses a slot.
+    static_cast<void>(handle.scheduleAt(7U, [&] { order.push_back(3); }));
+    EXPECT_EQ(loop.runDueEvents(7U).events_executed, 2U);
+    EXPECT_EQ(order, (std::vector<int>{1, 3}));
+}
+
 TEST(EventLoopTest, TracksLocalAndSharedEventOwnership) {
     fil::sim::EventLoop loop;
     std::vector<fil::sim::EventOwner> observed;

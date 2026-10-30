@@ -26,6 +26,14 @@ this does not enable concurrent or reentrant World mutation. Leases are
 non-movable, unwind on exceptions, must nest in LIFO order, and must not outlive
 the loop implementation. This reduces host synchronization overhead without changing simulated timing.
 
+Scheduled callbacks live in reusable slots rather than per-event heap nodes.
+Each owner and global queue stores a `(timestamp, insertion sequence)` key with
+the slot identity; a monotonically increasing event id validates the slot, so a
+reused slot cannot resurrect a cancelled predecessor. Scheduling, cancellation,
+and same-time reentry keep the reference order: timestamp first, then insertion
+sequence. The slot vector only grows to the maximum number of simultaneously
+pending events.
+
 ## Execution optimizations
 
 | Mechanism | Behavior |

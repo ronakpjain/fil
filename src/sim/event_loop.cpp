@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <limits>
 #include <mutex>
+#include <numeric>
 #include <queue>
 #include <stdexcept>
 #include <unordered_map>
@@ -12,7 +13,14 @@
 
 namespace fil::sim {
 struct EventLoop::Impl {
-    struct Event {
+    /**
+     * @brief Callback storage for one scheduled event.
+     *
+     * Slots are reused after cancellation or execution. The monotonically
+     * increasing EventId is the slot's generation: stale heap entries compare
+     * their stored id against the slot and are discarded without an ABA risk.
+     */
+    struct Slot {
         SimTimeNs at{0};
         EventId id{0};
         std::uint64_t sequence{0};
@@ -20,19 +28,30 @@ struct EventLoop::Impl {
         EventCallback callback;
         std::function<bool()> locality_guard;
         bool globally_observed{true};
-        bool live{true};
+        bool live{false};
     };
 
-    using EventPtr = std::shared_ptr<Event>;
+    /** Key and slot reference carried by every pending queue entry. */
+    struct Entry {
+        SimTimeNs at{0};
+        std::uint64_t sequence{0};
+        std::uint32_t slot{0};
+        EventId id{0};
+    };
+
+    struct SlotRef {
+        std::uint32_t slot{0};
+        EventId id{0};
+    };
 
     struct Later {
-        bool operator()(const EventPtr& left, const EventPtr& right) const noexcept {
-            if (left->at != right->at) return left->at > right->at;
-            return left->sequence > right->sequence;
+        bool operator()(const Entry& left, const Entry& right) const noexcept {
+            if (left.at != right.at) return left.at > right.at;
+            return left.sequence > right.sequence;
         }
     };
 
-    using Queue = std::priority_queue<EventPtr, std::vector<EventPtr>, Later>;
+    using Queue = std::priority_queue<Entry, std::vector<Entry>, Later>;
 
     SimTimeNs shared_now{0};
     EventId next_id{1};
@@ -40,12 +59,14 @@ struct EventLoop::Impl {
     std::size_t maximum_same_time_events{100000};
     mutable std::recursive_mutex mutex;
     EventOwner serial_active_owner{shared_event_owner};
+    std::vector<Slot> slots;
+    std::vector<std::uint32_t> free_slots;
     Queue events;
     Queue globally_observed_events;
     std::unordered_map<EventOwner, Queue> owner_events;
     std::shared_ptr<const ObservationBarrier> observation_barrier;
     ObservationBarrier scheduler_observation_barrier;
-    std::unordered_map<EventId, EventPtr> live_events;
+    std::unordered_map<EventId, SlotRef> live_events;
     std::unordered_map<EventOwner, SimTimeNs> owner_now;
 
     static Impl*& exclusiveImpl() noexcept {
@@ -87,8 +108,23 @@ struct EventLoop::Impl {
         else owner_now[owner] = time;
     }
 
-    static void discardDeadFront(Queue& queue) {
-        while (!queue.empty() && !queue.top()->live) queue.pop();
+    [[nodiscard]] bool entryLive(const Entry& entry) const noexcept {
+        return entry.slot < slots.size()
+            && slots[entry.slot].live
+            && slots[entry.slot].id == entry.id;
+    }
+
+    static void discardDeadFront(Queue& queue, const std::vector<Slot>& slots) {
+        while (!queue.empty()) {
+            const Entry& entry = queue.top();
+            if (entry.slot < slots.size() && slots[entry.slot].live
+                && slots[entry.slot].id == entry.id) return;
+            queue.pop();
+        }
+    }
+
+    void discardDeadFront(Queue& queue) const {
+        discardDeadFront(queue, slots);
     }
 
     void discardDeadGlobalFront() {
@@ -102,15 +138,41 @@ struct EventLoop::Impl {
         return &found->second;
     }
 
-    void retire(const EventPtr& event) {
-        event->live = false;
-        live_events.erase(event->id);
+    void releaseSlot(const std::uint32_t index) noexcept {
+        Slot& slot = slots[index];
+        slot.live = false;
+        slot.callback = {};
+        slot.locality_guard = {};
+        free_slots.push_back(index);
+    }
+
+    void retire(const Entry& entry) {
+        Slot& slot = slots[entry.slot];
+        slot.live = false;
+        live_events.erase(slot.id);
+        free_slots.push_back(entry.slot);
         discardDeadFront(globally_observed_events);
     }
 
     void markOwner(EventRunResult& result, const EventOwner owner) const noexcept {
         if (owner < 64U) result.local_owner_mask |= std::uint64_t{1U} << owner;
         else result.shared_event_executed = true;
+    }
+
+    std::uint32_t acquireSlot() {
+        std::uint32_t index = 0;
+        if (!free_slots.empty()) {
+            index = free_slots.back();
+            free_slots.pop_back();
+        } else {
+            if (slots.size() >= std::numeric_limits<std::uint32_t>::max()) {
+                throw std::length_error("simulation event slot space exhausted");
+            }
+            index = static_cast<std::uint32_t>(slots.size());
+            slots.emplace_back();
+        }
+        slots[index].live = true;
+        return index;
     }
 
     EventId schedule(
@@ -125,16 +187,23 @@ struct EventLoop::Impl {
         const EventId id = next_id++;
         const EventOwner owner = currentOwner();
         const bool globally_observed = !locality_guard || owner == shared_event_owner;
-        auto event = std::make_shared<Event>(Event{
-            at, id, next_sequence++, owner, std::move(callback),
-            std::move(locality_guard), globally_observed, true,
-        });
-        events.push(event);
-        if (globally_observed) globally_observed_events.push(event);
+        const std::uint32_t index = acquireSlot();
+        Slot& slot = slots[index];
+        slot.at = at;
+        slot.id = id;
+        slot.sequence = next_sequence++;
+        slot.owner = owner;
+        slot.callback = std::move(callback);
+        slot.locality_guard = std::move(locality_guard);
+        slot.globally_observed = globally_observed;
+
+        const Entry entry{slot.at, slot.sequence, index, id};
+        events.push(entry);
+        if (globally_observed) globally_observed_events.push(entry);
         auto& owner_queue = owner_events[owner];
         discardDeadFront(owner_queue);
-        owner_queue.push(event);
-        live_events.emplace(id, event);
+        owner_queue.push(entry);
+        live_events.emplace(id, SlotRef{index, id});
         return id;
     }
 
@@ -149,7 +218,7 @@ struct EventLoop::Impl {
 
         for (;;) {
             discardDeadGlobalFront();
-            if (events.empty() || events.top()->at > deadline) {
+            if (events.empty() || events.top().at > deadline) {
                 shared_now = deadline;
                 // Owner clocks are clamped to the shared clock on read
                 // (see timeFor), so no per-frontier map walk is needed here.
@@ -157,8 +226,8 @@ struct EventLoop::Impl {
                 return result;
             }
 
-            const EventPtr event = events.top();
-            const SimTimeNs next_time = event->at;
+            const Entry entry = events.top();
+            const SimTimeNs next_time = entry.at;
             if (events_at_counted_time == 0U || next_time != counted_time) {
                 counted_time = next_time;
                 events_at_counted_time = 0U;
@@ -171,48 +240,58 @@ struct EventLoop::Impl {
             }
 
             events.pop();
-            shared_now = event->at;
+            shared_now = entry.at;
             ++events_at_counted_time;
-            invoke(event, result);
+            invoke(entry, result);
         }
     }
 
-    void invoke(const EventPtr& event, EventRunResult& result) {
-        setTime(event->owner, event->at);
-        markOwner(result, event->owner);
+    void invoke(const Entry& entry, EventRunResult& result) {
+        Slot& slot = slots[entry.slot];
+        const SimTimeNs at = slot.at;
+        const EventOwner owner = slot.owner;
+        const EventId id = slot.id;
+        // Move the callables out before the slot can be reused by a nested
+        // schedule or by the observer itself.
+        EventCallback callback = std::move(slot.callback);
+        std::function<bool()> locality_guard = std::move(slot.locality_guard);
+        slot.live = false;
+        live_events.erase(id);
+        free_slots.push_back(entry.slot);
+        discardDeadFront(globally_observed_events);
+
+        setTime(owner, at);
+        markOwner(result, owner);
         ++result.events_executed;
-        retire(event);
 
         const EventOwner previous_owner = currentOwner();
-        setCurrentOwner(event->owner);
+        setCurrentOwner(owner);
         try {
             const std::shared_ptr<const ObservationBarrier> observer = observation_barrier;
-            const bool owner_local = event->owner != shared_event_owner &&
-                event->locality_guard && event->locality_guard();
+            const bool owner_local = owner != shared_event_owner
+                && locality_guard && locality_guard();
             const EventObservation classification = owner_local
                 ? EventObservation::owner_local : EventObservation::global;
 
             if (scheduler_observation_barrier) {
                 scheduler_observation_barrier(
-                    event->at, event->owner,
+                    at, owner,
                     observer ? EventObservation::global : classification
                 );
             }
-            if (observer && *observer) (*observer)(event->at, event->owner, classification);
+            if (observer && *observer) (*observer)(at, owner, classification);
 
             // Observers can alter ADC hooks. Preserve the invocation snapshot so
             // downgrade notification still reaches an observer that clears its slot.
-            if (owner_local && !event->locality_guard()) {
+            if (owner_local && !locality_guard()) {
                 if (scheduler_observation_barrier) {
-                    scheduler_observation_barrier(
-                        event->at, event->owner, EventObservation::global
-                    );
+                    scheduler_observation_barrier(at, owner, EventObservation::global);
                 }
                 if (observer && *observer) {
-                    (*observer)(event->at, event->owner, EventObservation::global);
+                    (*observer)(at, owner, EventObservation::global);
                 }
             }
-            event->callback();
+            callback();
         } catch (...) {
             setCurrentOwner(previous_owner);
             throw;
@@ -294,9 +373,14 @@ bool EventLoop::cancel(const EventId id) noexcept {
     if (id == 0U) return false;
     const auto found = impl_->live_events.find(id);
     if (found == impl_->live_events.end()) return false;
-    found->second->live = false;
-    Impl::discardDeadFront(impl_->globally_observed_events);
+    const Impl::SlotRef ref = found->second;
+    if (ref.slot >= impl_->slots.size() || impl_->slots[ref.slot].id != ref.id) {
+        impl_->live_events.erase(found);
+        return false;
+    }
+    impl_->releaseSlot(ref.slot);
     impl_->live_events.erase(found);
+    impl_->discardDeadFront(impl_->globally_observed_events);
     return true;
 }
 
@@ -319,14 +403,14 @@ EventRunResult EventLoop::runOwnedEvents(
     std::size_t events_at_counted_time = 0U;
     for (;;) {
         Impl::Queue* const queue = impl_->ownerQueue(owner);
-        if (queue == nullptr || queue->empty() || queue->top()->at > deadline) {
+        if (queue == nullptr || queue->empty() || queue->top().at > deadline) {
             impl_->setTime(owner, deadline);
             result.stopped_at = deadline;
             return result;
         }
 
-        const Impl::EventPtr event = queue->top();
-        const SimTimeNs next_time = event->at;
+        const Impl::Entry entry = queue->top();
+        const SimTimeNs next_time = entry.at;
         if (events_at_counted_time == 0U || next_time != counted_time) {
             counted_time = next_time;
             events_at_counted_time = 0U;
@@ -340,7 +424,7 @@ EventRunResult EventLoop::runOwnedEvents(
 
         queue->pop();
         ++events_at_counted_time;
-        impl_->invoke(event, result);
+        impl_->invoke(entry, result);
     }
 }
 
@@ -358,6 +442,13 @@ void EventLoop::clear() noexcept {
     impl_->globally_observed_events = {};
     impl_->owner_events.clear();
     impl_->live_events.clear();
+    for (auto& slot : impl_->slots) {
+        slot.live = false;
+        slot.callback = {};
+        slot.locality_guard = {};
+    }
+    impl_->free_slots.resize(impl_->slots.size());
+    std::iota(impl_->free_slots.begin(), impl_->free_slots.end(), 0U);
 }
 
 SimTimeNs EventLoop::now() const noexcept {
@@ -379,14 +470,14 @@ std::optional<SimTimeNs> EventLoop::nextScheduledTime() {
     Impl::Lock lock(*impl_);
     impl_->discardDeadGlobalFront();
     if (impl_->events.empty()) return std::nullopt;
-    return impl_->events.top()->at;
+    return impl_->events.top().at;
 }
 
 std::optional<SimTimeNs> EventLoop::nextScheduledTime(const EventOwner owner) {
     Impl::Lock lock(*impl_);
     Impl::Queue* const queue = impl_->ownerQueue(owner);
     if (queue == nullptr || queue->empty()) return std::nullopt;
-    return queue->top()->at;
+    return queue->top().at;
 }
 
 ObservationBarrier EventLoop::exchangeObservationBarrier(ObservationBarrier barrier) {
@@ -409,11 +500,11 @@ ObservationBarrier EventLoop::exchangeSchedulerObservationBarrier(
 std::optional<SimTimeNs> EventLoop::nextObservationTime(const EventOwner owner) {
     Impl::Lock lock(*impl_);
     Impl::Queue* const owner_queue = impl_->ownerQueue(owner);
-    Impl::discardDeadFront(impl_->globally_observed_events);
+    impl_->discardDeadFront(impl_->globally_observed_events);
     std::optional<SimTimeNs> result;
-    if (owner_queue != nullptr && !owner_queue->empty()) result = owner_queue->top()->at;
+    if (owner_queue != nullptr && !owner_queue->empty()) result = owner_queue->top().at;
     if (!impl_->globally_observed_events.empty()) {
-        const SimTimeNs global_time = impl_->globally_observed_events.top()->at;
+        const SimTimeNs global_time = impl_->globally_observed_events.top().at;
         if (!result || global_time < *result) result = global_time;
     }
     return result;
