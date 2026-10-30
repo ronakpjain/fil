@@ -149,6 +149,7 @@ add_library(fil_core STATIC
     src/common/format.cpp
     src/config/config.cpp
     src/cpu/cortex_m4.cpp
+    src/cpu/effect_summary.cpp
     src/cpu/decoder.cpp
     src/cpu/execute.cpp
     src/cpu/jit.cpp
@@ -168,6 +169,7 @@ add_library(fil_core STATIC
     src/mem/memory_bus.cpp
     src/mem/mmio_router.cpp
     src/sim/event_loop.cpp
+    src/sim/lane_horizon.cpp
     src/sim/board.cpp
     src/sim/trace.cpp
     src/sim/stimulus.cpp
