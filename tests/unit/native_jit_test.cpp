@@ -34,19 +34,25 @@ TEST(NativeJitTest, DecodedLiteralAndStackAccessesMatchExactEveryPrefix) {
     const auto function = jit->compileNative(block, error);
     ASSERT_NE(function, nullptr) << error;
     const std::array<std::uint32_t, 4> costs{2U, 2U, 2U, 1U};
-    for (std::uint32_t limit = 0U; limit <= words.size(); ++limit) {
+    for (std::uint32_t variant = 0U; variant < 15U; ++variant) {
+        const auto mode = variant / 5U;
+        const auto limit = variant % 5U;
         fil::mem::MemoryBus bus, oracle;
         for (auto* memory : {&bus, &oracle}) {
             ASSERT_TRUE(memory->mapRom(flash, image.size(), "flash"));
             ASSERT_TRUE(memory->mapRam(ram, 64U, "ram"));
             ASSERT_TRUE(memory->loadBytes(flash, image));
             ASSERT_TRUE(memory->write32(ram + 20U, 0xcafebabeU));
+            ASSERT_TRUE(memory->write32(ram + 36U, 0xbadc0ffeU));
         }
         CpuState state;
         state.r[15] = flash;
         state.instruction_address = flash;
-        state.r[13] = state.msp = ram + 16U;
-        state.xpsr = xpsr_t | xpsr_n | xpsr_c | xpsr_q;
+        state.r[13] = ram + 48U; // Deliberately stale architectural mirror.
+        state.msp = ram + 16U;
+        state.psp = ram + 32U;
+        state.control = mode == 0U ? 0U : 2U;
+        state.xpsr = xpsr_t | xpsr_n | xpsr_c | xpsr_q | (mode == 2U ? 3U : 0U);
         CortexM4 reference(oracle);
         reference.state() = state;
         NativeExecutionContext context{&state, &bus, limit, 100U};

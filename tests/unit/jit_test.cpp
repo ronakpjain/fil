@@ -502,6 +502,35 @@ TEST(JitTest, ReversibleFinalMetadataMatchesEveryRetiredPrefixAndMemoryDecline) 
     }
 }
 
+TEST(JitTest, NativeFirstMemoryDeclineRetriesOnlyAfterAddressChanges) {
+    if (!fil::cpu::MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
+    auto memory = basicBus();
+    ASSERT_TRUE(memory.loadBytes(flash_base, halfwords({0x680aU, 0x3201U, 0xbf00U, 0xbe00U})));
+    ASSERT_TRUE(memory.write32(ram_base, 5U));
+    SharedMmio mmio;
+    ASSERT_TRUE(memory.mapMmio(0x40000000U, 16U, mmio, "mmio"));
+    memory.setReversibleRamOnly(true);
+    memory.setAllMmioTrapping(true);
+    fil::cpu::CortexM4 cpu(memory);
+    prepare(cpu);
+    cpu.state().r[1] = 0x40000000U;
+    for (unsigned i = 0U; i < 70U; ++i) static_cast<void>(cpu.prepareJitBlock(true));
+    fil::cpu::CortexM4::ReversibleCycleBudget budget;
+    budget.remaining_cycles = 100U;
+    ASSERT_FALSE(cpu.tryStepBudgetedReversibleJitBlock(2U, budget));
+    const auto attempts = cpu.jitStats().native_executions;
+    ASSERT_GT(attempts, 0U);
+    EXPECT_FALSE(cpu.tryStepBudgetedReversibleJitBlock(2U, budget));
+    EXPECT_EQ(cpu.jitStats().native_executions, attempts);
+    EXPECT_EQ(mmio.reads, 0);
+    cpu.state().r[1] = ram_base;
+    const auto success = cpu.tryStepBudgetedReversibleJitBlock(2U, budget);
+    ASSERT_TRUE(success);
+    EXPECT_EQ(success->execution.count, 2U);
+    EXPECT_GT(cpu.jitStats().native_executions, attempts);
+    EXPECT_EQ(cpu.state().r[2], 6U);
+}
+
 TEST(JitTest, MixedNativeReversibleMatchesCachedAtEveryBudgetAndDecline) {
     std::uint64_t native_total = 0U;
     for (const bool decline : {false, true}) {

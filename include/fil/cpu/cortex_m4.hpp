@@ -540,6 +540,8 @@ private:
         /// micro_prefix_count); the suffix keeps existing handlers.
         NativeFunction native_function{nullptr};
         std::uint8_t native_prefix_count{0U};
+        bool native_first_declined{false};
+        std::uint32_t native_declined_address{0U};
         MicroFunction micro_function{nullptr};
         std::uint8_t micro_prefix_count{0U};
         bool micro_attempted{false};

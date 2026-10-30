@@ -1820,8 +1820,16 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
     // preserve the unused suffix instead of zero-filling the whole array.
     std::uint8_t first_cached = 0U;
     std::uint8_t cached_limit = execution_count;
+    const auto first_native_address = [&] {
+        const auto& op = slot.ops[0];
+        const auto base = op.rn == 15U ? (entry_pc + 4U) & ~std::uint32_t{3U}
+            : state_.readRegister(op.rn);
+        return op.add ? base + op.imm : base - op.imm;
+    };
     if (native_memory_jit_enabled_ && slot.native_function && budget
-        && budget->fetch_stall == nullptr && state_.it_state == 0U) {
+        && budget->fetch_stall == nullptr && state_.it_state == 0U
+        && (!slot.native_first_declined
+            || first_native_address() != slot.native_declined_address)) {
         // Callback-free timing is stable throughout the capsule. Plan only
         // immutable costs; checked native helpers decide memory eligibility.
         std::array<std::uint32_t, JitStepOutcome::max_block> charges;
@@ -1866,8 +1874,17 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
             }
             ++jit_stats_.native_executions;
             jit_stats_.native_instructions += first_cached;
+            if (first_cached != 0U) slot.native_first_declined = false;
             if (context.exit_reason == NativeExitReason::helper_declined) {
                 ++jit_stats_.native_declines;
+                if (first_cached == 0U) {
+                    // A stable MMIO/fault address should not repeatedly enter
+                    // a native kernel merely to decline its first access. The
+                    // checked path remains authoritative (also after remaps);
+                    // a changed address immediately retries native execution.
+                    slot.native_first_declined = true;
+                    slot.native_declined_address = first_native_address();
+                }
                 cached_limit = first_cached;
             } else if (context.exit_reason == NativeExitReason::cycle_limit) {
                 cached_limit = first_cached;

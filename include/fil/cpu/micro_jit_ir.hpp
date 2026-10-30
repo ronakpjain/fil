@@ -132,6 +132,9 @@ struct MicroCpu {
 /** Static cost: one per op, branch costs 2 (taken-refill estimate). */
 [[nodiscard]] std::uint64_t microBlockCost(const MicroBlock& block) noexcept;
 
+/** Non-owning reference execution, including allocation-free single-op fallbacks. */
+std::size_t interpretMicroOps(std::span<const MicroInst> ops, MicroCpu& cpu, std::size_t max_instructions) noexcept;
+
 /** Reference interpreter: executes up to max_instructions, returns retired count. */
 std::size_t interpretMicroBlock(const MicroBlock& block, MicroCpu& cpu, std::size_t max_instructions) noexcept;
 

@@ -303,9 +303,13 @@ std::uint64_t microBlockCost(const MicroBlock& block) noexcept {
 }
 
 std::size_t interpretMicroBlock(const MicroBlock& block, MicroCpu& cpu, std::size_t max_instructions) noexcept {
+    return interpretMicroOps(block.ops, cpu, max_instructions);
+}
+
+std::size_t interpretMicroOps(std::span<const MicroInst> ops, MicroCpu& cpu, std::size_t max_instructions) noexcept {
     if (max_instructions == 0U) return 0U;
     std::size_t retired = 0U;
-    for (const auto& op : block.ops) {
+    for (const auto& op : ops) {
         if (retired >= max_instructions) break;
         const bool old_c = (cpu.xpsr & kFlagC) != 0U;
         switch (op.op) {

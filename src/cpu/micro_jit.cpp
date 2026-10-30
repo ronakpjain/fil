@@ -1550,7 +1550,7 @@ namespace {
         CpuState& state = *context->cpu_state;
         std::uint32_t loaded = 0U;
         const std::uint32_t address = op.kind == NativeOp::integer ? 0U
-            : op.absolute ? op.absolute_address : state.r[op.rn] + op.offset;
+            : op.absolute ? op.absolute_address : state.readRegister(op.rn) + op.offset;
         if (op.kind == NativeOp::load_word
             && !nativeRead32(context, op.pc, address, &loaded)) {
             context->failing_instruction_pc = op.pc;
@@ -1564,15 +1564,12 @@ namespace {
             break;
         }
         if (op.kind == NativeOp::integer) {
-            MicroBlock one;
-            one.entry_pc = op.pc;
-            one.ops.push_back(op.integer);
             MicroCpu guest;
             for (std::size_t r = 0; r < guest.r.size(); ++r) guest.r[r] = state.r[r];
             guest.lr = state.r[14];
             guest.pc = state.r[15];
             guest.xpsr = state.xpsr;
-            (void)interpretMicroBlock(one, guest, 1U);
+            (void)interpretMicroOps({&op.integer, 1U}, guest, 1U);
             for (std::size_t r = 0; r < guest.r.size(); ++r) state.r[r] = guest.r[r];
             state.r[14] = guest.lr;
             state.xpsr = guest.xpsr;
@@ -1968,7 +1965,25 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
         } else {
             if (op.absolute) e.movR32Imm(kAddr, op.absolute_address);
             else {
-                loadGuest(e, kScratch, cpu_offsets, op.rn);
+                if (op.rn == 13U) {
+                    // Architectural SP selects MSP/PSP; do not assume the
+                    // public r13 mirror was synchronized by an API caller.
+                    const auto use_msp = e.makeLabel();
+                    const auto have_sp = e.makeLabel();
+                    e.movR32M(kScratch, kCpu, cpu_offsets.xpsr);
+                    e.aluRImm(4U, kScratch, xpsr_ipsr_mask);
+                    e.jcc(5U, use_msp);
+                    e.movR32M(kScratch, kCpu, ctx_off(offsetof(CpuState, control)));
+                    e.aluRImm(4U, kScratch, 2U);
+                    e.jcc(4U, use_msp);
+                    e.movR32M(kScratch, kCpu, ctx_off(offsetof(CpuState, psp)));
+                    e.jmp(have_sp);
+                    e.bindLabel(use_msp);
+                    e.movR32M(kScratch, kCpu, ctx_off(offsetof(CpuState, msp)));
+                    e.bindLabel(have_sp);
+                } else {
+                    loadGuest(e, kScratch, cpu_offsets, op.rn);
+                }
                 if (op.offset != 0U) e.aluRImm(0U, kScratch, op.offset);
                 e.movRR(kAddr, kScratch);
             }
