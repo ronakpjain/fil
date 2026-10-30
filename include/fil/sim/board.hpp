@@ -89,7 +89,7 @@ public:
      * strictly increasing.
      */
     struct DeferredPurePrefix {
-        static constexpr std::size_t max_instructions = 64U;
+        static constexpr std::size_t max_instructions = 128U;
         static constexpr std::size_t max_memoized_instructions = 4096U;
         SimTimeNs start_time_ns{0};
         std::size_t count{0};
@@ -143,7 +143,7 @@ public:
      * observation must materialize before inspecting or mutating this board.
      */
     struct ReversibleRamPrefix : DeferredPurePrefix {
-        static constexpr std::size_t max_instructions = 64U;
+        static constexpr std::size_t max_instructions = 128U;
         struct ReversibleExecution {
             cpu::FastStepResult result{};
             // Metadata is live only in [0, count); admission and replay fill
