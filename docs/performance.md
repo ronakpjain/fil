@@ -226,11 +226,24 @@ second under every scheduler (exact, serial owner slices, and parallel lanes),
 so no parallel arrangement can finish that board faster than ~2.3 s. The
 critical path is the slowest board, not the coordination.
 
-front_driveline's cost is intrinsic to its code: it fires ~259k events per
-simulated second (one per ~181 instructions) and every one of its native
-traces reaches shared or MMIO state, so no trace can be certified as a private
-prefix and ~83% of its instructions take the per-entry fallback instead of a
-certificate. Use `--no-parallel-lanes` to run the same workload on one thread as
+front_driveline's cost is intrinsic to its code, and this is confirmed against
+the firmware rather than inferred. `fil disasm-window`
+`~/PER/monorepo/firmware/output/front_driveline/front_driveline.elf --addr
+0x8002ada` shows the hot region is FreeRTOS
+`prvCheckTasksWaitingTermination`: a tight list/tick loop of the form
+`ldr addr; ldr; subs #1; str; ... bl ...` that writes RAM every iteration and
+calls out every few instructions. The emulator's own counters agree:
+`trace_horizon_shared` is 1474 of 1474 and `trace_horizon_zero_prefix` is 1230
+of 1474, so 83% of native traces have no provably private prefix, and only 4012
+block / 315 native / 45 trace compilations exist, confirming a tiny code
+footprint. The native block builder also deliberately stops its stencil prefix
+at the first control-flow instruction, and the loop contains `bl` calls, so
+each entry retires only ~6 instructions. It fires ~259k events per simulated
+second (one per ~181 instructions), and ADC decimation demonstrates event
+dispatch dominates: decimation 1 costs 2.27 s with 259k events while decimation
+8 costs 0.42 s with 65k events at nearly the same instruction count. Because
+the loop mutates RAM it can never satisfy a RAM-neutral period certificate, so
+only ~17% of instructions are covered by certificate hits. Use `--no-parallel-lanes` to run the same workload on one thread as
 a validation reference; it costs ~6.5 s wall but the same ~6.5 s of CPU as the
 parallel lanes' useful work.
 
