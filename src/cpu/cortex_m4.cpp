@@ -1723,10 +1723,18 @@ bool CortexM4::peekReversibleBlockHeadDeclines(
 
 void CortexM4::observeNativeTraceBranch(const std::uint32_t pc, const bool taken) noexcept {
     auto& profile = native_branches_[jitBlockIndex(pc) & (native_branch_entries - 1U)];
+    if (!profile.valid || profile.pc != pc
+        || profile.generation != memory_.executionGeneration()) {
+        profile.taken_bias = taken ? 3U : 0U;
+    } else if (taken) {
+        if (profile.taken_bias < 3U) ++profile.taken_bias;
+    } else if (profile.taken_bias > 0U) {
+        --profile.taken_bias;
+    }
     profile.generation = memory_.executionGeneration();
     profile.pc = pc;
     profile.valid = true;
-    profile.taken = taken;
+    profile.taken = profile.taken_bias >= 2U;
 }
 
 void CortexM4::observeNativeTraceReturn(const std::uint32_t pc, const std::uint32_t target) noexcept {

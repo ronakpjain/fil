@@ -664,8 +664,13 @@ private:
         std::uint64_t generation{0U};
         std::uint32_t pc{0U};
         std::uint32_t target{0U};
+        /// Saturating two-bit taken counter: 0..1 predicts not-taken and 2..3
+        /// predicts taken. A single last-outcome bit flips on every
+        /// data-dependent alternation, so branch-heavy idle loops re-learned
+        /// constantly and left native traces at the first mismatch.
+        std::uint8_t taken_bias{2U};
         bool valid{false};
-        bool taken{false};
+        bool taken{true};
     };
     static constexpr std::size_t native_trace_entries = 256U;
     static constexpr std::uint8_t native_decline_streak_limit = 8U;
