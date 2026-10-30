@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <vector>
+#include <algorithm>
 
 namespace {
 
@@ -352,19 +353,49 @@ TEST(FdcanTest, TimedQueueSaturationReleasesOnlyRejectedSlot) {
     EXPECT_EQ(readWord(sender, fil::stm32g4::FdcanPeripheral::txbtoOffset), 1U);
 }
 
-TEST(FdcanTest, TracesBoundedReceiveFifoDrops) {
-    fil::sim::TraceRecorder trace;
+TEST(FdcanTest, DeferredResetAndReuseRejectStaleBufferGeneration) {
+    fil::sim::EventLoop loop;
     fil::stm32g4::FdcanMessageRam ram;
-    fil::stm32g4::FdcanPeripheral controller(1U, ram, nullptr, &trace);
-    writeWord(controller, fil::stm32g4::FdcanPeripheral::cccrOffset, 0U);
-    fil::devices::CanFrame frame;
-    frame.id = 0x123U;
-    for (std::uint64_t time = 0; time < 4U; ++time) {
-        static_cast<void>(controller.receiveFrame(frame, time));
+    fil::devices::VirtualCanBus bus("deferred");
+    fil::stm32g4::FdcanPeripheral sender(1U, ram, &loop);
+    ASSERT_TRUE(sender.attachBus(bus, "sender"));
+    writeWord(sender, fil::stm32g4::FdcanPeripheral::cccrOffset, 0U);
+    const auto offset = fil::stm32g4::FdcanMessageRam::txFifoOffset;
+    fil::devices::DeferredCanOutbox outbox;
+    {
+      fil::devices::DeferredCanScope scope(outbox, 0U, loop, 0U);
+      ram.storeWord(0U, offset, 0x123U << 18U);
+      writeWord(sender, fil::stm32g4::FdcanPeripheral::txbarOffset, 1U);
+      sender.reset();
+      writeWord(sender, fil::stm32g4::FdcanPeripheral::cccrOffset, 0U);
+      ram.storeWord(0U, offset, 0x456U << 18U);
+      writeWord(sender, fil::stm32g4::FdcanPeripheral::txbarOffset, 1U);
     }
-    const auto dropped = std::count_if(trace.records().begin(), trace.records().end(),
-        [](const auto& record) { return record.type == "can_rx_drop"; });
-    EXPECT_EQ(dropped, 1U);
+    std::stable_sort(outbox.begin(), outbox.end(),
+                     [](const auto &a, const auto &b) {
+                       return a.lane_sequence < b.lane_sequence;
+                     });
+    for (auto &command : outbox)
+      static_cast<void>(command.replay());
+    EXPECT_EQ(readWord(sender, 0x0c8U) & 1U, 0U);
+    EXPECT_EQ(readWord(sender, fil::stm32g4::FdcanPeripheral::txbtoOffset) & 1U,
+              1U);
+}
+
+TEST(FdcanTest, TracesBoundedReceiveFifoDrops) {
+  fil::sim::TraceRecorder trace;
+  fil::stm32g4::FdcanMessageRam ram;
+  fil::stm32g4::FdcanPeripheral controller(1U, ram, nullptr, &trace);
+  writeWord(controller, fil::stm32g4::FdcanPeripheral::cccrOffset, 0U);
+  fil::devices::CanFrame frame;
+  frame.id = 0x123U;
+  for (std::uint64_t time = 0; time < 4U; ++time) {
+    static_cast<void>(controller.receiveFrame(frame, time));
+  }
+  const auto dropped = std::count_if(
+      trace.records().begin(), trace.records().end(),
+      [](const auto &record) { return record.type == "can_rx_drop"; });
+  EXPECT_EQ(dropped, 1U);
 }
 
 TEST(FdcanTest, FiltersAgainstThePerMessageRamLists) {

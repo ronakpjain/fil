@@ -444,9 +444,11 @@ bool FdcanPeripheral::transmitBuffer(const std::uint32_t buffer_index) {
     }
     if (bus_ != nullptr) {
         Result<void> sent;
-        const auto completion = [this, buffer_index, frame](const std::uint64_t, const bool success) {
+        const std::uint64_t generation = ++tx_generation_[buffer_index];
+        const auto completion = [this, buffer_index, generation, frame](const std::uint64_t, const bool success) {
+            if (tx_generation_[buffer_index] != generation) return;
             if (success) {
-                completeTransmission(buffer_index, frame);
+                completeTransmission(buffer_index, generation, frame);
             } else {
                 const std::uint32_t bit = 1U << buffer_index;
                 setRegister(txbrp, registerValue(txbrp) & ~bit);
@@ -471,12 +473,14 @@ bool FdcanPeripheral::transmitBuffer(const std::uint32_t buffer_index) {
         }
     }
 
-    if (bus_ == nullptr) completeTransmission(buffer_index, frame);
+    if (bus_ == nullptr) completeTransmission(buffer_index, ++tx_generation_[buffer_index], frame);
     return true;
 }
 
 void FdcanPeripheral::completeTransmission(const std::uint32_t buffer_index,
+                                            const std::uint64_t generation,
                                             const devices::CanFrame& frame) {
+    if (tx_generation_[buffer_index] != generation) return;
     const std::uint32_t buffer_bit = 1U << buffer_index;
     if ((registerValue(txbrp) & buffer_bit) == 0U) return; // canceled/reset ownership
     setRegister(txbrp, registerValue(txbrp) & ~buffer_bit);
@@ -680,6 +684,7 @@ void FdcanPeripheral::storeRegister(const std::uint32_t word_offset, const std::
 }
 
 void FdcanPeripheral::onReset() {
+    for (auto& generation : tx_generation_) ++generation;
     if (bus_ != nullptr && bus_node_id_ != 0U) bus_->cancelSender(bus_node_id_);
     rx_fill_level_ = 0;
     rx_get_index_ = 0;

@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <limits>
 #include <vector>
+#include <thread>
+#include <algorithm>
 
 namespace {
 
@@ -384,18 +386,132 @@ TEST(CanBusTest, TimedQueueCarriesFractionalBitTimeRemainder) {
     EXPECT_EQ(times[1], expected_second);
 }
 
+TEST(CanBusTest, DeferredCommandsStageOnWorkersAndReplayInDeterministicOrder) {
+  fil::sim::EventLoop clock;
+  fil::devices::VirtualCanBus bus("deferred");
+  std::vector<std::uint32_t> received;
+  const auto a = bus.attach("a", false, [](const auto &, auto) {});
+  const auto b = bus.attach("b", false, [](const auto &, auto) {});
+  ASSERT_TRUE(a && b);
+  ASSERT_TRUE(bus.attach("receiver", false, [&](const auto &f, auto) {
+    received.push_back(f.id);
+  }));
+  fil::devices::DeferredCanOutbox outbox_a, outbox_b;
+  std::thread first([&] {
+    fil::devices::DeferredCanScope scope(outbox_b, 2U, clock, 2U);
+    fil::devices::CanFrame f;
+    f.id = 0x200U;
+    ASSERT_TRUE(bus.send(b.value(), f, 999U));
+  });
+  std::thread second([&] {
+    fil::devices::DeferredCanScope scope(outbox_a, 1U, clock, 1U);
+    fil::devices::CanFrame f;
+    f.id = 0x100U;
+    ASSERT_TRUE(bus.send(a.value(), f, 999U));
+  });
+  first.join();
+  second.join();
+  EXPECT_TRUE(received.empty());
+  fil::devices::DeferredCanOutbox outbox;
+  outbox.insert(outbox.end(), std::make_move_iterator(outbox_a.begin()),
+                std::make_move_iterator(outbox_a.end()));
+  outbox.insert(outbox.end(), std::make_move_iterator(outbox_b.begin()),
+                std::make_move_iterator(outbox_b.end()));
+  ASSERT_EQ(outbox.size(), 2U);
+  std::sort(outbox.begin(), outbox.end(), [](const auto &lhs, const auto &rhs) {
+    return std::tie(lhs.timestamp, lhs.board_index, lhs.lane_sequence) <
+           std::tie(rhs.timestamp, rhs.board_index, rhs.lane_sequence);
+  });
+  for (auto &command : outbox)
+    ASSERT_TRUE(command.replay());
+  EXPECT_EQ(received, (std::vector<std::uint32_t>{0x100U, 0x200U}));
+}
+
+TEST(CanBusTest, DeferredCancellationIsOrderedAndDoesNotMutateBusUntilReplay) {
+  fil::sim::EventLoop clock;
+  fil::devices::VirtualCanBus bus(
+      "deferred-cancel", 500'000U,
+      fil::devices::VirtualCanBus::DeliveryMode::timed, 4U);
+  bus.setEventLoop(&clock);
+  const auto sender = bus.attach("sender", false, [](const auto &, auto) {});
+  ASSERT_TRUE(sender);
+  fil::devices::CanFrame frame;
+  frame.id = 0x123U;
+  ASSERT_TRUE(bus.send(sender.value(), frame, 0U));
+  ASSERT_EQ(bus.queuedTransmissions(), 1U);
+  fil::devices::DeferredCanOutbox outbox;
+  {
+    fil::devices::DeferredCanScope scope(outbox, 0U, clock, 0U);
+    bus.cancelSender(sender.value());
+  }
+  EXPECT_EQ(bus.queuedTransmissions(), 1U);
+  ASSERT_EQ(outbox.size(), 1U);
+  EXPECT_EQ(outbox.front().operation,
+            fil::devices::DeferredCanCommand::Operation::cancel_sender);
+  ASSERT_TRUE(outbox.front().replay());
+  EXPECT_EQ(bus.queuedTransmissions(), 0U);
+}
+
+TEST(CanBusTest, DeferredCommandsKeepIssuingTimesRatherThanWindowStart) {
+    fil::sim::EventLoop clock;
+    fil::devices::VirtualCanBus bus("deferred-times");
+    const auto sender = bus.attach("sender", false, [](const auto&, auto) {});
+    ASSERT_TRUE(sender);
+    fil::devices::DeferredCanOutbox outbox;
+    fil::devices::CanFrame frame;
+    frame.id = 1U;
+    {
+        fil::devices::DeferredCanScope scope(outbox, 0U, clock, 0U);
+        ASSERT_TRUE(bus.send(sender.value(), frame, 17U));
+        static_cast<void>(clock.runOwnedEvents(0U, 50U));
+        ASSERT_TRUE(bus.inject(frame, 75U));
+        static_cast<void>(clock.runOwnedEvents(0U, 100U));
+        bus.cancelSender(sender.value());
+    }
+    ASSERT_EQ(outbox.size(), 3U);
+    EXPECT_EQ(outbox[0].timestamp, 17U);
+    EXPECT_EQ(outbox[1].timestamp, 75U);
+    EXPECT_EQ(outbox[2].timestamp, 100U);
+    EXPECT_EQ(outbox[0].lane_sequence, 0U);
+    EXPECT_EQ(outbox[2].lane_sequence, 2U);
+}
+
+TEST(CanBusTest, DeferredQueueAdmissionFailureInvokesCompletion) {
+  fil::sim::EventLoop clock;
+  fil::devices::VirtualCanBus bus(
+      "deferred-full", 500'000U,
+      fil::devices::VirtualCanBus::DeliveryMode::timed, 0U);
+  bus.setEventLoop(&clock);
+  bool completed = false;
+  fil::devices::DeferredCanOutbox outbox;
+  fil::devices::CanFrame frame;
+  frame.id = 1U;
+  {
+    fil::devices::DeferredCanScope scope(outbox, 0U, clock, 0U);
+    ASSERT_TRUE(bus.inject(frame, 123U,
+                           [&](auto, bool success) { completed = !success; }));
+  }
+  ASSERT_EQ(outbox.size(), 1U);
+  EXPECT_FALSE(outbox.front().replay());
+  EXPECT_TRUE(completed);
+  EXPECT_EQ(bus.queuedTransmissions(), 0U);
+}
+
 TEST(CanBusTest, ValidatesFramesAndAttachments) {
-    fil::devices::VirtualCanBus bus("vehicle");
-    const auto node = bus.attach("node", false, [](const auto&, std::uint64_t) {});
-    EXPECT_TRUE(node.hasValue()) << "attaches validation node";
-    EXPECT_TRUE(!bus.attach("node", false, [](const auto &, std::uint64_t) {}))
-        << "rejects duplicate CAN node";
-    fil::devices::CanFrame invalid;
-    invalid.id = 0x800U;
-    EXPECT_TRUE(node && !bus.send(node.value(), invalid, 0)) << "rejects oversized standard CAN ID";
-    EXPECT_TRUE(fil::devices::dlcToLength(15) == 64) << "maps CAN-FD DLC 15 to 64 bytes";
-    EXPECT_TRUE(fil::devices::lengthToDlc(13) == 10)
-        << "rounds payload length up to representable DLC";
+  fil::devices::VirtualCanBus bus("vehicle");
+  const auto node =
+      bus.attach("node", false, [](const auto &, std::uint64_t) {});
+  EXPECT_TRUE(node.hasValue()) << "attaches validation node";
+  EXPECT_TRUE(!bus.attach("node", false, [](const auto &, std::uint64_t) {}))
+      << "rejects duplicate CAN node";
+  fil::devices::CanFrame invalid;
+  invalid.id = 0x800U;
+  EXPECT_TRUE(node && !bus.send(node.value(), invalid, 0))
+      << "rejects oversized standard CAN ID";
+  EXPECT_TRUE(fil::devices::dlcToLength(15) == 64)
+      << "maps CAN-FD DLC 15 to 64 bytes";
+  EXPECT_TRUE(fil::devices::lengthToDlc(13) == 10)
+      << "rounds payload length up to representable DLC";
 }
 
 } // namespace

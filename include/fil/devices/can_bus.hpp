@@ -15,10 +15,53 @@
 #include <string_view>
 #include <vector>
 #include <utility>
+#include <memory>
 
 namespace fil::sim { class EventLoop; }
 
 namespace fil::devices {
+
+/** One coordinator-replayable CAN mutation captured by a worker shard. */
+struct DeferredCanCommand {
+    enum class Operation { send, inject, cancel_sender };
+    std::uint64_t timestamp{0};
+    std::uint32_t board_index{0};
+    std::uint64_t lane_sequence{0};
+    Operation operation{Operation::send};
+    std::function<Result<void>()> replay;
+};
+
+using DeferredCanOutbox = std::vector<DeferredCanCommand>;
+
+/**
+ * Thread-local staging scope. Commands are ordered by timestamp/board/lane sequence.
+ * send/inject success accepts an outbox entry, not shared queue admission;
+ * replay performs admission and reports rejection through the completion.
+ * Attachments/configuration must remain immutable until all workers are parked.
+ * Each command must be replayed at most once, with no staging scope active.
+ */
+class DeferredCanScope {
+public:
+    DeferredCanScope(DeferredCanOutbox& outbox, std::uint32_t board_index,
+                     sim::EventLoop& clock, std::uint32_t owner);
+    ~DeferredCanScope();
+    DeferredCanScope(const DeferredCanScope&) = delete;
+    DeferredCanScope& operator=(const DeferredCanScope&) = delete;
+    [[nodiscard]] static bool active() noexcept;
+    [[nodiscard]] static std::uint64_t timestamp() noexcept;
+    [[nodiscard]] static std::uint32_t boardIndex() noexcept;
+    [[nodiscard]] static std::uint64_t nextSequence() noexcept;
+    struct State {
+        DeferredCanOutbox* outbox;
+        std::uint32_t board;
+        sim::EventLoop* clock;
+        std::uint32_t owner;
+        std::uint64_t sequence{0};
+    };
+private:
+    State* previous_{nullptr};
+    State state_;
+};
 
 /** @brief One normalized classic CAN or CAN-FD data frame. */
 struct CanFrame {

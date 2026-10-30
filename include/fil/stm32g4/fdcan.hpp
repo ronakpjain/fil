@@ -219,7 +219,8 @@ private:
 
     [[nodiscard]] FilterDecision filter(const devices::CanFrame& frame) const noexcept;
     [[nodiscard]] bool transmitBuffer(std::uint32_t buffer_index);
-    void completeTransmission(std::uint32_t buffer_index, const devices::CanFrame& frame);
+    void completeTransmission(std::uint32_t buffer_index, std::uint64_t generation,
+                              const devices::CanFrame& frame);
     void acknowledgeRxFifo0(std::uint32_t acknowledged_index);
     void updateRxFifo0Status() noexcept;
     void updateTxFifoStatus() noexcept;
@@ -237,6 +238,7 @@ private:
     bool rx_message_lost_{false};
     std::uint8_t tx_get_index_{0};
     std::uint8_t tx_put_index_{0};
+    std::array<std::uint64_t, FdcanMessageRam::txFifoElementCount> tx_generation_{};
     InterruptCallback interrupt_callback_;
     std::array<LineInterruptCallback, 2> line_interrupt_callbacks_{};
     std::array<bool, 2> interrupt_line_asserted_{};

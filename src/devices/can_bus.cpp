@@ -9,6 +9,22 @@
 
 namespace fil::devices {
 
+namespace { thread_local DeferredCanScope::State* active_can_scope = nullptr; }
+DeferredCanScope::DeferredCanScope(DeferredCanOutbox& outbox, const std::uint32_t board,
+                                   sim::EventLoop& clock, const std::uint32_t owner)
+    : previous_(active_can_scope), state_{&outbox, board, &clock, owner, 0U} {
+    active_can_scope = &state_;
+}
+DeferredCanScope::~DeferredCanScope() { active_can_scope = previous_; }
+bool DeferredCanScope::active() noexcept { return active_can_scope != nullptr; }
+std::uint64_t DeferredCanScope::timestamp() noexcept {
+    return active_can_scope ? active_can_scope->clock->now(active_can_scope->owner) : 0U;
+}
+std::uint32_t DeferredCanScope::boardIndex() noexcept { return active_can_scope ? active_can_scope->board : 0; }
+std::uint64_t DeferredCanScope::nextSequence() noexcept {
+    return active_can_scope ? active_can_scope->sequence++ : 0;
+}
+
 std::uint8_t dlcToLength(const std::uint8_t dlc) noexcept {
     constexpr std::array<std::uint8_t, 16> lengths{
         0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64,
@@ -137,6 +153,15 @@ VirtualCanBus::~VirtualCanBus() {
 }
 
 void VirtualCanBus::cancelSender(const NodeId sender) noexcept {
+    if (DeferredCanScope::active()) {
+        const auto time = DeferredCanScope::timestamp();
+        auto* outbox = active_can_scope->outbox;
+        outbox->push_back({time, DeferredCanScope::boardIndex(), DeferredCanScope::nextSequence(),
+            DeferredCanCommand::Operation::cancel_sender, [this, sender]() -> Result<void> {
+                cancelSender(sender); return {};
+            }});
+        return;
+    }
     pending_.erase(std::remove_if(pending_.begin(), pending_.end(), [sender](const auto& tx) {
         return tx.sender && *tx.sender == sender;
     }), pending_.end());
@@ -161,6 +186,9 @@ Result<VirtualCanBus::NodeId> VirtualCanBus::attach(
     const bool loopback,
     ReceiveCallback callback
 ) {
+    if (DeferredCanScope::active()) {
+        return Error{ErrorCategory::runtime, "CAN attachment mutation is unsupported during deferred staging", std::nullopt};
+    }
     if (node.empty()) {
         return Error{ErrorCategory::invalid_argument, "CAN node name is empty", std::nullopt};
     }
@@ -179,6 +207,9 @@ Result<VirtualCanBus::NodeId> VirtualCanBus::attach(
 }
 
 void VirtualCanBus::detach(const NodeId id) noexcept {
+    // Attachment changes are coordinator-only; in particular, never mutate the
+    // shared node table from a worker staging scope.
+    if (DeferredCanScope::active()) return;
     cancelSender(id);
     nodes_.erase(std::remove_if(nodes_.begin(), nodes_.end(), [=](const Node& node) {
         return node.id == id;
@@ -419,6 +450,22 @@ Result<void> VirtualCanBus::send(
     if (node == nullptr) {
         return Error{ErrorCategory::invalid_argument, "CAN sender is not attached", std::nullopt};
     }
+    if (DeferredCanScope::active()) {
+        const auto staged_time = time_ns;
+        const std::string sender_name = node->name;
+        auto* outbox = active_can_scope->outbox;
+        outbox->push_back({staged_time, DeferredCanScope::boardIndex(), DeferredCanScope::nextSequence(),
+            DeferredCanCommand::Operation::send, [this, sender, frame, staged_time, sender_name, completion = std::move(completion)]() mutable {
+                if (find(sender) == nullptr) {
+                    if (completion) completion(staged_time, false);
+                    return Result<void>{Error{ErrorCategory::invalid_argument, "CAN sender detached before replay", std::nullopt}};
+                }
+                auto result = submit(Transmission{frame, sender, sender_name, staged_time, 0U, completion});
+                if (!result && completion) completion(staged_time, false);
+                return result;
+            }});
+        return {};
+    }
     return submit(Transmission{frame, sender, node->name, time_ns, 0U, std::move(completion)});
 }
 
@@ -426,6 +473,17 @@ Result<void> VirtualCanBus::inject(const CanFrame& frame, const std::uint64_t ti
                                    CompletionCallback completion) {
     auto valid = validate(frame);
     if (!valid) return valid.error();
+    if (DeferredCanScope::active()) {
+        const auto staged_time = time_ns;
+        auto* outbox = active_can_scope->outbox;
+        outbox->push_back({staged_time, DeferredCanScope::boardIndex(), DeferredCanScope::nextSequence(),
+            DeferredCanCommand::Operation::inject, [this, frame, staged_time, completion = std::move(completion)]() mutable {
+                auto result = submit(Transmission{frame, std::nullopt, "external", staged_time, 0U, completion});
+                if (!result && completion) completion(staged_time, false);
+                return result;
+            }});
+        return {};
+    }
     return submit(Transmission{frame, std::nullopt, "external", time_ns, 0U,
                               std::move(completion)});
 }
