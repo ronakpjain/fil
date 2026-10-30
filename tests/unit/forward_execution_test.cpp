@@ -77,6 +77,46 @@ TEST(ForwardExecutionTest, RetiresOnePredictableInstructionAndPublishesReadyTime
     EXPECT_EQ(exit.ready_time_ns, 20U + 1'000'000'000ULL / hz);
 }
 
+TEST(ForwardExecutionTest, EveryInstructionCutMatchesCheckedStepping) {
+    Fixture fixture({0x2001U, 0x3001U, 0x0001U, 0x3001U}); // movs/adds/lsls/adds
+    Fixture reference({0x2001U, 0x3001U, 0x0001U, 0x3001U});
+    fixture.cpu.state().r[15] = flash_base;
+    fixture.cpu.state().instruction_address = flash_base;
+    ASSERT_EQ(fixture.cpu.stepFast().reason, fil::cpu::StopReason::step_complete);
+    fixture.cpu.state().r[15] = flash_base + 2U;
+    fixture.cpu.state().instruction_address = flash_base + 2U;
+    ASSERT_EQ(fixture.cpu.stepFast().reason, fil::cpu::StopReason::step_complete);
+    for (const std::uint32_t pc : {flash_base + 4U, flash_base + 6U}) {
+        fixture.cpu.state().r[15] = pc;
+        fixture.cpu.state().instruction_address = pc;
+        ASSERT_EQ(fixture.cpu.stepFast().reason, fil::cpu::StopReason::step_complete);
+    }
+
+    for (std::uint32_t cut = 0U; cut <= 4U; ++cut) {
+        fixture.restart();
+        reference.restart();
+        std::uint64_t now = 0U;
+        std::uint64_t hz = 170'000'000U;
+        for (std::uint32_t i = 0U; i < cut; ++i) {
+            fil::cpu::ForwardExecutionLimit limit;
+            limit.instruction_credit = 1U;
+            limit.cycle_credit = 4U;
+            limit.elapsedNs = elapsedNs;
+            limit.elapsed_context = &hz;
+            const auto exit = fil::cpu::forwardCheckedStep(fixture.cpu, now, limit);
+            ASSERT_EQ(exit.reason, fil::cpu::ForwardExitReason::completed)
+                << "cut " << cut << " instruction " << i;
+            ASSERT_EQ(exit.completed_instructions, 1U);
+            now = exit.ready_time_ns;
+        }
+        for (std::uint32_t i = 0U; i < cut; ++i) {
+            ASSERT_EQ(reference.cpu.stepFast().reason, fil::cpu::StopReason::step_complete);
+        }
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(fixture.cpu.state(), reference.cpu.state()))
+            << "cut " << cut << " matches checked stepping";
+    }
+}
+
 TEST(ForwardExecutionTest, DeclinesBeforeEffectWhenCreditOrHorizonIsExhausted) {
     Fixture fixture({0x2001U, 0x3001U});
     fixture.warm();

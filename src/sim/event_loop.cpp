@@ -148,14 +148,6 @@ struct EventLoop::Impl {
         free_slots.push_back(index);
     }
 
-    void retire(const Entry& entry) {
-        Slot& slot = slots[entry.slot];
-        slot.live = false;
-        live_events.erase(slot.id);
-        free_slots.push_back(entry.slot);
-        discardDeadFront(globally_observed_events);
-    }
-
     void markOwner(EventRunResult& result, const EventOwner owner) const noexcept {
         if (owner < 64U) result.local_owner_mask |= std::uint64_t{1U} << owner;
         else result.shared_event_executed = true;
