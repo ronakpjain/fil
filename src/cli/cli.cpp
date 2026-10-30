@@ -1107,6 +1107,7 @@ ExitCode runNetworkCommand(
     std::uint64_t max_instructions = 50'000'000U;
     std::uint64_t quantum = 1'024U;
     sim::SimTimeNs cross_board_window_ns = 1'000U;
+    bool enable_parallel_lanes = true;
     std::optional<std::filesystem::path> trace_path;
     bool strict_mmio = false;
     bool trace_instructions = false;
@@ -1143,6 +1144,10 @@ ExitCode runNetworkCommand(
             }
             else if (option == "--cross-board-window-ns") cross_board_window_ns = parsed.value();
             else quantum = parsed.value();
+        } else if (option == "--no-parallel-lanes") {
+            enable_parallel_lanes = false;
+        } else if (option == "--parallel-lanes") {
+            enable_parallel_lanes = true;
         } else if (option == "--trace" || option == "--inject-can") {
             const auto value = nextOptionValue(args, index);
             if (!value) {
@@ -1230,6 +1235,7 @@ ExitCode runNetworkCommand(
     options.max_instructions_per_board = max_instructions;
     options.instruction_quantum = quantum;
     options.cross_board_window_ns = cross_board_window_ns;
+    options.enable_parallel_lanes = enable_parallel_lanes;
     options.trace_instructions = trace_instructions;
     options.detect_spin = detect_spin;
     options.enable_loop_batching = enable_loop_batching;
@@ -1971,6 +1977,7 @@ void printHelp(std::ostream& out) {
         << "Network options:\n"
         << "  --duration-ms N --max-instructions N --quantum N --trace FILE\n"
         << "  --cross-board-window-ns N (network commands: default 1000; 0 = exact)\n"
+        << "  --parallel-lanes | --no-parallel-lanes (validation reference)\n"
         << "  --strict-mmio --trace-instr --detect-spin --allow-breakpoint\n"
         << "  --adc-decimation N (keep 1 of N continuous ADC scans)\n"
         << "  --inject-can BUS[@TIME_MS]:ID:HEXDATA\n\n"
