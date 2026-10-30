@@ -531,6 +531,12 @@ bool emitOp(Emitter& e, const MicroInst& op, std::string& error) {
         else e.ubfm(wd, wm, amount, width);
         return true;
     }
+    case MicroOp::ubfx: {
+        // UBFM with immr=lsb, imms=lsb+width-1 extracts the bitfield.
+        e.ubfm(wd, wn, op.shift_amount & 31U,
+            (static_cast<std::uint32_t>(op.shift_amount) + op.imm - 1U) & 31U);
+        return true;
+    }
     case MicroOp::add_reg:        
         e.addSubReg(op.set_flags ? 1U : 0U, wd, wn, wm);
         return true;
@@ -1215,6 +1221,15 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
         storeGuest(e, o, op.rd, kEax);
         return true;
     }
+    case MicroOp::ubfx: {
+        loadGuest(e, kEax, o, op.rn);
+        if (op.shift_amount != 0U) e.shImm(5U, kEax, op.shift_amount); // shr
+        if (op.imm != 32U) {
+            e.aluRImm(4U, kEax, (std::uint32_t{1U} << op.imm) - 1U); // and mask
+        }
+        storeGuest(e, o, op.rd, kEax);
+        return true;
+    }
     case MicroOp::add_reg:
     case MicroOp::sub_reg: {
         const bool is_sub = op.op == MicroOp::sub_reg;
@@ -1836,6 +1851,7 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
         case MicroOp::cmp_imm: case MicroOp::cmn_imm: reads(op.rn); break;
         case MicroOp::cmp_reg: case MicroOp::cmn_reg: reads(op.rn); reads(op.rm); break;
         case MicroOp::extend: reads(op.rm); writes(op.rd); break;
+        case MicroOp::ubfx: reads(op.rn); writes(op.rd); break;
         case MicroOp::add_reg: case MicroOp::sub_reg:
         case MicroOp::and_reg: case MicroOp::orr_reg: case MicroOp::eor_reg: case MicroOp::bic_reg:
             reads(op.rn); reads(op.rm); writes(op.rd); break;
@@ -2010,11 +2026,14 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
             return nullptr;
         }
         expected_pc += op.size;
+        const bool extra_integer = op.kind == NativeOp::integer
+            && (op.integer.op == MicroOp::extend || op.integer.op == MicroOp::ubfx);
         if (op.kind == NativeOp::integer
             && (op.integer.pc != op.pc || op.integer.size != op.size
                 || op.integer.rd >= 13U || op.integer.rn >= 13U || op.integer.rm >= 13U
                 || op.integer.condition != Condition::al
-                || static_cast<unsigned>(op.integer.op) > static_cast<unsigned>(MicroOp::rrx)
+                || (static_cast<unsigned>(op.integer.op) > static_cast<unsigned>(MicroOp::rrx)
+                    && !extra_integer)
                 || static_cast<unsigned>(op.integer.shift) > static_cast<unsigned>(ShiftType::rrx)
                 || (op.integer.shift_immediate && op.integer.shift_amount > 32U))) {
             error = "native-jit: invalid integer operands or metadata";

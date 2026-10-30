@@ -61,6 +61,7 @@ enum class MicroOp : std::uint8_t {
     cbz,
     cbnz,
     extend,
+    ubfx,
 };
 
 /** Zero/sign extend width and signedness for MicroOp::extend. */

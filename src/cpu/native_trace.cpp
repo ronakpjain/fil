@@ -59,7 +59,11 @@ bool buildNativeTrace(std::span<const NativeTraceOp> sources, NativeTracePlan& o
         const auto op = lowered.integer.op;
         const bool branch = lowered.kind == NativeOp::integer
             && (op == MicroOp::b || op == MicroOp::b_cond || op == MicroOp::bl);
-        if (!(op <= MicroOp::bl || op == MicroOp::b_cond)) {
+        // Extend and bitfield-extract sit after the contiguous shift/branch
+        // range in the enum but are fully emitted; admit them explicitly.
+        const bool extra_integer = lowered.kind == NativeOp::integer
+            && (op == MicroOp::extend || op == MicroOp::ubfx);
+        if (!(op <= MicroOp::bl || op == MicroOp::b_cond || extra_integer)) {
             error = "native-trace: unsupported operation";
             return false;
         }
@@ -98,7 +102,11 @@ bool buildNativeTrace(std::span<const NativeTraceOp> sources, NativeTracePlan& o
             error = "native-trace: trace edge does not reach next operation";
             return false;
         }
-        if (!branch && op != MicroOp::bl && lowered.integer.op > MicroOp::rrx) {
+        // Extend and bitfield-extract ops sit after the contiguous
+        // shift/branch range in the enum but are fully emitted, so admit them
+        // explicitly rather than treating enum order as the supported set.
+        if (!branch && op != MicroOp::bl && lowered.integer.op > MicroOp::rrx
+            && !extra_integer) {
             error = "native-trace: unsupported operation";
             return false;
         }

@@ -300,6 +300,24 @@ MicroLowerResult tryLowerMicroInst(const MicroSource& source, MicroInst& out) no
         out = inst;
         return {true, MicroLowerReason::ok, {}};
     }
+    case InstrKind::ubfx: {
+        // UBFX Rd, Rn, #lsb, #width: extract a bitfield, no flags. The decoder
+        // guarantees lsb + width <= 32 and that neither register is PC.
+        if (!coreReg(d.rd) || !coreReg(d.rn) || d.imm == 0U || d.imm > 32U
+            || static_cast<std::uint32_t>(d.shift_amount) + d.imm > 32U
+            || d.ra != 0U || d.rm != 0U || d.register_list != 0U || d.writeback
+            || d.fp_double || d.branch_offset != 0 || d.immediate_carry_valid
+            || d.immediate_carry) {
+            return {false, MicroLowerReason::bad_shape, "ubfx shape"};
+        }
+        inst.op = MicroOp::ubfx;
+        inst.rd = d.rd;
+        inst.rn = d.rn;
+        inst.shift_amount = static_cast<std::uint8_t>(d.shift_amount);
+        inst.imm = d.imm;
+        out = inst;
+        return {true, MicroLowerReason::ok, {}};
+    }
     default:
         return {false, MicroLowerReason::unsupported_kind, "kind not in FilIR subset"};
     }
@@ -417,6 +435,13 @@ std::size_t interpretMicroOps(std::span<const MicroInst> ops, MicroCpu& cpu, std
                 value |= byte ? 0xffffff00U : 0xffff0000U;
             }
             writeOp(cpu, op.rd, value);
+            break;
+        }
+        case MicroOp::ubfx: {
+            const std::uint32_t width = op.imm;
+            const std::uint32_t mask = width == 32U
+                ? 0xffffffffU : (std::uint32_t{1U} << width) - 1U;
+            writeOp(cpu, op.rd, (readOp(cpu, op.rn) >> op.shift_amount) & mask);
             break;
         }
         case MicroOp::add_reg:
