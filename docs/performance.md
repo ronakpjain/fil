@@ -247,14 +247,37 @@ only ~17% of instructions are covered by certificate hits. Use `--no-parallel-la
 a validation reference; it costs ~6.5 s wall but the same ~6.5 s of CPU as the
 parallel lanes' useful work.
 
-`fil run-network ...` prints per-board JIT diagnostics. For front_driveline the
-reversible block path retires only ~3 instructions per entry because the hot
-loop reaches an MMIO access almost immediately; the remaining attempts decline
-at instruction 0. Removing the RAM-period certificate path is far worse
-(roughly 13x wall time and ~8x more span entries), so the certificate path is
-essential and must be extended rather than bypassed. The next improvement
-should let a committed span continue past a declining MMIO instruction using
-the checked handler instead of abandoning the whole attempt.
+`fil run-network ...` prints per-board JIT diagnostics. Note that the printed
+`block_executions` counter aggregates the native-trace, IT-scalar, trusted
+reversible and prepared block paths; dividing it by `block_instructions` does
+not measure block-path span length. Measured instead with temporary
+break-reason counters, front_driveline's 10.4M block executions end as follows:
+terminator or PC change 47.7% (dominated by `term_ret` returns at 27.6%), MMIO
+or store decline 2.5%, generic-op stop 2.5%, cycle credit 0.1%. Native traces
+are compiled at ~37 instructions but execute only ~6.8 because they exit on
+memory declines (509,584 per simulated second) far more often than on branch
+mismatches (about 70,000 after the saturating predictor below).
+
+The systemic limit is that every span mechanism stops at the first taken
+control flow or MMIO access: the fallback block loop breaks on any PC
+discontinuity, `prepareJitBlock` marks unconditional control flow as a
+terminator, and native traces must decline when a memory helper refuses an MMIO
+address because peripheral side effects cannot be journaled or replayed. Real
+firmware idle code (FreeRTOS `prvIdleTask` calling
+`prvCheckTasksWaitingTermination`) writes an MMIO register every few
+instructions and calls out every few instructions, so spans of three or four
+instructions are the expected steady state, not a defect.
+
+Removing the RAM-period certificate path is far worse (roughly 13x wall time
+and ~8x more span entries), and disabling certificate discovery entirely is
+neutral, so discovery is not a bottleneck; keep the certificate path.
+Measured-neutral changes that should not be retried: certificate-discovery
+guards, in-place scheduled-event rescheduling, clock caching, admitting every
+stencil kernel past its profitability gate, and certificate-cache slot changes.
+A real improvement requires a mechanism that can continue past an MMIO access
+while keeping instruction and cycle totals bit-identical, or a return-stitching
+strategy for call-dense code; both need differential tests over exact totals
+rather than the six-board aggregate.
 
 ## Validation
 
