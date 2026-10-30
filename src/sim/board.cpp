@@ -67,6 +67,12 @@ bool Board::appendReversibleChunk(
 
 struct Board::IdempotentPeriodCertificate {
     static constexpr std::size_t max_instructions = 32U;
+    // 2048 buckets cover every phase of a 32-instruction period through its
+    // low-bit-folded PC bucket without changing certificate semantics.
+    static constexpr std::size_t pc_index_entries = 2048U;
+    [[nodiscard]] static constexpr std::size_t pcBucket(const std::uint32_t pc) noexcept {
+        return ((pc >> 1U) ^ (pc >> 12U)) & (pc_index_entries - 1U);
+    }
     std::uint8_t count{0U};
     std::array<cpu::CpuState, max_instructions + 1U> states{};
     std::array<std::uint32_t, max_instructions> pcs{};
@@ -77,6 +83,11 @@ struct Board::IdempotentPeriodCertificate {
     std::array<mem::MemoryBus::ReadFootprint, max_instructions + 1U> footprints{};
     std::array<bool, max_instructions + 1U> have_fetch{};
     std::array<std::uint32_t, max_instructions + 1U> fetch_end{};
+    // Direct pc -> phase index so the admission hot path avoids scanning every
+    // phase with a full CpuState compare. PC collisions still fall back to the
+    // exact per-candidate compare, so the certificate stays conservative.
+    std::array<std::uint32_t, pc_index_entries> pc_index{};
+    std::array<std::uint8_t, pc_index_entries> pc_index_count{};
     mem::MemoryBus::ReadFootprint full_footprint{};
     mem::MemoryBus::SideEffectCheckpoint memory_checkpoint{};
     std::uint64_t restoration_generation{0U};
@@ -666,6 +677,22 @@ Board::buildIdempotentPeriodCertificate(
     }
     restore_endpoint();
     if (!valid || memory_.restorationGeneration() != restoration_generation) return {};
+    // Build the pc -> phase index once. Buckets whose phases disagree on PC
+    // are marked ambiguous and keep the exact linear scan at admission time.
+    // pc_index_count is 1 when the bucket maps to exactly one phase, 0 when the
+    // bucket is empty, and 0xff when phases in the bucket disagree on PC
+    // (a hash collision) so admission must fall back to the exact scan.
+    for (std::size_t i = 0U; i < period; ++i) {
+        const auto bucket = Certificate::pcBucket(certificate->pcs[i]);
+        const auto existing = certificate->pc_index_count[bucket];
+        if (existing == 0U) {
+            certificate->pc_index[bucket] = static_cast<std::uint32_t>(i);
+            certificate->pc_index_count[bucket] = 1U;
+        } else if (existing != 0xffU
+            && certificate->pcs[certificate->pc_index[bucket]] != certificate->pcs[i]) {
+            certificate->pc_index_count[bucket] = 0xffU;
+        }
+    }
     idempotent_period_cache_ = certificate;
     period_validation_checkpoint_ = checkpoint;
     period_validation_restoration_generation_ = restoration_generation;
@@ -777,13 +804,27 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
         bool valid = compatible;
         std::size_t phase = 0U;
         if (valid) {
-            valid = false;
-            for (std::size_t i = 0U; i < cert.count; ++i) {
-                if (prefix.entry_pc == cert.pcs[i]
-                    && cpu::bitwiseEqual(cpu_->state(), cert.states[i])) {
-                    phase = i;
-                    valid = true;
-                    break;
+            // Fast path: the pc->phase index narrows the search to (almost
+            // always) one candidate. Ambiguous buckets and differing CPU state
+            // fall back to the exact per-phase comparison below.
+            const auto bucket = IdempotentPeriodCertificate::pcBucket(prefix.entry_pc);
+            if (cert.pc_index_count[bucket] == 1U
+                && cert.pcs[cert.pc_index[bucket]] == prefix.entry_pc) {
+                const std::size_t candidate = cert.pc_index[bucket];
+                if (cpu::bitwiseEqual(cpu_->state(), cert.states[candidate])) {
+                    phase = candidate;
+                } else {
+                    valid = false;
+                }
+            } else {
+                valid = false;
+                for (std::size_t i = 0U; i < cert.count; ++i) {
+                    if (prefix.entry_pc == cert.pcs[i]
+                        && cpu::bitwiseEqual(cpu_->state(), cert.states[i])) {
+                        phase = i;
+                        valid = true;
+                        break;
+                    }
                 }
             }
         }
