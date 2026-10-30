@@ -626,6 +626,7 @@ private:
         std::uint32_t declined_address{0U};
         std::uint8_t hot{0U};
         std::uint8_t attempts{0U};
+        std::uint8_t detailed_prefix_count{0U};
         bool first_declined{false};
         bool charges_valid{false};
         bool charges_first_sequential{false};

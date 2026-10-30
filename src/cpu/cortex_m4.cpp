@@ -1833,6 +1833,19 @@ bool CortexM4::prepareNativeTrace(NativeTraceCacheEntry& entry) {
     jit_stats_.native_compilations += compiled;
     jit_stats_.trace_compilations += compiled;
     jit_stats_.trace_compiled_instructions += compiled * plan->ops.size();
+    // Detailed execution also discovers naturally restored idle periods.
+    // Preserve its former first-traversal cut instead of hiding a short
+    // period inside a 16-op slice of a longer unrolled compact trace.
+    auto detailed_count = std::min(plan->ops.size(), JitStepOutcome::max_block);
+    for (std::size_t i = 1U; i < detailed_count; ++i) {
+        for (std::size_t j = 0U; j < i; ++j) {
+            if (plan->ops[i].pc == plan->ops[j].pc) {
+                detailed_count = i;
+                break;
+            }
+        }
+    }
+    entry.detailed_prefix_count = static_cast<std::uint8_t>(detailed_count);
     entry.plan = std::move(plan);
     return true;
 }
@@ -1879,7 +1892,8 @@ std::optional<FastStepResult> CortexM4::executeNativeTrace(
     if (entry.first_declined && first_address() == entry.declined_address)
         return std::nullopt;
     const auto limit = std::min({max_instructions, plan.ops.size(),
-        detailed != nullptr ? JitStepOutcome::max_block : NativeTracePlan::max_ops});
+        detailed != nullptr ? static_cast<std::size_t>(entry.detailed_prefix_count)
+                            : NativeTracePlan::max_ops});
     const bool first_sequential = budget.have_fetch
         && plan.ops.front().pc == budget.fetch_end;
     const auto& timing = budget.fetch_timing;
