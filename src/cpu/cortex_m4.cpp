@@ -4,6 +4,7 @@
 #include "fil/cpu/jit.hpp"
 #include "fil/cpu/micro_jit_ir.hpp"
 #include "fil/cpu/native_ir.hpp"
+#include "fil/cpu/native_trace.hpp"
 #include "fil/cpu/native_execution.hpp"
 #include "fil/elf/elf_loader.hpp"
 #include "fil/mem/memory_bus.hpp"
@@ -1719,11 +1720,220 @@ bool CortexM4::peekReversibleBlockHeadDeclines(
     }
 }
 
+void CortexM4::observeNativeTraceBranch(const std::uint32_t pc, const bool taken) noexcept {
+    auto& profile = native_branches_[jitBlockIndex(pc) & (native_branch_entries - 1U)];
+    profile.generation = memory_.executionGeneration();
+    profile.pc = pc;
+    profile.valid = true;
+    profile.taken = taken;
+}
+
+void CortexM4::observeNativeTraceReturn(const std::uint32_t pc, const std::uint32_t target) noexcept {
+    auto& profile = native_branches_[jitBlockIndex(pc) & (native_branch_entries - 1U)];
+    profile.generation = memory_.executionGeneration();
+    profile.pc = pc;
+    profile.target = target;
+    profile.valid = true;
+}
+
+bool CortexM4::prepareNativeTrace(NativeTraceCacheEntry& entry) {
+    constexpr std::size_t trace_limit = 32U;
+    std::vector<NativeTraceOp> sources;
+    sources.reserve(trace_limit);
+    std::uint32_t pc = entry.pc;
+    bool has_memory_or_branch = false;
+    for (std::size_t i = 0U; i < trace_limit; ++i) {
+        bool repeated = false;
+        for (const auto& previous : sources) repeated |= previous.pc == pc;
+        if (repeated) break; // Execute a loop traversal, never elide iterations.
+        std::uint32_t raw = 0U;
+        std::uint8_t size = 0U;
+        const auto decoded = fetchDecode(pc, raw, size);
+        if (!decoded) break;
+        NativeInst lowered;
+        const bool stack = decoded->kind == InstrKind::push || decoded->kind == InstrKind::pop;
+        if (!stack && !tryLowerNativeInst({*decoded, pc, size}, lowered).ok) break;
+        const bool return_pop = decoded->kind == InstrKind::pop
+            && (decoded->register_list & (std::uint16_t{1U} << 15U)) != 0U;
+        const bool branch = decoded->kind == InstrKind::b || decoded->kind == InstrKind::bl || return_pop;
+        bool taken = branch;
+        std::uint32_t return_target = 0U;
+        if (return_pop) {
+            const auto& profile = native_branches_[jitBlockIndex(pc) & (native_branch_entries - 1U)];
+            if (!profile.valid || profile.pc != pc || profile.generation != entry.generation) break;
+            return_target = profile.target;
+        } else if (decoded->kind == InstrKind::b && decoded->condition != Condition::al) {
+            const auto& profile = native_branches_[jitBlockIndex(pc) & (native_branch_entries - 1U)];
+            if (!profile.valid || profile.pc != pc || profile.generation != entry.generation) break;
+            taken = profile.taken;
+        } else if (lowered.kind == NativeOp::integer
+            && (lowered.integer.op == MicroOp::cbz || lowered.integer.op == MicroOp::cbnz)) {
+            break;
+        }
+        NativeTraceOp op;
+        op.decoded = *decoded;
+        op.raw = raw;
+        op.pc = pc;
+        op.size = size;
+        op.expected_taken = taken;
+        const auto sequential = pc + size;
+        op.expected_next_pc = return_pop ? return_target : taken ? static_cast<std::uint32_t>(
+            static_cast<std::int64_t>(pc) + 4 + decoded->branch_offset) & ~std::uint32_t{1U}
+            : sequential;
+        op.execution_cycles = branch && !taken ? 1U : basePipelineCycles(*decoded);
+        if (branch && taken && op.expected_next_pc != sequential)
+            op.execution_cycles = static_cast<std::uint16_t>(
+                op.execution_cycles + takenBranchPenalty(decoded->kind));
+        has_memory_or_branch |= branch || stack || lowered.kind != NativeOp::integer;
+        sources.push_back(op);
+        pc = op.expected_next_pc;
+    }
+    // Tiny kernels cannot amortize the checked-call ABI. Leave pure straight
+    // line arithmetic to its existing calibrated stencil backend as well.
+    if (sources.size() < 8U || !has_memory_or_branch || !ensureMicroJit()) return false;
+    auto plan = std::make_shared<NativeTracePlan>();
+    if (!buildNativeTrace(sources, *plan, micro_jit_error_)) return false;
+    plan->generation = entry.generation;
+    const auto before = micro_jit_->compilations();
+    plan->function = micro_jit_->compileNativeTrace(*plan, micro_jit_error_);
+    if (!plan->function) return false;
+    const auto compiled = micro_jit_->compilations() - before;
+    jit_stats_.native_compilations += compiled;
+    jit_stats_.trace_compilations += compiled;
+    jit_stats_.trace_compiled_instructions += compiled * plan->ops.size();
+    entry.plan = std::move(plan);
+    return true;
+}
+
+std::optional<CortexM4::TimedJitStepOutcome> CortexM4::tryStepNativeTrace(
+    const std::size_t max_instructions, ReversibleCycleBudget& budget) {
+    const auto pc = state_.r[15];
+    if (!MicroJit::hostSupported() || state_.halted || !state_.thumb
+        || (state_.xpsr & xpsr_t) == 0U || (pc & 1U) != 0U
+        || state_.pending_exception || state_.pending_exc_return) return std::nullopt;
+    auto& entry = native_traces_[jitBlockIndex(pc) & (native_trace_entries - 1U)];
+    const auto generation = memory_.executionGeneration();
+    if (entry.pc != pc || entry.generation != generation) {
+        entry = {};
+        entry.pc = pc;
+        entry.generation = generation;
+    }
+    if (!entry.plan) {
+        if (entry.attempts >= 4U || ++entry.hot < 64U) return std::nullopt;
+        entry.hot = 0U;
+        ++entry.attempts;
+        if (!prepareNativeTrace(entry)) return std::nullopt;
+    }
+    return executeNativeTrace(entry, max_instructions, budget);
+}
+
+std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeNativeTrace(
+    NativeTraceCacheEntry& entry, const std::size_t max_instructions,
+    ReversibleCycleBudget& budget) {
+    const auto& plan = *entry.plan;
+    if (plan.generation != memory_.executionGeneration() || plan.ops.empty()
+        || plan.ops.front().pc != state_.r[15]) return std::nullopt;
+    const auto first_address = [&] {
+        const auto& op = plan.ops.front();
+        const auto& d = op.decoded;
+        const auto base = d.rn == 15U ? (op.pc + 4U) & ~std::uint32_t{3U}
+            : state_.readRegister(d.rn);
+        return d.add ? base + d.imm : base - d.imm;
+    };
+    if (entry.first_declined && first_address() == entry.declined_address)
+        return std::nullopt;
+    const auto limit = std::min({max_instructions, plan.ops.size(), JitStepOutcome::max_block});
+    std::array<std::uint32_t, JitStepOutcome::max_block> charges;
+    bool have_fetch = budget.have_fetch;
+    auto fetch_end = budget.fetch_end;
+    std::size_t planned = 0U;
+    for (; planned < limit; ++planned) {
+        const auto& op = plan.ops[planned];
+        const auto charged = static_cast<std::uint32_t>(op.execution_cycles)
+            + budget.fetchStallCycles(op.pc, have_fetch && op.pc == fetch_end);
+        if (charged > std::numeric_limits<std::uint16_t>::max()) break;
+        charges[planned] = charged;
+        have_fetch = true;
+        fetch_end = op.pc + op.size;
+    }
+    if (planned == 0U) return std::nullopt;
+    NativeExecutionContext context;
+    context.cpu_state = &state_;
+    context.memory_bus = &memory_;
+    context.instruction_limit = static_cast<std::uint32_t>(planned);
+    context.cycle_limit = budget.remaining_cycles;
+    context.charged_cycles = charges.data();
+    context.charged_cycles_count = static_cast<std::uint32_t>(planned);
+    plan.function(&context);
+    if (context.retired_count > planned)
+        throw std::logic_error("native trace exceeded its admitted prefix");
+    ++jit_stats_.native_executions;
+    ++jit_stats_.trace_executions;
+    jit_stats_.native_instructions += context.retired_count;
+    jit_stats_.trace_instructions += context.retired_count;
+    if (context.retired_count != 0U) entry.first_declined = false;
+    if (context.exit_reason == NativeExitReason::branch_mismatch) {
+        ++jit_stats_.trace_guard_mismatches;
+        if (context.retired_count == 0U) {
+            entry.plan.reset();
+            entry.hot = 0U; // Relearn the actually retired checked successor.
+            return std::nullopt;
+        }
+    } else if (context.exit_reason == NativeExitReason::helper_declined) {
+        ++jit_stats_.native_declines;
+        ++jit_stats_.trace_memory_declines;
+        if (context.retired_count == 0U) {
+            entry.first_declined = true;
+            entry.declined_address = first_address();
+        }
+    }
+    if (context.retired_count == 0U) return std::nullopt;
+    TimedJitStepOutcome timed;
+    auto& out = timed.execution;
+    std::uint32_t execution_cycles = 0U;
+    std::uint64_t charged_cycles = 0U;
+    for (std::size_t i = 0U; i < context.retired_count; ++i) {
+        const auto& op = plan.ops[i];
+        out.pcs[i] = op.pc;
+        out.sizes[i] = op.size;
+        timed.instruction_cycles[i] = op.execution_cycles;
+        budget.total_instruction_cycles[i] = static_cast<std::uint16_t>(charges[i]);
+        budget.remaining_cycles -= charges[i];
+        budget.have_fetch = true;
+        budget.fetch_end = op.pc + op.size;
+        execution_cycles += op.execution_cycles;
+        charged_cycles += charges[i];
+        if (op.decoded.kind == InstrKind::ldr || op.decoded.kind == InstrKind::str
+            || op.decoded.kind == InstrKind::push || op.decoded.kind == InstrKind::pop)
+            out.memory_free = false;
+    }
+    const auto& last = plan.ops[context.retired_count - 1U];
+    if (context.retired_cycles != charged_cycles || state_.r[15] != last.expected_next_pc
+        || state_.instruction_address != last.pc)
+        throw std::logic_error("native trace retirement metadata differs");
+    out.count = static_cast<std::uint8_t>(context.retired_count);
+    out.result.reason = StopReason::step_complete;
+    out.result.instruction_address = last.pc;
+    out.result.raw = last.raw;
+    out.result.instruction_size = last.size;
+    out.result.instructions = out.count;
+    out.result.cycles = static_cast<std::uint16_t>(execution_cycles);
+    out.result.suppress_loop_observation = last.decoded.kind == InstrKind::bl
+        || (last.decoded.kind == InstrKind::pop
+            && (last.decoded.register_list & (std::uint16_t{1U} << 15U)) != 0U);
+    ++jit_stats_.block_executions;
+    jit_stats_.block_instructions += out.count;
+    return timed;
+}
+
 std::optional<CortexM4::TimedJitStepOutcome> CortexM4::tryStepBudgetedReversibleJitBlock(
     const std::size_t max_instructions, ReversibleCycleBudget& budget) {
     if (max_instructions == 0U || !memory_.reversibleRamOnly()
         || !memory_.allMmioTrapping()) return std::nullopt;
     if (inItBlock(state_.it_state)) return tryStepItScalarFallback(&budget);
+    if (native_memory_jit_enabled_ && budget.fetch_stall == nullptr) {
+        if (auto trace = tryStepNativeTrace(max_instructions, budget)) return trace;
+    }
     if (!prepareJitBlock(true)) {
         if (auto scalar = tryStepItScalarFallback(&budget)) return scalar;
         return std::nullopt;
@@ -1965,6 +2175,13 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
                     return std::nullopt;
                 }
                 const auto retired_u8 = static_cast<std::uint8_t>(retired);
+                if (native_memory_jit_enabled_) {
+                    for (std::uint8_t j = 0U; j < retired_u8; ++j) {
+                        if (slot.ops[j].kind == InstrKind::b
+                            && slot.ops[j].condition != Condition::al)
+                            observeNativeTraceBranch(slot.pcs[j], ((failed >> j) & 1U) == 0U);
+                    }
+                }
                 if (failed != 0U) {
                     // Failed conditional branches retire for 1 cycle, not the
                     // planned base cost. Correct the planned charges in place
@@ -2135,6 +2352,12 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
             break;
         }
         if (compact) state_.instruction_address = pc;
+        if (native_memory_jit_enabled_ && op.kind == InstrKind::b && op.condition != Condition::al)
+            observeNativeTraceBranch(pc, condition_passed);
+        if (native_memory_jit_enabled_ && condition_passed && op.kind == InstrKind::pop
+            && (op.register_list & (std::uint16_t{1U} << 15U)) != 0U
+            && !state_.pending_exc_return && !state_.pending_exception)
+            observeNativeTraceReturn(pc, state_.r[15]);
         if (condition_passed && state_.r[15] != pc + size) {
             cycles = static_cast<std::uint16_t>(cycles + slot.branch_penalty[i]);
         }

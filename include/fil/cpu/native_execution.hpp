@@ -13,6 +13,7 @@ enum class NativeExitReason : std::uint32_t {
     instruction_limit,
     cycle_limit,
     helper_declined,
+    branch_mismatch,
     control_flow,
     unsupported_instruction,
 };

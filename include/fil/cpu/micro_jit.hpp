@@ -36,6 +36,7 @@ namespace fil::cpu {
 struct CpuState;
 struct MicroBlock;
 struct NativeBlock;
+struct NativeTracePlan;
 struct NativeExecutionContext;
 
 /** Block kernel with scheduler prefix limits: executes while data and
@@ -68,6 +69,9 @@ public:
 
     /** Compiles straight-line integer/word-memory ops; branches decline. */
     [[nodiscard]] NativeFunction compileNative(const NativeBlock& block, std::string& error);
+
+    /** Compile a guarded executed trace (up to NativeTracePlan::max_ops). */
+    [[nodiscard]] NativeFunction compileNativeTrace(const NativeTracePlan& plan, std::string& error);
 
     [[nodiscard]] std::uint64_t compilations() const noexcept { return compilations_; }
     [[nodiscard]] std::uint64_t bytesEmitted() const noexcept { return bytes_emitted_; }

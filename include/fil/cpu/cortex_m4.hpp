@@ -420,6 +420,12 @@ public:
         std::uint64_t native_executions{0};
         std::uint64_t native_instructions{0};
         std::uint64_t native_declines{0};
+        std::uint64_t trace_compilations{0};
+        std::uint64_t trace_compiled_instructions{0};
+        std::uint64_t trace_executions{0};
+        std::uint64_t trace_instructions{0};
+        std::uint64_t trace_guard_mismatches{0};
+        std::uint64_t trace_memory_declines{0};
     };
     [[nodiscard]] JitStats jitStats() const noexcept { return jit_stats_; }
 
@@ -591,6 +597,34 @@ private:
     }
     std::unique_ptr<std::array<JitBlockEntry, jit_block_entries>> jit_blocks_;
     std::array<std::uint16_t, jit_block_entries> jit_hot_{};
+    struct NativeTraceCacheEntry {
+        std::shared_ptr<const NativeTracePlan> plan;
+        std::uint64_t generation{0U};
+        std::uint32_t pc{0U};
+        std::uint32_t declined_address{0U};
+        std::uint8_t hot{0U};
+        std::uint8_t attempts{0U};
+        bool first_declined{false};
+    };
+    struct NativeBranchProfile {
+        std::uint64_t generation{0U};
+        std::uint32_t pc{0U};
+        std::uint32_t target{0U};
+        bool valid{false};
+        bool taken{false};
+    };
+    static constexpr std::size_t native_trace_entries = 256U;
+    static constexpr std::size_t native_branch_entries = 1024U;
+    std::array<NativeTraceCacheEntry, native_trace_entries> native_traces_{};
+    std::array<NativeBranchProfile, native_branch_entries> native_branches_{};
+    void observeNativeTraceBranch(std::uint32_t pc, bool taken) noexcept;
+    void observeNativeTraceReturn(std::uint32_t pc, std::uint32_t target) noexcept;
+    [[nodiscard]] bool prepareNativeTrace(NativeTraceCacheEntry& entry);
+    [[nodiscard]] std::optional<TimedJitStepOutcome> tryStepNativeTrace(
+        std::size_t max_instructions, ReversibleCycleBudget& budget);
+    [[nodiscard]] std::optional<TimedJitStepOutcome> executeNativeTrace(
+        NativeTraceCacheEntry& entry, std::size_t max_instructions,
+        ReversibleCycleBudget& budget);
     JitStats jit_stats_{};
     bool native_memory_jit_enabled_{true};
     static constexpr std::uint16_t jit_compile_threshold = 50U;
