@@ -587,6 +587,12 @@ private:
         MicroFunction micro_function{nullptr};
         std::uint8_t micro_prefix_count{0U};
         bool micro_attempted{false};
+        /// Consecutive reversible attempts at this entry that retired nothing.
+        /// Real firmware idle loops touch MMIO every few instructions, so the
+        /// block executor otherwise re-enters and retires zero on every visit.
+        /// Cleared by any successful retirement and rebuilt when the slot
+        /// regenerates, so new code or a remap always starts fresh.
+        std::uint8_t reversible_decline_streak{0U};
         std::array<DecodedInstruction, JitStepOutcome::max_block> ops{};
         std::array<std::uint32_t, JitStepOutcome::max_block> pcs{};
         std::array<std::uint8_t, JitStepOutcome::max_block> sizes{};
@@ -663,6 +669,7 @@ private:
     };
     static constexpr std::size_t native_trace_entries = 256U;
     static constexpr std::uint8_t native_decline_streak_limit = 8U;
+    static constexpr std::uint8_t reversible_decline_streak_limit = 4U;
     static constexpr std::size_t native_branch_entries = 1024U;
     std::array<NativeTraceCacheEntry, native_trace_entries> native_traces_{};
     std::array<NativeBranchProfile, native_branch_entries> native_branches_{};

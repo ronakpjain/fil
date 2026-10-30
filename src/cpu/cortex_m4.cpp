@@ -2134,6 +2134,12 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
         ++jit_stats_.block_decline_guard;
         return std::nullopt;
     }
+    // A block that keeps retiring nothing cannot make progress here; the
+    // checked path is authoritative and the caller falls back to it anyway.
+    if (slot.reversible_decline_streak >= reversible_decline_streak_limit) {
+        ++jit_stats_.block_decline_guard;
+        return std::nullopt;
+    }
 
     TimedJitStepOutcome timed;  // arrays are uninitialized; only [0, count) is used
     auto& out = timed.execution;
@@ -2499,9 +2505,13 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
     if (out.count == 0U) {
         ++jit_stats_.fallbacks;
         ++jit_stats_.block_decline_empty;
+        if (slot.reversible_decline_streak != std::numeric_limits<std::uint8_t>::max()) {
+            ++slot.reversible_decline_streak;
+        }
         return std::nullopt;
     }
     slot.decline_streak = 0U;
+    slot.reversible_decline_streak = 0U;
     // Native and cached execution both retire a contiguous leading prefix.
     // Read its final diagnostic metadata once, rather than carrying four
     // overwritten values (and their register pressure) through every handler.
