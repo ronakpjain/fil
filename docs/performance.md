@@ -258,6 +258,27 @@ are compiled at ~37 instructions but execute only ~6.8 because they exit on
 memory declines (509,584 per simulated second) far more often than on branch
 mismatches (about 70,000 after the saturating predictor below).
 
+The dominant cost is event delivery, not instruction execution. Running the same
+front_driveline firmware with ADC decimation 64 (8,108 events) takes 298 ms for
+43.5M instructions, while decimation 1 (259,492 events) takes 2,317 ms for 47.0M
+instructions: 251k extra events cost about 2.0 s while adding only 3.5M
+instructions. Each event adds roughly 62 extra execution entries (block,
+native-trace and single-step combined) for only about 14 extra instructions,
+i.e. roughly 8 us of host time per event callback. Full ADC fidelity is a hard
+requirement, so decimation is not an acceptable fix; the per-event path is what
+must become cheaper. A useful bound: even making every span-admission path free
+would remove only about 1.1 s of the current 2.3 s, which is still above the
+one-second target, so both per-event cost and span admission matter.
+
+Measured call counts for front_driveline over one simulated second:
+`prepareReversibleRamPrefix` runs 3,108,580 times and reaches its full
+speculative search 2,956,880 times; `stepMemoizedLocal` succeeds 1,689,030
+times and fails 1,419,550 times after doing that work; `stepCommittedLocal`
+succeeds only 10,687 times while failing 1,408,863 times; and the loop falls
+through to single-stepping 1,408,855 times. Every cheap pre-check (instruction
+limit, journal tracking, block boundary, clock, horizon) fires zero times, so
+there is no cheap rejection available ahead of the expensive search.
+
 The systemic limit is that every span mechanism stops at the first taken
 control flow or MMIO access: the fallback block loop breaks on any PC
 discontinuity, `prepareJitBlock` marks unconditional control flow as a
