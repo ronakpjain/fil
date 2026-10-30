@@ -1620,24 +1620,35 @@ namespace {
         }
         CpuState& state = *context->cpu_state;
         std::uint32_t loaded = 0U;
-        const bool byte_access = op.kind == NativeOp::load_byte
-            || op.kind == NativeOp::store_byte;
-        const bool is_load = op.kind == NativeOp::load_word || op.kind == NativeOp::load_byte;
-        const std::uint32_t address = op.kind == NativeOp::integer ? 0U
+        const bool is_memory = nativeOpIsMemory(op.kind);
+        const bool is_load = nativeOpIsLoad(op.kind);
+        const std::uint32_t width = nativeOpWidth(op.kind);
+        const std::uint32_t address = !is_memory ? 0U
             : op.absolute ? op.absolute_address : state.readRegister(op.rn) + op.offset;
         if (is_load
-            && !(byte_access ? nativeRead8(context, op.pc, address, &loaded)
-                             : nativeRead32(context, op.pc, address, &loaded))) {
+            && !(width == 1U ? nativeRead8(context, op.pc, address, &loaded)
+                             : width == 2U ? nativeRead16(context, op.pc, address, &loaded)
+                                           : nativeRead32(context, op.pc, address, &loaded))) {
             context->failing_instruction_pc = op.pc;
             context->exit_reason = NativeExitReason::helper_declined;
             break;
         }
-        if (!is_load && op.kind != NativeOp::integer
-            && !(byte_access ? nativeWrite8(context, op.pc, address, state.r[op.rd])
-                             : nativeWrite32(context, op.pc, address, state.r[op.rd]))) {
+        if (!is_load && is_memory
+            && !(width == 1U ? nativeWrite8(context, op.pc, address, state.r[op.rd])
+                             : width == 2U ? nativeWrite16(context, op.pc, address, state.r[op.rd])
+                                           : nativeWrite32(context, op.pc, address, state.r[op.rd]))) {
             context->failing_instruction_pc = op.pc;
             context->exit_reason = NativeExitReason::helper_declined;
             break;
+        }
+        if (is_load) {
+            const bool sign_extend = op.kind == NativeOp::load_byte_signed
+                || op.kind == NativeOp::load_half_signed;
+            if (sign_extend) {
+                const std::uint32_t sign_bit = width == 1U ? 0x80U : 0x8000U;
+                const std::uint32_t fill = width == 1U ? 0xffffff00U : 0xffff0000U;
+                if ((loaded & sign_bit) != 0U) loaded |= fill;
+            }
         }
         if (op.kind == NativeOp::integer) {
             MicroCpu guest;
@@ -1704,25 +1715,32 @@ namespace {
                 break;
             }
         }
-        if (!stack_op && (op.native.kind == NativeOp::load_word || op.native.kind == NativeOp::store_word
-                || op.native.kind == NativeOp::load_byte || op.native.kind == NativeOp::store_byte)) {
+        if (!stack_op && nativeOpIsMemory(op.native.kind)) {
             const auto& memop = op.native;
             const std::uint32_t addr = memop.absolute ? memop.absolute_address
                 : state.readRegister(memop.rn) + memop.offset;
             std::uint32_t loaded = 0U;
-            const bool byte_access = memop.kind == NativeOp::load_byte
-                || memop.kind == NativeOp::store_byte;
-            const bool mem_load = memop.kind == NativeOp::load_word || memop.kind == NativeOp::load_byte;
+            const std::uint32_t width = nativeOpWidth(memop.kind);
+            const bool mem_load = nativeOpIsLoad(memop.kind);
             const bool ok = mem_load
-                ? (byte_access ? nativeRead8(ctx, op.pc, addr, &loaded)
-                               : nativeRead32(ctx, op.pc, addr, &loaded))
-                : (byte_access ? nativeWrite8(ctx, op.pc, addr, state.r[memop.rd])
-                               : nativeWrite32(ctx, op.pc, addr, state.r[memop.rd]));
+                ? (width == 1U ? nativeRead8(ctx, op.pc, addr, &loaded)
+                               : width == 2U ? nativeRead16(ctx, op.pc, addr, &loaded)
+                                            : nativeRead32(ctx, op.pc, addr, &loaded))
+                : (width == 1U ? nativeWrite8(ctx, op.pc, addr, state.r[memop.rd])
+                               : width == 2U ? nativeWrite16(ctx, op.pc, addr, state.r[memop.rd])
+                                            : nativeWrite32(ctx, op.pc, addr, state.r[memop.rd]));
             if (!ok) {
                 ctx->failing_instruction_pc = op.pc;
                 ctx->exit_reason = NativeExitReason::helper_declined; break;
             }
-            if (mem_load) state.r[memop.rd] = loaded;
+            if (mem_load) {
+                if (memop.kind == NativeOp::load_byte_signed || memop.kind == NativeOp::load_half_signed) {
+                    const std::uint32_t sign_bit = width == 1U ? 0x80U : 0x8000U;
+                    const std::uint32_t fill = width == 1U ? 0xffffff00U : 0xffff0000U;
+                    if ((loaded & sign_bit) != 0U) loaded |= fill;
+                }
+                state.r[memop.rd] = loaded;
+            }
         }
         if (inst.op == MicroOp::b || is_cond || inst.op == MicroOp::bl) {
             if (inst.op == MicroOp::bl) state.r[14] = (op.pc + op.size) | 1U;
@@ -2019,9 +2037,7 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
     for (std::size_t i = 0; i < block.ops.size(); ++i) {
         const auto& op = block.ops[i];
         if (op.pc != expected_pc
-            || (op.kind != NativeOp::integer && op.kind != NativeOp::load_word
-                && op.kind != NativeOp::store_word && op.kind != NativeOp::load_byte
-                && op.kind != NativeOp::store_byte)) {
+            || static_cast<unsigned>(op.kind) > static_cast<unsigned>(NativeOp::load_half_signed)) {
             error = "native-jit: invalid opcode or discontinuous block";
             return nullptr;
         }
@@ -2153,8 +2169,8 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
                 if (op.offset != 0U) e.aluRImm(0U, kScratch, op.offset);
                 e.movRR(kAddr, kScratch);
             }
-            const bool mem_load = op.kind == NativeOp::load_word || op.kind == NativeOp::load_byte;
-            const bool mem_byte = op.kind == NativeOp::load_byte || op.kind == NativeOp::store_byte;
+            const bool mem_load = nativeOpIsLoad(op.kind);
+            const std::uint32_t mem_width = nativeOpWidth(op.kind);
             if (!mem_load) loadGuest(e, kValue, cpu_offsets, op.rd);
             // Preserve guest NZCV/retained xPSR across the C ABI helper.
             e.movRR(3U, kNzcv); e.movRR(15U, kRetain);
@@ -2162,9 +2178,12 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
             e.movR32Imm(6U, op.pc); // RSI = instruction PC
             e.movRR(kEdx, kAddr);
             if (mem_load) e.leaR64(1U, 4U, 0U); // RCX = [RSP]
-            const auto helper = mem_byte
+            const auto helper = mem_width == 1U
                 ? (mem_load ? reinterpret_cast<std::uintptr_t>(&nativeRead8)
                             : reinterpret_cast<std::uintptr_t>(&nativeWrite8))
+                : mem_width == 2U
+                ? (mem_load ? reinterpret_cast<std::uintptr_t>(&nativeRead16)
+                            : reinterpret_cast<std::uintptr_t>(&nativeWrite16))
                 : (mem_load ? reinterpret_cast<std::uintptr_t>(&nativeRead32)
                             : reinterpret_cast<std::uintptr_t>(&nativeWrite32));
             e.movR64Imm(kEax, static_cast<std::uint64_t>(helper));
@@ -2176,6 +2195,12 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
             e.jcc(4U, helper_exit);
             if (mem_load) {
                 e.movR32M(kScratch, 4U, 0U);
+                // LDRSB/LDRSH sign-extend the loaded field before committing.
+                if (op.kind == NativeOp::load_byte_signed) {
+                    e.shImm(4U, kScratch, 24U); e.shImm(7U, kScratch, 24U);
+                } else if (op.kind == NativeOp::load_half_signed) {
+                    e.shImm(4U, kScratch, 16U); e.shImm(7U, kScratch, 16U);
+                }
                 storeGuest(e, cpu_offsets, op.rd, kScratch);
             }
         }
@@ -2364,18 +2389,28 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
                 if (m.offset != 0U) e.aluRImm(0U,kEax,m.offset);
                 e.movRR(addrreg,kEax);
             }
-            const bool t_load = m.kind == NativeOp::load_word || m.kind == NativeOp::load_byte;
-            const bool t_byte = m.kind == NativeOp::load_byte || m.kind == NativeOp::store_byte;
+            const bool t_load = nativeOpIsLoad(m.kind);
+            const std::uint32_t t_width = nativeOpWidth(m.kind);
             if (!t_load) loadGuest(e,valuereg,offsets,m.rd);
             e.movRR(3U,kNzcv); e.movRR(15U,kRetain); e.movRR64(7U,ctx); e.movR32Imm(6U,op.pc); e.movRR(kEdx,addrreg);
             if (t_load) e.leaR64(1U,4U,0U);
-            const auto helper = t_byte
+            const auto helper = t_width == 1U
                 ? (t_load ? reinterpret_cast<std::uintptr_t>(&nativeRead8) : reinterpret_cast<std::uintptr_t>(&nativeWrite8))
+                : t_width == 2U
+                ? (t_load ? reinterpret_cast<std::uintptr_t>(&nativeRead16) : reinterpret_cast<std::uintptr_t>(&nativeWrite16))
                 : (t_load ? reinterpret_cast<std::uintptr_t>(&nativeRead32) : reinterpret_cast<std::uintptr_t>(&nativeWrite32));
             e.movR64Imm(kEax,helper); e.callReg(kEax);
             e.movRR(kNzcv,3U); e.movRR(kRetain,15U); e.movRR64(7U,cpu);
             e.u8(0x84U); e.u8(0xc0U); e.jcc(4U,exits[i].helper);
-            if (t_load) { e.movR32M(kEax,4U,0U); storeGuest(e,offsets,m.rd,kEax); }
+            if (t_load) {
+                e.movR32M(kEax,4U,0U);
+                if (m.kind == NativeOp::load_byte_signed) {
+                    e.shImm(4U, kEax, 24U); e.shImm(7U, kEax, 24U);
+                } else if (m.kind == NativeOp::load_half_signed) {
+                    e.shImm(4U, kEax, 16U); e.shImm(7U, kEax, 16U);
+                }
+                storeGuest(e,offsets,m.rd,kEax);
+            }
         }
         // Only the live cycle accumulator advances here. RAM-only helpers
         // consume explicit PCs and no pending NZCV/PC/progress metadata; the

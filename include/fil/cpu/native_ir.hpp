@@ -8,7 +8,17 @@ namespace fil::cpu {
  * proves instruction shape, never mapping, permissions, or RAM stability.
  * The existing pure MicroBlock ABI and its admission policy are unchanged.
  */
-enum class NativeOp : std::uint8_t { integer, load_word, store_word, load_byte, store_byte };
+enum class NativeOp : std::uint8_t {
+    integer,
+    load_word,
+    store_word,
+    load_byte,
+    store_byte,
+    load_half,
+    store_half,
+    load_byte_signed,
+    load_half_signed,
+};
 
 struct NativeInst {
     NativeOp kind{NativeOp::integer};
@@ -21,6 +31,29 @@ struct NativeInst {
     std::uint32_t absolute_address{0};
     bool absolute{false};
 };
+
+/** @brief True for any native memory operation. */
+[[nodiscard]] constexpr bool nativeOpIsMemory(NativeOp op) noexcept {
+    return op != NativeOp::integer;
+}
+/** @brief True for native load operations (any width/sign). */
+[[nodiscard]] constexpr bool nativeOpIsLoad(NativeOp op) noexcept {
+    return op == NativeOp::load_word || op == NativeOp::load_byte
+        || op == NativeOp::load_half || op == NativeOp::load_byte_signed
+        || op == NativeOp::load_half_signed;
+}
+/** @brief Accessed width in bytes for a native memory operation. */
+[[nodiscard]] constexpr std::uint32_t nativeOpWidth(NativeOp op) noexcept {
+    switch (op) {
+    case NativeOp::load_byte:
+    case NativeOp::store_byte:
+    case NativeOp::load_byte_signed: return 1U;
+    case NativeOp::load_half:
+    case NativeOp::store_half:
+    case NativeOp::load_half_signed: return 2U;
+    default: return 4U;
+    }
+}
 
 struct NativeBlock {
     static constexpr std::size_t max_ops = MicroBlock::max_ops;

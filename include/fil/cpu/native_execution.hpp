@@ -64,5 +64,13 @@ struct NativeExecutionContext {
 [[nodiscard]] bool nativeWrite8(
     NativeExecutionContext* context, std::uint32_t instruction_pc,
     std::uint32_t address, std::uint32_t value) noexcept;
+/** @brief Nonthrowing halfword load ABI; false declines without changing output/state. */
+[[nodiscard]] bool nativeRead16(
+    NativeExecutionContext* context, std::uint32_t instruction_pc,
+    std::uint32_t address, std::uint32_t* value_out) noexcept;
+/** @brief Reversible-only nonthrowing halfword store; only non-executable RAM is accepted. */
+[[nodiscard]] bool nativeWrite16(
+    NativeExecutionContext* context, std::uint32_t instruction_pc,
+    std::uint32_t address, std::uint32_t value) noexcept;
 
 } // namespace fil::cpu

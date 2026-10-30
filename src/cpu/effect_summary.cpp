@@ -83,10 +83,7 @@ EffectSummary summarizeNativeEffects(
                 && (op.decoded.register_list & 0x8000U) != 0U;
         } else if (op.native.kind == NativeOp::integer) {
             control_flow = isControlFlowMicroOp(op.native.integer.op);
-        } else if (op.native.kind == NativeOp::load_word
-                   || op.native.kind == NativeOp::store_word
-                   || op.native.kind == NativeOp::load_byte
-                   || op.native.kind == NativeOp::store_byte) {
+        } else if (nativeOpIsMemory(op.native.kind)) {
             std::uint32_t address = op.native.absolute_address;
             if (!op.native.absolute) {
                 if (op.native.rn == 13U && stack) {
