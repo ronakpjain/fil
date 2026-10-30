@@ -4,6 +4,7 @@
 #include "fil/cpu/jit.hpp"
 #include "fil/cpu/micro_jit_ir.hpp"
 #include "fil/cpu/native_ir.hpp"
+#include "fil/cpu/effect_summary.hpp"
 #include "fil/cpu/native_trace.hpp"
 #include "fil/cpu/native_execution.hpp"
 #include "fil/elf/elf_loader.hpp"
@@ -1794,6 +1795,31 @@ bool CortexM4::prepareNativeTrace(NativeTraceCacheEntry& entry) {
     auto plan = std::make_shared<NativeTracePlan>();
     if (!buildNativeTrace(sources, *plan, micro_jit_error_)) return false;
     plan->generation = entry.generation;
+    // Record conservative horizon opportunity for this immutable plan. The
+    // summary deliberately omits a stack-pointer fact: the cached plan can be
+    // entered with a different SP, so only directly backed non-MMIO ranges are
+    // proved private. Expensive attribution stays off the execution path.
+    {
+        const auto regions = memory_.regions();
+        std::vector<PrivateRegion> private_regions;
+        private_regions.reserve(regions.size());
+        for (const auto& region : regions) {
+            if (region.kind == mem::RegionKind::mmio || !region.readable) continue;
+            const std::uint64_t end = static_cast<std::uint64_t>(region.base) + region.size;
+            private_regions.push_back({region.base,
+                end > std::numeric_limits<std::uint32_t>::max()
+                    ? std::numeric_limits<std::uint32_t>::max() : static_cast<std::uint32_t>(end)});
+        }
+        PrivateMemoryFacts facts;
+        facts.regions = private_regions;
+        const auto summary = summarizeNativeEffects(plan->ops, facts);
+        ++jit_stats_.trace_horizon_summaries;
+        jit_stats_.trace_horizon_instructions += plan->ops.size();
+        jit_stats_.trace_horizon_local_ops += summary.local_ops;
+        if (summary.reaches_shared) ++jit_stats_.trace_horizon_shared;
+        if (summary.unknown_control_flow) ++jit_stats_.trace_horizon_control_flow;
+        if (summary.local_ops == 0U) ++jit_stats_.trace_horizon_zero_prefix;
+    }
     const auto before = micro_jit_->compilations();
     plan->function = micro_jit_->compileNativeTrace(*plan, micro_jit_error_);
     if (!plan->function) return false;

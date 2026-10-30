@@ -426,6 +426,13 @@ public:
         std::uint64_t trace_instructions{0};
         std::uint64_t trace_guard_mismatches{0};
         std::uint64_t trace_memory_declines{0};
+        /// Conservative effect summaries computed when traces are prepared.
+        std::uint64_t trace_horizon_summaries{0};
+        std::uint64_t trace_horizon_instructions{0};
+        std::uint64_t trace_horizon_local_ops{0};
+        std::uint64_t trace_horizon_shared{0};
+        std::uint64_t trace_horizon_control_flow{0};
+        std::uint64_t trace_horizon_zero_prefix{0};
     };
     [[nodiscard]] JitStats jitStats() const noexcept { return jit_stats_; }
 
