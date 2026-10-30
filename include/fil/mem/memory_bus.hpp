@@ -483,6 +483,47 @@ private:
     [[nodiscard]] static bool footprintContains(
         const ReadFootprint& footprint, std::uint32_t address
     ) noexcept;
+    // Open-addressed address set reused across calls. Slots carry a generation
+    // stamp so an untouched slot from an earlier call reads as empty without
+    // clearing the table, keeping each window pass O(window) with no per-call
+    // initialization. Used to find the first journal entry of each address in
+    // one forward pass instead of rescanning the window per candidate.
+    struct WindowAddressSet {
+        static constexpr std::uint32_t size = 1U << 14U;
+        struct Slot {
+            std::uint32_t address{0};
+            std::uint32_t stamp{0};
+        };
+        mutable std::array<Slot, size> slots{};
+        mutable std::uint32_t generation{0};
+
+        // Starts a fresh logical pass. Stale slots from earlier passes read as
+        // empty because their stamp differs; only the rare wrap clears the table.
+        void beginPass() const noexcept {
+            std::uint32_t current = generation + 1U;
+            if (current == 0U) {
+                for (Slot& slot : slots) slot.stamp = 0U;
+                current = 1U;
+            }
+            generation = current;
+        }
+        // Returns true when `address` was not present in this pass, then inserts it.
+        [[nodiscard]] bool insertNew(std::uint32_t address) const noexcept {
+            const std::uint32_t current = generation;
+            std::uint32_t index = (address * 2654435761U) >> (32U - 14U);
+            for (;;) {
+                Slot& slot = slots[index];
+                if (slot.stamp != current) {
+                    slot.address = address;
+                    slot.stamp = current;
+                    return true;
+                }
+                if (slot.address == address) return false;
+                index = (index + 1U) & (size - 1U);
+            }
+        }
+    };
+    mutable WindowAddressSet window_address_set_;
     void recordMutation(std::uint32_t address, std::uint8_t old_value, bool external) noexcept;
     [[nodiscard]] bool storeUnjournaledWord(
         Region& region, std::size_t offset, std::uint32_t value

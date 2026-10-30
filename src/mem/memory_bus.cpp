@@ -1003,31 +1003,28 @@ bool MemoryBus::ramInputsCompatibleSince(
     }
     if (checkpoint.mutation_sequence == mutation_sequence_) return true;
 
+    // Single forward pass. The original predicate rescanned every earlier
+    // window entry to decide whether a candidate mutation was the first for
+    // its address, which is O(window^2) for the multi-mutation windows that
+    // dominate long runs. An address set yields the same answer in O(window).
+    window_address_set_.beginPass();
     for (std::uint64_t sequence = checkpoint.mutation_sequence + 1U;
          sequence <= mutation_sequence_; ++sequence) {
-        const BackedMutation& first = mutation_journal_[(sequence - 1U) % mutation_journal_capacity];
-        if (first.sequence != sequence) return false;
-        const Region* const region = find(first.address);
+        const BackedMutation& mutation = mutation_journal_[(sequence - 1U) % mutation_journal_capacity];
+        if (mutation.sequence != sequence) return false;
+        const Region* const region = find(mutation.address);
         if (region == nullptr || region->info.kind == RegionKind::mmio
             || region->info.kind == RegionKind::alias) return false;
         // Journal identity and backing are still checked for every mutation.
         // Only footprint candidates need earliest-old-value reconstruction;
         // unrelated bytes cannot affect this immutable certificate.
-        if (!footprintContains(footprint, first.address)) continue;
-        bool first_for_address = true;
-        for (std::uint64_t prior = checkpoint.mutation_sequence + 1U;
-             prior < sequence; ++prior) {
-            const BackedMutation& previous = mutation_journal_[(prior - 1U) % mutation_journal_capacity];
-            if (previous.sequence != prior) return false;
-            if (previous.address == first.address) {
-                first_for_address = false;
-                break;
-            }
-        }
-        if (!first_for_address) continue;
+        if (!footprintContains(footprint, mutation.address)) continue;
+        // Later mutations of the same address cannot decide compatibility; only
+        // the first one carries the pre-window value that must still hold.
+        if (!window_address_set_.insertNew(mutation.address)) continue;
 
-        const std::size_t offset = first.address - region->info.base;
-        if (region->bytes[offset] != first.old_value) return false;
+        const std::size_t offset = mutation.address - region->info.base;
+        if (region->bytes[offset] != mutation.old_value) return false;
     }
     return true;
 }
