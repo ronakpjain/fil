@@ -201,6 +201,33 @@ A bounded, immutable period certificate can avoid execution and replay for natur
 
 **Decimation changes firmware-visible behavior.** Keep N at 1 for full fidelity.
 
+## Measured six-board characteristics
+
+Host: AMD Ryzen 9 4900HS (8 physical cores, 16 threads), PGO Release build,
+`configs/networks/per_vehicle.json`, ADC decimation 1. One simulated second of
+the six-board `per_vehicle` network currently costs roughly 2.4 s wall
+(~0.4x real time); the exact-scheduler reference (`--cross-board-window-ns 0`)
+costs roughly 7 s. Wall time is insensitive to the window for values at or above
+100 us and grows sharply below that, so the default 1000 ns window should be
+raised for throughput runs.
+
+Wall time is bounded by two boards, not by scheduling or cross-board
+coordination. Per-board solo wall times for one simulated second are
+dashboard ~0.37 s, main_module ~0.32 s, torque_vector ~0.16 s, a_box ~0.63 s,
+and front_driveline and rear_driveline ~2.28 s each. Six independent
+single-board processes reproduce the same total and the same front_driveline
+cost, so the bottleneck is that board's per-instruction execution cost rather
+than parallelism.
+
+`fil run-network ...` prints per-board JIT diagnostics. For front_driveline the
+reversible block path retires only ~3 instructions per entry because the hot
+loop reaches an MMIO access almost immediately; the remaining attempts decline
+at instruction 0. Removing the RAM-period certificate path is far worse
+(roughly 13x wall time and ~8x more span entries), so the certificate path is
+essential and must be extended rather than bypassed. The next improvement
+should let a committed span continue past a declining MMIO instruction using
+the checked handler instead of abandoning the whole attempt.
+
 ## Validation
 
 ```bash
