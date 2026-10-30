@@ -105,13 +105,21 @@ Result<void> ExceptionController::enter(cpu::CpuState& state, const std::uint16_
         state.r[15] | 1U,
         state.xpsr | cpu::xpsr_t | (add_padding ? (1U << 9U) : 0U),
     };
-    for (std::size_t index = 0; index < frame.size(); ++index) {
-        auto written = memory_.write32(
-            core_frame_base + static_cast<std::uint32_t>(index * 4U),
-            frame[index],
-            {mem::AccessType::data_write, state.currentInstrAddr()}
-        );
-        if (!written) return runtimeError("unable to stack exception frame: " + mem::formatBusFault(written.fault()));
+    // Stack the eight-word core frame with one bulk probe. The bulk helper
+    // journals and footprints every word exactly like sequential write32
+    // calls, but performs a single region lookup instead of eight; this path
+    // runs on every interrupt of interrupt-heavy firmware.
+    if (!memory_.tryFastWriteWords(core_frame_base,
+            static_cast<std::uint32_t>(frame.size()), frame.data(),
+            {mem::AccessType::data_write, state.currentInstrAddr()})) {
+        for (std::size_t index = 0; index < frame.size(); ++index) {
+            auto written = memory_.write32(
+                core_frame_base + static_cast<std::uint32_t>(index * 4U),
+                frame[index],
+                {mem::AccessType::data_write, state.currentInstrAddr()}
+            );
+            if (!written) return runtimeError("unable to stack exception frame: " + mem::formatBusFault(written.fault()));
+        }
     }
 
     stack_pointer = new_sp;
@@ -178,13 +186,19 @@ Result<void> ExceptionController::exceptionReturn(
     }
     state.fp_lazy_active = false;
     std::array<std::uint32_t, 8> frame{};
-    for (std::size_t index = 0; index < frame.size(); ++index) {
-        auto value = memory_.read32(
-            stack_pointer + core_frame_offset + static_cast<std::uint32_t>(index * 4U),
-            {mem::AccessType::data_read, state.currentInstrAddr()}
-        );
-        if (!value) return runtimeError("unable to unstack exception frame: " + mem::formatBusFault(value.fault()));
-        frame[index] = value.value();
+    // One bulk probe for the whole core frame; identical per-word footprint
+    // and fault behaviour to eight sequential read32 calls.
+    if (!memory_.tryFastReadWords(stack_pointer + core_frame_offset,
+            static_cast<std::uint32_t>(frame.size()), frame.data(),
+            {mem::AccessType::data_read, state.currentInstrAddr()})) {
+        for (std::size_t index = 0; index < frame.size(); ++index) {
+            auto value = memory_.read32(
+                stack_pointer + core_frame_offset + static_cast<std::uint32_t>(index * 4U),
+                {mem::AccessType::data_read, state.currentInstrAddr()}
+            );
+            if (!value) return runtimeError("unable to unstack exception frame: " + mem::formatBusFault(value.fault()));
+            frame[index] = value.value();
+        }
     }
     if ((frame[7] & cpu::xpsr_t) == 0) {
         std::ostringstream message;
