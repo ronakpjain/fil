@@ -1819,6 +1819,13 @@ bool CortexM4::prepareNativeTrace(NativeTraceCacheEntry& entry) {
         if (summary.reaches_shared) ++jit_stats_.trace_horizon_shared;
         if (summary.unknown_control_flow) ++jit_stats_.trace_horizon_control_flow;
         if (summary.local_ops == 0U) ++jit_stats_.trace_horizon_zero_prefix;
+        // Opportunity estimate only: the entry SP lets the analysis cross
+        // stack traffic, but a cached trace may later be entered with a
+        // different SP, so this value is never used for lane admission.
+        facts.stack_pointer = state_.readRegister(13);
+        const auto stack_summary = summarizeNativeEffects(plan->ops, facts);
+        jit_stats_.trace_horizon_stack_local_ops += stack_summary.local_ops;
+        if (stack_summary.reaches_shared) ++jit_stats_.trace_horizon_stack_shared;
     }
     const auto before = micro_jit_->compilations();
     plan->function = micro_jit_->compileNativeTrace(*plan, micro_jit_error_);

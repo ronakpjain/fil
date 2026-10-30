@@ -433,6 +433,9 @@ public:
         std::uint64_t trace_horizon_shared{0};
         std::uint64_t trace_horizon_control_flow{0};
         std::uint64_t trace_horizon_zero_prefix{0};
+        /// Stack-optimistic opportunity estimate, not a lane-admission proof.
+        std::uint64_t trace_horizon_stack_local_ops{0};
+        std::uint64_t trace_horizon_stack_shared{0};
     };
     [[nodiscard]] JitStats jitStats() const noexcept { return jit_stats_; }
 
