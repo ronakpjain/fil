@@ -1059,23 +1059,70 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
             const std::size_t period = prefix.count;
             if (!stop && period != 0U && period == speculative.count
                 && cpu_->state().r[15] == prefix.entry_pc
-                && budget.have_fetch == prefix.entry_have_fetch
-                && budget.fetch_end == prefix.entry_fetch_end
-                && prefix.entry_state.matches(cpu_->state())
+                && prefix.entry_state.matchesExceptInstructionAddress(cpu_->state())
                 && memory_.executionGeneration() == prefix.execution_generation
                 && memory_.sideEffectCheckpoint().mutation_sequence
                     == prefix.memory_checkpoint.mutation_sequence
                 && memory_.sideEffectsRestoredSince(prefix.memory_checkpoint)) {
                 const std::uint64_t period_cycles = cycles;
-                // Certification replays a whole period. Build the optional
-                // cache only when this admission can immediately fold at least
-                // one period; otherwise the extra execution cannot shorten
-                // this capsule and a later admission may certify if useful.
-                const bool can_fold = limit - prefix.count >= period
-                    && period_cycles <= budget.remaining_cycles;
-                if (can_fold && period <= IdempotentPeriodCertificate::max_instructions) {
-                    prefix.period_certificate = buildIdempotentPeriodCertificate(
-                        period, period_cycles);
+                const bool same_fetch = budget.have_fetch == prefix.entry_have_fetch
+                    && budget.fetch_end == prefix.entry_fetch_end;
+                const bool discovery_only = !same_fetch
+                    || prefix.entry_state.instruction_address != cpu_->state().instruction_address;
+                std::uint64_t certificate_cycles = period_cycles;
+                bool adjusted_cycles_valid = true;
+                if (discovery_only) {
+                    const auto& flash = peripherals_->flash();
+                    const std::uint32_t original_stall = flash.fetchStallCycles(prefix.entry_pc,
+                        prefix.entry_have_fetch && prefix.entry_pc == prefix.entry_fetch_end);
+                    const std::uint32_t endpoint_stall = flash.fetchStallCycles(prefix.entry_pc,
+                        budget.have_fetch && prefix.entry_pc == budget.fetch_end);
+                    if (endpoint_stall >= original_stall) {
+                        const auto delta = static_cast<std::uint64_t>(endpoint_stall - original_stall);
+                        adjusted_cycles_valid = period_cycles <= std::numeric_limits<std::uint64_t>::max() - delta;
+                        if (adjusted_cycles_valid) certificate_cycles += delta;
+                    } else {
+                        const auto delta = static_cast<std::uint64_t>(original_stall - endpoint_stall);
+                        adjusted_cycles_valid = period_cycles >= delta;
+                        if (adjusted_cycles_valid) certificate_cycles -= delta;
+                    }
+                }
+                // Certification is worthwhile only when a later folded period
+                // fits this admission's instruction and cycle credit.
+                const bool can_certify = limit - prefix.count >= period
+                    && adjusted_cycles_valid && certificate_cycles <= budget.remaining_cycles;
+                if (can_certify && period <= IdempotentPeriodCertificate::max_instructions) {
+                    struct FetchMetadataRestore {
+                        Board& board;
+                        bool have_fetch;
+                        std::uint32_t fetch_end;
+                        ~FetchMetadataRestore() {
+                            board.have_last_fetch_ = have_fetch;
+                            board.last_fetch_end_ = fetch_end;
+                        }
+                    };
+                    const bool saved_have_fetch = have_last_fetch_;
+                    const std::uint32_t saved_fetch_end = last_fetch_end_;
+                    if (discovery_only) {
+                        have_last_fetch_ = budget.have_fetch;
+                        last_fetch_end_ = budget.fetch_end;
+                    }
+                    {
+                        FetchMetadataRestore restore{*this, saved_have_fetch, saved_fetch_end};
+                        prefix.period_certificate = buildIdempotentPeriodCertificate(
+                            period, certificate_cycles);
+                    }
+                }
+                // A certificate discovered from the actual endpoint is useful
+                // for future admissions, but its first ordinary prefix must
+                // remain the exact un-folded execution just observed.
+                if (discovery_only) {
+                    if (prefix.period_certificate) {
+                        speculative.count = static_cast<std::uint8_t>(prefix.count);
+                        speculative.result.instructions = static_cast<std::uint32_t>(prefix.count);
+                        break;
+                    }
+                    continue; // No certificate: retain ordinary speculative work, never fold mismatched timing.
                 }
                 while (limit - prefix.count >= period
                        && period_cycles <= budget.remaining_cycles) {

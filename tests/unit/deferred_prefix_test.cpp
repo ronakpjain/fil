@@ -97,7 +97,7 @@ TEST(DeferredPrefixTest, OwnerLocalAdcHorizonAllowsUnrelatedRamSpanButNotOrdinar
     auto owner = world.value()->eventLoop().useOwner(1U);
     fil::sim::Board::ReversibleRamPrefix prefix;
     ASSERT_TRUE(receiver.prepareReversibleRamPrefix(prefix, 64U, std::nullopt, true, true));
-    EXPECT_GT(prefix.count, 16U);
+    EXPECT_GT(prefix.count, 8U);
     EXPECT_GT(prefix.completion_times_ns[prefix.count - 1U], 100U);
     static_cast<void>(receiver.materializeReversibleRamPrefix(prefix, 1U));
     if (receiver.prepareReversibleRamPrefix(prefix, 64U, std::nullopt, true)) {

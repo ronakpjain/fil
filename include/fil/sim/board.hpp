@@ -177,10 +177,13 @@ public:
                 pending_exc_return = state.pending_exc_return;
             }
             [[nodiscard]] bool matches(const cpu::CpuState& state) const noexcept {
+                return matchesExceptInstructionAddress(state)
+                    && instruction_address == state.instruction_address;
+            }
+            [[nodiscard]] bool matchesExceptInstructionAddress(const cpu::CpuState& state) const noexcept {
                 return r == state.r && xpsr == state.xpsr && msp == state.msp && psp == state.psp
                     && primask == state.primask && basepri == state.basepri
                     && faultmask == state.faultmask && control == state.control
-                    && instruction_address == state.instruction_address
                     && thumb == state.thumb && halted == state.halted && it_state == state.it_state
                     && pending_exception == state.pending_exception
                     && pending_exc_return == state.pending_exc_return;

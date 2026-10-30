@@ -2,6 +2,7 @@
 #include "../fixture_support.hpp"
 #include "fil/stm32g4/stm32g4.hpp"
 
+#include <array>
 #include <cstdint>
 #include <gtest/gtest.h>
 
@@ -97,6 +98,164 @@ bool warmIdempotentPeriodCache(fil::sim::Board& board) {
     if (!reused || reused->memoized_count == 0U) return false;
     static_cast<void>(board.materializeReversibleRamPrefix(*reused, reused->count));
     return true;
+}
+
+struct TinyPeriodSetup {
+    std::vector<std::uint8_t> code;
+    std::uint32_t entry_offset{0U};
+    std::uint32_t r0{0U};
+    std::uint32_t flash_acr{0U};
+};
+
+bool installTinyPeriod(fil::sim::Board& board, const TinyPeriodSetup& setup) {
+    const auto base = board.cpu().state().r[15] & ~1U;
+    if (setup.flash_acr != 0U
+        && !board.memory().write32(0x40022000U, setup.flash_acr)) return false;
+    if (!board.memory().loadBytes(base, setup.code)) return false;
+    auto& state = board.cpu().state();
+    state.r[15] = base + setup.entry_offset;
+    state.r[0] = setup.r0;
+    state.instruction_address = 0x12345678U;
+    const auto entry = state;
+    for (const auto offset : {0U, 2U, 4U, 6U}) {
+        state.r[15] = base + offset;
+        for (unsigned i = 0U; i < 70U; ++i) static_cast<void>(board.cpu().prepareJitBlock());
+    }
+    state = entry;
+    return board.cpu().jitBlockReady();
+}
+
+TEST(BoardTest, EndpointDiscoveryKeepsCurrentTwoInstructionPrefixExactAtEveryCut) {
+    const TinyPeriodSetup setup{{0x00U,0xbfU, 0xfdU,0xe7U}, 0U, 0U, 0U};
+    for (const bool native : {false, true}) {
+        for (std::size_t cut = 1U; cut <= 2U; ++cut) {
+            SCOPED_TRACE(::testing::Message() << "native=" << native << " cut=" << cut);
+            auto exact = fil::sim::Board::load(fixtureBoard());
+            auto candidate = fil::sim::Board::load(fixtureBoard());
+            ASSERT_TRUE(exact && candidate);
+            exact.value()->cpu().setNativeMemoryJitEnabled(native);
+            candidate.value()->cpu().setNativeMemoryJitEnabled(native);
+            ASSERT_TRUE(installTinyPeriod(*exact.value(), setup));
+            ASSERT_TRUE(installTinyPeriod(*candidate.value(), setup));
+            const auto prefix = candidate.value()->prepareReversibleRamPrefix(8U);
+            ASSERT_TRUE(prefix);
+            ASSERT_EQ(prefix->count, 2U);
+            ASSERT_EQ(prefix->memoized_count, 0U);
+            ASSERT_TRUE(prefix->period_certificate)
+                << "incoming instruction metadata/fetch differs but endpoint replay certifies";
+            EXPECT_EQ(prefix->folded_instructions, 0U);
+            fil::sim::BoardRunOptions options;
+            options.duration_ns = 0U;
+            options.enable_loop_batching = false;
+            options.enable_jit = true;
+            options.max_instructions = cut;
+            const auto expected = exact.value()->run(options);
+            ASSERT_EQ(expected.instructions, cut);
+            const auto committed = candidate.value()->materializeReversibleRamPrefix(*prefix, cut);
+            EXPECT_EQ(committed.cpu_result.cycles, expected.cycles);
+            EXPECT_EQ(committed.elapsed_ns, expected.time_ns);
+            EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.value()->cpu().state(),
+                                               exact.value()->cpu().state()));
+            EXPECT_EQ(prefix->completion_times_ns[cut - 1U], expected.time_ns);
+            if (cut == 2U) {
+                const auto reused = candidate.value()->prepareReversibleRamPrefix(8U);
+                ASSERT_TRUE(reused);
+                EXPECT_GT(reused->memoized_count, 0U);
+                static_cast<void>(candidate.value()->materializeReversibleRamPrefix(
+                    *reused, reused->memoized_count));
+                candidate.value()->cpu().state().instruction_address ^= 2U;
+                const auto strict_miss = candidate.value()->prepareReversibleRamPrefix(8U);
+                ASSERT_TRUE(strict_miss);
+                EXPECT_EQ(strict_miss->memoized_count, 0U)
+                    << "cache admission retains exact instruction-address matching";
+                static_cast<void>(candidate.value()->materializeReversibleRamPrefix(
+                    *strict_miss, strict_miss->count));
+            }
+        }
+    }
+}
+
+TEST(BoardTest, EndpointDiscoveryAdjustsPositiveAndNegativeFirstFetchStall) {
+    const std::array<TinyPeriodSetup, 2> cases{
+        // Entry NOP then B to entry: the observed endpoint fetch is nonsequential.
+        TinyPeriodSetup{{0x00U,0xbfU, 0x00U,0xbfU, 0xfdU,0xe7U}, 2U, 0U, 4U | (1U << 8U)},
+        // BX to entry followed by B back to the BX: endpoint fetch is sequential.
+        TinyPeriodSetup{{0x00U,0x47U, 0xfdU,0xe7U}, 2U, 0U, 4U | (1U << 8U)}
+    };
+    for (std::size_t which = 0U; which < cases.size(); ++which) {
+        const auto& setup = cases[which];
+        auto exact = fil::sim::Board::load(fixtureBoard());
+        auto candidate = fil::sim::Board::load(fixtureBoard());
+        ASSERT_TRUE(exact && candidate);
+        for (auto* board : {exact.value().get(), candidate.value().get()}) {
+            board->cpu().setNativeMemoryJitEnabled(false);
+            const auto base = board->cpu().state().r[15] & ~1U;
+            ASSERT_TRUE(board->memory().write32(0x40022000U, setup.flash_acr));
+            ASSERT_TRUE(board->memory().loadBytes(base, setup.code));
+            board->cpu().state().r[15] = base + (which == 0U ? 0U : 0U);
+            if (which == 1U) board->cpu().state().r[0] = base + 2U + 1U;
+        }
+        if (which == 0U) {
+            // Seed a sequential incoming fetch at entry base+2.
+            for (auto* board : {exact.value().get(), candidate.value().get()}) {
+                fil::sim::BoardRunOptions one;
+                one.duration_ns = 0U; one.max_instructions = 1U;
+                one.enable_loop_batching = false; one.enable_jit = true;
+                ASSERT_EQ(board->run(one).instructions, 1U);
+            }
+        }
+        for (auto* board : {exact.value().get(), candidate.value().get()}) {
+            const std::uint32_t base = (board->cpu().state().r[15] & ~1U)
+                - (which == 0U ? 2U : 0U);
+            board->cpu().state().r[15] = base + 2U;
+            board->cpu().state().instruction_address = 0x76543210U;
+            const auto entry = board->cpu().state();
+            for (const auto offset : {0U, 2U, 4U, 6U}) {
+                board->cpu().state().r[15] = base + offset;
+                for (unsigned i = 0U; i < 70U; ++i)
+                    static_cast<void>(board->cpu().prepareJitBlock());
+            }
+            board->cpu().state() = entry;
+        }
+        const auto prefix = candidate.value()->prepareReversibleRamPrefix(8U);
+        ASSERT_TRUE(prefix) << which;
+        ASSERT_EQ(prefix->count, 2U) << which;
+        ASSERT_EQ(prefix->memoized_count, 0U) << which;
+        ASSERT_TRUE(prefix->period_certificate) << which;
+        const std::uint64_t observed_cycles = prefix->cumulative_cycles[1U];
+        fil::sim::BoardRunOptions options;
+        options.duration_ns = 0U; options.max_instructions = 2U;
+        options.enable_loop_batching = false; options.enable_jit = true;
+        const auto expected = exact.value()->run(options);
+        ASSERT_EQ(expected.instructions, 2U);
+        const auto committed = candidate.value()->materializeReversibleRamPrefix(*prefix, 2U);
+        EXPECT_EQ(committed.cpu_result.cycles, expected.cycles) << which;
+        EXPECT_EQ(committed.elapsed_ns, expected.time_ns - prefix->start_time_ns) << which;
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.value()->cpu().state(),
+            exact.value()->cpu().state())) << which;
+        const auto reused = candidate.value()->prepareReversibleRamPrefix(8U);
+        ASSERT_TRUE(reused) << which;
+        ASSERT_GT(reused->memoized_count, 0U) << which;
+        const std::uint64_t future_period_cycles = reused->period_cycles;
+        if (which == 0U) EXPECT_EQ(future_period_cycles, observed_cycles + 4U);
+        else EXPECT_EQ(future_period_cycles, observed_cycles - 4U);
+        for (std::size_t cut = 1U; cut <= 2U; ++cut) {
+            const auto admission = cut == 1U ? reused
+                : candidate.value()->prepareReversibleRamPrefix(8U);
+            ASSERT_TRUE(admission) << which << " cut=" << cut;
+            ASSERT_GT(admission->memoized_count, 0U) << which << " cut=" << cut;
+            options.max_instructions = cut;
+            const auto exact_start = exact.value()->eventLoop().now();
+            const auto reference = exact.value()->run(options);
+            ASSERT_EQ(reference.instructions, cut);
+            const auto exact_elapsed = exact.value()->eventLoop().now() - exact_start;
+            const auto result = candidate.value()->materializeReversibleRamPrefix(*admission, cut);
+            EXPECT_EQ(result.cpu_result.cycles, reference.cycles) << which << " cut=" << cut;
+            EXPECT_EQ(result.elapsed_ns, exact_elapsed) << which << " cut=" << cut;
+            EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.value()->cpu().state(),
+                exact.value()->cpu().state())) << which << " cut=" << cut;
+        }
+    }
 }
 
 TEST(BoardTest, RamNeutralTransitionTracksUnreadIdempotentStoreDestinations) {
