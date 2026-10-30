@@ -219,6 +219,21 @@ single-board processes reproduce the same total and the same front_driveline
 cost, so the bottleneck is that board's per-instruction execution cost rather
 than parallelism.
 
+Parallelism is already near its floor, so the remaining gap cannot be closed by
+scheduling. The six lanes cost 2.4x more CPU than the same boards run
+separately, and front_driveline alone costs 2.29 s of CPU for one simulated
+second under every scheduler (exact, serial owner slices, and parallel lanes),
+so no parallel arrangement can finish that board faster than ~2.3 s. The
+critical path is the slowest board, not the coordination.
+
+front_driveline's cost is intrinsic to its code: it fires ~259k events per
+simulated second (one per ~181 instructions) and every one of its native
+traces reaches shared or MMIO state, so no trace can be certified as a private
+prefix and ~83% of its instructions take the per-entry fallback instead of a
+certificate. Use `--no-parallel-lanes` to run the same workload on one thread as
+a validation reference; it costs ~6.5 s wall but the same ~6.5 s of CPU as the
+parallel lanes' useful work.
+
 `fil run-network ...` prints per-board JIT diagnostics. For front_driveline the
 reversible block path retires only ~3 instructions per entry because the hot
 loop reaches an MMIO access almost immediately; the remaining attempts decline
