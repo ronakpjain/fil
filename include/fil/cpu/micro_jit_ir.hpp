@@ -40,6 +40,8 @@ enum class MicroOp : std::uint8_t {
     sub_imm,
     cmp_imm,
     cmn_imm,
+    cmp_reg,
+    cmn_reg,
     add_reg,
     sub_reg,
     and_reg,

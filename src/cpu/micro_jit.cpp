@@ -507,7 +507,15 @@ bool emitOp(Emitter& e, const MicroInst& op, std::string& error) {
     case MicroOp::cmn_imm:
         e.addSubImm(1U, 31U, wn, op.imm);
         return true;
-    case MicroOp::add_reg:
+    case MicroOp::cmp_reg:
+        // SUBS XZR, rn, rm: NZCV only, no register writeback.
+        e.addSubReg(3U, 31U, wn, wm);
+        return true;
+    case MicroOp::cmn_reg:
+        // ADDS XZR, rn, rm: NZCV only, no register writeback.
+        e.addSubReg(1U, 31U, wn, wm);
+        return true;
+    case MicroOp::add_reg:        
         e.addSubReg(op.set_flags ? 1U : 0U, wd, wn, wm);
         return true;
     case MicroOp::sub_reg:
@@ -1163,6 +1171,15 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
         endAddSub(e, o, is_sub, 0U, false);
         return true;
     }
+    case MicroOp::cmp_reg:
+    case MicroOp::cmn_reg: {
+        const bool is_sub = op.op == MicroOp::cmp_reg;
+        loadGuest(e, kEax, o, op.rn);
+        beginFlags(e);
+        e.aluRM(is_sub ? 5U : 0U, kEax, kState, guestDisp(o, op.rm));
+        endAddSub(e, o, is_sub, 0U, false);
+        return true;
+    }
     case MicroOp::add_reg:
     case MicroOp::sub_reg: {
         const bool is_sub = op.op == MicroOp::sub_reg;
@@ -1771,6 +1788,7 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
         case MicroOp::movt: reads(op.rd); writes(op.rd); break;
         case MicroOp::add_imm: case MicroOp::sub_imm: reads(op.rn); writes(op.rd); break;
         case MicroOp::cmp_imm: case MicroOp::cmn_imm: reads(op.rn); break;
+        case MicroOp::cmp_reg: case MicroOp::cmn_reg: reads(op.rn); reads(op.rm); break;
         case MicroOp::add_reg: case MicroOp::sub_reg:
         case MicroOp::and_reg: case MicroOp::orr_reg: case MicroOp::eor_reg: case MicroOp::bic_reg:
             reads(op.rn); reads(op.rm); writes(op.rd); break;

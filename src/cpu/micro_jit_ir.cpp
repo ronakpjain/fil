@@ -160,6 +160,18 @@ MicroLowerResult tryLowerMicroInst(const MicroSource& source, MicroInst& out) no
     case InstrKind::cmp:
     case InstrKind::cmn: {
         const bool is_cmp = d.kind == InstrKind::cmp;
+        if (d.form == OperandForm::register_value) {
+            // Register compare/subtract-without-writeback: NZCV from rn +/- rm
+            // with no destination. Mirrors the immediate form's flag contract.
+            if (!registerShape(d) || !coreReg(d.rn) || !coreReg(d.rm) || !d.set_flags) {
+                return {false, MicroLowerReason::bad_shape, "cmp/cmn reg shape"};
+            }
+            inst.op = is_cmp ? MicroOp::cmp_reg : MicroOp::cmn_reg;
+            inst.rn = d.rn;
+            inst.rm = d.rm;
+            out = inst;
+            return {true, MicroLowerReason::ok, {}};
+        }
         if (!immediateShape(d) || !coreReg(d.rn) || !d.set_flags
             || d.immediate_carry_valid || d.immediate_carry) {
             return {false, MicroLowerReason::bad_shape, "cmp/cmn shape"};
@@ -353,6 +365,16 @@ std::size_t interpretMicroOps(std::span<const MicroInst> ops, MicroCpu& cpu, std
         }
         case MicroOp::cmn_imm: {
             AddResult r = addWithCarry(readOp(cpu, op.rn), op.imm, false);
+            applyNzcv(cpu, r);
+            break;
+        }
+        case MicroOp::cmp_reg: {
+            AddResult r = addWithCarry(readOp(cpu, op.rn), ~readOp(cpu, op.rm), true);
+            applyNzcv(cpu, r);
+            break;
+        }
+        case MicroOp::cmn_reg: {
+            AddResult r = addWithCarry(readOp(cpu, op.rn), readOp(cpu, op.rm), false);
             applyNzcv(cpu, r);
             break;
         }
