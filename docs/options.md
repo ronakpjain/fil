@@ -6,9 +6,12 @@ and `make help`.
 
 ## Defaults
 
-Fidelity-preserving speedups are automatic: JIT, proven single-board loop
-batching, and eligible guarded network RAM capsules. Diagnostics retain safe
-fallbacks; no optimization switches are needed. Network loop batching stays off.
+JIT and proven single-board loop batching are automatic. Network commands use
+independent board slices with a **1000 ns cross-board synchronization window**.
+This is a bounded-skew communication model, not exact cross-board instruction
+ordering. ADC, timers, DMA and interrupts still execute locally at full fidelity.
+Instruction tracing, spin detection and the alternative loop scheduler retain
+exact scheduling fallbacks. Network loop batching stays off.
 
 **ADC decimation defaults to 1 (full fidelity).** `--adc-decimation N` accepts
 1–1024; values above 1 trade fidelity for speed by skipping continuous ADC scans
@@ -37,7 +40,13 @@ If both are supplied, the symbol takes precedence.
 
 Network-only controls:
 
-- `--quantum N`: scheduling work cap; default 1024, must be nonzero.
+- `--quantum N`: exact-scheduler work cap; default 1024, must be nonzero.
+- `--cross-board-window-ns N`: independent execution window, default 1000.
+  Shared callbacks run at rendezvous with their logical timestamps preserved;
+  a receiving board observes the effect at its next instruction boundary.
+  Communication delay is bounded by one window plus ordinary in-flight
+  instruction latency. Larger values increase allowed cross-board skew.
+  `0` selects the exact reference scheduler with eligible guarded RAM capsules.
 - `--inject-can BUS[@TIME_MS]:ID:HEXDATA`: repeatable CAN injection; omitted
   time means time zero.
 
@@ -51,7 +60,8 @@ fil serve-network network.json --transport stdio
 ```
 
 Both accept `--duration-ms`, `--max-instructions`, `--quantum`, MMIO controls,
-`--trace-instr`, `--detect-spin`, and `--adc-decimation` from above.
+`--trace-instr`, `--detect-spin`, `--cross-board-window-ns`, and
+`--adc-decimation` from above.
 Duration defaults to unlimited; `0` also means unlimited. The instruction limit
 is 50,000,000 per board **per slice**. Neither accepts `--trace FILE`.
 

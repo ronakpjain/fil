@@ -2,9 +2,12 @@
 
 ## Recommended defaults
 
-Use Release with supported IPO, automatic JIT, eligible guarded network RAM
-capsules, and ADC decimation 1 as the baseline. Plain `run-network` uses its
-validated fast path without enabling flags. Network loop batching is off;
+Use Release with supported IPO, automatic JIT, and ADC decimation 1 as the
+baseline. Plain `run-network` uses independent board slices with a 1000 ns
+cross-board synchronization window. This deliberately relaxes cross-board
+ordering; it does not skip local peripheral work. `--cross-board-window-ns 0`
+selects the exact scheduler with eligible guarded RAM capsules as a reference.
+Network loop batching is off;
 single-board `run` batches proven loops automatically. Diagnostic modes such as
 instruction tracing and spin detection retain safe correctness fallbacks and
 may disable optimized paths. Experimental scheduler implementations remain
@@ -51,7 +54,7 @@ before the device callback runs.
 | Loop batching | Single-board `run` automatically batches proven repeated loops; network commands do not. Unproven paths execute normally; tracing retains instruction-level execution. |
 | Cached JIT handlers | JIT is automatic. Specialized handlers and prepared blocks fall back for unsupported or unsafe operations. |
 | Bespoke stencil JIT | Compiles straight-line integer superblocks (ALU, shifts, conditional branches, terminal calls) directly to host machine code: one stencil per guest op in a bump-allocated arena, with scheduler prefix limits and taken-branch exits reported back to dispatch. A bounded exact-key cache reuses immutable kernels after decoded-block eviction, avoiding repeated emission and executable-memory permission changes. Register transfers are limited to the block's referenced and modified registers, preserving values across partial-prefix exits. Unshifted core-register MOVs are native, including N/Z updates that preserve C/V. Blocks with memory suffixes can use a native pure-integer leading prefix; every memory operation remains in checked handlers. Serves plain, trusted, and budgeted reversible block paths with identical guest state, cycles, and event ordering; unsupported, memory/MMIO, system, and floating-point work retains existing paths. Disabled with `FIL_ENABLE_MICRO_JIT=OFF`. |
-| Guarded native traces | Hot generation-tagged traces stitch supported integer/byte/word-memory operations, register compares, byte/halfword extends and bitfield extracts, direct calls/branches, profiled conditional edges, and narrow PUSH/POP across basic blocks. x86-64 emits stencils; AArch64 retains an allocation-free checked C++ fallback. The trace builder admits these extra integer operations explicitly, so enum placement does not silently exclude them from the supported set. Conditional mismatches exit before the branch retires; predicted POP targets are validated before register/SP commit. Whole-span stack stores retain journal and store-footprint tracking. Every represented instruction executes individually under exact instruction/cycle credit, and retirement metadata comes from the trace plan rather than a basic-block slot. x86-64 retains committed cycles in a callee-saved register and publishes PC, diagnostic address, NZCV and progress once at the selected exit; guest register, LR, SP and RAM effects remain immediate. This requires synchronous RAM-only helpers that do not inspect deferred CPU/progress metadata; new PC/flag-reading operands or observers require materialization first. Plans, profiles, compilation attempts and executable storage are bounded; unsupported forms, changed generations, IT, pending exceptions and custom fetch callbacks keep checked execution. Trace diagnostics count actual native work, including speculative certificate replay, not a speed guarantee. |
+| Guarded native traces | Hot generation-tagged traces stitch supported integer/byte/word-memory operations, register compares, byte/halfword extends and bitfield extracts, direct calls/branches, profiled conditional edges, and narrow PUSH/POP across basic blocks. x86-64 emits stencils; AArch64 retains an allocation-free checked C++ fallback. The trace builder admits these extra integer operations explicitly, so enum placement does not silently exclude them from the supported set. Conditional mismatches exit before the branch retires; predicted POP targets are validated before register/SP commit. Whole-span stack stores retain journal and store-footprint tracking. Repeated PCs can be unrolled up to 64 operations in compact committed execution; the detailed reversible API remains capped at its 16-entry metadata capacity. Timing plans cache the full flash-timing snapshot and entry fetch sequencing, with prefix sums for aggregate retirement. Every represented instruction executes individually under exact instruction/cycle credit, and retirement metadata comes from the trace plan rather than a basic-block slot. x86-64 retains committed cycles in a callee-saved register and publishes PC, diagnostic address, NZCV and progress once at the selected exit; guest register, LR, SP and RAM effects remain immediate. This requires synchronous RAM-only helpers that do not inspect deferred CPU/progress metadata; new PC/flag-reading operands or observers require materialization first. Plans, profiles, compilation attempts and executable storage are bounded; unsupported forms, changed generations, IT, pending exceptions and custom fetch callbacks keep checked execution. Trace diagnostics count actual native work, including speculative certificate replay, not a speed guarantee. |
 | Mixed native RAM prefixes | Eligible reversible integer/word-memory prefixes, including normalized literal loads and read-only SP-relative bases, use emitted x86-64 stencils with precise instruction and cycle limits. Checked helpers retain RAM permissions, access attribution, read footprints and write journaling; declined memory operations remain unretired for exact fallback. Custom timing callbacks keep the existing handler path. SP-relative accesses select architectural MSP/PSP. Repeated first-access native declines at an unchanged address use the checked path; changed addresses retry native execution. AArch64 retains its pure stencil backend and a checked mixed-execution fallback over allocation-free, non-owning operation spans. Native retirement/decline diagnostics report coverage, not a speed guarantee. |
 | Validated network fast path | Plain `run-network` uses compact single-instruction dispatch without loop-proof state. Networks of up to eight boards use a fixed-width timestamp reduction, retaining all tied completions and deterministic board ordering. |
 | Guarded RAM capsules | Reversible private-RAM capsules are automatic on eligible network work. Preliminary safety checks resolve the first journal entry of each touched address with a single generation-stamped address set rather than rescanning the window per mutation, so multi-mutation windows stay linear. Capturing the speculative pass directly into the published evaluation record avoids a second per-instruction metadata copy. Observation barriers, bounded native prefixes, and rollback preserve modeled effects; validate changes against capsules-disabled execution. |
@@ -124,9 +127,39 @@ instruction timing.
 
 ### Scheduling and guarded RAM capsules
 
-Network commands use the compact exact single-instruction scheduler by default; network loop batching remains off. General lockstep bursts require a proven pure fixed-cost multi-instruction frontier; scalar timing predictions alone do not authorize a burst.
+Network commands default to independent owner timelines. Eligible unobserved
+networks execute boards on persistent host workers with private event domains;
+tracing and external event/trace observers retain serial execution. Each owner
+uses validated RAM-period certificates for repeated idle work and checked
+RAM-only native spans otherwise. Certificate misses retain journaled local
+admission, but each admitted span commits in full: there is no cross-board
+snapshot, interruption rollback or replay. Spans stop strictly before owner
+events and SysTick boundaries; MMIO and unsupported instructions use checked
+scalar execution. Owner callbacks preserve their local timestamps and instruction
+completion ordering. Shared callbacks are dispatched separately at window
+rendezvous, before releasing the next board slices. Pending interrupts are
+settled before the next slice's foreground instruction.
 
-Guarded RAM capsules are automatic on eligible network work. Diagnostic safety fallbacks preserve behavior when tracing, spin detection, or other observation-sensitive conditions make capsule execution unsafe. Only journaled, reversible writes to non-executable private RAM are admitted; MMIO, FP/system operations, executable stores, unsupported handlers, and unsafe event boundaries end a span. CAN delivery and board-failure draining are observation barriers. CPU/RAM state must not be inspected or modified while a prefix is active except through scheduled callbacks, which materialize it first. Reentrant or concurrent mutation of a running World is unsupported. Run options are snapshotted per invocation.
+This is intentionally approximate **only across boards**: communication effects
+are visible within one configured window plus the latency of an instruction
+already in flight. The window defaults to 1000 ns. CAN request timestamps are
+captured from the issuing board clock before switching to the shared domain.
+CAN operations are staged per lane with their issuing timestamps, then replayed
+in timestamp/board/local-order with shared events interleaved while workers are
+parked. Shared queue admission and its error/completion feedback occur at this
+rendezvous, not concurrently in workers. Reset/reuse generations reject stale
+TX completions. CAN queue feedback and same-window shared-state interactions
+may differ from exact dispatch; do not compare final PCs or instruction counts
+across timing models as if they were identical. Owner callbacks must not directly inspect or
+mutate another board. Reentrant clock/event dispatch during owner-only runs is
+rejected; scheduling and cancellation from callbacks remain supported.
+
+`--cross-board-window-ns 0` retains the exact reference scheduler. In that
+scheduler, general lockstep bursts require a proven pure fixed-cost
+multi-instruction frontier; scalar timing predictions alone do not authorize
+a burst. Network loop batching remains off.
+
+Guarded RAM capsules are automatic on eligible exact-scheduler network work. Diagnostic safety fallbacks preserve behavior when tracing, spin detection, or other observation-sensitive conditions make capsule execution unsafe. Only journaled, reversible writes to non-executable private RAM are admitted; MMIO, FP/system operations, executable stores, unsupported handlers, and unsafe event boundaries end a span. CAN delivery and board-failure draining are observation barriers. CPU/RAM state must not be inspected or modified while a prefix is active except through scheduled callbacks, which materialize it first. Reentrant or concurrent mutation of a running World is unsupported. Run options are snapshotted per invocation.
 
 Certificate-hit admission retains entry read footprints, memory checkpoints,
 generation validation, and owner-aware event horizons, but skips the speculative
@@ -137,7 +170,9 @@ sampling it again after restoring only CPU/fetch state.
 
 Native kernels keep the scheduler prefix limit and failed-conditional mask in disjoint fields. Requests are clamped to the block length before packing, and each prefix check reads only the limit field. This corrects a regression in which a failed conditional branch could enlarge the limit, execute an unreported suffix, undercharge cycles, and eventually break interrupted replay. Dispatch restores CPU state if a kernel reports an impossible retirement count; it must never retain speculative changes from a declined kernel.
 
-Validation combines emitter and reversible-execution prefix regressions with real-firmware comparisons against capsules-disabled execution, including trace equality and final counters/PCs beyond the former failure point. These comparisons cover the tested workloads and intervals, not all possible firmware. Use `WorldRunOptions::enable_ram_capsules` for API comparisons; CLI comparisons currently require changing the network-command defaults in `src/cli/cli.cpp`. Comparing two capsule-enabled runs alone does not establish equivalence to exact dispatch.
+Validation combines emitter and reversible-execution prefix regressions with real-firmware comparisons against capsules-disabled execution, including trace equality and final counters/PCs beyond the former failure point. These comparisons cover the tested workloads and intervals, not all possible firmware. Use `WorldRunOptions::cross_board_window_ns = 0` and
+`WorldRunOptions::enable_ram_capsules` for exact API comparisons; select exact
+CLI timing with `--cross-board-window-ns 0`. Comparing two capsule-enabled runs alone does not establish equivalence to exact dispatch.
 
 Audited ADC conversions can be owner-local observations: a capsule may span
 another board's conversions while its own conversions still materialize it.

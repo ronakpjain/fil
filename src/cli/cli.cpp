@@ -1097,6 +1097,7 @@ ExitCode runNetworkCommand(
     std::uint64_t duration_ms = 1'000U;
     std::uint64_t max_instructions = 50'000'000U;
     std::uint64_t quantum = 1'024U;
+    sim::SimTimeNs cross_board_window_ns = 1'000U;
     std::optional<std::filesystem::path> trace_path;
     bool strict_mmio = false;
     bool trace_instructions = false;
@@ -1110,7 +1111,8 @@ ExitCode runNetworkCommand(
 
     for (std::size_t index = 2; index < args.size(); ++index) {
         const std::string_view option = args[index];
-        if (option == "--duration-ms" || option == "--max-instructions" || option == "--quantum" || option == "--adc-decimation") {
+        if (option == "--duration-ms" || option == "--max-instructions" || option == "--quantum" || option == "--adc-decimation"
+            || option == "--cross-board-window-ns") {
             const auto value = nextOptionValue(args, index);
             if (!value) {
                 err << "fil: " << option << " requires a value\n";
@@ -1130,6 +1132,7 @@ ExitCode runNetworkCommand(
                 }
                 adc_decimation = static_cast<std::uint32_t>(parsed.value());
             }
+            else if (option == "--cross-board-window-ns") cross_board_window_ns = parsed.value();
             else quantum = parsed.value();
         } else if (option == "--trace" || option == "--inject-can") {
             const auto value = nextOptionValue(args, index);
@@ -1217,6 +1220,7 @@ ExitCode runNetworkCommand(
     options.duration_ns = duration_ms * 1'000'000ULL;
     options.max_instructions_per_board = max_instructions;
     options.instruction_quantum = quantum;
+    options.cross_board_window_ns = cross_board_window_ns;
     options.trace_instructions = trace_instructions;
     options.detect_spin = detect_spin;
     options.enable_loop_batching = enable_loop_batching;
@@ -1240,6 +1244,9 @@ ExitCode runNetworkCommand(
         << "cycles: " << result.value().cycles << '\n'
         << "time_ns: " << result.value().end_time_ns << '\n'
         << "rounds: " << result.value().rounds << '\n'
+        << "parallel_lanes: " << result.value().parallel_lanes << '\n'
+        << "cross_board_window_ns: " << (trace_instructions || detect_spin || enable_loop_batching
+            ? 0U : cross_board_window_ns) << '\n'
         << "dispatches: " << result.value().dispatches << '\n'
         << "exact_dispatches: " << result.value().exact_dispatches << '\n'
         << "loop_batches: " << result.value().loop_batches << '\n'
@@ -1282,6 +1289,8 @@ ExitCode runNetworkCommand(
                 << " admitted_instructions=" << board.memoized_instructions << '\n';
         }
         if (sim::Board* instance = world.value()->board(board.name)) {
+            out << "clock: board=" << board.name << " hz="
+                << instance->peripherals().rcc().systemClockHz() << '\n';
             if (enable_jit) printJitStats(out, instance->cpu(), board.name);
             const auto unknown = instance->peripherals().router().unknownAccesses();
             for (const auto& access : unknown) {
@@ -1335,6 +1344,7 @@ ExitCode networkMonitorCommand(
 
     std::uint64_t max_instructions = 50'000'000U;
     std::uint64_t quantum = 1'024U;
+    sim::SimTimeNs cross_board_window_ns = 1'000U;
     std::optional<std::uint64_t> duration_ns;
     std::uint64_t refresh_ms = 1U;
     std::uint32_t adc_decimation = 1U;
@@ -1352,7 +1362,7 @@ ExitCode networkMonitorCommand(
         const std::string_view option = args[index];
         if (option == "--max-instructions" || option == "--quantum"
             || option == "--duration-ms" || option == "--refresh-ms"
-            || option == "--adc-decimation") {
+            || option == "--adc-decimation" || option == "--cross-board-window-ns") {
             const auto value = nextOptionValue(args, index);
             if (!value) {
                 err << "fil: " << option << " requires a value\n";
@@ -1366,6 +1376,7 @@ ExitCode networkMonitorCommand(
             }
             if (option == "--max-instructions") max_instructions = parsed.value();
             else if (option == "--quantum") quantum = parsed.value();
+            else if (option == "--cross-board-window-ns") cross_board_window_ns = parsed.value();
             else if (option == "--adc-decimation") {
                 if (parsed.value() < 1U || parsed.value() > 1024U) {
                     err << "fil: --adc-decimation requires a factor in [1, 1024]\n";
@@ -1686,6 +1697,7 @@ ExitCode networkMonitorCommand(
         options.duration_ns = duration_ns ? std::min(slice_ns, *duration_ns - elapsed) : slice_ns;
         options.max_instructions_per_board = max_instructions;
         options.instruction_quantum = quantum;
+        options.cross_board_window_ns = cross_board_window_ns;
         options.enable_loop_batching = enable_loop_batching;
         options.enable_jit = enable_jit;
         options.enable_ram_capsules = enable_ram_capsules;
@@ -1949,6 +1961,7 @@ void printHelp(std::ostream& out) {
         << "  --serial ID --openocd PATH --timeout-ms N --artifacts DIRECTORY\n\n"
         << "Network options:\n"
         << "  --duration-ms N --max-instructions N --quantum N --trace FILE\n"
+        << "  --cross-board-window-ns N (network commands: default 1000; 0 = exact)\n"
         << "  --strict-mmio --trace-instr --detect-spin --allow-breakpoint\n"
         << "  --adc-decimation N (keep 1 of N continuous ADC scans)\n"
         << "  --inject-can BUS[@TIME_MS]:ID:HEXDATA\n\n"

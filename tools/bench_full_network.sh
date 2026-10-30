@@ -16,6 +16,7 @@ Options:
   --reference-binary PATH   matched baseline executable; runs alternate order
   --duration-ms N           simulated duration per measurement (default: 5000)
   --reps N                  repetitions per executable (default: 3)
+  --cross-board-window-ns N  cross-board skew window (default: 1000; 0 = exact)
   --min-throughput X        required realtime ratio (default: above 1.0)
   -h, --help                show this help
 EOF
@@ -45,12 +46,13 @@ binary="$ROOT_DIR/build-pgo/fil"
 reference_binary=
 duration_ms=5000
 reps=3
+cross_board_window_ns=1000
 min_throughput=
 threshold_requested=0
 
 while (($#)); do
     case $1 in
-        --binary|--reference-binary|--duration-ms|--reps|--min-throughput)
+        --binary|--reference-binary|--duration-ms|--reps|--min-throughput|--cross-board-window-ns)
             (($# >= 2)) || fail "$1 requires a value"
             option=$1
             value=$2
@@ -63,6 +65,9 @@ while (($#)); do
                     duration_ms=$((10#$value))
                     ;;
                 --min-throughput) min_throughput=$value; threshold_requested=1 ;;
+                --cross-board-window-ns)
+                    [[ $value =~ ^[0-9]+$ ]] || fail '--cross-board-window-ns must be a nonnegative integer'
+                    cross_board_window_ns=$value ;;
                 --reps)
                     positive_integer "$value" || fail '--reps must be a positive integer'
                     reps=$((10#$value))
@@ -131,7 +136,7 @@ run_network() {
     command=("$executable" run-network "$NETWORK"
         --duration-ms "$duration"
         --max-instructions "$((duration * 1000000))" --quantum 1024
-        --strict-mmio --adc-decimation 1)
+        --strict-mmio --adc-decimation 1 --cross-board-window-ns "$cross_board_window_ns")
 
     TIMEFORMAT='%6R'
     if (cd "$ROOT_DIR" && { time "${command[@]}" </dev/null > "$stdout_file" 2> "$stderr_file"; }) 2> "$timing_file"; then
@@ -167,6 +172,11 @@ run_network() {
                     key == "instructions" || key == "cycles" || key == "event_callbacks")
                     summary[key] = value
             }
+            if ($0 ~ /^clock: board=[^ ]+ hz=[0-9]+$/) {
+                name = $2; sub(/^board=/, "", name)
+                hz = $3; sub(/^hz=/, "", hz)
+                printf "C|%s|%s\n", name, hz
+            }
             if ($0 ~ /^board .+: stop=[a-z-]+ instructions=[0-9]+ pc=0x[0-9a-fA-F]+$/) {
                 line = $0
                 sub(/^board /, "", line)
@@ -191,6 +201,7 @@ run_network() {
 
     if ! awk -F'|' -v duration="$duration" '
         $1 == "S" { summary[$2] = $3 }
+        $1 == "C" { clocks[$2] = $3; clock_count++ }
         $1 == "B" {
             name = $2
             if (name in board_stop) {
@@ -228,7 +239,15 @@ run_network() {
                 print "expected six board results, got " board_count
                 invalid = 1
             }
+            if (clock_count != 6) {
+                print "expected six board clock reports, got " clock_count
+                invalid = 1
+            }
             for (name in board_stop) {
+                if (clocks[name] != "170000000") {
+                    print "board " name " is not running at 170 MHz: " clocks[name]
+                    invalid = 1
+                }
                 if (board_stop[name] != "time-budget") {
                     print "board " name " did not reach the time budget: " board_stop[name]
                     invalid = 1
@@ -256,6 +275,7 @@ run_network() {
     RUN_NORMALIZED=$normalized_file
     RUN_TIME_NS=$(awk -F'|' '$1 == "S" && $2 == "time_ns" { print $3 }' "$normalized_file")
     RUN_INSTRUCTIONS=$(awk -F'|' '$1 == "S" && $2 == "instructions" { print $3 }' "$normalized_file")
+    RUN_CYCLES=$(awk -F'|' '$1 == "S" && $2 == "cycles" { print $3 }' "$normalized_file")
     RUN_WALL=$wall
 }
 
@@ -264,8 +284,8 @@ print_measurement() {
     local simulated wall_display
     simulated=$(awk -v ns="$RUN_TIME_NS" 'BEGIN { printf "%.9f", ns / 1000000000 }')
     wall_display=$(awk -v wall="$RUN_WALL" 'BEGIN { printf "%.3f", wall }')
-    printf 'Run %s (%s): wall=%ss simulated=%ss instructions=%s\n' \
-        "$number" "$label" "$wall_display" "$simulated" "$RUN_INSTRUCTIONS"
+    printf 'Run %s (%s): wall=%ss simulated=%ss instructions=%s cycles=%s\n' \
+        "$number" "$label" "$wall_display" "$simulated" "$RUN_INSTRUCTIONS" "$RUN_CYCLES"
 }
 
 candidate_times=()
