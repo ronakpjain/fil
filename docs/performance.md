@@ -17,8 +17,8 @@ see the [README](../README.md) and `make help` for building.
 ## Event-loop overhead
 
 Relative scheduling and relative clock advancement avoid redundant recursive
-mutex acquisitions. During a serial `World::run`, an exclusive event-loop lease
-holds the recursive mutex once; same-thread operations on that loop skip
+mutex acquisitions. During a serial `World::run` or a standalone `Board::run`, an exclusive
+event-loop lease holds the recursive mutex once; same-thread operations on that loop skip
 relocking. Nested callbacks retain deterministic ordering, and mutex-protected
 operations on other threads wait until the run returns. Outside a lease, those
 operations retain ordinary locking. Owner-context scopes remain serial-only;

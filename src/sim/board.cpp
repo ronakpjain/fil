@@ -1823,6 +1823,11 @@ BoardRunResult Board::cpuFailure(const cpu::RunResult& result) const {
 }
 
 BoardRunResult Board::run(const BoardRunOptions& options) {
+    // A standalone run owns the board and its event loop until it returns.
+    // Hold one exclusive lease so every per-instruction clock/event query
+    // avoids re-locking; other threads still block until the run finishes.
+    const auto exclusive_execution = event_loop_->useExclusiveExecution();
+    static_cast<void>(exclusive_execution);
     BoardRunResult aggregate;
     aggregate.reason = BoardStopReason::instruction_budget;
     std::optional<std::uint32_t> proven_spin_pc;

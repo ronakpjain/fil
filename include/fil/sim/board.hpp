@@ -237,7 +237,13 @@ public:
     /** @brief Rebuilds reset memory and resets CPU/system/peripheral state. */
     [[nodiscard]] Result<void> reset();
 
-    /** @brief Runs until a configured boundary or architectural failure. */
+    /**
+     * @brief Runs until a configured boundary or architectural failure.
+     *
+     * Holds the event loop's exclusive lease until return. Mutex-protected
+     * event-loop operations on other threads wait for the run to finish;
+     * concurrent or reentrant board mutation is unsupported.
+     */
     [[nodiscard]] BoardRunResult run(const BoardRunOptions& options);
 
     /**
