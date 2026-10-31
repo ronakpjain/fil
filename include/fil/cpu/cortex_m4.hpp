@@ -662,6 +662,26 @@ private:
         std::array<std::uint32_t, NativeTracePlan::max_ops> charges{};
         std::array<std::uint32_t, NativeTracePlan::max_ops + 1U> charged_prefix{};
         std::array<std::uint32_t, NativeTracePlan::max_ops + 1U> execution_prefix{};
+        /// Retarget to another entry PC without clearing the charge and prefix
+        /// arrays: they are read only while their validity flags are set, so a
+        /// whole-object clear would write ~1.6 KB per retargeted slot.
+        void retarget(
+            const std::uint32_t entry_pc, const std::uint64_t entry_generation
+        ) noexcept {
+            plan.reset();
+            generation = entry_generation;
+            pc = entry_pc;
+            declined_address = 0U;
+            hot = 0U;
+            attempts = 0U;
+            detailed_prefix_count = 0U;
+            first_declined = false;
+            decline_streak = 0U;
+            charges_valid = false;
+            charges_valid_prefix_count = 0U;
+            charges_first_sequential = false;
+            charges_timing = {};
+        }
     };
     struct NativeBranchProfile {
         std::uint64_t generation{0U};

@@ -1873,11 +1873,7 @@ std::optional<FastStepResult> CortexM4::tryStepNativeTrace(
         || state_.pending_exception || state_.pending_exc_return) return std::nullopt;
     auto& entry = native_traces_[jitBlockIndex(pc) & (native_trace_entries - 1U)];
     const auto generation = memory_.executionGeneration();
-    if (entry.pc != pc || entry.generation != generation) {
-        entry = {};
-        entry.pc = pc;
-        entry.generation = generation;
-    }
+    if (entry.pc != pc || entry.generation != generation) entry.retarget(pc, generation);
     if (!entry.plan) {
         if (entry.attempts >= 4U || ++entry.hot < 64U) return std::nullopt;
         entry.hot = 0U;

@@ -21,7 +21,9 @@ NativeStackResult nativeStackTransfer(NativeExecutionContext* c, std::uint32_t p
         if (old_sp < bytes || static_cast<std::uint64_t>(start) + bytes > (std::uint64_t{1} << 32U)
             || !c->memory_bus->isReversibleRamTarget(start)
             || !c->memory_bus->containsWritableRamRange(start, bytes)) return NativeStackResult::memory_declined;
-        std::array<std::uint32_t, 16> values{};
+        // Only the first `count` entries are written and read; clearing all
+        // sixteen would cost a 64-byte store per transferred stack frame.
+        std::array<std::uint32_t, 16> values;
         std::uint32_t n = 0;
         for (std::uint32_t r = 0; r < 16; ++r) if (mask & (1U << r)) values[n++] = s.readRegister(static_cast<std::uint8_t>(r));
         if (!c->memory_bus->tryFastWriteWords(start, count, values.data(), {mem::AccessType::data_write, pc}))
@@ -30,7 +32,7 @@ NativeStackResult nativeStackTransfer(NativeExecutionContext* c, std::uint32_t p
         return NativeStackResult::success;
     }
     const auto footprint = c->memory_bus->readFootprint();
-    std::array<std::uint32_t, 16> values{};
+    std::array<std::uint32_t, 16> values;
     if (!c->memory_bus->tryFastReadWords(start, count, values.data(), {mem::AccessType::data_read, pc}))
         return NativeStackResult::memory_declined;
     std::uint32_t n = 0;
