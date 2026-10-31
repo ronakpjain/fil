@@ -298,7 +298,14 @@ stencil kernel past its profitability gate, and certificate-cache slot changes.
 A real improvement requires a mechanism that can continue past an MMIO access
 while keeping instruction and cycle totals bit-identical, or a return-stitching
 strategy for call-dense code; both need differential tests over exact totals
-rather than the six-board aggregate.
+rather than the six-board aggregate. Native trace return stitching is narrowly
+limited to the canonical 16-bit `BX LR` encoding. It may follow a previously
+observed Thumb return target only when that target's execution-generation
+profile matches; generated and portable execution re-check LR at runtime and
+decline before retiring BX on target mismatch, a non-Thumb LR, or an
+exception-return token. This does not admit arbitrary `BX Rm` or claim a
+measured speedup. Per-instruction execution/fetch cycle admission remains
+unchanged.
 
 ## Validation
 

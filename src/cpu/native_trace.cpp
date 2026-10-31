@@ -57,8 +57,9 @@ bool buildNativeTrace(std::span<const NativeTraceOp> sources, NativeTracePlan& o
             if (!result.ok) { error = "native-trace: " + result.detail; return false; }
         }
         const auto op = lowered.integer.op;
-        const bool branch = lowered.kind == NativeOp::integer
-            && (op == MicroOp::b || op == MicroOp::b_cond || op == MicroOp::bl);
+        const bool bx_lr = lowered.kind == NativeOp::bx_lr;
+        const bool branch = bx_lr || (lowered.kind == NativeOp::integer
+            && (op == MicroOp::b || op == MicroOp::b_cond || op == MicroOp::bl));
         // Extend and bitfield-extract sit after the contiguous shift/branch
         // range in the enum but are fully emitted; admit them explicitly.
         const bool extra_integer = lowered.kind == NativeOp::integer
@@ -70,7 +71,16 @@ bool buildNativeTrace(std::span<const NativeTraceOp> sources, NativeTracePlan& o
         const std::uint32_t sequential = src.pc + src.size;
         const std::uint32_t target = static_cast<std::uint32_t>(
             static_cast<std::int64_t>(src.pc) + 4 + lowered.integer.branch_offset) & ~1U;
-        if (op == MicroOp::bl) {
+        if (bx_lr) {
+            const auto canonical = src.size == 2U ? decode16(static_cast<std::uint16_t>(src.raw))
+                                                   : std::optional<DecodedInstruction>{};
+            if (!canonical || canonical->kind != InstrKind::bx || canonical->rm != 14U
+                || !src.expected_taken || (src.expected_next_pc & 1U) != 0U
+                || (src.expected_next_pc & 0xfffffff0U) == 0xfffffff0U) {
+                error = "native-trace: invalid BX LR edge";
+                return false;
+            }
+        } else if (op == MicroOp::bl) {
             // Direct BL is permitted, and always takes its direct target.
             if (src.expected_next_pc != target || !src.expected_taken) {
                 error = "native-trace: BL edge mismatch";

@@ -385,6 +385,103 @@ TEST(NativeJitTest, TraceValidationRejectsBadEdgesAndOverlongWithoutMutatingOutp
     ASSERT_EQ(plan.ops.size(), 1U); EXPECT_EQ(plan.ops.front().pc, old_pc);
 }
 
+TEST(NativeJitTest, BxLrIsTraceOnlyAndRequiresCanonicalOperands) {
+    const auto bx = decode16(0x4770U); ASSERT_TRUE(bx);
+    NativeInst lowered;
+    ASSERT_TRUE(tryLowerNativeInst({*bx, 0x08014d00U, 2U}, lowered).ok);
+    EXPECT_EQ(lowered.kind, NativeOp::bx_lr);
+    auto malformed = *bx; malformed.condition = Condition::eq;
+    EXPECT_FALSE(tryLowerNativeInst({malformed, 0x08014d00U, 2U}, lowered).ok);
+    malformed = *bx; malformed.rn = 1U;
+    EXPECT_FALSE(tryLowerNativeInst({malformed, 0x08014d00U, 2U}, lowered).ok);
+    NativeBlock block;
+    const std::array<MicroSource, 1> block_source{{{*bx, 0x08014d00U, 2U}}};
+    EXPECT_FALSE(buildNativeBlock(block_source, block).ok);
+    block.entry_pc = 0x08014d00U; block.ops.push_back(lowered);
+    std::string compile_error;
+    auto jit = MicroJit::create(compile_error); ASSERT_TRUE(jit);
+    EXPECT_EQ(jit->compileNative(block, compile_error), nullptr);
+
+    NativeTraceOp op{}; op.decoded = *bx; op.raw = 0x4770U; op.pc = 0x08014d00U;
+    op.size = 2U; op.execution_cycles = 3U; op.expected_taken = true;
+    NativeTracePlan plan; std::string error;
+    for (const auto target : {0xfffffff0U, 0xfffffff2U, 0xfffffff4U, 0xfffffff6U,
+                              0xfffffff8U, 0xfffffffaU, 0xfffffffcU, 0xfffffffeU}) {
+        op.expected_next_pc = target;
+        EXPECT_FALSE(buildNativeTrace({&op, 1U}, plan, error)) << std::hex << target;
+    }
+}
+
+TEST(NativeJitTest, EmittedCallBxLrChainMatchesPortableAtEveryCut) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
+    constexpr std::uint32_t pc = 0x08014e00U;
+    DecodedInstruction bl{}; bl.kind = InstrKind::bl; bl.condition = Condition::al;
+    bl.form = OperandForm::immediate; bl.is_32bit = true; bl.branch_offset = 2;
+    bl.raw = 0xf000f800U;
+    const auto bx = decode16(0x4770U); ASSERT_TRUE(bx);
+    std::array<NativeTraceOp, 2> ops{};
+    ops[0].decoded = bl; ops[0].raw = bl.raw; ops[0].pc = pc;
+    ops[0].size = 4U; ops[0].execution_cycles = 3U;
+    ops[0].expected_taken = true; ops[0].expected_next_pc = pc + 6U;
+    ops[1].decoded = *bx; ops[1].raw = bx->raw; ops[1].pc = pc + 6U;
+    ops[1].size = 2U; ops[1].execution_cycles = 3U;
+    ops[1].expected_taken = true; ops[1].expected_next_pc = pc + 4U;
+    NativeTracePlan plan; std::string error;
+    ASSERT_TRUE(buildNativeTrace(ops, plan, error)) << error;
+    auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    const auto fn = jit->compileNativeTrace(plan, error); ASSERT_NE(fn, nullptr) << error;
+    const std::array<std::uint32_t, 2> costs{3U, 3U};
+    for (std::uint32_t limit = 0U; limit <= 2U; ++limit)
+    for (std::uint64_t credit = 0U; credit <= 6U; ++credit) {
+        CpuState actual; actual.r[15] = pc;
+        CpuState expected = actual;
+        fil::mem::MemoryBus memory, oracle;
+        NativeExecutionContext a{&actual, &memory, limit, credit};
+        NativeExecutionContext e{&expected, &oracle, limit, credit};
+        a.charged_cycles = e.charged_cycles = costs.data();
+        a.charged_cycles_count = e.charged_cycles_count = costs.size();
+        interpretNativeTrace(plan, e); fn(&a);
+        EXPECT_EQ(a.retired_count, e.retired_count) << limit << "," << credit;
+        EXPECT_EQ(a.retired_cycles, e.retired_cycles) << limit << "," << credit;
+        EXPECT_EQ(a.exit_reason, e.exit_reason) << limit << "," << credit;
+        EXPECT_TRUE(bitwiseEqual(actual, expected)) << limit << "," << credit;
+        if (limit == 2U && credit == 6U) {
+            EXPECT_EQ(a.retired_count, 2U); EXPECT_EQ(actual.r[15], pc + 4U);
+        }
+    }
+}
+
+TEST(NativeJitTest, EmittedBxLrReturnIsGuardedBeforeRetirement) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
+    constexpr std::uint32_t pc = 0x08014f00U, target = pc + 0x40U;
+    const auto bx = decode16(0x4770U); ASSERT_TRUE(bx);
+    NativeTraceOp op{}; op.decoded = *bx; op.raw = 0x4770U; op.pc = pc;
+    op.size = 2U; op.execution_cycles = 3U; op.expected_taken = true;
+    op.expected_next_pc = target;
+    NativeTracePlan plan; std::string error;
+    ASSERT_TRUE(buildNativeTrace({&op, 1U}, plan, error)) << error;
+    auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    const auto fn = jit->compileNativeTrace(plan, error); ASSERT_NE(fn, nullptr) << error;
+    const std::array<std::uint32_t, 1> cost{3U};
+    for (const auto lr : {target | 1U, target, 0xfffffff1U, target + 3U}) {
+        CpuState actual; actual.r[14] = lr; actual.r[15] = pc;
+        CpuState expected = actual;
+        fil::mem::MemoryBus memory, oracle;
+        NativeExecutionContext a{&actual, &memory, 1U, 3U};
+        NativeExecutionContext e{&expected, &oracle, 1U, 3U};
+        a.charged_cycles = e.charged_cycles = cost.data();
+        a.charged_cycles_count = e.charged_cycles_count = 1U;
+        interpretNativeTrace(plan, e); fn(&a);
+        EXPECT_EQ(a.retired_count, e.retired_count);
+        EXPECT_EQ(a.retired_cycles, e.retired_cycles);
+        EXPECT_EQ(a.exit_reason, e.exit_reason);
+        EXPECT_EQ(a.failing_instruction_pc, e.failing_instruction_pc);
+        EXPECT_TRUE(bitwiseEqual(actual, expected));
+        if (lr == (target | 1U)) EXPECT_EQ(a.retired_count, 1U);
+        else { EXPECT_EQ(a.retired_count, 0U); EXPECT_EQ(a.exit_reason, NativeExitReason::branch_mismatch); }
+    }
+}
+
 TEST(NativeJitTest, EmittedStackReturnTraceMatchesPortableFallbackAtEveryBoundary) {
     if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
     constexpr std::uint32_t pc = 0x08015000U, ram = 0x20000000U;

@@ -1763,10 +1763,12 @@ bool CortexM4::prepareNativeTrace(NativeTraceCacheEntry& entry) {
         if (!stack && !tryLowerNativeInst({*decoded, pc, size}, lowered).ok) break;
         const bool return_pop = decoded->kind == InstrKind::pop
             && (decoded->register_list & (std::uint16_t{1U} << 15U)) != 0U;
-        const bool branch = decoded->kind == InstrKind::b || decoded->kind == InstrKind::bl || return_pop;
+        const bool return_bx_lr = lowered.kind == NativeOp::bx_lr;
+        const bool branch = decoded->kind == InstrKind::b || decoded->kind == InstrKind::bl
+            || return_pop || return_bx_lr;
         bool taken = branch;
         std::uint32_t return_target = 0U;
-        if (return_pop) {
+        if (return_pop || return_bx_lr) {
             const auto& profile = native_branches_[jitBlockIndex(pc) & (native_branch_entries - 1U)];
             if (!profile.valid || profile.pc != pc || profile.generation != entry.generation) break;
             return_target = profile.target;
@@ -1785,14 +1787,15 @@ bool CortexM4::prepareNativeTrace(NativeTraceCacheEntry& entry) {
         op.size = size;
         op.expected_taken = taken;
         const auto sequential = pc + size;
-        op.expected_next_pc = return_pop ? return_target : taken ? static_cast<std::uint32_t>(
+        op.expected_next_pc = (return_pop || return_bx_lr) ? return_target : taken ? static_cast<std::uint32_t>(
             static_cast<std::int64_t>(pc) + 4 + decoded->branch_offset) & ~std::uint32_t{1U}
             : sequential;
         op.execution_cycles = branch && !taken ? 1U : basePipelineCycles(*decoded);
         if (branch && taken && op.expected_next_pc != sequential)
             op.execution_cycles = static_cast<std::uint16_t>(
                 op.execution_cycles + takenBranchPenalty(decoded->kind));
-        has_memory_or_branch |= branch || stack || lowered.kind != NativeOp::integer;
+        has_memory_or_branch |= branch || stack
+            || (lowered.kind != NativeOp::integer && lowered.kind != NativeOp::bx_lr);
         sources.push_back(op);
         pc = op.expected_next_pc;
     }
@@ -2482,8 +2485,12 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
         if (compact) state_.instruction_address = pc;
         if (native_memory_jit_enabled_ && op.kind == InstrKind::b && op.condition != Condition::al)
             observeNativeTraceBranch(pc, condition_passed);
-        if (native_memory_jit_enabled_ && condition_passed && op.kind == InstrKind::pop
-            && (op.register_list & (std::uint16_t{1U} << 15U)) != 0U
+        const bool returned_from_pop_pc = op.kind == InstrKind::pop
+            && (op.register_list & (std::uint16_t{1U} << 15U)) != 0U;
+        const bool returned_from_bx_lr = op.kind == InstrKind::bx && op.rm == 14U
+            && (state_.r[14] & 1U) != 0U;
+        if (native_memory_jit_enabled_ && condition_passed
+            && (returned_from_pop_pc || returned_from_bx_lr)
             && !state_.pending_exc_return && !state_.pending_exception)
             observeNativeTraceReturn(pc, state_.r[15]);
         if (condition_passed && state_.r[15] != pc + size) {

@@ -502,6 +502,86 @@ TEST(JitTest, ReversibleFinalMetadataMatchesEveryRetiredPrefixAndMemoryDecline) 
     }
 }
 
+TEST(JitTest, WarmedNativeTraceStitchesRealBlBxLrAndMatchesCheckedCuts) {
+    if (!fil::cpu::MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
+    // BL targets the BX LR at +12; return continues at +4 and runs successors.
+    const auto words = halfwords({0xf000U, 0xf804U, 0xbf00U, 0xbf00U, 0xbf00U,
+        0xbf00U, 0x4770U, 0xbf00U, 0xbf00U, 0xbf00U, 0xbf00U, 0xbf00U});
+    auto bus = basicBus(), oracle = basicBus();
+    ASSERT_TRUE(bus.loadBytes(flash_base, words));
+    ASSERT_TRUE(oracle.loadBytes(flash_base, words));
+    bus.setReversibleRamOnly(true); bus.setAllMmioTrapping(true);
+    oracle.setReversibleRamOnly(true); oracle.setAllMmioTrapping(true);
+    fil::cpu::CortexM4 candidate(bus), checked(oracle);
+    prepare(candidate); prepare(checked); checked.setNativeMemoryJitEnabled(false);
+    // Repeatedly execute through the checked/native block path until the real
+    // BL and BX have been observed and the trace is actually entered.
+    candidate.state().r[15] = flash_base;
+    candidate.state().r[14] = 0U;
+    for (unsigned i = 0U; i < 4000U && candidate.jitStats().trace_instructions == 0U; ++i) {
+        if (candidate.state().r[15] >= flash_base + 24U) {
+            candidate.state().r[15] = flash_base;
+            candidate.state().r[14] = 0U;
+        }
+        fil::cpu::CortexM4::ReversibleCycleBudget warm; warm.remaining_cycles = 1000U;
+        if (!candidate.tryStepBudgetedReversibleJitBlock(64U, warm))
+            ASSERT_EQ(candidate.stepFast().reason, fil::cpu::StopReason::step_complete);
+    }
+    ASSERT_GT(candidate.jitStats().trace_executions, 0U)
+        << "trace compilations=" << candidate.jitStats().trace_compilations
+        << " state pc=" << std::hex << candidate.state().r[15]
+        << " bx profile was not observed or trace preparation declined";
+    ASSERT_GE(candidate.jitStats().trace_compiled_instructions, 8U);
+
+    fil::cpu::CpuState initial; initial.r[15] = flash_base;
+    initial.instruction_address = flash_base + 64U;
+    const auto trace_before = candidate.jitStats().trace_instructions;
+    bool observed_trace = false;
+    for (std::size_t limit = 1U; limit <= 8U; ++limit)
+    for (std::uint32_t credit = 0U; credit <= 20U; ++credit) {
+        candidate.state() = checked.state() = initial;
+        fil::cpu::CortexM4::ReversibleCycleBudget actual_budget;
+        actual_budget.remaining_cycles = credit;
+        actual_budget.fetch_timing = {flash_base, flash_base + 64U,
+            flash_base + 64U, flash_base + 128U, 3U, 1U};
+        auto expected_budget = actual_budget;
+        const auto actual = candidate.tryStepBudgetedReversibleJitBlock(limit, actual_budget);
+        if (!actual) {
+            EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.state(), checked.state()));
+            continue;
+        }
+        observed_trace |= candidate.jitStats().trace_instructions > trace_before;
+        std::size_t expected_count = 0U;
+        std::uint32_t expected_execution_cycles = 0U;
+        for (std::size_t i = 0U; i < actual->execution.count; ++i) {
+            const auto pc = checked.state().r[15];
+            const auto stall = expected_budget.fetchStallCycles(pc,
+                expected_budget.have_fetch && pc == expected_budget.fetch_end);
+            const auto expected = checked.stepFast();
+            ASSERT_EQ(expected.reason, fil::cpu::StopReason::step_complete);
+            const auto charged = static_cast<std::uint32_t>(expected.cycles) + stall;
+            ASSERT_LE(charged, expected_budget.remaining_cycles);
+            expected_budget.remaining_cycles -= charged;
+            expected_budget.have_fetch = true;
+            expected_budget.fetch_end = pc + expected.instruction_size;
+            ++expected_count;
+            expected_execution_cycles += expected.cycles;
+            EXPECT_EQ(actual->execution.pcs[i], expected.instruction_address);
+            EXPECT_EQ(actual->execution.sizes[i], expected.instruction_size);
+            EXPECT_EQ(actual->instruction_cycles[i], expected.cycles);
+            EXPECT_EQ(actual_budget.total_instruction_cycles[i], charged);
+        }
+        EXPECT_EQ(actual->execution.count, expected_count);
+        EXPECT_EQ(actual->execution.result.instructions, expected_count);
+        EXPECT_EQ(actual->execution.result.cycles, expected_execution_cycles);
+        EXPECT_EQ(actual_budget.remaining_cycles, expected_budget.remaining_cycles);
+        EXPECT_EQ(actual_budget.have_fetch, expected_budget.have_fetch);
+        EXPECT_EQ(actual_budget.fetch_end, expected_budget.fetch_end);
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.state(), checked.state()));
+    }
+    EXPECT_TRUE(observed_trace);
+}
+
 TEST(JitTest, NativeTraceMatchesCheckedPrefixesBudgetsAndChangedBranchInputs) {
     if (!fil::cpu::MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
     const auto code = halfwords({0xbf00U, 0x6008U, 0x680aU, 0x3202U, 0x2a03U,

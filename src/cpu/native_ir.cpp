@@ -1,4 +1,5 @@
 #include "fil/cpu/native_ir.hpp"
+#include "fil/cpu/decoder.hpp"
 
 #include <utility>
 
@@ -9,6 +10,27 @@ MicroLowerResult tryLowerNativeInst(const MicroSource& source, NativeInst& out) 
     inst.pc = source.pc;
     inst.size = source.size;
     const auto& d = source.decoded;
+    if (d.kind == InstrKind::bx && source.size == 2U && (source.pc & 1U) == 0U) {
+        const auto canonical = decode16(static_cast<std::uint16_t>(d.raw));
+        if (canonical && canonical->kind == InstrKind::bx && canonical->rm == 14U
+            && d.raw == 0x4770U && d.condition == Condition::al
+            && d.form == OperandForm::register_value && d.rm == canonical->rm
+            && d.rd == canonical->rd && d.rn == canonical->rn && d.ra == canonical->ra
+            && d.imm == canonical->imm && d.branch_offset == canonical->branch_offset
+            && d.register_list == canonical->register_list && d.shift_type == canonical->shift_type
+            && d.shift_amount == canonical->shift_amount && d.set_flags == canonical->set_flags
+            && d.index == canonical->index && d.add == canonical->add
+            && d.writeback == canonical->writeback
+            && d.immediate_carry_valid == canonical->immediate_carry_valid
+            && d.immediate_carry == canonical->immediate_carry
+            && d.fp_double == canonical->fp_double && d.is_32bit == canonical->is_32bit
+            && d.raw == canonical->raw) {
+            inst.kind = NativeOp::bx_lr;
+            out = inst;
+            return {true, MicroLowerReason::ok, {}};
+        }
+        return {false, MicroLowerReason::bad_shape, "BX lowering requires canonical BX LR"};
+    }
     const bool is_load = d.kind == InstrKind::ldr || d.kind == InstrKind::ldrb
         || d.kind == InstrKind::ldrh || d.kind == InstrKind::ldrsb
         || d.kind == InstrKind::ldrsh;
@@ -79,6 +101,8 @@ MicroLowerResult buildNativeBlock(std::span<const MicroSource> sources, NativeBl
         NativeInst inst;
         const auto result = tryLowerNativeInst(sources[i], inst);
         if (!result.ok) return result;
+        if (inst.kind == NativeOp::bx_lr)
+            return {false, MicroLowerReason::unsupported_kind, "BX LR is trace-only"};
         const bool terminal = inst.kind == NativeOp::integer
             && (inst.integer.op == MicroOp::b || inst.integer.op == MicroOp::bl
                 || inst.integer.op == MicroOp::b_cond || inst.integer.op == MicroOp::cbz

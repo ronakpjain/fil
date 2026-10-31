@@ -18,6 +18,8 @@ enum class NativeOp : std::uint8_t {
     store_half,
     load_byte_signed,
     load_half_signed,
+    /** Canonical Thumb BX LR only; runtime target is guarded before retirement. */
+    bx_lr,
 };
 
 struct NativeInst {
@@ -34,7 +36,7 @@ struct NativeInst {
 
 /** @brief True for any native memory operation. */
 [[nodiscard]] constexpr bool nativeOpIsMemory(NativeOp op) noexcept {
-    return op != NativeOp::integer;
+    return op != NativeOp::integer && op != NativeOp::bx_lr;
 }
 /** @brief True for native load operations (any width/sign). */
 [[nodiscard]] constexpr bool nativeOpIsLoad(NativeOp op) noexcept {

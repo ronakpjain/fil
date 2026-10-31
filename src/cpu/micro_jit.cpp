@@ -1692,10 +1692,14 @@ namespace {
         const auto cycles = ctx->charged_cycles[i];
         const auto& inst = op.native.integer;
         const bool is_cond = inst.op == MicroOp::b_cond;
-        const bool taken = inst.op == MicroOp::b || inst.op == MicroOp::bl
+        const bool bx_lr = op.native.kind == NativeOp::bx_lr;
+        const bool taken = bx_lr || inst.op == MicroOp::b || inst.op == MicroOp::bl
             || (is_cond && conditionPasses(inst.condition, state.xpsr));
-        if ((inst.op == MicroOp::b || is_cond || inst.op == MicroOp::bl)
-            && taken != op.expected_taken) {
+        if (((inst.op == MicroOp::b || is_cond || inst.op == MicroOp::bl)
+             && taken != op.expected_taken)
+            || (bx_lr && ((state.r[14] & 1U) == 0U
+                || state.r[14] != (op.expected_next_pc | 1U)
+                || (state.r[14] & 0xfffffff0U) == 0xfffffff0U))) {
             ctx->failing_instruction_pc = op.pc;
             ctx->exit_reason = NativeExitReason::branch_mismatch;
             break;
@@ -1742,7 +1746,10 @@ namespace {
                 state.r[memop.rd] = loaded;
             }
         }
-        if (inst.op == MicroOp::b || is_cond || inst.op == MicroOp::bl) {
+        if (bx_lr) {
+            // The target guard above ensures a Thumb return and excludes the
+            // architectural exception-return token range before any effects.
+        } else if (inst.op == MicroOp::b || is_cond || inst.op == MicroOp::bl) {
             if (inst.op == MicroOp::bl) state.r[14] = (op.pc + op.size) | 1U;
         } else if (!stack_op && op.native.kind == NativeOp::integer) {
             MicroCpu guest;
@@ -2036,8 +2043,12 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
     auto expected_pc = block.entry_pc;
     for (std::size_t i = 0; i < block.ops.size(); ++i) {
         const auto& op = block.ops[i];
+        if (op.kind == NativeOp::bx_lr) {
+            error = "native-jit: BX LR is trace-only";
+            return nullptr;
+        }
         if (op.pc != expected_pc
-            || static_cast<unsigned>(op.kind) > static_cast<unsigned>(NativeOp::load_half_signed)) {
+            || static_cast<unsigned>(op.kind) > static_cast<unsigned>(NativeOp::bx_lr)) {
             error = "native-jit: invalid opcode or discontinuous block";
             return nullptr;
         }
@@ -2063,7 +2074,7 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
             error = "native-jit: branch or malformed op declined";
             return nullptr;
         }
-        if (op.kind != NativeOp::integer
+        if (op.kind != NativeOp::integer && op.kind != NativeOp::bx_lr
             && (op.rd >= 13U || (!op.absolute && op.rn > 13U))) {
             error = "native-jit: invalid memory register";
             return nullptr;
@@ -2346,7 +2357,13 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
         e.cmpR32Imm(kEax, static_cast<std::uint32_t>(i + 1U));
         e.jcc(2U, exits[i].unsupported);
         e.cmpR64Imm8(costs, 0U); e.jcc(4U, exits[i].unsupported);
+        const bool bx_lr = op.native.kind == NativeOp::bx_lr;
         const auto conditional = inst.op == MicroOp::b_cond;
+        if (bx_lr) {
+            e.movR32M(kEax, cpu, offsets.r + 56U);
+            e.cmpR32Imm(kEax, op.expected_next_pc | 1U);
+            e.jcc(5U, exits[i].mismatch);
+        }
         if (conditional) {
             const auto actually_taken = e.makeLabel(), guard_done = e.makeLabel();
             if (!emitX86CondTaken(e, inst.condition, 0U, actually_taken, error)) {
@@ -2372,10 +2389,10 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
             e.cmpR32Imm(kEax, static_cast<std::uint32_t>(NativeStackResult::branch_mismatch));
             e.jcc(4U, exits[i].mismatch);
             e.testRR(kEax, kEax); e.jcc(5U, exits[i].helper);
-        } else if (!(conditional || inst.op == MicroOp::b || inst.op == MicroOp::bl)
+        } else if (!(bx_lr || conditional || inst.op == MicroOp::b || inst.op == MicroOp::bl)
                    && op.native.kind == NativeOp::integer) {
             if (!emitX86Op(e, offsets, inst, error)) { impl_->trace_cache.pop_back(); return nullptr; }
-        } else if (!(conditional || inst.op == MicroOp::b || inst.op == MicroOp::bl)) {
+        } else if (!(bx_lr || conditional || inst.op == MicroOp::b || inst.op == MicroOp::bl)) {
             const auto& m = op.native; constexpr std::uint32_t addrreg = 2U, valuereg = 1U;
             if (m.absolute) e.movR32Imm(addrreg, m.absolute_address);
             else {
