@@ -3,8 +3,8 @@
 ## Recommended defaults
 
 Use Release with supported IPO, automatic JIT, and ADC decimation 1 as the
-baseline. Plain `run-network` uses independent board slices with a 1000 ns
-cross-board synchronization window. This deliberately relaxes cross-board
+baseline. Network commands use eligible parallel board lanes by default, with a
+100000 ns (100 µs) cross-board synchronization window. This deliberately relaxes cross-board
 ordering; it does not skip local peripheral work. `--cross-board-window-ns 0`
 selects the exact scheduler with eligible guarded RAM capsules as a reference.
 Network loop batching is off;
@@ -208,8 +208,8 @@ Host: AMD Ryzen 9 4900HS (8 physical cores, 16 threads), PGO Release build,
 the six-board `per_vehicle` network currently costs roughly 2.4 s wall
 (~0.4x real time); the exact-scheduler reference (`--cross-board-window-ns 0`)
 costs roughly 7 s. Wall time is insensitive to the window for values at or above
-100 us and grows sharply below that, so the default 1000 ns window should be
-raised for throughput runs.
+100 us and grows sharply below that. The default window is now 100 us; use
+`--cross-board-window-ns 0` for exact cross-board reference scheduling.
 
 Wall time is bounded by two boards, not by scheduling or cross-board
 coordination. Per-board solo wall times for one simulated second are

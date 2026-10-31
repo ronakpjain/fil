@@ -44,7 +44,7 @@ struct WorldRunOptions {
     bool enable_ram_capsules{true}; ///< Guarded reversible RAM prefixes; incompatible modes fall back automatically.
     bool stop_on_board_failure{true}; ///< Stop on failure; parallel lanes finish their current window before stopping.
     std::uint32_t adc_decimation{1}; ///< Keep 1 of N continuous ADC scans on every board.
-    SimTimeNs cross_board_window_ns{1'000}; ///< Bounded-skew owner slices; zero selects exact reference scheduling.
+    SimTimeNs cross_board_window_ns{100'000}; ///< Bounded-skew owner slices; zero selects exact reference scheduling.
     bool enable_parallel_lanes{true}; ///< Eligible unobserved owner lanes run concurrently; false is a validation reference.
 };
 

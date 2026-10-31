@@ -41,7 +41,11 @@ If both are supplied, the symbol takes precedence.
 Network-only controls:
 
 - `--quantum N`: exact-scheduler work cap; default 1024, must be nonzero.
-- `--cross-board-window-ns N`: independent execution window, default 1000.
+- `--parallel-lanes` / `--no-parallel-lanes`: use eligible parallel owner lanes
+  by default; disable them for serial validation. Tracing and observation barriers
+  can require serial fallback.
+- `--cross-board-window-ns N`: independent execution window, default 100000
+  (100 µs).
   Shared callbacks run at rendezvous with their logical timestamps preserved;
   a receiving board observes the effect at its next instruction boundary.
   Communication delay is bounded by one window plus ordinary in-flight
@@ -60,8 +64,8 @@ fil serve-network network.json --transport stdio
 ```
 
 Both accept `--duration-ms`, `--max-instructions`, `--quantum`, MMIO controls,
-`--trace-instr`, `--detect-spin`, `--cross-board-window-ns`, and
-`--adc-decimation` from above.
+`--trace-instr`, `--detect-spin`, `--cross-board-window-ns`,
+`--parallel-lanes`, `--no-parallel-lanes`, and `--adc-decimation` from above.
 Duration defaults to unlimited; `0` also means unlimited. The instruction limit
 is 50,000,000 per board **per slice**. Neither accepts `--trace FILE`.
 

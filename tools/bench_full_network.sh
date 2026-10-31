@@ -16,7 +16,7 @@ Options:
   --reference-binary PATH   matched baseline executable; runs alternate order
   --duration-ms N           simulated duration per measurement (default: 5000)
   --reps N                  repetitions per executable (default: 3)
-  --cross-board-window-ns N  cross-board skew window (default: 1000; 0 = exact)
+  --cross-board-window-ns N  cross-board skew window (default: 100000; 0 = exact)
   --min-throughput X        required realtime ratio (default: above 1.0)
   -h, --help                show this help
 EOF
@@ -46,7 +46,7 @@ binary="$ROOT_DIR/build-pgo/fil"
 reference_binary=
 duration_ms=5000
 reps=3
-cross_board_window_ns=1000
+cross_board_window_ns=100000
 min_throughput=
 threshold_requested=0
 

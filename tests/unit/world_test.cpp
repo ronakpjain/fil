@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -672,6 +673,55 @@ TEST(WorldTest, CanOutputTraceCarriesExactBusAndFirmwareOrigin) {
             return has("bus", "vehicle/sub") && has("origin", "firmware/node");
         });
     EXPECT_NE(found, world.value()->trace().records().end());
+}
+
+TEST(WorldTest, NetworkDefaultsUseParallelLanesAndHundredMicrosecondWindows) {
+    EXPECT_EQ(fil::sim::WorldRunOptions{}.cross_board_window_ns, 100'000U);
+    EXPECT_TRUE(fil::sim::WorldRunOptions{}.enable_parallel_lanes);
+    TempWorldConfigs files;
+    const auto network_path = files.writeNetwork({
+        files.writeBoard("defaults-alpha.json", "defaults-alpha"),
+        files.writeBoard("defaults-beta.json", "defaults-beta"),
+    });
+    const std::string path = network_path.string();
+    const std::vector<std::vector<std::string_view>> overrides{
+        {}, {"--no-parallel-lanes"}, {"--no-parallel-lanes", "--parallel-lanes"},
+        {"--cross-board-window-ns", "0"},
+    };
+    for (std::size_t i = 0U; i < overrides.size(); ++i) {
+        SCOPED_TRACE(i);
+        std::vector<std::string_view> args{
+            "run-network", path, "--duration-ms", "0", "--max-instructions", "1",
+        };
+        args.insert(args.end(), overrides[i].begin(), overrides[i].end());
+        std::ostringstream out, err;
+        ASSERT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::success) << err.str();
+        EXPECT_NE(out.str().find(i == 3U ? "cross_board_window_ns: 0\n"
+                                        : "cross_board_window_ns: 100000\n"), std::string::npos);
+        const bool parallel = (i == 0U || i == 2U)
+            && std::thread::hardware_concurrency() > 1U;
+        EXPECT_NE(out.str().find(parallel ? "parallel_lanes: 2\n" : "parallel_lanes: 0\n"),
+                  std::string::npos);
+        EXPECT_TRUE(err.str().empty());
+    }
+}
+
+TEST(WorldTest, WatchNetworkAcceptsParallelLaneOverrides) {
+    TempWorldConfigs files;
+    const std::string path = files.writeNetwork({files.writeBoard("watch-lanes.json", "watch-lanes")}).string();
+    for (const std::string_view option : {"--parallel-lanes", "--no-parallel-lanes"}) {
+        SCOPED_TRACE(option);
+        const std::string_view args[]{"watch-network", path, "--duration-ms", "1",
+                                     "--no-wall-pacing", option};
+        std::istringstream input{"quit\n"};
+        std::ostringstream out, err;
+        auto* const original_input = std::cin.rdbuf(input.rdbuf());
+        const auto result = fil::cli::run(args, out, err);
+        std::cin.rdbuf(original_input);
+        std::cin.clear();
+        EXPECT_EQ(result, fil::cli::ExitCode::success) << err.str();
+        EXPECT_TRUE(err.str().empty());
+    }
 }
 
 TEST(WorldTest, ExecutesRunNetworkCli) {

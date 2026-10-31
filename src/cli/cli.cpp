@@ -1106,8 +1106,8 @@ ExitCode runNetworkCommand(
     std::uint64_t duration_ms = 1'000U;
     std::uint64_t max_instructions = 50'000'000U;
     std::uint64_t quantum = 1'024U;
-    sim::SimTimeNs cross_board_window_ns = 1'000U;
-    bool enable_parallel_lanes = true;
+    sim::SimTimeNs cross_board_window_ns = sim::WorldRunOptions{}.cross_board_window_ns;
+    bool enable_parallel_lanes = sim::WorldRunOptions{}.enable_parallel_lanes;
     std::optional<std::filesystem::path> trace_path;
     bool strict_mmio = false;
     bool trace_instructions = false;
@@ -1359,7 +1359,8 @@ ExitCode networkMonitorCommand(
 
     std::uint64_t max_instructions = 50'000'000U;
     std::uint64_t quantum = 1'024U;
-    sim::SimTimeNs cross_board_window_ns = 1'000U;
+    sim::SimTimeNs cross_board_window_ns = sim::WorldRunOptions{}.cross_board_window_ns;
+    bool enable_parallel_lanes = sim::WorldRunOptions{}.enable_parallel_lanes;
     std::optional<std::uint64_t> duration_ns;
     std::uint64_t refresh_ms = 1U;
     std::uint32_t adc_decimation = 1U;
@@ -1430,6 +1431,8 @@ ExitCode networkMonitorCommand(
         } else if (option == "--strict-mmio") strict_mmio = true;
         else if (option == "--lenient-mmio") strict_mmio = false;
         else if (option == "--no-wall-pacing") wall_pacing = false;
+        else if (option == "--parallel-lanes") enable_parallel_lanes = true;
+        else if (option == "--no-parallel-lanes") enable_parallel_lanes = false;
         else if (option == "--trace-instr") trace_instructions = true;
         else if (option == "--detect-spin") detect_spin = true;
         else if (option != "--control-stdin") {
@@ -1713,6 +1716,7 @@ ExitCode networkMonitorCommand(
         options.max_instructions_per_board = max_instructions;
         options.instruction_quantum = quantum;
         options.cross_board_window_ns = cross_board_window_ns;
+        options.enable_parallel_lanes = enable_parallel_lanes;
         options.enable_loop_batching = enable_loop_batching;
         options.enable_jit = enable_jit;
         options.enable_ram_capsules = enable_ram_capsules;
@@ -1976,8 +1980,8 @@ void printHelp(std::ostream& out) {
         << "  --serial ID --openocd PATH --timeout-ms N --artifacts DIRECTORY\n\n"
         << "Network options:\n"
         << "  --duration-ms N --max-instructions N --quantum N --trace FILE\n"
-        << "  --cross-board-window-ns N (network commands: default 1000; 0 = exact)\n"
-        << "  --parallel-lanes | --no-parallel-lanes (validation reference)\n"
+        << "  --cross-board-window-ns N (network commands: default 100000; 0 = exact)\n"
+        << "  --parallel-lanes (default) | --no-parallel-lanes (validation reference)\n"
         << "  --strict-mmio --trace-instr --detect-spin --allow-breakpoint\n"
         << "  --adc-decimation N (keep 1 of N continuous ADC scans)\n"
         << "  --inject-can BUS[@TIME_MS]:ID:HEXDATA\n\n"
