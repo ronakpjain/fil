@@ -213,6 +213,15 @@ elseif(FIL_PGO_PROFILE)
     target_compile_options(fil_core PRIVATE "-fprofile-instr-use=${FIL_PGO_PROFILE}")
     target_compile_options(fil PRIVATE "-fprofile-instr-use=${FIL_PGO_PROFILE}")
     target_link_options(fil PRIVATE "-fprofile-instr-use=${FIL_PGO_PROFILE}")
+    # The compiler flag names the profile but does not make it a build input.
+    # Retraining at the same path must invalidate every profiled object too.
+    get_filename_component(fil_profile_dependency "${FIL_PGO_PROFILE}" ABSOLUTE
+        BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    foreach(fil_profile_target IN ITEMS fil_core fil)
+        get_target_property(fil_profile_sources ${fil_profile_target} SOURCES)
+        set_property(SOURCE ${fil_profile_sources} APPEND PROPERTY
+            OBJECT_DEPENDS "${fil_profile_dependency}")
+    endforeach()
 endif()
 
 find_program(FIL_ARM_NONE_EABI_GCC arm-none-eabi-gcc)
