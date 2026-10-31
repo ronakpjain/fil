@@ -1,8 +1,8 @@
 // Bespoke FilIR stencil emitters.
 //
 // The pure micro-block backend emits AArch64 or x86_64 stencils. The mixed
-// native backend emits integer/memory stencils on x86_64 and uses its C++
-// trampoline on AArch64; other hosts compile to a stub. Guest regs map to
+// native backend emits integer/memory/trace stencils on both hosts; other
+// hosts compile to a stub. Guest regs map to
 // host regs for the whole pure block:
 //
 //   x0         CpuState* (preserved)
@@ -740,6 +740,8 @@ bool emitOp(Emitter& e, const MicroInst& op, std::string& error) {
     error = "unhandled micro op";
     return false;
 }
+
+#include "aarch64_native_emit.inc"
 
 #endif // FIL_MICRO_JIT_AARCH64
 
@@ -1612,83 +1614,6 @@ struct MicroJit::Impl {
 
 namespace {
 
-[[maybe_unused]] void executeNativeBlock(NativeExecutionContext* context, const NativeBlock* block) noexcept {
-    if (block == nullptr || context == nullptr || context->cpu_state == nullptr) return;
-    context->retired_count = 0U;
-    context->exit_reason = NativeExitReason::none;
-    for (std::size_t i = 0; i < block->ops.size(); ++i) {
-        const auto& op = block->ops[i];
-        context->current_instruction_pc = op.pc;
-        if (context->retired_count >= context->instruction_limit) {
-            context->exit_reason = NativeExitReason::instruction_limit;
-            break;
-        }
-        if (context->charged_cycles == nullptr || i >= context->charged_cycles_count) {
-            context->failing_instruction_pc = op.pc;
-            context->exit_reason = NativeExitReason::unsupported_instruction;
-            break;
-        }
-        const std::uint64_t cost = context->charged_cycles[i];
-        if (context->retired_cycles > context->cycle_limit
-            || cost > context->cycle_limit - context->retired_cycles) {
-            context->exit_reason = NativeExitReason::cycle_limit;
-            break;
-        }
-        CpuState& state = *context->cpu_state;
-        std::uint32_t loaded = 0U;
-        const bool is_memory = nativeOpIsMemory(op.kind);
-        const bool is_load = nativeOpIsLoad(op.kind);
-        const std::uint32_t width = nativeOpWidth(op.kind);
-        const std::uint32_t address = !is_memory ? 0U
-            : op.absolute ? op.absolute_address : state.readRegister(op.rn) + op.offset;
-        if (is_load
-            && !(width == 1U ? nativeRead8(context, op.pc, address, &loaded)
-                             : width == 2U ? nativeRead16(context, op.pc, address, &loaded)
-                                           : nativeRead32(context, op.pc, address, &loaded))) {
-            context->failing_instruction_pc = op.pc;
-            context->exit_reason = NativeExitReason::helper_declined;
-            break;
-        }
-        if (!is_load && is_memory
-            && !(width == 1U ? nativeWrite8(context, op.pc, address, state.r[op.rd])
-                             : width == 2U ? nativeWrite16(context, op.pc, address, state.r[op.rd])
-                                           : nativeWrite32(context, op.pc, address, state.r[op.rd]))) {
-            context->failing_instruction_pc = op.pc;
-            context->exit_reason = NativeExitReason::helper_declined;
-            break;
-        }
-        if (is_load) {
-            const bool sign_extend = op.kind == NativeOp::load_byte_signed
-                || op.kind == NativeOp::load_half_signed;
-            if (sign_extend) {
-                const std::uint32_t sign_bit = width == 1U ? 0x80U : 0x8000U;
-                const std::uint32_t fill = width == 1U ? 0xffffff00U : 0xffff0000U;
-                if ((loaded & sign_bit) != 0U) loaded |= fill;
-            }
-        }
-        if (op.kind == NativeOp::integer) {
-            MicroCpu guest;
-            for (std::size_t r = 0; r < guest.r.size(); ++r) guest.r[r] = state.r[r];
-            guest.lr = state.r[14];
-            guest.pc = state.r[15];
-            guest.xpsr = state.xpsr;
-            (void)interpretMicroOps({&op.integer, 1U}, guest, 1U);
-            for (std::size_t r = 0; r < guest.r.size(); ++r) state.r[r] = guest.r[r];
-            state.r[14] = guest.lr;
-            state.xpsr = guest.xpsr;
-        } else if (is_load) {
-            state.r[op.rd] = loaded;
-        }
-        state.instruction_address = op.pc;
-        state.r[15] = op.pc + op.size;
-        context->retired_cycles += cost;
-        ++context->retired_count;
-    }
-    if (context->exit_reason == NativeExitReason::none
-        && context->retired_count == block->ops.size())
-        context->exit_reason = NativeExitReason::none;
-}
-
 [[maybe_unused]] void executeNativeTrace(NativeExecutionContext* ctx,
                                           const NativeTracePlan* plan) noexcept {
     if (ctx == nullptr || ctx->cpu_state == nullptr || plan == nullptr) return;
@@ -2099,10 +2024,8 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
     std::lock_guard lock(impl_->mutex);
     for (const auto& entry : impl_->native_cache)
         if (sameNativeBlock(entry.block, block)) return entry.function;
-    // Native cache entries also own the AArch64 fallback's embedded block
-    // descriptor. Never evict one while its callable code may remain in use.
     // Startup alone exceeds 128 shapes on the real network. Keep a bounded
-    // descriptor set large enough for steady-state kernels as well; executable
+    // cache large enough for steady-state kernels as well; executable
     // storage is independently bounded by the arena.
     constexpr std::size_t kNativeCacheEntries = 1024U;
     if (impl_->native_cache.size() >= kNativeCacheEntries) {
@@ -2263,13 +2186,9 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
     if (!e.patchBranches(error)) { impl_->native_cache.pop_back(); return nullptr; }
     code = std::move(e.code);
 #elif defined(FIL_MICRO_JIT_AARCH64)
-    const auto block_ptr = reinterpret_cast<std::uintptr_t>(&entry.block);
-    const auto runner_ptr = reinterpret_cast<std::uintptr_t>(&executeNativeBlock);
-    const std::uint32_t words[] = {0x58000081U, 0x580000B0U, 0xD61F0200U};
-    code.resize(32U, 0U);
-    std::memcpy(code.data(), words, sizeof(words));
-    std::memcpy(code.data() + 16U, &block_ptr, sizeof(block_ptr));
-    std::memcpy(code.data() + 24U, &runner_ptr, sizeof(runner_ptr));
+    if (!aarch64detail::emitBlock(entry.block, code, error)) {
+        impl_->native_cache.pop_back(); return nullptr;
+    }
 #else
     error = "native-jit: host ABI unsupported";
     impl_->native_cache.pop_back();
@@ -2480,13 +2399,9 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     if (!e.patchBranches(error)) { impl_->trace_cache.pop_back(); return nullptr; }
     code = std::move(e.code);
 #elif defined(FIL_MICRO_JIT_AARCH64)
-    const auto descriptor = reinterpret_cast<std::uintptr_t>(&entry.plan);
-    const auto runner = reinterpret_cast<std::uintptr_t>(&executeNativeTrace);
-    const std::uint32_t words[] = {0x58000081U, 0x580000B0U, 0xD61F0200U};
-    code.resize(32U, 0U);
-    std::memcpy(code.data(), words, sizeof(words));
-    std::memcpy(code.data() + 16U, &descriptor, sizeof(descriptor));
-    std::memcpy(code.data() + 24U, &runner, sizeof(runner));
+    if (!aarch64detail::emitTrace(entry.plan, code, error)) {
+        impl_->trace_cache.pop_back(); return nullptr;
+    }
 #else
     impl_->trace_cache.pop_back(); error = "native-trace: unsupported host"; return nullptr;
 #endif

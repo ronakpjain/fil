@@ -28,7 +28,7 @@ struct NativeTracePlan {
     static constexpr std::size_t max_ops = 64U;
 };
 
-/** Allocation-free reference/AArch64 execution of an already validated plan. */
+/** Allocation-free portable reference execution of an already validated plan. */
 void interpretNativeTrace(const NativeTracePlan& plan, NativeExecutionContext& context) noexcept;
 
 /** Lower/validate atomically. Inputs' native member is deliberately ignored. */

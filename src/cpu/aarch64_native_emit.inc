@@ -1,0 +1,227 @@
+// Included inside fil::cpu, after the pure AArch64 stencil emitter.
+// Native blocks and traces share one per-instruction execution/commit model.
+namespace aarch64detail {
+
+class NativeEmitter : public Emitter {
+public:
+    void movX(std::uint32_t rd, std::uint32_t rn) {
+        emit(0xAA0003E0U | (rn << 16U) | rd);
+    }
+    void immX(std::uint32_t rd, std::uint64_t value) {
+        emit(0xD2800000U | ((static_cast<std::uint32_t>(value) & 0xffffU) << 5U) | rd);
+        for (unsigned i = 1; i < 4; ++i)
+            emit(0xF2800000U | (i << 21U)
+                | ((static_cast<std::uint32_t>(value >> (16U * i)) & 0xffffU) << 5U) | rd);
+    }
+    void load(std::uint32_t rd, std::uint32_t base, std::size_t off, bool wide = false) {
+        emit((wide ? 0xF9400000U : 0xB9400000U)
+            | (static_cast<std::uint32_t>(off / (wide ? 8U : 4U)) << 10U) | (base << 5U) | rd);
+    }
+    void store(std::uint32_t rd, std::uint32_t base, std::size_t off, bool wide = false) {
+        emit((wide ? 0xF9000000U : 0xB9000000U)
+            | (static_cast<std::uint32_t>(off / (wide ? 8U : 4U)) << 10U) | (base << 5U) | rd);
+    }
+    void storeImm(std::uint32_t base, std::size_t off, std::uint32_t value) {
+        movImm(17U, value); store(17U, base, off);
+    }
+    void cbzX(std::uint32_t rt, std::size_t label) {
+        fixups.push_back({words.size(), label, 1U}); emit(0xB4000000U | rt);
+    }
+    void cond(std::uint32_t condition, std::size_t label) {
+        fixups.push_back({words.size(), label, 1U}); emit(0x54000000U | condition);
+    }
+    void cmpW(std::uint32_t rn, std::uint32_t rm) { addSubReg(3U, 31U, rn, rm); }
+    void addX(std::uint32_t rd, std::uint32_t rn, std::uint32_t rm) {
+        emit(0x8B000000U | (rm << 16U) | (rn << 5U) | rd);
+    }
+    void subX(std::uint32_t rd, std::uint32_t rn, std::uint32_t rm) {
+        emit(0xCB000000U | (rm << 16U) | (rn << 5U) | rd);
+    }
+    void call(std::uintptr_t address) {
+        immX(16U, address); emit(0xD63F0200U); // blr x16
+    }
+};
+
+struct Op {
+    NativeInst native;
+    std::uint32_t next_pc;
+    bool trace{false};
+    bool expected_taken{false};
+    bool stack{false};
+    bool push{false};
+    std::uint32_t register_list{0};
+};
+
+bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::string& error) {
+    NativeEmitter e;
+    constexpr std::uint32_t ctx = 19U, cpu = 20U, cost = 21U;
+    constexpr auto r = offsetof(CpuState, r);
+    constexpr auto psr = offsetof(CpuState, xpsr);
+    constexpr auto retired = offsetof(NativeExecutionContext, retired_count);
+    constexpr auto cycles = offsetof(NativeExecutionContext, retired_cycles);
+    constexpr auto reason = offsetof(NativeExecutionContext, exit_reason);
+    constexpr auto failing = offsetof(NativeExecutionContext, failing_instruction_pc);
+    const auto early = e.makeLabel(), done = e.makeLabel();
+    e.cbzX(0U, early);
+    e.load(9U, 0U, offsetof(NativeExecutionContext, cpu_state), true);
+    e.cbzX(9U, early);
+    // x19=context, x20=CPU, x21=current cost survive all scalar helpers.
+    // 32 bytes of nonvolatile saves plus 16 bytes for load output/padding.
+    e.sub64Imm(31U, 31U, 48U);
+    e.store(19U, 31U, 0U, true); e.store(20U, 31U, 8U, true);
+    e.store(21U, 31U, 16U, true); e.store(30U, 31U, 24U, true);
+    e.movX(ctx, 0U); e.movX(cpu, 9U);
+    e.store(31U, ctx, retired); e.store(31U, ctx, reason);
+
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+        const auto& op = ops[i];
+        const auto& m = op.native;
+        const auto& inst = m.integer;
+        const auto instruction_exit = e.makeLabel(), cycle_exit = e.makeLabel();
+        const auto unsupported_exit = e.makeLabel(), helper_exit = e.makeLabel();
+        const auto mismatch_exit = e.makeLabel(), next = e.makeLabel();
+        e.storeImm(ctx, offsetof(NativeExecutionContext, current_instruction_pc), m.pc);
+        e.load(9U, ctx, offsetof(NativeExecutionContext, instruction_limit));
+        e.cmpImm(9U, static_cast<std::uint32_t>(i + 1U)); e.cond(3U, instruction_exit); // lo
+        e.load(11U, ctx, offsetof(NativeExecutionContext, charged_cycles), true);
+        e.cbzX(11U, unsupported_exit);
+        e.load(9U, ctx, offsetof(NativeExecutionContext, charged_cycles_count));
+        e.cmpImm(9U, static_cast<std::uint32_t>(i + 1U)); e.cond(3U, unsupported_exit);
+
+        const bool branch = m.kind == NativeOp::integer
+            && (inst.op == MicroOp::b || inst.op == MicroOp::bl || inst.op == MicroOp::b_cond);
+        if (op.trace && branch && inst.op == MicroOp::b_cond) {
+            // ARM and AArch64 use identical condition encodings (AL/NV handled explicitly).
+            if (inst.condition == Condition::al) {
+                if (!op.expected_taken) e.b(mismatch_exit);
+            } else if (inst.condition == Condition::nv) {
+                error = "native-aarch64: NV condition"; return false;
+            } else {
+                e.load(9U, cpu, psr); e.msrNzcv(9U);
+                const auto condition = static_cast<std::uint32_t>(inst.condition);
+                e.cond(op.expected_taken ? (condition ^ 1U) : condition, mismatch_exit);
+            }
+        }
+        if (m.kind == NativeOp::bx_lr) {
+            e.load(9U, cpu, r + 56U);
+            e.movImm(10U, op.next_pc | 1U);
+            e.cmpW(9U, 10U); e.cond(1U, mismatch_exit);
+            // Equality above enforces Thumb bit; exclude EXC_RETURN even if the
+            // recorded edge itself happens to name an exception-return token.
+            e.movImm(10U, 0xfffffff0U); e.logicReg(0U, 9U, 9U, 10U);
+            e.cmpW(9U, 10U); e.cond(0U, mismatch_exit);
+        }
+        // Subtract before adding to avoid wrapping the cycle accumulator.
+        e.load(9U, ctx, cycles, true);
+        e.load(10U, ctx, offsetof(NativeExecutionContext, cycle_limit), true);
+        e.cmp64(9U, 10U); e.cond(8U, cycle_exit); // hi
+        e.subX(10U, 10U, 9U);
+        e.load(cost, 11U, i * sizeof(std::uint32_t));
+        e.cmp64(cost, 10U); e.cond(8U, cycle_exit);
+
+        if (op.stack) {
+            e.movX(0U, ctx); e.movImm(1U, m.pc);
+            e.movImm(2U, op.register_list); e.movImm(3U, op.push ? 1U : 0U);
+            e.movImm(4U, op.next_pc);
+            e.call(reinterpret_cast<std::uintptr_t>(&nativeStackTransfer));
+            e.cmpImm(0U, static_cast<std::uint32_t>(NativeStackResult::branch_mismatch));
+            e.cond(0U, mismatch_exit);
+            e.cbnzW(0U, helper_exit);
+        } else if (nativeOpIsMemory(m.kind)) {
+            if (m.absolute) e.movImm(2U, m.absolute_address);
+            else {
+                if (m.rn == 13U) {
+                    // SP reads select MSP/PSP, not the possibly stale r[13] mirror.
+                    const auto have_sp = e.makeLabel();
+                    e.load(2U, cpu, offsetof(CpuState, msp));
+                    e.load(9U, cpu, psr); e.andImm(9U, 9U, 0U, 8U);
+                    e.cbnzW(9U, have_sp); // handler mode always uses MSP
+                    e.load(9U, cpu, offsetof(CpuState, control));
+                    e.ubfm(9U, 9U, 1U, 1U); e.cbzW(9U, have_sp);
+                    e.load(2U, cpu, offsetof(CpuState, psp)); e.bindLabel(have_sp);
+                } else e.load(2U, cpu, r + m.rn * 4U);
+                e.addSubImm(0U, 2U, 2U, m.offset);
+            }
+            const bool load = nativeOpIsLoad(m.kind);
+            const auto width = nativeOpWidth(m.kind);
+            e.movX(0U, ctx); e.movImm(1U, m.pc);
+            if (load) e.emit(0x910083E3U); // add x3, sp, #32 (output)
+            else e.load(3U, cpu, r + m.rd * 4U);
+            const auto helper = width == 1U
+                ? (load ? reinterpret_cast<std::uintptr_t>(&nativeRead8) : reinterpret_cast<std::uintptr_t>(&nativeWrite8))
+                : width == 2U
+                ? (load ? reinterpret_cast<std::uintptr_t>(&nativeRead16) : reinterpret_cast<std::uintptr_t>(&nativeWrite16))
+                : (load ? reinterpret_cast<std::uintptr_t>(&nativeRead32) : reinterpret_cast<std::uintptr_t>(&nativeWrite32));
+            e.call(helper);
+            // Only the bool result byte is guaranteed by the scalar ABI.
+            e.andImm(0U, 0U, 0U, 7U); e.cbzW(0U, helper_exit);
+            if (load) {
+                e.load(9U, 31U, 32U);
+                if (m.kind == NativeOp::load_byte_signed) e.sbfm(9U, 9U, 0U, 7U);
+                if (m.kind == NativeOp::load_half_signed) e.sbfm(9U, 9U, 0U, 15U);
+                e.store(9U, cpu, r + m.rd * 4U);
+            }
+        } else if (branch) {
+            if (inst.op == MicroOp::bl) e.storeImm(cpu, r + 56U, (m.pc + m.size) | 1U);
+        } else if (m.kind == NativeOp::integer) {
+            // Reuse exactly the same integer stencils as the pure backend.
+            // Guest flags are materialized at every commit/helper boundary;
+            // admission checks and helper calls may freely clobber host NZCV.
+            e.movX(0U, cpu);
+            for (std::uint8_t reg = 0; reg <= 12U; ++reg) e.ldrW(hostReg(reg), r + reg * 4U);
+            e.ldrW(15U, r + 56U); e.ldrW(16U, psr);
+            e.msrNzcv(16U); e.clearTopNibble(16U);
+            if (!emitOp(e, inst, error)) return false;
+            for (std::uint8_t reg = 0; reg <= 12U; ++reg) e.strW(hostReg(reg), r + reg * 4U);
+            e.strW(15U, r + 56U);
+            e.mrsNzcv(17U); e.logicReg(2U, 16U, 16U, 17U); e.strW(16U, psr);
+        }
+        e.storeImm(cpu, r + 60U, op.next_pc);
+        e.storeImm(cpu, offsetof(CpuState, instruction_address), m.pc);
+        e.load(9U, ctx, cycles, true); e.addX(9U, 9U, cost); e.store(9U, ctx, cycles, true);
+        e.storeImm(ctx, retired, static_cast<std::uint32_t>(i + 1U));
+        e.b(next);
+        const auto exit = [&](std::size_t label, NativeExitReason why, bool failed) {
+            e.bindLabel(label);
+            if (failed) e.storeImm(ctx, failing, m.pc);
+            e.storeImm(ctx, reason, static_cast<std::uint32_t>(why)); e.b(done);
+        };
+        exit(instruction_exit, NativeExitReason::instruction_limit, false);
+        exit(cycle_exit, NativeExitReason::cycle_limit, false);
+        exit(unsupported_exit, NativeExitReason::unsupported_instruction, true);
+        exit(helper_exit, NativeExitReason::helper_declined, true);
+        exit(mismatch_exit, NativeExitReason::branch_mismatch, true);
+        e.bindLabel(next);
+    }
+    e.bindLabel(done);
+    e.load(19U, 31U, 0U, true); e.load(20U, 31U, 8U, true);
+    e.load(21U, 31U, 16U, true); e.load(30U, 31U, 24U, true);
+    e.emit(0x9100C3FFU); // add sp, sp, #48
+    e.bindLabel(early); e.ret();
+    if (!e.patchBranches(error)) return false;
+    code.resize(e.words.size() * sizeof(std::uint32_t));
+    std::memcpy(code.data(), e.words.data(), code.size());
+    return true;
+}
+
+bool emitBlock(const NativeBlock& block, std::vector<std::uint8_t>& code, std::string& error) {
+    std::vector<Op> ops;
+    for (const auto& inst : block.ops) ops.push_back({inst, inst.pc + inst.size});
+    return emitNative(ops, code, error);
+}
+
+bool emitTrace(const NativeTracePlan& plan, std::vector<std::uint8_t>& code, std::string& error) {
+    std::vector<Op> ops;
+    for (const auto& inst : plan.ops) {
+        const bool stack = inst.decoded.kind == InstrKind::push || inst.decoded.kind == InstrKind::pop;
+        auto native = inst.native;
+        // Stack trace nodes have no scalar NativeInst; their source metadata
+        // lives on the trace node itself.
+        native.pc = inst.pc; native.size = inst.size;
+        ops.push_back({native, inst.expected_next_pc, true, inst.expected_taken,
+            stack, inst.decoded.kind == InstrKind::push, inst.decoded.register_list});
+    }
+    return emitNative(ops, code, error);
+}
+
+} // namespace aarch64detail

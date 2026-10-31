@@ -181,6 +181,7 @@ void checkProgram(const std::vector<std::uint16_t>& code, std::uint64_t seed_bas
 // Exercise edge-case IR directly so encodings/lowering do not hide aliases or
 // amounts that cannot be expressed by a single Thumb-16 instruction.
 void expectInterpretedAndJitted(const MicroInst& inst, CpuState initial) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no micro-jit emitter on this host";
     MicroBlock block;
     block.entry_pc = inst.pc;
     block.ops.push_back(inst);
@@ -299,6 +300,7 @@ TEST(MicroJitEmitterTest, RegressionLsrs32SelfAliasCarry) {
 }
 
 TEST(MicroJitEmitterTest, RegressionExtendKindIsPartOfCacheKeyBothOrders) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no micro-jit emitter on this host";
     for (const auto first_kind : {ExtendKind::uxtb, ExtendKind::sxtb}) {
         const auto second_kind = first_kind == ExtendKind::uxtb ? ExtendKind::sxtb : ExtendKind::uxtb;
         std::string error;

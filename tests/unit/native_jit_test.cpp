@@ -6,8 +6,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <string>
+#include <vector>
 
 namespace {
 using namespace fil::cpu;
@@ -154,6 +156,163 @@ TEST(NativeJitTest, RejectsMalformedDirectIrBeforeEmission) {
         EXPECT_EQ(jit->compileNative(block, error), nullptr) << variant;
     }
     EXPECT_NE(jit->compileNative(valid, error), nullptr) << error;
+}
+
+TEST(NativeJitTest, EmitsDirectInstructionStencilsForBlocksAndTraces) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
+    const auto decoded = decode16(0x2001U);
+    ASSERT_TRUE(decoded);
+    const MicroSource source{*decoded, 0x08000000U, 2U};
+    NativeBlock block;
+    ASSERT_TRUE(buildNativeBlock({&source, 1U}, block).ok);
+    std::string error;
+    auto jit = MicroJit::create(error);
+    ASSERT_TRUE(jit) << error;
+    ASSERT_NE(jit->compileNative(block, error), nullptr) << error;
+    // Even one guest instruction emits admission, execution and commit code.
+    EXPECT_GT(jit->bytesEmitted(), 32U);
+    const auto before = jit->bytesEmitted();
+    NativeTraceOp op;
+    op.decoded = *decoded; op.raw = decoded->raw; op.pc = source.pc;
+    op.size = 2U; op.execution_cycles = 1U; op.expected_next_pc = source.pc + 2U;
+    NativeTracePlan plan;
+    ASSERT_TRUE(buildNativeTrace({&op, 1U}, plan, error)) << error;
+    ASSERT_NE(jit->compileNativeTrace(plan, error), nullptr) << error;
+    EXPECT_GT(jit->bytesEmitted() - before, 32U);
+}
+
+TEST(NativeJitTest, IntegerStencilsMatchPortableOracleForEveryFlagPattern) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
+    constexpr std::uint32_t pc = 0x08010000U;
+    std::vector<MicroInst> cases;
+    for (unsigned op = static_cast<unsigned>(MicroOp::nop);
+         op <= static_cast<unsigned>(MicroOp::rrx); ++op) {
+        for (bool flags : {false, true}) {
+            MicroInst inst;
+            inst.op = static_cast<MicroOp>(op);
+            inst.pc = pc; inst.size = 4U; inst.rd = 1U; inst.rn = 1U; inst.rm = 2U;
+            inst.imm = 0x87654321U; inst.shift_amount = 7U; inst.set_flags = flags;
+            cases.push_back(inst);
+            if (inst.op == MicroOp::add_shift || inst.op == MicroOp::sub_shift) {
+                inst.shift = ShiftType::rrx; inst.shift_amount = 0U; cases.push_back(inst);
+            }
+            if (inst.op == MicroOp::lsl || inst.op == MicroOp::lsr || inst.op == MicroOp::asr) {
+                if (!flags) {
+                    inst.shift_immediate = false; cases.push_back(inst);
+                }
+                if (inst.op != MicroOp::lsl) {
+                    inst.shift_immediate = true; inst.shift_amount = 32U;
+                    inst.rd = inst.rm; cases.push_back(inst);
+                }
+            }
+        }
+    }
+    for (auto kind : {ExtendKind::uxtb, ExtendKind::uxth, ExtendKind::sxtb, ExtendKind::sxth}) {
+        for (auto rotate : {0U, 8U, 16U, 24U}) {
+            MicroInst inst;
+            inst.op = MicroOp::extend; inst.extend_kind = kind; inst.imm = rotate;
+            inst.pc = pc; inst.size = 4U; inst.rd = inst.rm = 2U;
+            cases.push_back(inst);
+        }
+    }
+    for (const auto& inst : cases) {
+        SCOPED_TRACE(static_cast<unsigned>(inst.op));
+        NativeInst native;
+        native.pc = pc; native.size = 4U; native.integer = inst;
+        NativeBlock block;
+        block.entry_pc = pc; block.ops = {native};
+        std::string error;
+        auto jit = MicroJit::create(error);
+        ASSERT_TRUE(jit) << error;
+        const auto fn = jit->compileNative(block, error);
+        ASSERT_NE(fn, nullptr) << error;
+        const std::array<std::uint32_t, 1> costs{3U};
+        for (std::uint32_t flags = 0; flags < 16U; ++flags) {
+            for (auto value : {0U, 1U, 31U, 32U, 33U, 255U, 256U, 0x80fe7f01U, 0xffffffffU}) {
+                CpuState state;
+                for (unsigned r = 0; r < 16U; ++r) state.r[r] = 0xfedcba98U + r;
+                state.r[2] = value; state.xpsr = (flags << 28U) | 0x090f0000U;
+                MicroCpu oracle;
+                for (unsigned r = 0; r < oracle.r.size(); ++r) oracle.r[r] = state.r[r];
+                oracle.lr = state.r[14]; oracle.xpsr = state.xpsr; oracle.pc = state.r[15];
+                ASSERT_EQ(interpretMicroOps({&inst, 1U}, oracle, 1U), 1U);
+                auto expected = state;
+                for (unsigned r = 0; r < oracle.r.size(); ++r) expected.r[r] = oracle.r[r];
+                expected.r[14] = oracle.lr; expected.r[15] = oracle.pc;
+                expected.xpsr = oracle.xpsr; expected.instruction_address = pc;
+                NativeExecutionContext ctx{&state, nullptr, 1U, 3U};
+                ctx.charged_cycles = costs.data(); ctx.charged_cycles_count = 1U;
+                fn(&ctx);
+                ASSERT_TRUE(bitwiseEqual(state, expected)) << "NZCV=" << flags << " value=" << value;
+                EXPECT_EQ(ctx.retired_count, 1U); EXPECT_EQ(ctx.retired_cycles, 3U);
+                EXPECT_EQ(ctx.exit_reason, NativeExitReason::none);
+            }
+        }
+    }
+}
+
+TEST(NativeJitTest, AllMemoryWidthsAndShortCostArraysRetirePreciselyAtEveryCut) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
+    constexpr std::uint32_t pc = 0x08018000U, ram = 0x20000000U;
+    // STR/STRB/STRH, LDR/LDRB/LDRH.
+    constexpr std::array<std::uint16_t, 6> words{
+        0x6001U, 0x7101U, 0x8101U, 0x6802U, 0x7903U, 0x8904U};
+    std::array<MicroSource, 6> sources;
+    std::array<NativeTraceOp, 6> trace;
+    for (std::size_t i = 0; i < words.size(); ++i) {
+        const auto decoded = decode16(words[i]);
+        ASSERT_TRUE(decoded);
+        sources[i] = {*decoded, pc + static_cast<std::uint32_t>(i * 2U), 2U};
+        trace[i].decoded = *decoded; trace[i].raw = decoded->raw; trace[i].pc = sources[i].pc;
+        trace[i].size = 2U; trace[i].execution_cycles = 2U;
+        trace[i].expected_next_pc = sources[i].pc + 2U;
+    }
+    // Add normalized absolute accesses for signed helper results in blocks.
+    NativeBlock block;
+    ASSERT_TRUE(buildNativeBlock(std::span{sources}.first(6U), block).ok);
+    for (auto kind : {NativeOp::load_byte_signed, NativeOp::load_half_signed}) {
+        NativeInst inst;
+        inst.kind = kind; inst.rd = kind == NativeOp::load_byte_signed ? 5U : 7U;
+        inst.pc = pc + static_cast<std::uint32_t>(block.ops.size() * 2U); inst.size = 2U;
+        inst.absolute = true; inst.absolute_address = ram + 4U;
+        block.ops.push_back(inst);
+    }
+    NativeTracePlan plan;
+    std::string error;
+    ASSERT_TRUE(buildNativeTrace(std::span{trace}.first(6U), plan, error)) << error;
+    auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    const auto block_fn = jit->compileNative(block, error); ASSERT_NE(block_fn, nullptr) << error;
+    const auto trace_fn = jit->compileNativeTrace(plan, error); ASSERT_NE(trace_fn, nullptr) << error;
+    const std::array<std::uint32_t, 8> costs{2U, 2U, 2U, 2U, 2U, 2U, 2U, 2U};
+    for (bool use_trace : {false, true}) {
+        const auto count = use_trace ? 6U : 8U;
+        for (std::uint32_t limit = 0; limit <= count; ++limit)
+        for (std::uint32_t available = 0; available <= count; ++available) {
+            fil::mem::MemoryBus memory;
+            ASSERT_TRUE(memory.mapRam(ram, 16U, "ram"));
+            ASSERT_TRUE(memory.write32(ram + 4U, 0x80808080U));
+            CpuState state;
+            state.r[0] = ram; state.r[1] = 0x89abcdefU;
+            state.xpsr = 0xf90f0000U; state.r[15] = pc;
+            NativeExecutionContext ctx{&state, &memory, limit, 100U};
+            ctx.charged_cycles = costs.data(); ctx.charged_cycles_count = available;
+            (use_trace ? trace_fn : block_fn)(&ctx);
+            const auto retired = std::min(limit, available);
+            EXPECT_EQ(ctx.retired_count, retired); EXPECT_EQ(ctx.retired_cycles, retired * 2U);
+            EXPECT_EQ(ctx.exit_reason, available < limit ? NativeExitReason::unsupported_instruction
+                : limit < count ? NativeExitReason::instruction_limit : NativeExitReason::none);
+            EXPECT_EQ(state.r[15], pc + retired * 2U);
+            EXPECT_EQ(state.xpsr, 0xf90f0000U);
+            if (retired >= 1U) EXPECT_EQ(memory.read32(ram).value(), 0x89abcdefU);
+            if (retired >= 2U) EXPECT_EQ(memory.read32(ram + 4U).value(), 0x808080efU);
+            if (retired >= 3U) EXPECT_EQ(memory.read16(ram + 8U).value(), 0xcdefU);
+            if (retired >= 4U) EXPECT_EQ(state.r[2], 0x89abcdefU);
+            if (retired >= 5U) EXPECT_EQ(state.r[3], 0xefU);
+            if (retired >= 6U) EXPECT_EQ(state.r[4], 0xcdefU);
+            if (retired >= 7U) EXPECT_EQ(state.r[5], 0xffffffefU);
+            if (retired >= 8U) EXPECT_EQ(state.r[7], 0xffff80efU);
+        }
+    }
 }
 
 TEST(NativeJitTest, AlternatingIntegerMemoryPreciseLimitsAndFlags) {
@@ -605,8 +764,8 @@ TEST(NativeJitTest, DeferredMetadataAndLiveCyclesMatchOracleAcrossExitMatrix) {
     }
 }
 
-TEST(NativeJitTest, TracePreservesSysVCalleeSavedRegistersAcrossStackHelpers) {
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32)
+TEST(NativeJitTest, TracePreservesHostCalleeSavedRegistersAcrossStackHelpers) {
+#if (defined(__x86_64__) || defined(__aarch64__)) && (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32)
     if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
     constexpr std::uint32_t pc = 0x08017000U, ram = 0x20000000U;
     const auto push = decode16(0xb501U), pop = decode16(0xbd01U);
@@ -627,6 +786,40 @@ TEST(NativeJitTest, TracePreservesSysVCalleeSavedRegistersAcrossStackHelpers) {
     const std::array<std::uint32_t, 2> costs{3U, 5U};
     NativeExecutionContext context{&state, &memory, 2U, 8U};
     context.charged_cycles = costs.data(); context.charged_cycles_count = costs.size();
+#if defined(__aarch64__)
+    std::array<std::uint64_t, 11> observed{};
+    register auto* argument asm("x0") = &context;
+    register auto target asm("x16") = function;
+    register auto* output asm("x2") = observed.data();
+    // Save the caller's nonvolatile registers and LR, plus the output pointer.
+    // Keep SP aligned and do not touch Darwin's reserved x18.
+    asm volatile(
+        "sub sp, sp, #112\n\t"
+        "stp x19, x20, [sp, #0]\n\tstp x21, x22, [sp, #16]\n\t"
+        "stp x23, x24, [sp, #32]\n\tstp x25, x26, [sp, #48]\n\t"
+        "stp x27, x28, [sp, #64]\n\tstp x29, x30, [sp, #80]\n\t"
+        "str x2, [sp, #96]\n\t"
+        "mov x19, #0x5a5a\n\tmov x20, x19\n\tmov x21, x19\n\tmov x22, x19\n\t"
+        "mov x23, x19\n\tmov x24, x19\n\tmov x25, x19\n\tmov x26, x19\n\t"
+        "mov x27, x19\n\tmov x28, x19\n\tmov x29, x19\n\t"
+        "blr x16\n\tldr x2, [sp, #96]\n\t"
+        "stp x19, x20, [x2, #0]\n\tstp x21, x22, [x2, #16]\n\t"
+        "stp x23, x24, [x2, #32]\n\tstp x25, x26, [x2, #48]\n\t"
+        "stp x27, x28, [x2, #64]\n\tstr x29, [x2, #80]\n\t"
+        "ldp x19, x20, [sp, #0]\n\tldp x21, x22, [sp, #16]\n\t"
+        "ldp x23, x24, [sp, #32]\n\tldp x25, x26, [sp, #48]\n\t"
+        "ldp x27, x28, [sp, #64]\n\tldp x29, x30, [sp, #80]\n\t"
+        "add sp, sp, #112"
+        : "+r"(argument), "+r"(target), "+r"(output)
+        :
+        : "x1", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
+          "x12", "x13", "x14", "x15", "x17", "x30", "cc", "memory",
+          "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+          "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
+          "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+          "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
+    for (const auto value : observed) EXPECT_EQ(value, 0x5a5aU);
+#else
     std::array<std::uint64_t, 6> observed{};
     auto* argument = &context;
     // Six register saves plus the saved output pointer and padding preserve
@@ -645,11 +838,12 @@ TEST(NativeJitTest, TracePreservesSysVCalleeSavedRegistersAcrossStackHelpers) {
         : "d"(observed.data())
         : "rcx", "rsi", "r8", "r9", "r10", "r11", "cc", "memory");
     for (const auto value : observed) EXPECT_EQ(value, 0x1122334455667788ULL);
+#endif
     EXPECT_EQ(context.retired_count, 2U);
     EXPECT_EQ(context.retired_cycles, 8U);
     EXPECT_EQ(state.r[15], pc + 16U);
 #else
-    GTEST_SKIP() << "SysV x86-64 ABI harness";
+    GTEST_SKIP() << "AArch64 or SysV x86-64 ABI harness";
 #endif
 }
 
