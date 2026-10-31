@@ -27,6 +27,10 @@ using fil::cpu::CortexM4;
 using fil::cpu::CpuState;
 using fil::cpu::MicroBlock;
 using fil::cpu::MicroFunction;
+using fil::cpu::MicroInst;
+using fil::cpu::MicroOp;
+using fil::cpu::ExtendKind;
+using fil::cpu::ShiftType;
 using fil::cpu::MicroJit;
 using fil::cpu::MicroSource;
 
@@ -171,6 +175,148 @@ void checkProgram(const std::vector<std::uint16_t>& code, std::uint64_t seed_bas
             ADD_FAILURE() << "trial " << trial << " code size " << code.size();
             return;
         }
+    }
+}
+
+// Exercise edge-case IR directly so encodings/lowering do not hide aliases or
+// amounts that cannot be expressed by a single Thumb-16 instruction.
+void expectInterpretedAndJitted(const MicroInst& inst, CpuState initial) {
+    MicroBlock block;
+    block.entry_pc = inst.pc;
+    block.ops.push_back(inst);
+    fil::cpu::MicroCpu oracle;
+    for (std::size_t r = 0U; r < oracle.r.size(); ++r) oracle.r[r] = initial.r[r];
+    oracle.lr = initial.r[14];
+    oracle.pc = initial.r[15];
+    oracle.xpsr = initial.xpsr;
+    ASSERT_EQ(fil::cpu::interpretMicroOps(block.ops, oracle, 1U), 1U);
+
+    std::string error;
+    auto jit = MicroJit::create(error);
+    ASSERT_TRUE(jit) << error;
+    const auto fn = jit->compile(block, error);
+    ASSERT_NE(fn, nullptr) << error;
+    const auto retired = fn(&initial, 1U) & 0xffffffffU;
+    ASSERT_EQ(retired, 1U);
+    for (std::size_t r = 0U; r < oracle.r.size(); ++r) EXPECT_EQ(initial.r[r], oracle.r[r]) << "r" << r;
+    EXPECT_EQ(initial.r[14], oracle.lr);
+    EXPECT_EQ(initial.r[15], oracle.pc);
+    EXPECT_EQ(initial.xpsr, oracle.xpsr);
+}
+
+MicroInst oneOp(MicroOp op, std::uint8_t rd = 0U, std::uint8_t rn = 0U,
+                std::uint8_t rm = 0U) {
+    MicroInst inst;
+    inst.op = op;
+    inst.rd = rd;
+    inst.rn = rn;
+    inst.rm = rm;
+    inst.pc = kFlash;
+    inst.size = 4U;
+    return inst;
+}
+
+TEST(MicroJitEmitterTest, RegressionMovtWritesUpperHalf) {
+    auto inst = oneOp(MicroOp::movt, 2U);
+    inst.imm = 0xABCDU;
+    CpuState state{};
+    state.r[2] = 0x12345678U;
+    state.r[15] = kFlash;
+    expectInterpretedAndJitted(inst, state);
+}
+
+TEST(MicroJitEmitterTest, RegressionRegisterShiftsPreserveFlagsAndAliases) {
+    for (const auto op : {MicroOp::lsl, MicroOp::lsr, MicroOp::asr}) {
+        for (const std::uint8_t amount : {std::uint8_t{0}, std::uint8_t{1}, std::uint8_t{31},
+                                           std::uint8_t{32}, std::uint8_t{33}, std::uint8_t{255}}) {
+            auto inst = oneOp(op, 3U, 3U, 4U);
+            inst.shift_immediate = false;
+            inst.shift_amount = 0U;
+            CpuState state{};
+            state.r[3] = 0x81234567U;
+            state.r[4] = amount;
+            state.r[15] = kFlash;
+            state.xpsr = 0xF90F0000U;
+            expectInterpretedAndJitted(inst, state);
+        }
+        // 256 is masked by the register-shift amount byte; exercise with low byte 0.
+        auto inst = oneOp(op, 3U, 3U, 4U);
+        inst.shift_immediate = false;
+        CpuState state{};
+        state.r[3] = 0x81234567U;
+        state.r[4] = 256U;
+        state.r[15] = kFlash;
+        state.xpsr = 0x690F0000U;
+        expectInterpretedAndJitted(inst, state);
+    }
+}
+
+TEST(MicroJitEmitterTest, RegressionShiftedAddSubRrxScratchAliases) {
+    for (const auto op : {MicroOp::add_shift, MicroOp::sub_shift}) {
+        for (const bool carry : {false, true}) {
+            for (const bool set_flags : {false, true}) {
+                for (const bool dest_aliases_rhs : {false, true}) {
+                    auto inst = oneOp(op, dest_aliases_rhs ? 2U : 1U, 1U, 2U);
+                    inst.shift = ShiftType::rrx;
+                    inst.shift_amount = 0U;
+                    inst.set_flags = set_flags;
+                    CpuState state{};
+                    state.r[1] = 0x76543210U;
+                    state.r[2] = 0x80000003U;
+                    state.r[15] = kFlash;
+                    state.xpsr = (carry ? 0x20000000U : 0U) | 0x090F0000U;
+                    expectInterpretedAndJitted(inst, state);
+                }
+            }
+        }
+    }
+}
+
+TEST(MicroJitEmitterTest, RegressionExtendKindsRotateAndAlias) {
+    for (const auto kind : {ExtendKind::uxtb, ExtendKind::uxth, ExtendKind::sxtb, ExtendKind::sxth}) {
+        for (const std::uint32_t rotate : {0U, 8U, 16U, 24U}) {
+            auto inst = oneOp(MicroOp::extend, 5U, 0U, 5U);
+            inst.extend_kind = kind;
+            inst.imm = rotate;
+            CpuState state{};
+            state.r[5] = 0x80FE7F01U;
+            state.r[15] = kFlash;
+            expectInterpretedAndJitted(inst, state);
+        }
+    }
+}
+
+TEST(MicroJitEmitterTest, RegressionLsrs32SelfAliasCarry) {
+    auto inst = oneOp(MicroOp::lsr, 6U, 0U, 6U);
+    inst.shift_immediate = true;
+    inst.shift_amount = 32U;
+    inst.set_flags = true;
+    CpuState state{};
+    state.r[6] = 0x80000001U;
+    state.r[15] = kFlash;
+    state.xpsr = 0x090F0000U;
+    expectInterpretedAndJitted(inst, state);
+}
+
+TEST(MicroJitEmitterTest, RegressionExtendKindIsPartOfCacheKeyBothOrders) {
+    for (const auto first_kind : {ExtendKind::uxtb, ExtendKind::sxtb}) {
+        const auto second_kind = first_kind == ExtendKind::uxtb ? ExtendKind::sxtb : ExtendKind::uxtb;
+        std::string error;
+        auto jit = MicroJit::create(error);
+        ASSERT_TRUE(jit) << error;
+        auto first = oneOp(MicroOp::extend, 0U, 0U, 1U);
+        auto second = first;
+        first.extend_kind = first_kind;
+        second.extend_kind = second_kind;
+        ASSERT_NE(jit->compile(MicroBlock{{first}, false, kFlash}, error), nullptr) << error;
+        const auto second_fn = jit->compile(MicroBlock{{second}, false, kFlash}, error);
+        ASSERT_NE(second_fn, nullptr) << error;
+        CpuState state{};
+        state.r[1] = 0x00000080U;
+        state.r[15] = kFlash;
+        ASSERT_EQ(second_fn(&state, 1U) & 0xffffffffU, 1U);
+        const std::uint32_t expected = second_kind == ExtendKind::sxtb ? 0xFFFFFF80U : 0x80U;
+        EXPECT_EQ(state.r[0], expected);
     }
 }
 

@@ -79,7 +79,8 @@ bool sameMicroInst(const MicroInst& a, const MicroInst& b) noexcept {
         && a.imm == b.imm && a.condition == b.condition && a.shift == b.shift
         && a.shift_amount == b.shift_amount && a.set_flags == b.set_flags
         && a.carry_valid == b.carry_valid && a.carry == b.carry
-        && a.shift_immediate == b.shift_immediate && a.branch_offset == b.branch_offset
+        && a.shift_immediate == b.shift_immediate && a.extend_kind == b.extend_kind
+        && a.branch_offset == b.branch_offset
         && a.pc == b.pc && a.size == b.size;
 }
 
@@ -462,10 +463,14 @@ bool emitShiftValue(Emitter& e, std::uint32_t wd, std::uint32_t wn,
     }
     case ShiftType::rrx:
         // (oldC << 31) | (value >> 1); old C is host C (== guest C).
-        e.mrsNzcv(17U);
-        e.ubfm(wd, wn, 1U, 31U); // lsr #1
-        e.lsr64(17U, 17U, 29U);
-        e.bfi(wd, 17U, 31U, 1U);
+        // Shifted operands land in w17; standalone RRX keeps outgoing carry in w1.
+        {
+            const auto scratch = wd == 17U ? 1U : 17U;
+            e.mrsNzcv(scratch);
+            e.ubfm(wd, wn, 1U, 31U); // lsr #1
+            e.lsr64(scratch, scratch, 29U);
+            e.bfi(wd, scratch, 31U, 1U);
+        }
         return true;
     }
     return false;
@@ -496,8 +501,7 @@ bool emitOp(Emitter& e, const MicroInst& op, std::string& error) {
         e.movz(wd, op.imm & 0xffffU, 0U);
         return true;
     case MicroOp::movt:
-        e.movImm(1U, (op.imm & 0xffffU) << 16U);
-        e.bfi(wd, 1U, 0U, 16U);
+        e.movk(wd, op.imm & 0xffffU, 1U);
         return true;
     case MicroOp::add_imm:
         e.addSubImm(op.set_flags ? 1U : 0U, wd, wn, op.imm);
@@ -520,15 +524,20 @@ bool emitOp(Emitter& e, const MicroInst& op, std::string& error) {
         e.addSubReg(1U, 31U, wn, wm);
         return true;
     case MicroOp::extend: {
-        // UBFM/SBFM rotate the source right by immr then extract the low
-        // width bits, which is exactly UXTB/UXTH/SXTB/SXTH with ROR #n.
+        // Rotate first, then extract: imms is an end bit, not a width;
+        // a wrapping UBFM/SBFM bitfield is not a rotated extract.
         const std::uint32_t amount = op.imm & 31U;
         const std::uint32_t width = (op.extend_kind == ExtendKind::uxtb
             || op.extend_kind == ExtendKind::sxtb) ? 7U : 15U;
         const bool signed_extend = op.extend_kind == ExtendKind::sxtb
             || op.extend_kind == ExtendKind::sxth;
-        if (signed_extend) e.sbfm(wd, wm, amount, width);
-        else e.ubfm(wd, wm, amount, width);
+        if (amount != 0U) {
+            e.movImm(1U, amount);
+            e.shiftV(3U, 17U, wm, 1U);
+        }
+        const auto source = amount == 0U ? wm : 17U;
+        if (signed_extend) e.sbfm(wd, source, 0U, width);
+        else e.ubfm(wd, source, 0U, width);
         return true;
     }
     case MicroOp::ubfx: {
@@ -594,17 +603,24 @@ bool emitOp(Emitter& e, const MicroInst& op, std::string& error) {
                 return false;
             }
             const std::uint32_t kind = type == ShiftType::lsl ? 0U : type == ShiftType::lsr ? 1U : 2U;
+            // Preserve guest NZCV above the amount in x1 across range-check CMP.
+            e.mrsNzcv(17U);
+            e.bfi64(1U, 17U, 32U, 32U);
             if (type == ShiftType::asr) {
                 // amount >= 32 -> sign fill; else asrv.
                 e.sbfmAsr(17U, wn, 31U); // fill = 0 / 0xffffffff
                 e.shiftV(kind, wd, wn, 1U);
                 e.cmpImm(1U, 32U);
                 e.csel(wd, 17U, wd, 2U); // hs: amount >= 32 -> fill
+                e.lsr64(17U, 1U, 32U);
+                e.msrNzcv(17U);
                 return true;
             }
             e.shiftV(kind, wd, wn, 1U);
             e.cmpImm(1U, 32U);
             e.csel(wd, 31U, wd, 2U); // hs: amount >= 32 -> 0
+            e.lsr64(17U, 1U, 32U);
+            e.msrNzcv(17U);
             return true;
         }
         const std::uint32_t amount = type == ShiftType::rrx ? 1U : op.shift_amount;
@@ -645,8 +661,8 @@ bool emitOp(Emitter& e, const MicroInst& op, std::string& error) {
                 e.movImm(1U, amount);
                 e.shiftV(1U, 17U, wv, 1U);
                 result_in_temp = true;
+                carry_lsb = amount - 1U;
             }
-            carry_lsb = amount - 1U;
             break;
         case ShiftType::asr:
             if (amount == 0U || amount > 32U) {
@@ -661,8 +677,8 @@ bool emitOp(Emitter& e, const MicroInst& op, std::string& error) {
                 e.movImm(1U, amount);
                 e.shiftV(2U, 17U, wv, 1U);
                 result_in_temp = true;
+                carry_lsb = amount - 1U;
             }
-            carry_lsb = amount - 1U;
             break;
         case ShiftType::ror: {
             const std::uint32_t rotation = amount & 31U;
