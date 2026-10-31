@@ -336,7 +336,7 @@ Result<WorldRunResult> World::runIndependent(const WorldRunOptions& options) {
         [&](const std::size_t i) {
             auto lane = event_loop_.useLaneDomain(static_cast<EventOwner>(i));
             execute_lane(i);
-        }) : nullptr;
+        }, std::min(boards_.size(), detail::laneExecutionSlots()) - 1U) : nullptr;
     output.parallel_lanes = parallel ? boards_.size() : 0U;
     const auto drain_shared = [&](const SimTimeNs at) {
         const auto events = event_loop_.runSharedEvents(at);

@@ -1,3 +1,4 @@
+#include "fil/devices/can_bus.hpp"
 #include "fil/sim/board.hpp"
 #include "fil/sim/world.hpp"
 #include "fil/stm32g4/stm32g4.hpp"
@@ -7,6 +8,7 @@
 #include <cstdint>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <limits>
@@ -1027,6 +1029,108 @@ TEST(WorldTimeTest, PersistentLaneWorkersWakeAfterUnbalancedWindows) {
     for (const auto count : {0U, 1U, 3U}) {
         fil::sim::detail::LaneWorkers idle(count, [](auto) { ADD_FAILURE(); });
     } // Also join workers that may not yet have observed startup completion.
+}
+
+TEST(WorldTimeTest, QueuedLaneWorkersJoinEveryConsumerBeforeTheNextWindow) {
+    for (const auto jobs : {0U, 1U, 6U}) {
+        for (const auto background : {0U, 1U, 3U, 8U}) {
+            SCOPED_TRACE(jobs);
+            SCOPED_TRACE(background);
+            std::vector<std::atomic<std::size_t>> counts(jobs);
+            std::size_t epoch = 0U;
+            const auto coordinator = std::this_thread::get_id();
+            fil::sim::detail::LaneWorkers workers(jobs, [&](const auto index) {
+                EXPECT_EQ(counts[index].fetch_add(1U, std::memory_order_relaxed), epoch);
+                if (background == 0U) EXPECT_EQ(std::this_thread::get_id(), coordinator);
+                if (index + 1U == jobs && epoch % 31U == 0U)
+                    std::this_thread::sleep_for(std::chrono::microseconds{100});
+                else if (epoch % 7U == 0U) std::this_thread::yield();
+            }, background);
+            for (; epoch < 256U; ++epoch) {
+                workers.run();
+                for (const auto& count : counts)
+                    EXPECT_EQ(count.load(std::memory_order_relaxed), epoch + 1U);
+            }
+        }
+    }
+}
+
+TEST(WorldTimeTest, QueuedLaneWorkersDrainAllFailuresAndClearThemBeforeRethrow) {
+    for (const auto background : {0U, 1U, 3U, 8U}) {
+        SCOPED_TRACE(background);
+        std::vector<std::size_t> counts(6U, 0U);
+        bool fail = true;
+        fil::sim::detail::LaneWorkers workers(counts.size(), [&](const auto index) {
+            ++counts[index];
+            if (fail && (index == 1U || index == 4U))
+                throw std::runtime_error(std::to_string(index));
+        }, background);
+        for (unsigned invocation = 0U; invocation < 16U; ++invocation) {
+            fail = true;
+            try {
+                workers.run();
+                FAIL() << "expected both failing jobs to be captured";
+            } catch (const std::runtime_error& error) {
+                EXPECT_STREQ(error.what(), "1");
+            }
+            for (const auto count : counts) EXPECT_EQ(count, 2U * invocation + 1U);
+            fail = false;
+            EXPECT_NO_THROW(workers.run());
+            for (const auto count : counts) EXPECT_EQ(count, 2U * invocation + 2U);
+        }
+    }
+}
+
+TEST(WorldTimeTest, QueuedLaneWorkersRestoreCoordinatorOwnerDomainsAfterExceptions) {
+    for (const auto background : {0U, 1U, 3U}) {
+        SCOPED_TRACE(background);
+        fil::sim::EventLoop events;
+        auto domains = events.useLaneDomains(6U);
+        std::vector<std::size_t> counts(6U, 0U);
+        std::vector<fil::devices::DeferredCanOutbox> outboxes(6U);
+        std::atomic<bool> background_failed{false};
+        const auto coordinator = std::this_thread::get_id();
+        bool fail = true;
+        std::uint64_t at = 1U;
+        {
+            fil::sim::detail::LaneWorkers workers(counts.size(), [&](const auto index) {
+                const auto id = static_cast<fil::sim::EventOwner>(index);
+                auto lane = events.useLaneDomain(id);
+                auto owner = events.useOwner(id);
+                EXPECT_FALSE(fil::devices::DeferredCanScope::active());
+                fil::devices::DeferredCanScope communications(outboxes[index],
+                    static_cast<std::uint32_t>(index), events, id);
+                EXPECT_TRUE(fil::devices::DeferredCanScope::active());
+                EXPECT_EQ(fil::devices::DeferredCanScope::boardIndex(), index);
+                EXPECT_EQ(fil::devices::DeferredCanScope::nextSequence(), 0U);
+                EXPECT_EQ(events.activeOwner(), id);
+                static_cast<void>(events.scheduleAt(at, [&, index] { ++counts[index]; }));
+                EXPECT_FALSE(events.runOwnedEvents(id, at).same_time_limit_hit);
+                if (fail && background != 0U) {
+                    if (std::this_thread::get_id() == coordinator) {
+                        background_failed.wait(false, std::memory_order_acquire);
+                    } else {
+                        background_failed.store(true, std::memory_order_release);
+                        background_failed.notify_one();
+                        throw std::runtime_error("background owner failure");
+                    }
+                } else if (fail && index == 2U) throw std::runtime_error("coordinator owner failure");
+            }, background);
+            EXPECT_THROW(workers.run(), std::runtime_error);
+            if (background != 0U) EXPECT_TRUE(background_failed.load(std::memory_order_acquire));
+            EXPECT_FALSE(fil::devices::DeferredCanScope::active());
+            EXPECT_EQ(events.activeOwner(), fil::sim::shared_event_owner);
+            EXPECT_NO_THROW(static_cast<void>(events.now()));
+            fail = false;
+            ++at;
+            EXPECT_NO_THROW(workers.run());
+            EXPECT_FALSE(fil::devices::DeferredCanScope::active());
+            EXPECT_EQ(events.activeOwner(), fil::sim::shared_event_owner);
+            EXPECT_NO_THROW(static_cast<void>(events.runSharedEvents(at)));
+        }
+        domains.close();
+        for (const auto count : counts) EXPECT_EQ(count, 2U);
+    }
 }
 
 TEST(WorldTimeTest, ParallelOwnerWindowsMatchSerialOwnerExecution) {
