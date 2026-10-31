@@ -640,6 +640,31 @@ TEST(MemoryBusTest, RamInputCompatibilityIsScopedAndDoesNotRelaxTransactionCheck
     EXPECT_FALSE(bus.canRestoreSideEffects(mmio_checkpoint));
 }
 
+TEST(MemoryBusTest, RamInputCompatibilityRechecksRegionBoundariesAndTopAddress) {
+    fil::mem::MemoryBus bus;
+    constexpr std::uint32_t first = 0x20000000U;
+    constexpr std::uint32_t second = first + 0x20U;
+    constexpr std::uint32_t top = 0xfffffff0U;
+    ASSERT_TRUE(bus.mapRam(first, 0x20U, "first"));
+    ASSERT_TRUE(bus.mapRam(second, 0x20U, "second"));
+    ASSERT_TRUE(bus.mapRam(top, 0x10U, "top"));
+    const fil::mem::AccessContext read{fil::mem::AccessType::data_read, 0x08000100U};
+    const fil::mem::AccessContext write{fil::mem::AccessType::data_write, 0x08000100U};
+    ASSERT_TRUE(bus.read8(first + 0x1fU, read));
+    ASSERT_TRUE(bus.read8(second, read));
+    ASSERT_TRUE(bus.read8(0xffffffffU, read));
+    const auto footprint = bus.takeReadFootprint();
+    const auto checkpoint = bus.sideEffectCheckpoint();
+    for (const auto address : {first + 0x1eU, first + 0x1fU, second,
+                               second + 1U, top, 0xffffffffU, first}) {
+        ASSERT_TRUE(bus.write8(address, 0x5aU, write));
+        ASSERT_TRUE(bus.write8(address, 0U, write));
+    }
+    EXPECT_TRUE(bus.ramInputsCompatibleSince(checkpoint, footprint));
+    ASSERT_TRUE(bus.write8(0xffffffffU, 1U, write));
+    EXPECT_FALSE(bus.ramInputsCompatibleSince(checkpoint, footprint));
+}
+
 TEST(MemoryBusTest, RamInputCompatibilityUsesCompleteReadStoreUnionForAllOrigins) {
     using fil::mem::AccessContext;
     using fil::mem::AccessType;

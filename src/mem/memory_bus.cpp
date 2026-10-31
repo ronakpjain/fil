@@ -1008,11 +1008,16 @@ bool MemoryBus::ramInputsCompatibleSince(
     // its address, which is O(window^2) for the multi-mutation windows that
     // dominate long runs. An address set yields the same answer in O(window).
     window_address_set_.beginPass();
+    // Stack and DMA journals commonly contain many bytes in one region.
+    // Mapping is stable throughout this synchronous validation, so retain the
+    // last region while still checking every mutation's backing and identity.
+    const Region* region = nullptr;
     for (std::uint64_t sequence = checkpoint.mutation_sequence + 1U;
          sequence <= mutation_sequence_; ++sequence) {
         const BackedMutation& mutation = mutation_journal_[(sequence - 1U) % mutation_journal_capacity];
         if (mutation.sequence != sequence) return false;
-        const Region* const region = find(mutation.address);
+        if (region == nullptr || !region->contains(mutation.address))
+            region = find(mutation.address);
         if (region == nullptr || region->info.kind == RegionKind::mmio
             || region->info.kind == RegionKind::alias) return false;
         // Journal identity and backing are still checked for every mutation.
