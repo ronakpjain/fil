@@ -1,5 +1,7 @@
 #include "fil/cpu/micro_jit_ir.hpp"
 
+#include <bit>
+
 namespace fil::cpu {
 namespace {
 
