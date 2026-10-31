@@ -1,5 +1,6 @@
 #include "fil/cpu/native_stack.hpp"
 #include <array>
+#include <bit>
 
 namespace fil::cpu {
 NativeStackResult nativeStackTransfer(NativeExecutionContext* c, std::uint32_t pc,
@@ -12,8 +13,7 @@ NativeStackResult nativeStackTransfer(NativeExecutionContext* c, std::uint32_t p
     const bool loads_pc = !is_push && (mask & 0x8000U);
     if (is_push && (mask & 0x8000U)) return NativeStackResult::memory_declined;
     if (loads_pc && (mask & 0x4000U)) return NativeStackResult::memory_declined;
-    std::uint32_t count = 0;
-    for (std::uint32_t bits = mask; bits != 0; bits &= bits - 1U) ++count;
+    const std::uint32_t count = static_cast<std::uint32_t>(std::popcount(mask));
     const std::uint64_t bytes = static_cast<std::uint64_t>(count) * 4U;
     const std::uint32_t old_sp = s.readRegister(13U);
     const std::uint32_t start = is_push ? old_sp - static_cast<std::uint32_t>(bytes) : old_sp;
@@ -25,7 +25,10 @@ NativeStackResult nativeStackTransfer(NativeExecutionContext* c, std::uint32_t p
         // sixteen would cost a 64-byte store per transferred stack frame.
         std::array<std::uint32_t, 16> values;
         std::uint32_t n = 0;
-        for (std::uint32_t r = 0; r < 16; ++r) if (mask & (1U << r)) values[n++] = s.readRegister(static_cast<std::uint8_t>(r));
+        for (std::uint32_t bits = mask; bits != 0U; bits &= bits - 1U) {
+            const auto r = static_cast<std::uint32_t>(std::countr_zero(bits));
+            values[n++] = s.r[r];
+        }
         if (!c->memory_bus->tryFastWriteWords(start, count, values.data(), {mem::AccessType::data_write, pc}))
             return NativeStackResult::memory_declined;
         s.writeRegister(13U, start);
@@ -37,7 +40,8 @@ NativeStackResult nativeStackTransfer(NativeExecutionContext* c, std::uint32_t p
         return NativeStackResult::memory_declined;
     std::uint32_t n = 0;
     std::uint32_t target = 0;
-    for (std::uint32_t r = 0; r < 16; ++r) if (mask & (1U << r)) {
+    for (std::uint32_t bits = mask; bits != 0U; bits &= bits - 1U) {
+        const auto r = static_cast<std::uint32_t>(std::countr_zero(bits));
         if (r == 15U) target = values[n];
         ++n;
     }
@@ -52,8 +56,9 @@ NativeStackResult nativeStackTransfer(NativeExecutionContext* c, std::uint32_t p
         }
     }
     n = 0;
-    for (std::uint32_t r = 0; r < 16; ++r) if (mask & (1U << r)) {
-        if (r != 15U) s.writeRegister(static_cast<std::uint8_t>(r), values[n]);
+    for (std::uint32_t bits = mask; bits != 0U; bits &= bits - 1U) {
+        const auto r = static_cast<std::uint32_t>(std::countr_zero(bits));
+        if (r != 15U) s.r[r] = values[n];
         ++n;
     }
     s.writeRegister(13U, old_sp + static_cast<std::uint32_t>(bytes));
