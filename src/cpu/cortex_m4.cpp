@@ -1925,12 +1925,17 @@ std::optional<FastStepResult> CortexM4::executeNativeTrace(
         auto fetch_end = plan.ops.front().pc;
         entry.charged_prefix[0] = 0U;
         entry.execution_prefix[0] = 0U;
+        entry.charges_valid_prefix_count = 0U;
         for (std::size_t i = 0U; i < plan.ops.size(); ++i) {
             const auto& op = plan.ops[i];
             const bool sequential = i == 0U ? first_sequential
                 : have_fetch && op.pc == fetch_end;
             entry.charges[i] = static_cast<std::uint32_t>(op.execution_cycles)
                 + timing.stall(op.pc, sequential);
+            if (entry.charges_valid_prefix_count == i
+                && entry.charges[i] <= std::numeric_limits<std::uint16_t>::max()) {
+                ++entry.charges_valid_prefix_count;
+            }
             entry.charged_prefix[i + 1U] = entry.charged_prefix[i] + entry.charges[i];
             entry.execution_prefix[i + 1U] = entry.execution_prefix[i] + op.execution_cycles;
             have_fetch = true;
@@ -1940,10 +1945,8 @@ std::optional<FastStepResult> CortexM4::executeNativeTrace(
         entry.charges_first_sequential = first_sequential;
         entry.charges_valid = true;
     }
-    std::size_t planned = 0U;
-    for (; planned < limit; ++planned) {
-        if (entry.charges[planned] > std::numeric_limits<std::uint16_t>::max()) break;
-    }
+    const auto planned = std::min(limit,
+        static_cast<std::size_t>(entry.charges_valid_prefix_count));
     if (planned == 0U) return std::nullopt;
     const auto* charges = entry.charges.data();
     NativeExecutionContext context;

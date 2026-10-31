@@ -702,6 +702,97 @@ TEST(JitTest, NativeTraceMatchesCheckedPrefixesBudgetsAndChangedBranchInputs) {
     EXPECT_GT(candidate.jitStats().trace_guard_mismatches, 0U);
 }
 
+TEST(JitTest, NativeTraceCachesValidChargePrefixAcrossTimingKeys) {
+    if (!fil::cpu::MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
+    const auto code = halfwords({0xbf00U, 0x6008U, 0x680aU, 0x3202U, 0x2a03U,
+        0xd102U, 0x3301U, 0x604bU, 0x684cU, 0xe7f5U});
+    auto bus = basicBus(), oracle = basicBus();
+    ASSERT_TRUE(bus.loadBytes(flash_base, code));
+    ASSERT_TRUE(oracle.loadBytes(flash_base, code));
+    for (auto* memory : {&bus, &oracle}) {
+        memory->setReversibleRamOnly(true);
+        memory->setAllMmioTrapping(true);
+    }
+    fil::cpu::CortexM4 candidate(bus), manual(oracle);
+    prepare(candidate);
+    candidate.state().r[0] = 1U;
+    candidate.state().r[1] = ram_base;
+    manual.setNativeMemoryJitEnabled(false);
+    for (unsigned i = 0U; i < 4000U && candidate.jitStats().trace_instructions == 0U; ++i) {
+        fil::cpu::CortexM4::ReversibleCycleBudget warm;
+        warm.remaining_cycles = 1000U;
+        if (!candidate.tryStepCommittedRamSpan(64U, warm))
+            ASSERT_EQ(candidate.stepFast().reason, fil::cpu::StopReason::step_complete);
+    }
+    ASSERT_GT(candidate.jitStats().trace_instructions, 0U);
+
+    struct TimingCase {
+        std::uint16_t nonsequential;
+        std::uint16_t sequential;
+        bool have_fetch;
+        std::size_t expected;
+    };
+    // Observable prefix lengths: an oversized first charge declines, a valid
+    // first charge followed by an oversized sequential charge retires one
+    // instruction, and restoring small charges under either sequencing key
+    // recovers the full requested prefix.
+    constexpr std::size_t full = 10U;
+    for (const auto timing : std::array<TimingCase, 5>{{
+            {std::numeric_limits<std::uint16_t>::max(), 0U, false, 0U},
+            {0U, std::numeric_limits<std::uint16_t>::max(), false, 1U},
+            {0U, std::numeric_limits<std::uint16_t>::max(), true, 0U},
+            {0U, 0U, false, full}, {0U, 0U, true, full}}}) {
+        SCOPED_TRACE(::testing::Message() << timing.nonsequential << '/'
+            << timing.sequential << '/' << timing.have_fetch);
+        prepare(candidate);
+        candidate.state().r[0] = 1U;
+        candidate.state().r[1] = ram_base;
+        manual.state() = candidate.state();
+        ASSERT_TRUE(bus.write32(ram_base, 0U));
+        ASSERT_TRUE(oracle.write32(ram_base, 0U));
+        fil::cpu::CortexM4::ReversibleCycleBudget budget;
+        budget.remaining_cycles = 100000U;
+        budget.have_fetch = timing.have_fetch;
+        budget.fetch_end = timing.have_fetch ? flash_base : flash_base + 64U;
+        budget.fetch_timing = {flash_base, flash_base + 128U, 0U, 0U,
+            timing.nonsequential, timing.sequential};
+        budget.total_instruction_cycles.fill(0xBEEFU);
+        const auto actual = candidate.tryStepBudgetedReversibleJitBlock(full, budget);
+        if (timing.expected == 0U) {
+            EXPECT_FALSE(actual);
+            EXPECT_EQ(budget.remaining_cycles, 100000U);
+            EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.state(), manual.state()));
+            continue;
+        }
+        ASSERT_TRUE(actual);
+        // Independent oracle: single-step the same instructions with explicit
+        // fetch-timing arithmetic to derive the expected committed prefix.
+        std::uint64_t charged = 0U;
+        bool sequential_source = timing.have_fetch;
+        std::uint32_t fetch_end = budget.fetch_end;
+        for (std::size_t i = 0U; i < timing.expected; ++i) {
+            const auto pc = manual.state().r[15];
+            const bool sequential = sequential_source && pc == fetch_end;
+            const auto stepped = manual.stepFast();
+            ASSERT_EQ(stepped.reason, fil::cpu::StopReason::step_complete);
+            const auto charge = static_cast<std::uint32_t>(stepped.cycles)
+                + (sequential ? timing.sequential : timing.nonsequential);
+            ASSERT_LE(charge, std::numeric_limits<std::uint16_t>::max());
+            charged += charge;
+            sequential_source = true;
+            fetch_end = pc + stepped.instruction_size;
+        }
+        EXPECT_EQ(actual->execution.count, timing.expected);
+        EXPECT_EQ(actual->execution.result.instructions, timing.expected);
+        EXPECT_EQ(budget.remaining_cycles, 100000U - charged);
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.state(), manual.state()));
+        EXPECT_TRUE(std::all_of(budget.total_instruction_cycles.begin() + timing.expected,
+            budget.total_instruction_cycles.end(), [](const auto value) {
+                return value == 0xBEEFU;
+            }));
+    }
+}
+
 TEST(JitTest, CommittedRamSpanUnrollsLoopsWithEveryIterationRetired) {
     if (!fil::cpu::MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
     // LDR r2,[r1]; ADDS r2,#1; STR r2,[r1]; CMP r2,r0; BCC loop; BKPT.

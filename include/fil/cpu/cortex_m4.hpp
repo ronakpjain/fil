@@ -655,6 +655,8 @@ private:
         // dominated real workload time. Generation changes rebuild the entry.
         std::uint8_t decline_streak{0U};
         bool charges_valid{false};
+        /// Leading cached charges representable by NativeExecution's uint16_t input.
+        std::uint8_t charges_valid_prefix_count{0U};
         bool charges_first_sequential{false};
         ReversibleCycleBudget::FetchTiming charges_timing{};
         std::array<std::uint32_t, NativeTracePlan::max_ops> charges{};
