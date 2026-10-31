@@ -15,6 +15,7 @@
 #include <optional>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 
 namespace fil::elf {
@@ -711,10 +712,17 @@ private:
         std::array<std::uint16_t, JitStepOutcome::max_block>* instruction_cycles = nullptr);
     [[nodiscard]] std::optional<TimedJitStepOutcome> executeTrustedReversibleJitBlock(
         std::size_t max_instructions, ReversibleCycleBudget* budget = nullptr);
-    [[nodiscard]] std::optional<TimedJitStepOutcome> tryStepBudgetedReversibleJitBlockImpl(
-        std::size_t max_instructions, ReversibleCycleBudget& budget, bool try_native_trace);
+    // Share execution/timing logic, but omit reversible output in committed mode.
+    template <bool Detailed>
+    [[nodiscard]] auto executeTrustedReversibleJitBlockImpl(
+        std::size_t max_instructions, ReversibleCycleBudget* budget)
+        -> std::optional<std::conditional_t<Detailed, TimedJitStepOutcome, FastStepResult>>;
+    template <bool Detailed>
+    [[nodiscard]] auto tryStepBudgetedReversibleJitBlockImpl(
+        std::size_t max_instructions, ReversibleCycleBudget& budget, bool try_native_trace)
+        -> std::optional<std::conditional_t<Detailed, TimedJitStepOutcome, FastStepResult>>;
     [[nodiscard]] std::optional<TimedJitStepOutcome> tryStepItScalarFallback(
-        ReversibleCycleBudget* budget);
+        ReversibleCycleBudget* budget, bool record_cycles = true);
     [[nodiscard]] bool executeJitFast(const DecodedInstruction& op, JitFast fast,
                                       std::uint32_t pc) noexcept;
     [[nodiscard]] std::optional<DecodedInstruction> fetchDecode(

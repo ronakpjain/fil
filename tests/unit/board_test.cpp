@@ -390,6 +390,46 @@ TEST(BoardTest, ReversibleRamPrefixChainsBranchesAndReplaysLongCuts) {
                                        full_exact.value()->cpu().state()));
 }
 
+TEST(BoardTest, CacheOnlyRamPreparationDoesNotSpeculateOnMiss) {
+    auto board = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(board);
+    ASSERT_TRUE(installBranchingReversibleProgram(*board.value()));
+    const auto state = board.value()->cpu().state();
+    const auto effects = board.value()->memory().sideEffectGeneration();
+    const auto reads = board.value()->memory().readFootprint();
+    const auto now = board.value()->eventLoop().now();
+    fil::sim::Board::ReversibleRamPrefix prefix;
+    EXPECT_FALSE(board.value()->prepareReversibleRamPrefix(
+        prefix, 64U, std::nullopt, false, false, true));
+    EXPECT_EQ(prefix.count, 0U);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(state, board.value()->cpu().state()));
+    EXPECT_EQ(effects, board.value()->memory().sideEffectGeneration());
+    EXPECT_EQ(reads.words, board.value()->memory().readFootprint().words);
+    EXPECT_EQ(reads.complete, board.value()->memory().readFootprint().complete);
+    EXPECT_EQ(now, board.value()->eventLoop().now());
+    EXPECT_TRUE(board.value()->prepareReversibleRamPrefix(prefix, 64U));
+}
+
+TEST(BoardTest, CacheOnlyRamPreparationRetainsPeriodHits) {
+    auto cached = fil::sim::Board::load(fixtureBoard());
+    auto reference = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(cached && reference);
+    ASSERT_TRUE(warmIdempotentPeriodCache(*cached.value()));
+    ASSERT_TRUE(warmIdempotentPeriodCache(*reference.value()));
+    fil::sim::Board::ReversibleRamPrefix hit;
+    ASSERT_TRUE(cached.value()->prepareReversibleRamPrefix(
+        hit, 31U, std::nullopt, false, false, true));
+    ASSERT_EQ(hit.memoized_count, 31U);
+    const auto expected = reference.value()->prepareReversibleRamPrefix(31U);
+    ASSERT_TRUE(expected);
+    const auto actual = cached.value()->materializeReversibleRamPrefix(hit, 31U);
+    const auto ordinary = reference.value()->materializeReversibleRamPrefix(*expected, 31U);
+    EXPECT_EQ(actual.cpu_result.instructions, ordinary.cpu_result.instructions);
+    EXPECT_EQ(actual.cpu_result.cycles, ordinary.cpu_result.cycles);
+    EXPECT_EQ(actual.elapsed_ns, ordinary.elapsed_ns);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(cached.value()->cpu().state(), reference.value()->cpu().state()));
+}
+
 TEST(BoardTest, ReusableReversibleRamOutputUsesOnlyLiveMetadata) {
     auto board = fil::sim::Board::load(fixtureBoard());
     ASSERT_TRUE(board);

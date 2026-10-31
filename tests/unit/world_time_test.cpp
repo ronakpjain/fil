@@ -1067,6 +1067,82 @@ TEST(WorldTimeTest, ParallelOwnerWindowsMatchSerialOwnerExecution) {
     }
 }
 
+TEST(WorldTimeTest, OwnerRamRunnerMatchesCheckedMmioAndInterruptsAfterWarmup) {
+    TempWorldTimeConfigs files;
+    const auto config = files.network({files.writeBoard("alpha.json", "alpha"),
+                                       files.writeBoard("beta.json", "beta")});
+    auto fast = fil::sim::World::load(config);
+    auto checked = fil::sim::World::load(config);
+    ASSERT_TRUE(fast && checked);
+    for (auto* world : {fast.value().get(), checked.value().get()}) {
+        ASSERT_TRUE(configureZeroWaitFixture(*world));
+        for (const auto name : {"alpha", "beta"}) {
+            ASSERT_TRUE(configureSysTickIdleLoop(*world, name, 2U));
+            auto& board = *world->board(name);
+            const auto start = board.cpu().state().r[15];
+            const std::vector<std::uint8_t> code{
+                0x08U, 0x68U, // ldr r0, [r1]
+                0x01U, 0x30U, // adds r0, #1
+                0x18U, 0x60U, // str r0, [r3]
+                0x22U, 0x68U, // ldr r2, [r4] (live DWT_CYCCNT MMIO)
+                0xfaU, 0xe7U, // b start
+            };
+            ASSERT_TRUE(board.memory().loadBytes(start, code));
+            ASSERT_TRUE(board.memory().write32(0x20000040U, 0U));
+            ASSERT_TRUE(board.memory().write32(0xe0001000U, 1U));
+            board.cpu().state().r[1] = 0x20000040U;
+            board.cpu().state().r[3] = 0x20000040U;
+            board.cpu().state().r[4] = 0xe0001004U;
+        }
+        world->setDiagnosticsEnabled(false);
+    }
+    std::array<std::vector<std::uint32_t>, 2U> fast_observations, checked_observations;
+    for (std::size_t lane = 0U; lane < 2U; ++lane) {
+        const auto name = lane == 0U ? "alpha" : "beta";
+        for (const bool candidate : {false, true}) {
+            auto& world = candidate ? *fast.value() : *checked.value();
+            auto* board = world.board(name);
+            auto& observations = candidate ? fast_observations[lane] : checked_observations[lane];
+            auto owner = world.eventLoop().useOwner(static_cast<fil::sim::EventOwner>(lane));
+            for (const auto at : {17U, 100U, 1'999U, 3'125U, 7'777U, 100'000U, 100'001U}) {
+                static_cast<void>(world.eventLoop().scheduleAt(at, [board, &observations] {
+                    observations.push_back(board->cpu().state().r[0]);
+                }));
+            }
+        }
+    }
+    auto options = runOptions(1'000'000U);
+    options.cross_board_window_ns = 100'000U;
+    for (const auto budget : {3U, 10'003U, 4'097U, 1U, 32'000U}) {
+        SCOPED_TRACE(budget);
+        options.max_instructions_per_board = budget;
+        options.enable_jit = true;
+        const auto actual = fast.value()->run(options);
+        options.enable_jit = false;
+        const auto expected = checked.value()->run(options);
+        ASSERT_TRUE(actual && expected);
+        EXPECT_EQ(actual.value().reason, expected.value().reason);
+        EXPECT_EQ(actual.value().instructions, expected.value().instructions);
+        EXPECT_EQ(actual.value().cycles, expected.value().cycles);
+        EXPECT_EQ(actual.value().end_time_ns, expected.value().end_time_ns);
+        EXPECT_EQ(actual.value().event_callbacks, expected.value().event_callbacks);
+        EXPECT_EQ(fast_observations, checked_observations);
+        for (const auto name : {"alpha", "beta"}) {
+            auto& a = *fast.value()->board(name);
+            auto& b = *checked.value()->board(name);
+            EXPECT_TRUE(fil::cpu::bitwiseEqual(a.cpu().state(), b.cpu().state()));
+            for (const auto& region : a.memory().regions()) {
+                if (region.kind != fil::mem::RegionKind::ram) continue;
+                for (std::uint32_t offset = 0U; offset < region.size; ++offset) {
+                    const auto address = region.base + offset;
+                    ASSERT_EQ(a.memory().read8(address).value(), b.memory().read8(address).value())
+                        << "RAM address " << address;
+                }
+            }
+        }
+    }
+}
+
 TEST(WorldTimeTest, IndependentWindowsPreserveLocalInterruptsAndInstructionBudgets) {
     TempWorldTimeConfigs files;
     const auto alpha = files.writeBoard("alpha.json", "alpha");

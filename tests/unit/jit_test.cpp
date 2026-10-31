@@ -51,6 +51,31 @@ struct FakeFetchStalls {
     std::uint16_t sequential{0U};
 };
 
+struct FetchCallbackLog {
+    const fil::cpu::CortexM4::ReversibleCycleBudget* budget{nullptr};
+    std::array<std::uint32_t, 16U> pcs{};
+    std::array<bool, 16U> sequential{};
+    std::array<std::uint64_t, 16U> remaining{};
+    std::array<std::uint32_t, 16U> fetch_end{};
+    std::array<bool, 16U> have_fetch{};
+    std::size_t count{0U};
+};
+
+std::uint16_t logFetchStall(const void* context, const std::uint32_t pc, const bool sequential) {
+    auto& log = *static_cast<FetchCallbackLog*>(const_cast<void*>(context));
+    if (log.count < log.pcs.size()) {
+        log.pcs[log.count] = pc;
+        log.sequential[log.count] = sequential;
+        if (log.budget) {
+            log.remaining[log.count] = log.budget->remaining_cycles;
+            log.fetch_end[log.count] = log.budget->fetch_end;
+            log.have_fetch[log.count] = log.budget->have_fetch;
+        }
+    }
+    ++log.count;
+    return sequential ? 1U : 3U;
+}
+
 std::uint16_t fakeFetchStall(
     const void* context, const std::uint32_t, const bool sequential) {
     const auto& stalls = *static_cast<const FakeFetchStalls*>(context);
@@ -717,6 +742,7 @@ TEST(JitTest, CommittedRamSpanUnrollsLoopsWithEveryIterationRetired) {
                 ASSERT_TRUE(oracle.write32(ram_base, 0U));
                 fil::cpu::CortexM4::ReversibleCycleBudget budget;
                 budget.remaining_cycles = credit;
+                budget.total_instruction_cycles.fill(0xBEEFU);
                 budget.fetch_timing = {flash_base, flash_base + 256U, 0U, 0U, 4U, 1U};
                 budget.have_fetch = (limit & 1U) != 0U;
                 budget.fetch_end = flash_base;
@@ -742,6 +768,10 @@ TEST(JitTest, CommittedRamSpanUnrollsLoopsWithEveryIterationRetired) {
                 EXPECT_EQ(credit - budget.remaining_cycles, charged_cycles);
                 EXPECT_EQ(budget.have_fetch, have_fetch);
                 EXPECT_EQ(budget.fetch_end, fetch_end);
+                EXPECT_TRUE(std::all_of(budget.total_instruction_cycles.begin(),
+                    budget.total_instruction_cycles.end(), [](const std::uint16_t value) {
+                        return value == 0xBEEFU;
+                    }));
                 EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.state(), checked.state()));
                 EXPECT_EQ(bus.read32(ram_base).value(), oracle.read32(ram_base).value());
             }
@@ -785,6 +815,116 @@ TEST(JitTest, CommittedUnrolledTraceDeclinesLaterLoopCarriedAddress) {
     EXPECT_EQ(actual->cycles, cycles);
     EXPECT_EQ(1000U - budget.remaining_cycles, cycles);
     EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.state(), checked.state()));
+}
+
+TEST(JitTest, CompactCommittedFallbackPreservesDetailedResultAndFetchOrdering) {
+    const auto code = halfwords({0x2001U, 0x3001U, 0x6008U, 0x680aU, 0x2a02U, 0xd100U});
+    auto compact_bus = basicBus(), detailed_bus = basicBus();
+    ASSERT_TRUE(compact_bus.loadBytes(flash_base, code));
+    ASSERT_TRUE(detailed_bus.loadBytes(flash_base, code));
+    for (auto* memory : {&compact_bus, &detailed_bus}) {
+        memory->setReversibleRamOnly(true);
+        memory->setAllMmioTrapping(true);
+    }
+    fil::cpu::CortexM4 compact(compact_bus), detailed(detailed_bus);
+    prepare(compact); prepare(detailed);
+    compact.setNativeMemoryJitEnabled(false);
+    detailed.setNativeMemoryJitEnabled(false);
+    for (unsigned i = 0U; i < 70U; ++i) {
+        static_cast<void>(compact.prepareJitBlock(true));
+        static_cast<void>(detailed.prepareJitBlock(true));
+    }
+
+    for (std::uint32_t credit = 0U; credit <= 20U; ++credit) {
+        SCOPED_TRACE(credit);
+        prepare(compact); prepare(detailed);
+        fil::cpu::CortexM4::ReversibleCycleBudget a, b;
+        a.remaining_cycles = b.remaining_cycles = credit;
+        compact.state().r[1] = detailed.state().r[1] = ram_base;
+        FetchCallbackLog compact_log, detailed_log;
+        compact_log.budget = &a;
+        detailed_log.budget = &b;
+        a.fetch_stall = b.fetch_stall = logFetchStall;
+        a.context = &compact_log;
+        b.context = &detailed_log;
+        a.total_instruction_cycles.fill(0xBEEFU);
+        const auto actual = compact.tryStepCommittedRamSpan(6U, a);
+        const auto expected = detailed.tryStepBudgetedReversibleJitBlock(6U, b);
+        ASSERT_EQ(actual.has_value(), expected.has_value());
+        EXPECT_EQ(compact_log.count, detailed_log.count);
+        for (std::size_t i = 0U; i < compact_log.count && i < compact_log.pcs.size(); ++i) {
+            EXPECT_EQ(compact_log.pcs[i], detailed_log.pcs[i]);
+            EXPECT_EQ(compact_log.sequential[i], detailed_log.sequential[i]);
+            EXPECT_EQ(compact_log.remaining[i], detailed_log.remaining[i]);
+            EXPECT_EQ(compact_log.fetch_end[i], detailed_log.fetch_end[i]);
+            EXPECT_EQ(compact_log.have_fetch[i], detailed_log.have_fetch[i]);
+        }
+        if (actual) {
+            const auto& ref = expected->execution.result;
+            EXPECT_EQ(actual->reason, ref.reason);
+            EXPECT_EQ(actual->instructions, ref.instructions);
+            EXPECT_EQ(actual->cycles, ref.cycles);
+            EXPECT_EQ(actual->instruction_address, ref.instruction_address);
+            EXPECT_EQ(actual->raw, ref.raw);
+            EXPECT_EQ(actual->instruction_size, ref.instruction_size);
+            EXPECT_EQ(actual->suppress_loop_observation, ref.suppress_loop_observation);
+        }
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(compact.state(), detailed.state()));
+        EXPECT_EQ(compact_bus.read32(ram_base).value(), detailed_bus.read32(ram_base).value());
+        EXPECT_EQ(a.remaining_cycles, b.remaining_cycles);
+        EXPECT_EQ(a.have_fetch, b.have_fetch);
+        EXPECT_EQ(a.fetch_end, b.fetch_end);
+        EXPECT_TRUE(std::all_of(a.total_instruction_cycles.begin(),
+            a.total_instruction_cycles.end(), [](const std::uint16_t value) {
+                return value == 0xBEEFU;
+            }));
+    }
+}
+
+TEST(JitTest, CompactItFallbackKeepsCycleArrayUntouchedAtEveryBudgetCut) {
+    const auto code = halfwords({0xbf08U, 0x3001U, 0xbf00U}); // IT EQ; ADDS r0, #1; NOP
+    auto compact_bus = basicBus(), detailed_bus = basicBus();
+    ASSERT_TRUE(compact_bus.loadBytes(flash_base, code));
+    ASSERT_TRUE(detailed_bus.loadBytes(flash_base, code));
+    for (auto* memory : {&compact_bus, &detailed_bus}) {
+        memory->setReversibleRamOnly(true);
+        memory->setAllMmioTrapping(true);
+    }
+    fil::cpu::CortexM4 compact(compact_bus), detailed(detailed_bus);
+    compact.setNativeMemoryJitEnabled(false);
+    detailed.setNativeMemoryJitEnabled(false);
+    const FakeFetchStalls stalls{2U, 1U};
+    for (const bool zero : {false, true}) {
+        for (std::uint32_t credit = 0U; credit <= 8U; ++credit) {
+            SCOPED_TRACE(credit);
+            SCOPED_TRACE(zero);
+            prepare(compact); prepare(detailed);
+            if (zero) {
+                compact.state().xpsr |= 1U << 30U;
+                detailed.state().xpsr |= 1U << 30U;
+            }
+            fil::cpu::CortexM4::ReversibleCycleBudget a, b;
+            a.remaining_cycles = b.remaining_cycles = credit;
+            a.fetch_stall = b.fetch_stall = fakeFetchStall;
+            a.context = b.context = &stalls;
+            a.total_instruction_cycles.fill(0xBEEFU);
+            for (unsigned step = 0U; step < 2U; ++step) {
+                const auto actual = compact.tryStepCommittedRamSpan(8U, a);
+                const auto expected = detailed.tryStepBudgetedReversibleJitBlock(8U, b);
+                ASSERT_EQ(actual.has_value(), expected.has_value());
+                EXPECT_TRUE(fil::cpu::bitwiseEqual(compact.state(), detailed.state()));
+                EXPECT_EQ(a.remaining_cycles, b.remaining_cycles);
+                EXPECT_EQ(a.have_fetch, b.have_fetch);
+                EXPECT_EQ(a.fetch_end, b.fetch_end);
+                EXPECT_TRUE(std::all_of(a.total_instruction_cycles.begin(),
+                    a.total_instruction_cycles.end(), [](auto value) { return value == 0xBEEFU; }));
+                if (!actual) break;
+                EXPECT_EQ(actual->instructions, expected->execution.result.instructions);
+                EXPECT_EQ(actual->cycles, expected->execution.result.cycles);
+                EXPECT_EQ(actual->instruction_address, expected->execution.result.instruction_address);
+            }
+        }
+    }
 }
 
 TEST(JitTest, CommittedRamSpanMatchesDetailedReversiblePrefixes) {

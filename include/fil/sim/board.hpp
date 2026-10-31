@@ -278,12 +278,16 @@ public:
      */
     [[nodiscard]] std::optional<ReversibleRamPrefix> prepareReversibleRamPrefix(
         std::size_t max_instructions, std::optional<SimTimeNs> deadline = std::nullopt);
-    /** @brief Fills reusable scheduler-owned storage, avoiding certificate copies. */
+    /**
+     * @brief Fills reusable scheduler-owned storage, avoiding certificate copies.
+     * Cache-only misses leave CPU/RAM unchanged and skip speculative discovery.
+     */
     [[nodiscard]] bool prepareReversibleRamPrefix(
         ReversibleRamPrefix& out, std::size_t max_instructions,
         std::optional<SimTimeNs> deadline = std::nullopt,
         bool allow_single_prefix = false,
-        bool owner_local_barrier_installed = false);
+        bool owner_local_barrier_installed = false,
+        bool cache_only = false);
 
     /** @brief Commits the started prefix, restoring/replaying an interrupted suffix. */
     [[nodiscard]] ConcurrentStepResult materializeReversibleRamPrefix(
@@ -312,6 +316,12 @@ private:
     [[nodiscard]] std::optional<ConcurrentStepResult> stepMemoizedLocal(
         std::size_t max_instructions, std::optional<SimTimeNs> deadline);
     std::unique_ptr<ReversibleRamPrefix> local_prefix_;
+    struct LocalPrefixProbe {
+        std::uint32_t pc{0U};
+        std::uint8_t visits{0U};
+    };
+    // Profitability hints only: a deferred discovery always executes normally.
+    std::array<LocalPrefixProbe, 256U> local_prefix_probes_{};
     bool owner_slice_active_{false};
 
     [[nodiscard]] static bool appendReversibleChunk(

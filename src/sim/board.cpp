@@ -209,6 +209,7 @@ Result<void> Board::reset() {
     transition_restoration_generations_.fill(memory_.restorationGeneration());
     transition_hotness_.fill(0U);
     transition_probes_ = {};
+    local_prefix_probes_ = {};
     period_validation_checkpoint_ = {};
     period_validation_restoration_generation_ = memory_.restorationGeneration();
     read_footprint_boundary_.reset();
@@ -709,7 +710,8 @@ std::optional<Board::ReversibleRamPrefix> Board::prepareReversibleRamPrefix(
 
 bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
     const std::size_t max_instructions, const std::optional<SimTimeNs> deadline,
-    const bool allow_single_prefix, const bool owner_local_barrier_installed) {
+    const bool allow_single_prefix, const bool owner_local_barrier_installed,
+    const bool cache_only) {
     prefix.count = 0U;
     prefix.memoized_count = 0U;
     prefix.compressed_period = false;
@@ -1015,6 +1017,10 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
         ++transition_hotness_[slot];
         return true;
     }
+    // Owner-local execution can commit ordinary RAM spans directly. Keep
+    // certificate hits, but avoid speculative snapshots/metadata on sampled
+    // discovery misses; this declines optimization, never guest work.
+    if (cache_only) return false;
     // Cached cuts restore certificate states directly, never entry_state.
     // Capture the rollback snapshot only before actual speculative execution.
     prefix.entry_state.capture(cpu_->state());
@@ -1894,7 +1900,13 @@ std::optional<Board::ConcurrentStepResult> Board::stepMemoizedLocal(
     auto horizon = saturatingAdd(event_loop_->now(),
         elapsedForCycles(std::numeric_limits<std::uint16_t>::max()));
     if (deadline) horizon = std::min(horizon, *deadline);
-    if (!prepareReversibleRamPrefix(*local_prefix_, max_instructions, horizon, false, true))
+    const auto pc = cpu_->state().r[15];
+    auto& probe = local_prefix_probes_[((pc >> 1U) ^ (pc >> 9U))
+        & (local_prefix_probes_.size() - 1U)];
+    if (probe.pc != pc) probe = {pc, 0U};
+    const auto visits = probe.visits++;
+    const bool cache_only = visits >= transition_hotness_threshold && (visits & 63U) != 0U;
+    if (!prepareReversibleRamPrefix(*local_prefix_, max_instructions, horizon, false, true, cache_only))
         return std::nullopt;
     return materializeReversibleRamPrefix(*local_prefix_, local_prefix_->count);
 }
@@ -1954,9 +1966,22 @@ std::optional<cpu::FastStepResult> Board::stepCommittedLocal(
     // effects commit once, with no journal, snapshot, restore, or replay.
     // Traps prevent any MMIO or executable write inside the native span.
     ReversibleMemoryGuard guard(memory_);
-    auto executed = cpu_->tryStepCommittedRamSpan(max_instructions, budget);
-    if (!executed || executed->instructions == 0U) return std::nullopt;
-    auto result = *executed;
+    cpu::FastStepResult result;
+    std::uint32_t instructions = 0U;
+    bool suppress_loop_observation = false;
+    while (instructions < max_instructions) {
+        const auto request = std::min<std::size_t>(max_instructions - instructions,
+            cpu::NativeTracePlan::max_ops);
+        const auto executed = cpu_->tryStepCommittedRamSpan(request, budget);
+        if (!executed || executed->instructions == 0U) break;
+        instructions += executed->instructions;
+        suppress_loop_observation |= executed->suppress_loop_observation;
+        result = *executed;
+        if (result.reason != cpu::StopReason::step_complete || blockBoundaryPending()) break;
+    }
+    if (instructions == 0U) return std::nullopt;
+    result.instructions = instructions;
+    result.suppress_loop_observation = suppress_loop_observation;
     result.cycles = static_cast<std::uint16_t>(credit - budget.remaining_cycles);
     have_last_fetch_ = budget.have_fetch;
     last_fetch_end_ = budget.fetch_end;
@@ -2005,7 +2030,9 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
                 options.max_instructions - aggregate.instructions,
                 DeferredPurePrefix::max_memoized_instructions)), limit_time) : std::nullopt;
         const auto committed = !memoized && owner_slice_active_ && jit_ok
-            ? stepCommittedLocal(jit_limit, limit_time) : std::nullopt;
+            ? stepCommittedLocal(jit_limit == 1U ? 1U : static_cast<std::size_t>(
+                std::min<std::uint64_t>(options.max_instructions - aggregate.instructions,
+                    DeferredPurePrefix::max_memoized_instructions)), limit_time) : std::nullopt;
         auto result = memoized ? memoized->cpu_result : committed ? *committed
             : stepWithFetchTiming(jit_ok, limit_time, owner_slice_active_ ? 1U : jit_limit);
         if (memoized && local_prefix_->memoized_count != 0U) {
