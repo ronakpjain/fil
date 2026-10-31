@@ -1399,17 +1399,25 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
                 // A certificate discovered from the actual endpoint is useful
                 // for future admissions, but its first ordinary prefix must
                 // remain the exact un-folded execution just observed.
-                if (discovery_only && (prefix.period_certificate || whole_period_certified)) {
-                    speculative.count = static_cast<std::uint8_t>(prefix.count);
-                    speculative.result.instructions = static_cast<std::uint32_t>(prefix.count);
-                    break;
+                if (discovery_only) {
+                    if (prefix.period_certificate || whole_period_certified) {
+                        speculative.count = static_cast<std::uint8_t>(prefix.count);
+                        speculative.result.instructions = static_cast<std::uint32_t>(prefix.count);
+                        break;
+                    }
+                    // Certification may decline at a cold interior instruction.
+                    // Keep collecting the ordinary checked span rather than
+                    // caching a needlessly short transition at this boundary.
+                    continue;
                 }
-                const bool may_fold = prefix.period_certificate != nullptr
-                    || prefix.whole_ram_neutral_period_certificate != nullptr;
+                // The actual checked period already returned CPU, fetch and
+                // every RAM byte to its entry state under the MMIO guard.
+                // Repeating it within this same event-bounded transaction needs
+                // no persistent certificate; partial cuts retain checked replay.
                 const std::uint64_t fold_period_cycles = prefix.whole_ram_neutral_period_certificate
                     ? prefix.whole_ram_neutral_period_certificate->cumulative_cycles[period]
                     : period_cycles;
-                while (may_fold && limit - prefix.count >= period
+                while (limit - prefix.count >= period
                        && fold_period_cycles <= budget.remaining_cycles) {
                     for (std::size_t i = 0U; i < period; ++i) {
                         const std::size_t dst = prefix.count++;

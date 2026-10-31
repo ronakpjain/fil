@@ -259,7 +259,8 @@ TEST(BoardTest, EndpointDiscoveryAdjustsPositiveAndNegativeFirstFetchStall) {
     }
 }
 
-bool installWholeRamNeutralPeriod(fil::sim::Board& board, const unsigned nops = 1U) {
+bool installWholeRamNeutralPeriod(fil::sim::Board& board, const unsigned nops = 1U,
+    const bool warm_interior = true) {
     const auto start = board.cpu().state().r[15] & ~1U;
     constexpr std::uint32_t target = 0x20000080U;
     constexpr std::uint32_t original = 0x13579bdfU;
@@ -284,12 +285,49 @@ bool installWholeRamNeutralPeriod(fil::sim::Board& board, const unsigned nops = 
     state.instruction_address = 0x12345678U;
     const auto entry = state;
     for (std::size_t offset = 0U; offset < code.size(); offset += 2U) {
+        if (!warm_interior && offset != 0U) continue;
         state.r[15] = start + static_cast<std::uint32_t>(offset);
         for (unsigned i = 0U; i < 80U; ++i)
             static_cast<void>(board.cpu().prepareJitBlock());
     }
     state = entry;
     return true;
+}
+
+TEST(BoardTest, ColdPeriodCertificationKeepsLongCheckedSpansAndExactCuts) {
+    for (const bool recurring_entry : {false, true}) {
+        for (const std::size_t cut : {1U, 3U, 4U, 7U, 127U, 128U}) {
+            auto exact = fil::sim::Board::load(fixtureBoard());
+            auto candidate = fil::sim::Board::load(fixtureBoard());
+            ASSERT_TRUE(exact && candidate);
+            ASSERT_TRUE(installWholeRamNeutralPeriod(*exact.value(), 1U, false));
+            ASSERT_TRUE(installWholeRamNeutralPeriod(*candidate.value(), 1U, false));
+            fil::sim::BoardRunOptions options;
+            options.duration_ns = 0U;
+            options.enable_loop_batching = false;
+            if (recurring_entry) {
+                options.max_instructions = 4U;
+                ASSERT_EQ(exact.value()->run(options).instructions, 4U);
+                ASSERT_EQ(candidate.value()->run(options).instructions, 4U);
+            }
+            const auto start = exact.value()->eventLoop().now();
+            const auto prefix = candidate.value()->prepareReversibleRamPrefix(128U);
+            ASSERT_TRUE(prefix);
+            ASSERT_EQ(prefix->count, 128U);
+            EXPECT_EQ(prefix->memoized_count, 0U);
+            EXPECT_FALSE(prefix->whole_ram_neutral_period_certificate);
+            if (recurring_entry) EXPECT_GT(prefix->folded_instructions, 0U);
+            options.max_instructions = cut;
+            const auto expected = exact.value()->run(options);
+            const auto actual = candidate.value()->materializeReversibleRamPrefix(*prefix, cut);
+            EXPECT_EQ(actual.cpu_result.cycles, expected.cycles);
+            EXPECT_EQ(actual.elapsed_ns, expected.time_ns - start);
+            EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.value()->cpu().state(),
+                exact.value()->cpu().state())) << recurring_entry << " cut=" << cut;
+            EXPECT_EQ(candidate.value()->memory().read32(0x20000080U).value(),
+                exact.value()->memory().read32(0x20000080U).value());
+        }
+    }
 }
 
 TEST(BoardTest, WholeRamNeutralPeriodFoldsAndReplaysEveryPartialCut) {
