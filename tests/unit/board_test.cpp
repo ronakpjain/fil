@@ -1,4 +1,5 @@
 #include "fil/sim/board.hpp"
+#include "fil/sim/world.hpp"
 #include "../fixture_support.hpp"
 #include "fil/stm32g4/stm32g4.hpp"
 
@@ -408,6 +409,113 @@ TEST(BoardTest, CacheOnlyRamPreparationDoesNotSpeculateOnMiss) {
     EXPECT_EQ(reads.complete, board.value()->memory().readFootprint().complete);
     EXPECT_EQ(now, board.value()->eventLoop().now());
     EXPECT_TRUE(board.value()->prepareReversibleRamPrefix(prefix, 64U));
+}
+
+TEST(BoardTest, MissHintsPeriodicallyRediscoverAfterCodeGenerationChange) {
+    const auto make_world = [] {
+        auto directory = std::make_unique<fil::test::TemporaryDirectory>("fil-board-hint");
+        const auto fixture = fixtureBoard();
+        const auto board_path = directory->write("board.json",
+            std::string("{\"schema_version\":1,\"name\":\"hint\",\"mcu\":\"")
+                + fixture.mcu_path.string() + "\",\"elf\":\"" + fixture.elf_path.string()
+                + "\",\"vector_base\":\"0x08000000\"}");
+        fil::config::NetworkConfig config;
+        config.name = "hint-network";
+        config.source_path = directory->root() / "network.json";
+        config.board_paths.push_back(board_path);
+        auto world = fil::sim::World::load(config);
+        return std::pair{std::move(directory), std::move(world)};
+    };
+    auto [hint_directory, hinted] = make_world();
+    auto [reference_directory, reference] = make_world();
+    ASSERT_TRUE(hinted && reference);
+    auto* hinted_board = hinted.value()->board("hint");
+    auto* reference_board = reference.value()->board("hint");
+    ASSERT_NE(hinted_board, nullptr);
+    ASSERT_NE(reference_board, nullptr);
+    const auto start = hinted_board->cpu().state().r[15] & ~1U;
+    const std::vector<std::uint8_t> changing_loop{0x01U,0x30U, 0xfdU,0xe7U};
+    ASSERT_TRUE(hinted_board->memory().loadBytes(start, changing_loop));
+    ASSERT_TRUE(reference_board->memory().loadBytes(start, changing_loop));
+    fil::sim::WorldRunOptions options;
+    options.duration_ns = 0U;
+    options.cross_board_window_ns = 100'000U;
+    options.instruction_quantum = 2U;
+    options.max_instructions_per_board = 2U;
+    options.enable_ram_capsules = true;
+    const auto run_checked = [&] {
+        auto checked_options = options;
+        // The independent owner runner selects its checked path via JIT;
+        // enable_ram_capsules alone does not disable its local memoization.
+        checked_options.enable_jit = false;
+        checked_options.enable_ram_capsules = false;
+        return reference.value()->run(checked_options);
+    };
+    for (unsigned i = 0U; i < 8U; ++i) {
+        const auto hinted_miss = hinted.value()->run(options);
+        ASSERT_TRUE(hinted_miss);
+        const auto exact_miss = run_checked();
+        ASSERT_TRUE(exact_miss);
+        ASSERT_EQ(hinted_miss.value().boards[0].result.instructions, 2U);
+        EXPECT_EQ(hinted_miss.value().instructions, exact_miss.value().instructions);
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(hinted_board->cpu().state(), reference_board->cpu().state()));
+    }
+
+    // Every short owner run is exactly two guest instructions and returns to
+    // the same entry PC. This deliberately saturates the entry's eight misses.
+    EXPECT_EQ(hinted_board->cpu().state().r[15], start);
+    EXPECT_EQ(hinted_board->cpu().state().r[0], reference_board->cpu().state().r[0]);
+    const std::vector<std::uint8_t> idle_loop{0x00U,0xbfU, 0xfdU,0xe7U};
+    ASSERT_TRUE(hinted_board->memory().loadBytes(start, idle_loop));
+    ASSERT_TRUE(reference_board->memory().loadBytes(start, idle_loop));
+
+    // Prove the exact new-generation idle-loop certificate independently of
+    // the sampling policy. This isolates the test to the hint's guarantee:
+    // after repeated known-cold entries, periodic sampling must resume lookup.
+    for (auto* board : {hinted_board, reference_board}) {
+        for (const auto offset : {0U, 2U}) {
+            board->cpu().state().r[15] = start + offset;
+            for (unsigned i = 0U; i < 70U; ++i)
+                static_cast<void>(board->cpu().prepareJitBlock());
+        }
+        board->cpu().state().r[15] = start;
+        fil::mem::MemoryBus::TrackingScope tracking(board->memory(), true, true);
+        fil::sim::Board::ReversibleRamPrefix seed;
+        ASSERT_TRUE(board->prepareReversibleRamPrefix(seed, 128U));
+        ASSERT_NE(seed.period_certificate, nullptr);
+        static_cast<void>(board->materializeReversibleRamPrefix(seed, seed.count));
+    }
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(hinted_board->cpu().state(), reference_board->cpu().state()));
+
+    // Visits 8..63 are cache-only; the visit at 64 is the forced periodic
+    // lookup. Then a longer slice must hit the pre-seeded certificate.
+    for (unsigned i = 0U; i < 56U; ++i) {
+        options.max_instructions_per_board = 2U;
+        const auto hinted_skip = hinted.value()->run(options);
+        ASSERT_TRUE(hinted_skip);
+        const auto exact_skip = run_checked();
+        ASSERT_TRUE(exact_skip);
+        EXPECT_EQ(hinted_skip.value().instructions, exact_skip.value().instructions);
+    }
+    options.max_instructions_per_board = 256U;
+    const auto discovery = hinted.value()->run(options); // visit 64 looks up the pre-seeded period
+    ASSERT_TRUE(discovery);
+    ASSERT_TRUE(run_checked());
+
+    options.max_instructions_per_board = 256U;
+    const auto hinted_result = hinted.value()->run(options);
+    const auto exact_result = run_checked();
+    ASSERT_TRUE(hinted_result && exact_result);
+    ASSERT_EQ(hinted_result.value().boards.size(), 1U);
+    EXPECT_GT(hinted_result.value().boards[0].memoized_instructions, 0U)
+        << "periodic discovery must recover certificate hits after code generation changes";
+    EXPECT_EQ(hinted_result.value().instructions, exact_result.value().instructions);
+    EXPECT_EQ(hinted_result.value().boards[0].result.cycles,
+              exact_result.value().boards[0].result.cycles);
+    EXPECT_EQ(hinted_result.value().end_time_ns, exact_result.value().end_time_ns);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(hinted_board->cpu().state(), reference_board->cpu().state()));
+    EXPECT_EQ(hinted_board->memory().read32(0x20000040U).value(),
+              reference_board->memory().read32(0x20000040U).value());
 }
 
 TEST(BoardTest, CacheOnlyRamPreparationRetainsPeriodHits) {

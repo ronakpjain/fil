@@ -319,6 +319,7 @@ private:
     struct LocalPrefixProbe {
         std::uint32_t pc{0U};
         std::uint8_t visits{0U};
+        std::uint8_t misses{0U};
     };
     // Profitability hints only: a deferred discovery always executes normally.
     std::array<LocalPrefixProbe, 256U> local_prefix_probes_{};

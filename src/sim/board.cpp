@@ -1894,20 +1894,27 @@ std::optional<Board::ConcurrentStepResult> Board::stepMemoizedLocal(
     const std::size_t max_instructions, const std::optional<SimTimeNs> deadline) {
     if (max_instructions < 2U || !memory_.writeJournalTracking() || blockBoundaryPending())
         return std::nullopt;
+    const auto pc = cpu_->state().r[15];
+    auto& probe = local_prefix_probes_[((pc >> 1U) ^ (pc >> 9U))
+        & (local_prefix_probes_.size() - 1U)];
+    if (probe.pc != pc) probe = {pc, 0U, 0U};
+    const auto visits = probe.visits++;
+    const bool discovery = visits < transition_hotness_threshold || (visits & 63U) == 0U;
+    if (!discovery && probe.misses >= transition_hotness_threshold) return std::nullopt;
     if (!local_prefix_) local_prefix_ = std::make_unique<ReversibleRamPrefix>();
     // FastStepResult carries a 16-bit aggregate charge. Bound even compressed
     // certificates before admission; a full commit accounts these cycles once.
     auto horizon = saturatingAdd(event_loop_->now(),
         elapsedForCycles(std::numeric_limits<std::uint16_t>::max()));
     if (deadline) horizon = std::min(horizon, *deadline);
-    const auto pc = cpu_->state().r[15];
-    auto& probe = local_prefix_probes_[((pc >> 1U) ^ (pc >> 9U))
-        & (local_prefix_probes_.size() - 1U)];
-    if (probe.pc != pc) probe = {pc, 0U};
-    const auto visits = probe.visits++;
-    const bool cache_only = visits >= transition_hotness_threshold && (visits & 63U) != 0U;
-    if (!prepareReversibleRamPrefix(*local_prefix_, max_instructions, horizon, false, true, cache_only))
-        return std::nullopt;
+    const bool prepared = prepareReversibleRamPrefix(
+        *local_prefix_, max_instructions, horizon, false, true, !discovery);
+    if (prepared && local_prefix_->memoized_count != 0U) {
+        probe.misses = 0U;
+        return materializeReversibleRamPrefix(*local_prefix_, local_prefix_->count);
+    }
+    if (probe.misses < transition_hotness_threshold) ++probe.misses;
+    if (!prepared) return std::nullopt;
     return materializeReversibleRamPrefix(*local_prefix_, local_prefix_->count);
 }
 
