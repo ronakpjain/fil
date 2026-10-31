@@ -96,6 +96,28 @@ struct Board::IdempotentPeriodCertificate {
     std::uint64_t flash_acr_generation{0U};
 };
 
+struct Board::WholeRamNeutralPeriodCertificate {
+    static constexpr std::size_t max_instructions = 32U;
+    std::uint8_t count{0U};
+    cpu::CpuState entry_state{};
+    bool entry_have_fetch{false};
+    std::uint32_t entry_fetch_end{0U};
+    std::array<std::uint32_t, max_instructions> pcs{};
+    std::array<std::uint8_t, max_instructions> sizes{};
+    std::array<std::uint32_t, max_instructions> raw{};
+    // Total charged timing includes fetch stalls; retain pipeline-only cost too
+    // because reversible replay compares it before reapplying live fetch timing.
+    std::array<std::uint16_t, max_instructions> cpu_instruction_cycles{};
+    std::array<std::uint16_t, max_instructions> instruction_cycles{};
+    std::array<std::uint64_t, max_instructions + 1U> cumulative_cycles{};
+    mem::MemoryBus::ReadFootprint full_footprint{};
+    mem::MemoryBus::SideEffectCheckpoint checkpoint{};
+    std::uint64_t restoration_generation{0U};
+    std::uint64_t execution_generation{0U};
+    std::uint64_t clock_hz{0U};
+    std::uint64_t flash_generation{0U};
+};
+
 struct Board::RamNeutralTransitionCertificate {
     static constexpr std::size_t max_instructions = ReversibleRamPrefix::max_instructions;
     std::uint8_t count{0U};
@@ -204,6 +226,8 @@ Result<void> Board::reset() {
     loop_observations_ = {};
     loop_observation_generation_ = 1U;
     idempotent_period_cache_.reset();
+    whole_ram_neutral_period_cache_.reset();
+    whole_ram_neutral_validation_checkpoint_ = {};
     ram_neutral_transition_cache_ = {};
     transition_validation_checkpoints_ = {};
     transition_restoration_generations_.fill(memory_.restorationGeneration());
@@ -701,6 +725,111 @@ Board::buildIdempotentPeriodCertificate(
     return idempotent_period_cache_;
 }
 
+std::shared_ptr<const Board::WholeRamNeutralPeriodCertificate>
+Board::buildWholeRamNeutralPeriodCertificate(
+    const std::size_t period, const std::uint64_t period_cycles) {
+    using Certificate = WholeRamNeutralPeriodCertificate;
+    if (period == 0U || period > Certificate::max_instructions
+        || !memory_.readFootprintTracking()) return {};
+
+    const auto endpoint_state = cpu_->state();
+    const bool endpoint_have_fetch = have_last_fetch_;
+    const auto endpoint_fetch_end = last_fetch_end_;
+    const auto endpoint_footprint = memory_.readFootprint();
+    const auto start_checkpoint = memory_.sideEffectCheckpoint();
+    const auto start_restoration_generation = memory_.restorationGeneration();
+    const auto execution_generation = memory_.executionGeneration();
+    const auto clock_hz = peripherals_->rcc().systemClockHz();
+    const auto flash_generation = peripherals_->flash().acrGeneration();
+    auto certificate = std::make_shared<Certificate>();
+    certificate->count = static_cast<std::uint8_t>(period);
+    certificate->entry_state = endpoint_state;
+    certificate->entry_have_fetch = endpoint_have_fetch;
+    certificate->entry_fetch_end = endpoint_fetch_end;
+
+    memory_.restoreReadFootprint(mem::MemoryBus::ReadFootprint{});
+    bool valid = endpoint_footprint.complete;
+    std::uint64_t total_cycles = 0U;
+    const auto& flash = peripherals_->flash();
+    cpu::CortexM4::ReversibleCycleBudget budget{};
+    budget.remaining_cycles = std::numeric_limits<std::uint64_t>::max();
+    budget.have_fetch = endpoint_have_fetch;
+    budget.fetch_end = endpoint_fetch_end;
+    const auto wait = static_cast<std::uint16_t>(flash.waitStates());
+    budget.fetch_timing = {flash.flashBase(), flash.flashBase() + flash.bankSize(),
+        0U, flash.bankSize(), wait,
+        static_cast<std::uint16_t>((flash.prefetchEnabled() || flash.instructionCacheEnabled()) ? 0U : wait)};
+    {
+        ReversibleMemoryGuard guard(memory_);
+        mem::MemoryBus::StoreFootprintScope store_footprints(memory_);
+        for (std::size_t i = 0U; valid && i < period; ++i) {
+            auto step = cpu_->tryStepBudgetedReversibleJitBlock(1U, budget);
+            if (!step || step->execution.count != 1U
+                || step->execution.result.reason != cpu::StopReason::step_complete) {
+                valid = false;
+                break;
+            }
+            auto footprint = memory_.takeReadFootprint();
+            const auto charged = budget.total_instruction_cycles[0];
+            if (!footprint.complete || charged == 0U
+                || total_cycles > std::numeric_limits<std::uint64_t>::max() - charged) {
+                valid = false;
+                break;
+            }
+            const auto& result = step->execution.result;
+            total_cycles += charged;
+            certificate->pcs[i] = result.instruction_address;
+            certificate->sizes[i] = result.instruction_size;
+            certificate->raw[i] = result.raw;
+            certificate->cpu_instruction_cycles[i] = step->instruction_cycles[0];
+            certificate->instruction_cycles[i] = charged;
+            certificate->cumulative_cycles[i + 1U] = total_cycles;
+            for (std::size_t word = 0U; word < footprint.words.size(); ++word)
+                certificate->full_footprint.words[word] |= footprint.words[word];
+            certificate->full_footprint.complete = certificate->full_footprint.complete
+                && footprint.complete;
+        }
+        valid = valid && total_cycles == period_cycles
+            && cpu::bitwiseEqual(cpu_->state(), endpoint_state)
+            && budget.have_fetch == endpoint_have_fetch
+            && budget.fetch_end == endpoint_fetch_end
+            && memory_.sideEffectsRestoredSince(start_checkpoint)
+            && memory_.executionGeneration() == execution_generation
+            && peripherals_->rcc().systemClockHz() == clock_hz
+            && peripherals_->flash().acrGeneration() == flash_generation;
+    }
+    if (!valid) {
+        const auto current = memory_.sideEffectCheckpoint();
+        if (current.mutation_sequence != start_checkpoint.mutation_sequence
+            && memory_.canRestoreSideEffects(start_checkpoint)) {
+            static_cast<void>(memory_.restoreSideEffects(start_checkpoint));
+        }
+        cpu_->state() = endpoint_state;
+        have_last_fetch_ = endpoint_have_fetch;
+        last_fetch_end_ = endpoint_fetch_end;
+        memory_.restoreReadFootprint(endpoint_footprint);
+        return {};
+    }
+    // A successful replay is byte-neutral. Keep its journal history rather
+    // than restoring an empty/no-op undo (which changes restoration generation).
+    cpu_->state() = endpoint_state;
+    have_last_fetch_ = endpoint_have_fetch;
+    last_fetch_end_ = endpoint_fetch_end;
+    memory_.restoreReadFootprint(endpoint_footprint);
+    certificate->full_footprint.complete = certificate->full_footprint.complete
+        && certificate->count != 0U;
+    if (!certificate->full_footprint.complete
+        || memory_.restorationGeneration() != start_restoration_generation) return {};
+    certificate->checkpoint = memory_.sideEffectCheckpoint();
+    certificate->restoration_generation = memory_.restorationGeneration();
+    certificate->execution_generation = execution_generation;
+    certificate->clock_hz = clock_hz;
+    certificate->flash_generation = flash_generation;
+    whole_ram_neutral_period_cache_ = certificate;
+    whole_ram_neutral_validation_checkpoint_ = certificate->checkpoint;
+    return whole_ram_neutral_period_cache_;
+}
+
 std::optional<Board::ReversibleRamPrefix> Board::prepareReversibleRamPrefix(
     const std::size_t max_instructions, const std::optional<SimTimeNs> deadline) {
     ReversibleRamPrefix prefix{};
@@ -720,6 +849,7 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
     prefix.first_fetch_delta = 0;
     prefix.folded_instructions = 0U;
     prefix.period_certificate.reset();
+    prefix.whole_ram_neutral_period_certificate.reset();
     prefix.transition_certificate.reset();
     prefix.period_phase = 0U;
     prefix.evaluated.count = 0U;
@@ -793,6 +923,57 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
         }
         return (total_cycles * nanoseconds_per_second + prefix.time_fraction) / frequency;
     };
+    // RAM-neutral periods are reusable only at their exact entry CPU/fetch
+    // phase. Intermediate phases may have different RAM bytes, so never map
+    // an arbitrary phase directly from CPU snapshots.
+    if (whole_ram_neutral_period_cache_) {
+        const auto& cert = *whole_ram_neutral_period_cache_;
+        // A phase miss needs no journal walk. Once the exact entry state is
+        // proved, validate only mutations since the last successful lookup;
+        // rescanning from construction grows the work until journal rollover.
+        const bool valid = cert.count != 0U
+            && prefix.entry_pc == cert.entry_state.r[15]
+            && prefix.entry_have_fetch == cert.entry_have_fetch
+            && prefix.entry_fetch_end == cert.entry_fetch_end
+            && cpu::bitwiseEqual(cpu_->state(), cert.entry_state)
+            && restoration_generation == cert.restoration_generation
+            && prefix.execution_generation == cert.execution_generation
+            && frequency == cert.clock_hz
+            && prefix.flash_generation == cert.flash_generation
+            && memory_.ramInputsCompatibleSince(
+                whole_ram_neutral_validation_checkpoint_, cert.full_footprint);
+        if (valid) {
+            std::uint64_t cycles = 0U;
+            const std::size_t admission_limit = std::min<std::size_t>(
+                limit, ReversibleRamPrefix::max_instructions);
+            for (std::size_t n = 0U; n < admission_limit; ++n) {
+                const auto charged = cert.instruction_cycles[n % cert.count];
+                if (charged == 0U || charged > cycle_credit - std::min(cycle_credit, cycles)
+                    || cycles + charged >= 65536U) break;
+                cycles += charged;
+                if (systick && cycles >= *systick) break;
+                const auto elapsed = elapsed_for_span(cycles);
+                if (horizon && elapsed >= *horizon - now) break;
+                const auto completion = saturatingAdd(now, elapsed);
+                if (completion <= now || (prefix.count != 0U
+                    && completion <= prefix.completion_times_ns[prefix.count - 1U])) break;
+                prefix.cumulative_cycles[prefix.count] = cycles;
+                prefix.completion_times_ns[prefix.count] = completion;
+                ++prefix.count;
+            }
+            if (prefix.count >= (allow_single_prefix ? 1U : 2U)) {
+                prefix.memoized_count = prefix.count;
+                prefix.whole_ram_neutral_period_certificate = whole_ram_neutral_period_cache_;
+                prefix.evaluated.result.reason = cpu::StopReason::step_complete;
+                prefix.evaluated.result.instructions = static_cast<std::uint32_t>(prefix.count);
+                prefix.evaluated.count = static_cast<std::uint8_t>(prefix.count);
+                prefix.evaluated_checkpoint = prefix.memory_checkpoint;
+                whole_ram_neutral_validation_checkpoint_ = prefix.memory_checkpoint;
+                return true;
+            }
+            prefix.count = 0U;
+        }
+    }
     // A certificate is reusable at every phase, provided no RAM input read by
     // the complete period has changed since its last successful validation.
     if (idempotent_period_cache_) {
@@ -1112,8 +1293,6 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
                 && cpu_->state().r[15] == prefix.entry_pc
                 && prefix.entry_state.matchesExceptInstructionAddress(cpu_->state())
                 && memory_.executionGeneration() == prefix.execution_generation
-                && memory_.sideEffectCheckpoint().mutation_sequence
-                    == prefix.memory_checkpoint.mutation_sequence
                 && memory_.sideEffectsRestoredSince(prefix.memory_checkpoint)) {
                 const std::uint64_t period_cycles = cycles;
                 const bool same_fetch = budget.have_fetch == prefix.entry_have_fetch
@@ -1142,6 +1321,7 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
                 // fits this admission's instruction and cycle credit.
                 const bool can_certify = limit - prefix.count >= period
                     && adjusted_cycles_valid && certificate_cycles <= budget.remaining_cycles;
+                bool whole_period_certified = false;
                 if (can_certify && period <= IdempotentPeriodCertificate::max_instructions) {
                     struct FetchMetadataRestore {
                         Board& board;
@@ -1160,36 +1340,56 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
                     }
                     {
                         FetchMetadataRestore restore{*this, saved_have_fetch, saved_fetch_end};
-                        prefix.period_certificate = buildIdempotentPeriodCertificate(
-                            period, certificate_cycles);
+                        const auto now_checkpoint = memory_.sideEffectCheckpoint();
+                        if (now_checkpoint.mutation_sequence == prefix.memory_checkpoint.mutation_sequence) {
+                            prefix.period_certificate = buildIdempotentPeriodCertificate(
+                                period, certificate_cycles);
+                        } else {
+                            const auto certificate = buildWholeRamNeutralPeriodCertificate(
+                                period, certificate_cycles);
+                            whole_period_certified = certificate != nullptr;
+                            if (whole_period_certified) {
+                                prefix.evaluated_checkpoint = memory_.sideEffectCheckpoint();
+                                if (!discovery_only)
+                                    prefix.whole_ram_neutral_period_certificate = certificate;
+                            }
+                        }
                     }
                 }
                 // A certificate discovered from the actual endpoint is useful
                 // for future admissions, but its first ordinary prefix must
                 // remain the exact un-folded execution just observed.
-                if (discovery_only) {
-                    if (prefix.period_certificate) {
-                        speculative.count = static_cast<std::uint8_t>(prefix.count);
-                        speculative.result.instructions = static_cast<std::uint32_t>(prefix.count);
-                        break;
-                    }
-                    continue; // No certificate: retain ordinary speculative work, never fold mismatched timing.
+                if (discovery_only && (prefix.period_certificate || whole_period_certified)) {
+                    speculative.count = static_cast<std::uint8_t>(prefix.count);
+                    speculative.result.instructions = static_cast<std::uint32_t>(prefix.count);
+                    break;
                 }
-                while (limit - prefix.count >= period
-                       && period_cycles <= budget.remaining_cycles) {
+                const bool may_fold = prefix.period_certificate != nullptr
+                    || prefix.whole_ram_neutral_period_certificate != nullptr;
+                const std::uint64_t fold_period_cycles = prefix.whole_ram_neutral_period_certificate
+                    ? prefix.whole_ram_neutral_period_certificate->cumulative_cycles[period]
+                    : period_cycles;
+                while (may_fold && limit - prefix.count >= period
+                       && fold_period_cycles <= budget.remaining_cycles) {
                     for (std::size_t i = 0U; i < period; ++i) {
                         const std::size_t dst = prefix.count++;
-                        const auto charged = prefix.cumulative_cycles[i]
-                            - (i == 0U ? 0U : prefix.cumulative_cycles[i - 1U]);
+                        const auto charged = prefix.whole_ram_neutral_period_certificate
+                            ? prefix.whole_ram_neutral_period_certificate->instruction_cycles[i]
+                            : prefix.cumulative_cycles[i]
+                                - (i == 0U ? 0U : prefix.cumulative_cycles[i - 1U]);
                         cycles += charged;
                         prefix.cumulative_cycles[dst] = cycles;
                         prefix.completion_times_ns[dst] = saturatingAdd(now, elapsed_for_span(cycles));
-                        speculative.pcs[dst] = speculative.pcs[i];
-                        speculative.sizes[dst] = speculative.sizes[i];
-                        speculative.instruction_cycles[dst] = speculative.instruction_cycles[i];
+                        speculative.pcs[dst] = prefix.whole_ram_neutral_period_certificate
+                            ? prefix.whole_ram_neutral_period_certificate->pcs[i] : speculative.pcs[i];
+                        speculative.sizes[dst] = prefix.whole_ram_neutral_period_certificate
+                            ? prefix.whole_ram_neutral_period_certificate->sizes[i] : speculative.sizes[i];
+                        speculative.instruction_cycles[dst] = prefix.whole_ram_neutral_period_certificate
+                            ? prefix.whole_ram_neutral_period_certificate->cpu_instruction_cycles[i]
+                            : speculative.instruction_cycles[i];
                         ++prefix.folded_instructions;
                     }
-                    budget.remaining_cycles -= period_cycles;
+                    budget.remaining_cycles -= fold_period_cycles;
                 }
                 speculative.count = static_cast<std::uint8_t>(prefix.count);
                 speculative.result.instructions = static_cast<std::uint32_t>(prefix.count);
@@ -1352,6 +1552,56 @@ Board::ConcurrentStepResult Board::materializeReversibleRamPrefix(
         || memory_.executionGeneration() != prefix.execution_generation
         || time_fraction_ != prefix.time_fraction) {
         throw std::logic_error("stale reversible RAM prefix");
+    }
+    if (prefix.whole_ram_neutral_period_certificate && prefix.memoized_count != 0U) {
+        const auto& cert = *prefix.whole_ram_neutral_period_certificate;
+        if (whole_ram_neutral_period_cache_ != prefix.whole_ram_neutral_period_certificate
+            || cert.count == 0U || count > prefix.memoized_count
+            || memory_.restorationGeneration() != cert.restoration_generation
+            || !memory_.ramInputsCompatibleSince(prefix.memory_checkpoint, cert.full_footprint)
+            || !cpu::bitwiseEqual(cpu_->state(), cert.entry_state)
+            || have_last_fetch_ != cert.entry_have_fetch
+            || last_fetch_end_ != cert.entry_fetch_end) {
+            throw std::logic_error("stale whole RAM-neutral period certificate");
+        }
+        const std::size_t remainder = count % cert.count;
+        if (remainder != 0U) {
+            ReversibleMemoryGuard guard(memory_);
+            for (std::size_t i = 0U; i < remainder; ++i) {
+                const auto step = cpu_->stepFast();
+                if (step.reason != cpu::StopReason::step_complete || step.instructions != 1U
+                    || step.instruction_address != cert.pcs[i]
+                    || step.instruction_size != cert.sizes[i]) {
+                    throw std::logic_error("whole RAM-neutral period residual replay differs");
+                }
+                const auto actual = static_cast<std::uint64_t>(step.cycles)
+                    + peripherals_->flash().fetchStallCycles(step.instruction_address,
+                        i == 0U ? cert.entry_have_fetch
+                            && step.instruction_address == cert.entry_fetch_end
+                            : step.instruction_address == cert.pcs[i - 1U] + cert.sizes[i - 1U]);
+                if (actual != cert.instruction_cycles[i]) {
+                    throw std::logic_error("whole RAM-neutral period residual timing differs");
+                }
+            }
+            last_fetch_end_ = cert.pcs[remainder - 1U] + cert.sizes[remainder - 1U];
+            have_last_fetch_ = true;
+        }
+        auto footprint = prefix.entry_read_footprint;
+        if (count != 0U) {
+            for (std::size_t word = 0U; word < footprint.words.size(); ++word)
+                footprint.words[word] |= cert.full_footprint.words[word];
+            footprint.complete = footprint.complete && cert.full_footprint.complete;
+        }
+        memory_.restoreReadFootprint(footprint);
+        const auto last = (count - 1U) % cert.count;
+        auto result = prefix.evaluated.result;
+        result.instructions = static_cast<std::uint32_t>(count);
+        result.instruction_address = cert.pcs[last];
+        result.raw = cert.raw[last];
+        result.instruction_size = cert.sizes[last];
+        const auto cycles = prefix.cumulative_cycles[count - 1U];
+        result.cycles = static_cast<std::uint16_t>(cycles);
+        return ConcurrentStepResult{result, accountCycles(cycles)};
     }
     if (prefix.transition_certificate && prefix.memoized_count != 0U) {
         const auto& cert = *prefix.transition_certificate;

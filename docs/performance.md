@@ -204,6 +204,20 @@ rather than inspecting or resuming potentially speculative state.
 
 A bounded, immutable period certificate can avoid execution and replay for naturally recurring spans whose RAM bytes remain unchanged after every instruction, including idempotent stores. Compilation records each CPU/fetch endpoint and charged cycle cost. Discovery may ignore only the incoming prior-instruction diagnostic address and fetch predecessor: it independently certifies an exact endpoint-anchored period, adjusts the future first-fetch stall, and leaves the current ordinary prefix unfurled. Cached phase matching remains exact. Reuse requires a matching CPU phase, historical execution/clock/FLASH generations, complete canonical RAM read-and-store footprints, usable journal history, and an unchanged restoration token. A different fetch predecessor adjusts only the first instruction's ART stall; later fetch endpoints follow the certificate. Unrelated journaled RAM changes may remain compatible regardless of CPU or external origin; changed inputs, journal rewinds, reset, and transaction restoration reject reuse. Certificate validation uses complete read-and-store footprints, including unread destinations of idempotent stores; ordinary transaction validation remains stricter. Cached repeating spans use compressed periodic timing rather than filling one metadata entry per instruction. They admit up to 4096 logical instructions, bounded by event, SysTick, deadline, and representable cycle budgets; uncached speculative work retains a fixed 128-instruction limit, which amortizes the per-admission scheduler and certificate work over longer spans. Timing accessors and binary-search cuts reconstruct the selected period phase without modifying RAM and charge cycles once using the admission's original timing fraction. A boundary that cuts an admission retains its valid leading instructions instead of discarding the whole cached span. This does not omit ADC conversions, DMA, interrupts, or observation barriers. JIT diagnostics describe actual handler work, not the logical instructions represented by a cached period. The `memoized_prefixes`, `memoized_instructions`, and per-board `memoized_ram` diagnostics report certificate admissions; admitted instructions may be cut by a later barrier, so these counters are not committed instruction totals. This path uses cached handlers and does not compile RAM kernels. Capsule eligibility remains guarded: audited local ADC observations may be crossed only when provider/wiring, interrupt hooks, DMA identity, and the next directly backed RAM transfer satisfy the checks. Custom callbacks and unsupported DMA remain global observation barriers. Concurrency or reentrant mutation of a running World is unsupported; after a run throws, discard that World rather than inspecting or resuming potentially speculative state.
 
+A separate whole-period certificate handles loops that temporarily change RAM
+but restore every touched byte at the period boundary. It certifies the complete
+read-and-store footprint and requires the exact entry CPU and fetch phase;
+interior phases cannot be restored from CPU snapshots alone. Whole periods are
+folded without RAM changes, while an arbitrary partial cut replays its residual
+instructions with checked RAM effects. These admissions retain the bounded
+128-instruction metadata representation and the same event, SysTick, deadline,
+clock, executable-generation, flash-timing, and journal guards. CPU-only cycle
+metadata remains separate from charged flash timing for interrupted replay.
+Successful exact-entry lookups rebase the validated journal window only after
+input compatibility is proved, so unrelated history need not remain available
+since certificate construction. This mechanism recognizes execution behavior,
+not firmware symbols or function names.
+
 ## ADC decimation
 
 `--adc-decimation N` keeps one of every N continuous-mode scans (1–1024; default 1). Skipped scans omit normal register, DMA, interrupt, and sample-recording effects. Single-shot conversions are not skipped.

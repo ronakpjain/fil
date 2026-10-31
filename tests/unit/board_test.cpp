@@ -259,6 +259,163 @@ TEST(BoardTest, EndpointDiscoveryAdjustsPositiveAndNegativeFirstFetchStall) {
     }
 }
 
+bool installWholeRamNeutralPeriod(fil::sim::Board& board) {
+    const auto start = board.cpu().state().r[15] & ~1U;
+    constexpr std::uint32_t target = 0x20000080U;
+    constexpr std::uint32_t original = 0x13579bdfU;
+    constexpr std::uint32_t temporary = 0x2468ace0U;
+    const std::vector<std::uint8_t> code{
+        0x08U, 0x60U, // str r0, [r1]
+        0x0aU, 0x60U, // str r2, [r1] -- restore the entry byte value
+        0x00U, 0xbfU, // nop
+        0xfbU, 0xe7U, // b start
+    };
+    if (!board.memory().write32(target, original)
+        || !board.memory().loadBytes(start, code)) return false;
+    auto& state = board.cpu().state();
+    state.r[15] = start;
+    state.r[0] = temporary;
+    state.r[1] = target;
+    state.r[2] = original;
+    state.instruction_address = 0x12345678U;
+    const auto entry = state;
+    for (const auto offset : {0U, 2U, 4U, 6U}) {
+        state.r[15] = start + offset;
+        for (unsigned i = 0U; i < 80U; ++i)
+            static_cast<void>(board.cpu().prepareJitBlock());
+    }
+    state = entry;
+    return true;
+}
+
+TEST(BoardTest, WholeRamNeutralPeriodFoldsAndReplaysEveryPartialCut) {
+    for (const std::size_t cut : {1U, 2U, 3U, 4U, 5U, 8U, 11U, 12U}) {
+        auto exact = fil::sim::Board::load(fixtureBoard());
+        auto cached = fil::sim::Board::load(fixtureBoard());
+        ASSERT_TRUE(exact && cached);
+        ASSERT_TRUE(installWholeRamNeutralPeriod(*exact.value()));
+        ASSERT_TRUE(installWholeRamNeutralPeriod(*cached.value()));
+
+        const auto discovery = cached.value()->prepareReversibleRamPrefix(12U);
+        ASSERT_TRUE(discovery);
+        ASSERT_EQ(discovery->count, 4U);
+        static_cast<void>(cached.value()->materializeReversibleRamPrefix(*discovery, 4U));
+
+        fil::sim::BoardRunOptions options;
+        options.duration_ns = 0U;
+        options.enable_loop_batching = false;
+        options.max_instructions = 4U;
+        ASSERT_EQ(exact.value()->run(options).instructions, 4U);
+        const auto admission = cached.value()->prepareReversibleRamPrefix(12U);
+        ASSERT_TRUE(admission);
+        ASSERT_EQ(admission->count, 12U);
+        ASSERT_TRUE(admission->whole_ram_neutral_period_certificate);
+        EXPECT_EQ(cached.value()->memory().read32(0x20000080U).value(), 0x13579bdfU);
+
+        options.max_instructions = cut;
+        const auto expected = exact.value()->run(options);
+        ASSERT_EQ(expected.instructions, cut);
+        const auto actual = cached.value()->materializeReversibleRamPrefix(*admission, cut);
+        EXPECT_EQ(actual.cpu_result.cycles, expected.cycles) << "cut=" << cut;
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(cached.value()->cpu().state(),
+            exact.value()->cpu().state())) << "cut=" << cut;
+        EXPECT_EQ(cached.value()->memory().read32(0x20000080U).value(),
+            exact.value()->memory().read32(0x20000080U).value()) << "cut=" << cut;
+        if (cut == 12U) {
+            const auto hit = cached.value()->prepareReversibleRamPrefix(12U);
+            ASSERT_TRUE(hit && hit->whole_ram_neutral_period_certificate);
+            EXPECT_EQ(hit->memoized_count, 12U);
+            static_cast<void>(cached.value()->materializeReversibleRamPrefix(*hit, hit->count));
+        }
+    }
+}
+
+TEST(BoardTest, WholeRamNeutralFreshFoldReplaysCpuCyclesWithFlashStalls) {
+    for (const std::size_t cut : {4U, 5U, 8U, 11U}) {
+        auto exact = fil::sim::Board::load(fixtureBoard());
+        auto folded = fil::sim::Board::load(fixtureBoard());
+        ASSERT_TRUE(exact && folded);
+        ASSERT_TRUE(exact.value()->memory().write32(0x40022000U, 2U));
+        ASSERT_TRUE(folded.value()->memory().write32(0x40022000U, 2U));
+        ASSERT_TRUE(installWholeRamNeutralPeriod(*exact.value()));
+        ASSERT_TRUE(installWholeRamNeutralPeriod(*folded.value()));
+
+        const auto discovery = folded.value()->prepareReversibleRamPrefix(12U);
+        ASSERT_TRUE(discovery);
+        ASSERT_EQ(discovery->count, 4U);
+        static_cast<void>(folded.value()->materializeReversibleRamPrefix(*discovery, 4U));
+        fil::sim::BoardRunOptions options;
+        options.duration_ns = 0U;
+        options.enable_loop_batching = false;
+        options.max_instructions = 4U;
+        ASSERT_EQ(exact.value()->run(options).instructions, 4U);
+
+        // Invalidate the old memoized certificate without changing the store
+        // input bytes, forcing a fresh (nonmemoized) period discovery/fold.
+        constexpr std::uint32_t target = 0x20000080U;
+        const auto checkpoint = folded.value()->memory().sideEffectCheckpoint();
+        ASSERT_TRUE(folded.value()->memory().write32(target, 0xabcdef01U));
+        ASSERT_TRUE(folded.value()->memory().restoreSideEffects(checkpoint));
+
+        const auto admission = folded.value()->prepareReversibleRamPrefix(12U);
+        ASSERT_TRUE(admission);
+        ASSERT_EQ(admission->count, 12U);
+        ASSERT_EQ(admission->memoized_count, 0U);
+        ASSERT_GT(admission->folded_instructions, 0U);
+        ASSERT_TRUE(admission->whole_ram_neutral_period_certificate);
+
+        options.max_instructions = cut;
+        const auto expected = exact.value()->run(options);
+        ASSERT_EQ(expected.instructions, cut);
+        const auto actual = folded.value()->materializeReversibleRamPrefix(*admission, cut);
+        EXPECT_EQ(actual.cpu_result.cycles, expected.cycles) << "cut=" << cut;
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(folded.value()->cpu().state(),
+            exact.value()->cpu().state())) << "cut=" << cut;
+        EXPECT_EQ(folded.value()->memory().read32(target).value(),
+            exact.value()->memory().read32(target).value()) << "cut=" << cut;
+    }
+}
+
+TEST(BoardTest, WholeRamNeutralPeriodInvalidatesChangedStoreInput) {
+    auto board = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(board);
+    ASSERT_TRUE(installWholeRamNeutralPeriod(*board.value()));
+    const auto discovery = board.value()->prepareReversibleRamPrefix(12U);
+    ASSERT_TRUE(discovery);
+    static_cast<void>(board.value()->materializeReversibleRamPrefix(*discovery, discovery->count));
+    const auto seed = board.value()->prepareReversibleRamPrefix(12U);
+    ASSERT_TRUE(seed && seed->whole_ram_neutral_period_certificate);
+    static_cast<void>(board.value()->materializeReversibleRamPrefix(*seed, seed->count));
+    ASSERT_TRUE(board.value()->memory().write32(0x20000080U, 0xdeadbeefU));
+    const auto changed = board.value()->prepareReversibleRamPrefix(12U);
+    ASSERT_TRUE(changed);
+    EXPECT_FALSE(changed->whole_ram_neutral_period_certificate);
+    EXPECT_EQ(changed->memoized_count, 0U);
+    static_cast<void>(board.value()->materializeReversibleRamPrefix(*changed, changed->count));
+    // Checked execution must run the stores, not fold a period whose entry
+    // bytes no longer match. The loop itself overwrites the changed input.
+    EXPECT_EQ(board.value()->memory().read32(0x20000080U).value(), 0x13579bdfU);
+}
+
+TEST(BoardTest, WholeRamNeutralPeriodRebasesValidatedJournalWindows) {
+    auto board = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(board);
+    ASSERT_TRUE(installWholeRamNeutralPeriod(*board.value()));
+    const auto discovery = board.value()->prepareReversibleRamPrefix(12U);
+    ASSERT_TRUE(discovery);
+    static_cast<void>(board.value()->materializeReversibleRamPrefix(*discovery, discovery->count));
+    // More mutations than the journal can retain overall, but only a short
+    // byte-neutral window between consecutive validated phase-zero hits.
+    for (unsigned i = 0U; i < 5000U; ++i) {
+        ASSERT_TRUE(board.value()->memory().write8(0x20000100U, 1U));
+        ASSERT_TRUE(board.value()->memory().write8(0x20000100U, 0U));
+        const auto hit = board.value()->prepareReversibleRamPrefix(12U);
+        ASSERT_TRUE(hit && hit->whole_ram_neutral_period_certificate) << i;
+        ASSERT_EQ(hit->memoized_count, 12U) << i;
+        static_cast<void>(board.value()->materializeReversibleRamPrefix(*hit, hit->count));
+    }
+}
+
 TEST(BoardTest, RamNeutralTransitionTracksUnreadIdempotentStoreDestinations) {
     for (const bool cpu_origin : {false, true}) {
         for (const std::size_t cut : {1U, 2U, 4U}) {

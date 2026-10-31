@@ -77,6 +77,7 @@ struct BoardRunResult {
 /** @brief Loaded and wired firmware board instance. */
 class Board {
     struct IdempotentPeriodCertificate;
+    struct WholeRamNeutralPeriodCertificate;
     struct RamNeutralTransitionCertificate;
 public:
 
@@ -211,6 +212,7 @@ public:
         bool entry_have_fetch{false};
         std::uint32_t entry_fetch_end{0};
         std::shared_ptr<const IdempotentPeriodCertificate> period_certificate;
+        std::shared_ptr<const WholeRamNeutralPeriodCertificate> whole_ram_neutral_period_certificate;
         std::shared_ptr<const RamNeutralTransitionCertificate> transition_certificate;
         mem::MemoryBus::SideEffectCheckpoint transition_validation_checkpoint{};
         std::uint64_t transition_restoration_generation{0U};
@@ -469,6 +471,8 @@ private:
     [[nodiscard]] bool loopHasNoMmioSince(const ProvenLoop& loop) const noexcept;
     [[nodiscard]] std::shared_ptr<const IdempotentPeriodCertificate> buildIdempotentPeriodCertificate(
         std::size_t period, std::uint64_t period_cycles);
+    [[nodiscard]] std::shared_ptr<const WholeRamNeutralPeriodCertificate>
+    buildWholeRamNeutralPeriodCertificate(std::size_t period, std::uint64_t period_cycles);
     [[nodiscard]] std::optional<SimTimeNs> nextObservableTime(SimTimeNs boundary_time) const;
     [[nodiscard]] SimTimeNs nextInstructionElapsedNs() const noexcept {
         return elapsedForCycles(1U);
@@ -497,6 +501,8 @@ private:
     std::array<LoopObservation, 256> loop_observations_{};
     // Bounded to the most recently certified natural period.
     std::shared_ptr<const IdempotentPeriodCertificate> idempotent_period_cache_;
+    std::shared_ptr<const WholeRamNeutralPeriodCertificate> whole_ram_neutral_period_cache_;
+    mem::MemoryBus::SideEffectCheckpoint whole_ram_neutral_validation_checkpoint_{};
     static constexpr std::size_t transition_bucket_count = 16U;
     static constexpr std::size_t transition_ways = 4U;
     static constexpr std::size_t transition_slot_count = transition_bucket_count * transition_ways;
