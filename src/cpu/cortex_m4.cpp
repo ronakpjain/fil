@@ -1660,9 +1660,9 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepPreparedJitBlock(
 std::optional<CortexM4::TimedJitStepOutcome> CortexM4::tryStepReversibleJitBlock(
     const std::size_t max_instructions) {
     if (max_instructions == 0U) return std::nullopt;
-    if (inItBlock(state_.it_state)) return tryStepItScalarFallback(nullptr);
+    if (inItBlock(state_.it_state)) return tryStepItScalarFallback<true>(nullptr);
     if (!prepareJitBlock(true)) {
-        if (auto scalar = tryStepItScalarFallback(nullptr)) return scalar;
+        if (auto scalar = tryStepItScalarFallback<true>(nullptr)) return scalar;
         return std::nullopt;
     }
     if (memory_.reversibleRamOnly() && memory_.allMmioTrapping()) {
@@ -2035,12 +2035,8 @@ auto CortexM4::tryStepBudgetedReversibleJitBlockImpl(
     -> std::optional<std::conditional_t<Detailed, TimedJitStepOutcome, FastStepResult>> {
     if (max_instructions == 0U || !memory_.reversibleRamOnly()
         || !memory_.allMmioTrapping()) return std::nullopt;
-    if (inItBlock(state_.it_state)) {
-        auto scalar = tryStepItScalarFallback(&budget, Detailed);
-        if (!scalar) return std::nullopt;
-        if constexpr (Detailed) return scalar;
-        else return scalar->execution.result;
-    }
+    if (inItBlock(state_.it_state))
+        return tryStepItScalarFallback<Detailed>(&budget, Detailed);
     if constexpr (Detailed) {
         if (try_native_trace && native_memory_jit_enabled_ && budget.fetch_stall == nullptr) {
             TimedJitStepOutcome detailed;
@@ -2049,10 +2045,7 @@ auto CortexM4::tryStepBudgetedReversibleJitBlockImpl(
     }
     if (!prepareJitBlock(true)) {
         ++jit_stats_.block_prepare_failed;
-        auto scalar = tryStepItScalarFallback(&budget, Detailed);
-        if (!scalar) return std::nullopt;
-        if constexpr (Detailed) return scalar;
-        else return scalar->execution.result;
+        return tryStepItScalarFallback<Detailed>(&budget, Detailed);
     }
     return executeTrustedReversibleJitBlockImpl<Detailed>(max_instructions, &budget);
 }
@@ -2070,8 +2063,10 @@ std::optional<FastStepResult> CortexM4::tryStepCommittedRamSpan(
     return tryStepBudgetedReversibleJitBlockImpl<false>(max_instructions, budget, false);
 }
 
-std::optional<CortexM4::TimedJitStepOutcome> CortexM4::tryStepItScalarFallback(
-    ReversibleCycleBudget* budget, const bool record_cycles) {
+template <bool Detailed>
+auto CortexM4::tryStepItScalarFallback(
+    ReversibleCycleBudget* budget, const bool record_cycles)
+    -> std::optional<std::conditional_t<Detailed, TimedJitStepOutcome, FastStepResult>> {
     if (state_.halted || !state_.thumb || (state_.xpsr & xpsr_t) == 0U
         || (state_.r[15] & 1U) != 0U || state_.pending_exception
         || state_.pending_exc_return) return std::nullopt;
@@ -2118,25 +2113,39 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::tryStepItScalarFallback(
         state_ = before;
         return std::nullopt;
     }
-    TimedJitStepOutcome timed{};
-    auto& out = timed.execution;
-    out.count = 1U;
-    out.pcs[0] = stepped.instruction_address;
-    out.sizes[0] = stepped.instruction_size;
-    out.memory_free = true;
-    out.result = stepped;
-    timed.instruction_cycles[0] = stepped.cycles;
-    if (budget) {
-        const std::uint32_t charged = static_cast<std::uint32_t>(stepped.cycles) + stall;
-        if (record_cycles)
-            budget->total_instruction_cycles[0] = static_cast<std::uint16_t>(charged);
-        budget->remaining_cycles -= charged;
-        budget->have_fetch = true;
-        budget->fetch_end = pc + size;
+    if constexpr (Detailed) {
+        TimedJitStepOutcome timed{};
+        auto& out = timed.execution;
+        out.count = 1U;
+        out.pcs[0] = stepped.instruction_address;
+        out.sizes[0] = stepped.instruction_size;
+        out.memory_free = true;
+        out.result = stepped;
+        timed.instruction_cycles[0] = stepped.cycles;
+        if (budget) {
+            const std::uint32_t charged = static_cast<std::uint32_t>(stepped.cycles) + stall;
+            if (record_cycles)
+                budget->total_instruction_cycles[0] = static_cast<std::uint16_t>(charged);
+            budget->remaining_cycles -= charged;
+            budget->have_fetch = true;
+            budget->fetch_end = pc + size;
+        }
+        ++jit_stats_.block_executions;
+        ++jit_stats_.block_instructions;
+        return timed;
+    } else {
+        if (budget) {
+            const std::uint32_t charged = static_cast<std::uint32_t>(stepped.cycles) + stall;
+            if (record_cycles)
+                budget->total_instruction_cycles[0] = static_cast<std::uint16_t>(charged);
+            budget->remaining_cycles -= charged;
+            budget->have_fetch = true;
+            budget->fetch_end = pc + size;
+        }
+        ++jit_stats_.block_executions;
+        ++jit_stats_.block_instructions;
+        return stepped;
     }
-    ++jit_stats_.block_executions;
-    ++jit_stats_.block_instructions;
-    return timed;
 }
 
 std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJitBlock(

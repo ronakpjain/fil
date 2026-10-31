@@ -743,8 +743,10 @@ private:
     [[nodiscard]] auto tryStepBudgetedReversibleJitBlockImpl(
         std::size_t max_instructions, ReversibleCycleBudget& budget, bool try_native_trace)
         -> std::optional<std::conditional_t<Detailed, TimedJitStepOutcome, FastStepResult>>;
-    [[nodiscard]] std::optional<TimedJitStepOutcome> tryStepItScalarFallback(
-        ReversibleCycleBudget* budget, bool record_cycles = true);
+    template <bool Detailed>
+    [[nodiscard]] auto tryStepItScalarFallback(
+        ReversibleCycleBudget* budget, bool record_cycles = true)
+        -> std::optional<std::conditional_t<Detailed, TimedJitStepOutcome, FastStepResult>>;
     [[nodiscard]] bool executeJitFast(const DecodedInstruction& op, JitFast fast,
                                       std::uint32_t pc) noexcept;
     [[nodiscard]] std::optional<DecodedInstruction> fetchDecode(
