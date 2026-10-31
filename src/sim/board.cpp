@@ -943,35 +943,75 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
             && memory_.ramInputsCompatibleSince(
                 whole_ram_neutral_validation_checkpoint_, cert.full_footprint);
         if (valid) {
+            // At the exact certificate entry phase, timing is periodic from
+            // instruction zero. Keep only one period of deltas and represent
+            // the larger admitted span through DeferredPurePrefix's compressed
+            // cumulative-cycle accessor.
+            const bool compressed = frequency <= nanoseconds_per_second;
+            std::size_t admission_limit = std::min(limit,
+                compressed ? DeferredPurePrefix::max_memoized_instructions
+                           : DeferredPurePrefix::max_instructions);
+            if (compressed) {
+                prefix.compressed_period = true;
+                prefix.period_length = cert.count;
+                prefix.period_cycles = cert.cumulative_cycles[cert.count];
+                for (std::size_t n = 0U; n < cert.count; ++n) {
+                    prefix.rotated_cumulative_cycles[n] = cert.cumulative_cycles[n + 1U];
+                }
+                std::size_t low = 0U, high = admission_limit;
+                while (low < high) {
+                    const auto mid = low + (high - low + 1U) / 2U;
+                    const auto cycles = prefix.cumulativeCycles(mid - 1U);
+                    if (cycles <= cycle_credit && cycles < 65536U
+                        && (!systick || cycles < *systick)) low = mid;
+                    else high = mid - 1U;
+                }
+                admission_limit = low;
+            }
             std::uint64_t cycles = 0U;
-            const std::size_t admission_limit = std::min<std::size_t>(
-                limit, ReversibleRamPrefix::max_instructions);
-            for (std::size_t n = 0U; n < admission_limit; ++n) {
-                const auto charged = cert.instruction_cycles[n % cert.count];
-                if (charged == 0U || charged > cycle_credit - std::min(cycle_credit, cycles)
-                    || cycles + charged >= 65536U) break;
-                cycles += charged;
-                if (systick && cycles >= *systick) break;
+            if (compressed) {
+                prefix.count = admission_limit;
+                if (prefix.count != 0U) cycles = prefix.cumulativeCycles(prefix.count - 1U);
+            } else {
+                for (std::size_t n = 0U; n < admission_limit; ++n) {
+                    const auto charged = cert.instruction_cycles[n % cert.count];
+                    if (charged == 0U || charged > cycle_credit - std::min(cycle_credit, cycles)
+                        || cycles + charged >= 65536U) break;
+                    cycles += charged;
+                    if (systick && cycles >= *systick) break;
+                    const auto elapsed = elapsed_for_span(cycles);
+                    if (horizon && elapsed >= *horizon - now) break;
+                    const auto completion = saturatingAdd(now, elapsed);
+                    if (completion <= now || (prefix.count != 0U
+                        && completion <= prefix.completion_times_ns[prefix.count - 1U])) break;
+                    prefix.cumulative_cycles[prefix.count] = cycles;
+                    prefix.completion_times_ns[prefix.count] = completion;
+                    ++prefix.count;
+                }
+            }
+            if (compressed && prefix.count != 0U) {
                 const auto elapsed = elapsed_for_span(cycles);
-                if (horizon && elapsed >= *horizon - now) break;
-                const auto completion = saturatingAdd(now, elapsed);
-                if (completion <= now || (prefix.count != 0U
-                    && completion <= prefix.completion_times_ns[prefix.count - 1U])) break;
-                prefix.cumulative_cycles[prefix.count] = cycles;
-                prefix.completion_times_ns[prefix.count] = completion;
-                ++prefix.count;
+                if (elapsed == std::numeric_limits<SimTimeNs>::max()
+                    || (horizon && elapsed >= *horizon - now)
+                    || saturatingAdd(now, elapsed) <= now) {
+                    prefix.count = 0U;
+                }
             }
             if (prefix.count >= (allow_single_prefix ? 1U : 2U)) {
                 prefix.memoized_count = prefix.count;
                 prefix.whole_ram_neutral_period_certificate = whole_ram_neutral_period_cache_;
                 prefix.evaluated.result.reason = cpu::StopReason::step_complete;
                 prefix.evaluated.result.instructions = static_cast<std::uint32_t>(prefix.count);
-                prefix.evaluated.count = static_cast<std::uint8_t>(prefix.count);
+                prefix.evaluated.count = static_cast<std::uint8_t>(std::min<std::size_t>(
+                    prefix.count, ReversibleRamPrefix::max_instructions));
                 prefix.evaluated_checkpoint = prefix.memory_checkpoint;
                 whole_ram_neutral_validation_checkpoint_ = prefix.memory_checkpoint;
                 return true;
             }
             prefix.count = 0U;
+            prefix.compressed_period = false;
+            prefix.period_length = 0U;
+            prefix.period_cycles = 0U;
         }
     }
     // A certificate is reusable at every phase, provided no RAM input read by
@@ -1599,7 +1639,7 @@ Board::ConcurrentStepResult Board::materializeReversibleRamPrefix(
         result.instruction_address = cert.pcs[last];
         result.raw = cert.raw[last];
         result.instruction_size = cert.sizes[last];
-        const auto cycles = prefix.cumulative_cycles[count - 1U];
+        const auto cycles = prefix.cumulativeCycles(count - 1U);
         result.cycles = static_cast<std::uint16_t>(cycles);
         return ConcurrentStepResult{result, accountCycles(cycles)};
     }

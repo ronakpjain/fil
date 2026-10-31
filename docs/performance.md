@@ -209,9 +209,11 @@ but restore every touched byte at the period boundary. It certifies the complete
 read-and-store footprint and requires the exact entry CPU and fetch phase;
 interior phases cannot be restored from CPU snapshots alone. Whole periods are
 folded without RAM changes, while an arbitrary partial cut replays its residual
-instructions with checked RAM effects. These admissions retain the bounded
-128-instruction metadata representation and the same event, SysTick, deadline,
-clock, executable-generation, flash-timing, and journal guards. CPU-only cycle
+instructions with checked RAM effects. At clocks up to 1 GHz, these admissions
+use compressed periodic timing for up to 4096 instructions; higher clocks keep
+the bounded 128-instruction representation with strictly increasing completion
+timestamps. Both retain the same event, SysTick, deadline, clock,
+executable-generation, flash-timing, and journal guards. CPU-only cycle
 metadata remains separate from charged flash timing for interrupted replay.
 Successful exact-entry lookups rebase the validated journal window only after
 input compatibility is proved, so unrelated history need not remain available

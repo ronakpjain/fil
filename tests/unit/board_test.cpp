@@ -259,17 +259,21 @@ TEST(BoardTest, EndpointDiscoveryAdjustsPositiveAndNegativeFirstFetchStall) {
     }
 }
 
-bool installWholeRamNeutralPeriod(fil::sim::Board& board) {
+bool installWholeRamNeutralPeriod(fil::sim::Board& board, const unsigned nops = 1U) {
     const auto start = board.cpu().state().r[15] & ~1U;
     constexpr std::uint32_t target = 0x20000080U;
     constexpr std::uint32_t original = 0x13579bdfU;
     constexpr std::uint32_t temporary = 0x2468ace0U;
-    const std::vector<std::uint8_t> code{
+    std::vector<std::uint8_t> code{
         0x08U, 0x60U, // str r0, [r1]
         0x0aU, 0x60U, // str r2, [r1] -- restore the entry byte value
-        0x00U, 0xbfU, // nop
-        0xfbU, 0xe7U, // b start
     };
+    for (unsigned i = 0U; i < nops; ++i) code.insert(code.end(), {0x00U, 0xbfU});
+    const auto displacement = -static_cast<std::int32_t>((code.size() + 4U) / 2U);
+    const auto branch = static_cast<std::uint16_t>(0xe000U
+        | (static_cast<std::uint32_t>(displacement) & 0x7ffU));
+    code.push_back(static_cast<std::uint8_t>(branch));
+    code.push_back(static_cast<std::uint8_t>(branch >> 8U));
     if (!board.memory().write32(target, original)
         || !board.memory().loadBytes(start, code)) return false;
     auto& state = board.cpu().state();
@@ -279,8 +283,8 @@ bool installWholeRamNeutralPeriod(fil::sim::Board& board) {
     state.r[2] = original;
     state.instruction_address = 0x12345678U;
     const auto entry = state;
-    for (const auto offset : {0U, 2U, 4U, 6U}) {
-        state.r[15] = start + offset;
+    for (std::size_t offset = 0U; offset < code.size(); offset += 2U) {
+        state.r[15] = start + static_cast<std::uint32_t>(offset);
         for (unsigned i = 0U; i < 80U; ++i)
             static_cast<void>(board.cpu().prepareJitBlock());
     }
@@ -327,6 +331,113 @@ TEST(BoardTest, WholeRamNeutralPeriodFoldsAndReplaysEveryPartialCut) {
             EXPECT_EQ(hit->memoized_count, 12U);
             static_cast<void>(cached.value()->materializeReversibleRamPrefix(*hit, hit->count));
         }
+    }
+}
+
+TEST(BoardTest, WholeRamNeutralCachedPeriodCompressesAdmissionsThrough4096) {
+    for (const std::size_t cut : {1U, 127U, 128U, 129U, 255U, 4095U, 4096U}) {
+        auto exact = fil::sim::Board::load(fixtureBoard());
+        auto cached = fil::sim::Board::load(fixtureBoard());
+        ASSERT_TRUE(exact && cached);
+        ASSERT_TRUE(exact.value()->memory().write32(0x40022000U, 2U));
+        ASSERT_TRUE(cached.value()->memory().write32(0x40022000U, 2U));
+        ASSERT_TRUE(installWholeRamNeutralPeriod(*exact.value()));
+        ASSERT_TRUE(installWholeRamNeutralPeriod(*cached.value()));
+
+        const auto discovery = cached.value()->prepareReversibleRamPrefix(12U);
+        ASSERT_TRUE(discovery);
+        ASSERT_EQ(discovery->count, 4U);
+        static_cast<void>(cached.value()->materializeReversibleRamPrefix(*discovery, 4U));
+        const auto prefix = cached.value()->prepareReversibleRamPrefix(4096U);
+        ASSERT_TRUE(prefix);
+        ASSERT_TRUE(prefix->whole_ram_neutral_period_certificate);
+        ASSERT_TRUE(prefix->compressed_period);
+        ASSERT_EQ(prefix->count, 4096U);
+        ASSERT_EQ(prefix->memoized_count, 4096U);
+        ASSERT_EQ(prefix->evaluated.count, 128U);
+        ASSERT_EQ(prefix->completionTime(cut - 1U), prefix->start_time_ns
+            + (prefix->cumulativeCycles(cut - 1U) * 1'000'000'000ULL
+                + prefix->time_fraction) / prefix->clock_hz);
+
+        fil::sim::BoardRunOptions options;
+        options.duration_ns = 0U;
+        options.enable_loop_batching = false;
+        options.max_instructions = cut;
+        const auto expected = exact.value()->run(options);
+        ASSERT_EQ(expected.instructions, cut);
+        const auto actual = cached.value()->materializeReversibleRamPrefix(*prefix, cut);
+        EXPECT_EQ(actual.cpu_result.cycles, expected.cycles) << "cut=" << cut;
+        EXPECT_EQ(actual.elapsed_ns, expected.time_ns) << "cut=" << cut;
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(cached.value()->cpu().state(),
+            exact.value()->cpu().state())) << "cut=" << cut;
+        EXPECT_EQ(cached.value()->memory().read32(0x20000080U).value(),
+            exact.value()->memory().read32(0x20000080U).value()) << "cut=" << cut;
+    }
+}
+
+TEST(BoardTest, WholeRamNeutralHighClockKeepsBoundedStrictlyIncreasingTiming) {
+    auto exact = fil::sim::Board::load(fixtureBoard());
+    auto cached = fil::sim::Board::load(fixtureBoard());
+    ASSERT_TRUE(exact && cached);
+    for (auto* board : {exact.value().get(), cached.value().get()}) {
+        ASSERT_TRUE(board->memory().write32(0x4002100cU, 2U | (127U << 8U) | (1U << 24U)));
+        const auto cr = board->memory().read32(0x40021000U);
+        ASSERT_TRUE(cr);
+        ASSERT_TRUE(board->memory().write32(0x40021000U, cr.value() | (1U << 24U)));
+        ASSERT_TRUE(board->memory().write32(0x40021008U, 3U));
+        ASSERT_EQ(board->peripherals().rcc().systemClockHz(), 1'016'000'000U);
+        ASSERT_TRUE(installWholeRamNeutralPeriod(*board, 29U));
+    }
+    const auto discovery = cached.value()->prepareReversibleRamPrefix(128U);
+    ASSERT_TRUE(discovery);
+    ASSERT_EQ(discovery->count, 32U);
+    static_cast<void>(cached.value()->materializeReversibleRamPrefix(*discovery, discovery->count));
+    fil::sim::BoardRunOptions options;
+    options.duration_ns = 0U;
+    options.enable_loop_batching = false;
+    options.max_instructions = 32U;
+    ASSERT_EQ(exact.value()->run(options).instructions, 32U);
+    const auto start = exact.value()->eventLoop().now();
+    const auto prefix = cached.value()->prepareReversibleRamPrefix(4096U);
+    ASSERT_TRUE(prefix && prefix->whole_ram_neutral_period_certificate);
+    ASSERT_FALSE(prefix->compressed_period);
+    ASSERT_LE(prefix->count, 128U);
+    ASSERT_GT(prefix->count, 1U);
+    for (std::size_t i = 1U; i < prefix->count; ++i)
+        EXPECT_GT(prefix->completionTime(i), prefix->completionTime(i - 1U));
+    options.max_instructions = prefix->count;
+    const auto expected = exact.value()->run(options);
+    const auto actual = cached.value()->materializeReversibleRamPrefix(*prefix, prefix->count);
+    EXPECT_EQ(actual.cpu_result.cycles, expected.cycles);
+    EXPECT_EQ(actual.elapsed_ns, expected.time_ns - start);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(cached.value()->cpu().state(), exact.value()->cpu().state()));
+}
+
+TEST(BoardTest, WholeRamNeutralCachedAdmissionStopsStrictlyBeforeBoundaries) {
+    auto make_cached = [] {
+        auto board = fil::sim::Board::load(fixtureBoard());
+        if (!board || !installWholeRamNeutralPeriod(*board.value())) return board;
+        const auto discovery = board.value()->prepareReversibleRamPrefix(12U);
+        if (!discovery || discovery->count != 4U) return board;
+        static_cast<void>(board.value()->materializeReversibleRamPrefix(*discovery, 4U));
+        return board;
+    };
+    {
+        auto board = make_cached();
+        ASSERT_TRUE(board);
+        const auto baseline = board.value()->prepareReversibleRamPrefix(4096U);
+        ASSERT_TRUE(baseline && baseline->compressed_period);
+        ASSERT_TRUE(board.value()->eventLoop().scheduleAt(
+            baseline->completionTime(1U), [] {}));
+        EXPECT_FALSE(board.value()->prepareReversibleRamPrefix(4096U));
+    }
+    {
+        auto board = make_cached();
+        ASSERT_TRUE(board);
+        const auto baseline = board.value()->prepareReversibleRamPrefix(4096U);
+        ASSERT_TRUE(baseline && baseline->compressed_period);
+        EXPECT_FALSE(board.value()->prepareReversibleRamPrefix(
+            4096U, baseline->completionTime(1U)));
     }
 }
 
