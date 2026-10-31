@@ -1,2 +1,5 @@
 CompileFlags:
   CompilationDatabase: .
+  # CMake may omit -std when the selected compiler defaults to C++20 or newer.
+  # clangd's default can differ from that compiler's, so make the target explicit.
+  Add: [-std=c++20]
