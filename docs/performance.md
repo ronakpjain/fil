@@ -208,141 +208,21 @@ A bounded, immutable period certificate can avoid execution and replay for natur
 
 **Decimation changes firmware-visible behavior.** Keep N at 1 for full fidelity.
 
-## Apple M3: bounded lane waiting
+## Control-flow and MMIO boundaries
 
-The ADC-heavy driveline lanes can take much longer than the other four lanes.
-Previously, all waiting workers and the coordinator spun indefinitely (with
-periodic thread yields), competing with useful emulation. Bounded spinning
-followed by atomic parking reduces this contention without changing lane work.
+Prepared blocks end at control-flow terminators. Guarded native traces can
+stitch supported branches, calls, and returns across blocks, but checked memory
+helpers decline MMIO: peripheral side effects cannot be journaled or replayed
+by a RAM-only executor. Unsupported or declined work retains checked execution.
+Execution must honor event, SysTick, interrupt, and instruction-budget boundaries;
+batching cannot move peripheral effects ahead of their simulated instruction time.
 
-On the local Apple M3, matched Clang 23.1.4 Release builds used host-native
-optimization, IPO, and fresh source-specific PGO trained on one simulated second
-of the actual six-board network. Measurements alternate reference/candidate order,
-include startup, and use strict MMIO, ADC decimation 1, a 100000 ns window,
-quantum 1024, and no trace observers. No builds ran during timing.
-
-| 10 simulated seconds | Spinning reference | Bounded-wait candidate |
-| --- | ---: | ---: |
-| Pair 1 | 27.722 s | 18.876 s |
-| Pair 2 (candidate first) | 29.084 s | 20.266 s |
-| Pair 3 | 30.610 s | 28.538 s |
-| Median | 29.084 s | 20.266 s |
-
-The measured median improvement is 1.435x, or 0.493x real time. The substantial
-run-to-run drift means this is not a stable-speed guarantee, and it does **not**
-meet the faster-than-real-time target. Every run reached all six deadlines with
-2,691,840,851 instructions and 10,197,313,072 cycles at 10,000,000,000 ns.
-Separate 100 ms, 1 s, and 10 s comparisons matched complete CPU state, every RAM
-byte, per-board instruction/cycle/time totals, and selected event-loop/CAN counts.
-Those snapshots do not cover every peripheral's internal state or ordered event
-contents. Worker regressions cover uneven work, repeated windows, exceptions,
-empty/single pools, and idle destruction; Release and ASan/UBSan suites pass.
-
-## Historical Ryzen six-board characteristics
-
-Host: AMD Ryzen 9 4900HS (8 physical cores, 16 threads), PGO Release build,
-`configs/networks/per_vehicle.json`, ADC decimation 1. One simulated second of
-the six-board `per_vehicle` network currently costs roughly 2.4 s wall
-(~0.4x real time); the exact-scheduler reference (`--cross-board-window-ns 0`)
-costs roughly 7 s. Wall time is insensitive to the window for values at or above
-100 us and grows sharply below that. The default window is now 100 us; use
-`--cross-board-window-ns 0` for exact cross-board reference scheduling.
-
-Wall time is bounded by two boards, not by scheduling or cross-board
-coordination. Per-board solo wall times for one simulated second are
-dashboard ~0.37 s, main_module ~0.32 s, torque_vector ~0.16 s, a_box ~0.63 s,
-and front_driveline and rear_driveline ~2.28 s each. Six independent
-single-board processes reproduce the same total and the same front_driveline
-cost, so the bottleneck is that board's per-instruction execution cost rather
-than parallelism.
-
-Parallelism is already near its floor, so the remaining gap cannot be closed by
-scheduling. The six lanes cost 2.4x more CPU than the same boards run
-separately, and front_driveline alone costs 2.29 s of CPU for one simulated
-second under every scheduler (exact, serial owner slices, and parallel lanes),
-so no parallel arrangement can finish that board faster than ~2.3 s. The
-critical path is the slowest board, not the coordination.
-
-front_driveline's cost is intrinsic to its code, and this is confirmed against
-the firmware rather than inferred. `fil disasm-window`
-`~/PER/monorepo/firmware/output/front_driveline/front_driveline.elf --addr
-0x8002ada` shows the hot region is FreeRTOS
-`prvCheckTasksWaitingTermination`: a tight list/tick loop of the form
-`ldr addr; ldr; subs #1; str; ... bl ...` that writes RAM every iteration and
-calls out every few instructions. The emulator's own counters agree:
-`trace_horizon_shared` is 1474 of 1474 and `trace_horizon_zero_prefix` is 1230
-of 1474, so 83% of native traces have no provably private prefix, and only 4012
-block / 315 native / 45 trace compilations exist, confirming a tiny code
-footprint. The native block builder also deliberately stops its stencil prefix
-at the first control-flow instruction, and the loop contains `bl` calls, so
-each entry retires only ~6 instructions. It fires ~259k events per simulated
-second (one per ~181 instructions), and ADC decimation demonstrates event
-dispatch dominates: decimation 1 costs 2.27 s with 259k events while decimation
-8 costs 0.42 s with 65k events at nearly the same instruction count. Because
-the loop mutates RAM it can never satisfy a RAM-neutral period certificate, so
-only ~17% of instructions are covered by certificate hits. Use `--no-parallel-lanes` to run the same workload on one thread as
-a validation reference; it costs ~6.5 s wall but the same ~6.5 s of CPU as the
-parallel lanes' useful work.
-
-`fil run-network ...` prints per-board JIT diagnostics. Note that the printed
-`block_executions` counter aggregates the native-trace, IT-scalar, trusted
-reversible and prepared block paths; dividing it by `block_instructions` does
-not measure block-path span length. Measured instead with temporary
-break-reason counters, front_driveline's 10.4M block executions end as follows:
-terminator or PC change 47.7% (dominated by `term_ret` returns at 27.6%), MMIO
-or store decline 2.5%, generic-op stop 2.5%, cycle credit 0.1%. Native traces
-are compiled at ~37 instructions but execute only ~6.8 because they exit on
-memory declines (509,584 per simulated second) far more often than on branch
-mismatches (about 70,000 after the saturating predictor below).
-
-The dominant cost is event delivery, not instruction execution. Running the same
-front_driveline firmware with ADC decimation 64 (8,108 events) takes 298 ms for
-43.5M instructions, while decimation 1 (259,492 events) takes 2,317 ms for 47.0M
-instructions: 251k extra events cost about 2.0 s while adding only 3.5M
-instructions. Each event adds roughly 62 extra execution entries (block,
-native-trace and single-step combined) for only about 14 extra instructions,
-i.e. roughly 8 us of host time per event callback. Full ADC fidelity is a hard
-requirement, so decimation is not an acceptable fix; the per-event path is what
-must become cheaper. A useful bound: even making every span-admission path free
-would remove only about 1.1 s of the current 2.3 s, which is still above the
-one-second target, so both per-event cost and span admission matter.
-
-Measured call counts for front_driveline over one simulated second:
-`prepareReversibleRamPrefix` runs 3,108,580 times and reaches its full
-speculative search 2,956,880 times; `stepMemoizedLocal` succeeds 1,689,030
-times and fails 1,419,550 times after doing that work; `stepCommittedLocal`
-succeeds only 10,687 times while failing 1,408,863 times; and the loop falls
-through to single-stepping 1,408,855 times. Every cheap pre-check (instruction
-limit, journal tracking, block boundary, clock, horizon) fires zero times, so
-there is no cheap rejection available ahead of the expensive search.
-
-The systemic limit is that every span mechanism stops at the first taken
-control flow or MMIO access: the fallback block loop breaks on any PC
-discontinuity, `prepareJitBlock` marks unconditional control flow as a
-terminator, and native traces must decline when a memory helper refuses an MMIO
-address because peripheral side effects cannot be journaled or replayed. Real
-firmware idle code (FreeRTOS `prvIdleTask` calling
-`prvCheckTasksWaitingTermination`) writes an MMIO register every few
-instructions and calls out every few instructions, so spans of three or four
-instructions are the expected steady state, not a defect.
-
-Removing the RAM-period certificate path is far worse (roughly 13x wall time
-and ~8x more span entries), and disabling certificate discovery entirely is
-neutral, so discovery is not a bottleneck; keep the certificate path.
-Measured-neutral changes that should not be retried: certificate-discovery
-guards, in-place scheduled-event rescheduling, clock caching, admitting every
-stencil kernel past its profitability gate, and certificate-cache slot changes.
-A real improvement requires a mechanism that can continue past an MMIO access
-while keeping instruction and cycle totals bit-identical, or a return-stitching
-strategy for call-dense code; both need differential tests over exact totals
-rather than the six-board aggregate. Native trace return stitching is narrowly
-limited to the canonical 16-bit `BX LR` encoding. It may follow a previously
-observed Thumb return target only when that target's execution-generation
-profile matches; generated and portable execution re-check LR at runtime and
-decline before retiring BX on target mismatch, a non-Thumb LR, or an
-exception-return token. This does not admit arbitrary `BX Rm` or claim a
-measured speedup. Per-instruction execution/fetch cycle admission remains
-unchanged.
+Native trace return stitching is limited to the canonical 16-bit `BX LR`
+encoding. It may follow a previously observed Thumb return target only when its
+execution-generation profile matches. Generated and portable execution re-check
+LR at runtime and decline before retiring BX on target mismatch, a non-Thumb
+LR, or an exception-return token. This does not admit arbitrary `BX Rm`.
+Per-instruction execution and fetch-cycle admission remain unchanged.
 
 ## Validation
 
