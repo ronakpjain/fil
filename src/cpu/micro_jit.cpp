@@ -741,12 +741,12 @@ bool emitOp(Emitter& e, const MicroInst& op, std::string& error) {
     return false;
 }
 
-#include "aarch64_native_emit.inc"
+#include "aarch64_native_emit.hpp"
 
 #endif // FIL_MICRO_JIT_AARCH64
 
 #ifdef FIL_MICRO_JIT_X86_64
-#include "x86_native_emit.inc"
+#include "x86_native_emit.hpp"
 #endif // FIL_MICRO_JIT_X86_64
 
 struct MicroJit::Impl {
