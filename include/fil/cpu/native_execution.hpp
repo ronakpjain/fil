@@ -27,7 +27,11 @@ enum class NativeExitReason : std::uint32_t {
  * committed prefix, and current/failing_instruction_pc identify the guest
  * instruction associated with progress/decline. Cycle fields are CPU cycles
  * only (no peripheral timing). Emitters must publish exit_reason and progress
- * before returning; helpers never update CPU state or context.
+ * before returning. Synchronous checked helpers must not inspect deferred PC,
+ * instruction-address, NZCV, or progress metadata. Scalar memory helpers do not
+ * update CPU/context; stack helpers commit register/SP effects immediately and
+ * may inspect only the unchanged mode bits of xPSR. New observers or operands
+ * that need deferred metadata require materialization before calling them.
  */
 struct NativeExecutionContext {
     CpuState* cpu_state{nullptr};

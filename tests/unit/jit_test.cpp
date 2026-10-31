@@ -818,7 +818,9 @@ TEST(JitTest, CommittedUnrolledTraceDeclinesLaterLoopCarriedAddress) {
 }
 
 TEST(JitTest, CompactCommittedFallbackPreservesDetailedResultAndFetchOrdering) {
-    const auto code = halfwords({0x2001U, 0x3001U, 0x6008U, 0x680aU, 0x2a02U, 0xd100U});
+    // A one-op pure prefix avoids host-timing-dependent micro-kernel admission;
+    // otherwise the two independent CPUs can choose different dispatch paths.
+    const auto code = halfwords({0x2001U, 0x6008U, 0x680aU, 0x3001U, 0x2a02U, 0xd100U});
     auto compact_bus = basicBus(), detailed_bus = basicBus();
     ASSERT_TRUE(compact_bus.loadBytes(flash_base, code));
     ASSERT_TRUE(detailed_bus.loadBytes(flash_base, code));
@@ -834,6 +836,8 @@ TEST(JitTest, CompactCommittedFallbackPreservesDetailedResultAndFetchOrdering) {
         static_cast<void>(compact.prepareJitBlock(true));
         static_cast<void>(detailed.prepareJitBlock(true));
     }
+    ASSERT_EQ(compact.jitStats().micro_compilations, 0U);
+    ASSERT_EQ(detailed.jitStats().micro_compilations, 0U);
 
     for (std::uint32_t credit = 0U; credit <= 20U; ++credit) {
         SCOPED_TRACE(credit);

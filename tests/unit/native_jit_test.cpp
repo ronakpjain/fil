@@ -764,6 +764,74 @@ TEST(NativeJitTest, DeferredMetadataAndLiveCyclesMatchOracleAcrossExitMatrix) {
     }
 }
 
+TEST(NativeJitTest, LiveNzcvSurvivesRamAndStackHelpersAtEveryPrefixAndCredit) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
+    constexpr std::uint32_t pc = 0x08016800U, ram = 0x20000000U;
+    const std::array decoded{decode16(0x0064U), decode16(0x600cU), // LSLS r4,#1; STR r4,[r1]
+        decode32(0xeb15U, 0x0536U), decode16(0x680fU),          // ADDS r5,r5,r6,RRX; LDR r7,[r1]
+        decode16(0xb510U), decode16(0xbc10U),                  // PUSH {r4,lr}; POP {r4}
+        decode32(0xeb18U, 0x0837U)};                           // ADDS r8,r8,r7,RRX
+    constexpr std::array<std::uint8_t, 7> sizes{2U, 2U, 4U, 2U, 2U, 2U, 4U};
+    constexpr std::array<std::uint32_t, 7> costs{1U, 2U, 1U, 2U, 3U, 2U, 1U};
+    std::array<NativeTraceOp, 7> ops{};
+    auto next_pc = pc;
+    for (std::size_t i = 0U; i < ops.size(); ++i) {
+        ASSERT_TRUE(decoded[i]);
+        ops[i].decoded = *decoded[i]; ops[i].raw = decoded[i]->raw;
+        ops[i].pc = next_pc; ops[i].size = sizes[i];
+        next_pc += sizes[i]; ops[i].expected_next_pc = next_pc;
+        ops[i].execution_cycles = static_cast<std::uint16_t>(costs[i]);
+    }
+    NativeTracePlan plan; std::string error;
+    ASSERT_TRUE(buildNativeTrace(ops, plan, error)) << error;
+    auto jit = MicroJit::create(error); ASSERT_TRUE(jit) << error;
+    const auto function = jit->compileNativeTrace(plan, error);
+    ASSERT_NE(function, nullptr) << error;
+    for (std::uint32_t flags = 0U; flags < 16U; ++flags)
+    for (std::uint32_t mode = 0U; mode < 3U; ++mode)
+    for (std::uint32_t limit = 0U; limit <= ops.size(); ++limit)
+    for (std::uint64_t credit = 0U; credit <= 13U; ++credit) {
+        SCOPED_TRACE(flags);
+        SCOPED_TRACE(mode);
+        SCOPED_TRACE(limit);
+        SCOPED_TRACE(credit);
+        fil::mem::MemoryBus memory, oracle;
+        ASSERT_TRUE(memory.mapRam(ram, 128U, "ram"));
+        ASSERT_TRUE(oracle.mapRam(ram, 128U, "ram"));
+        CpuState state;
+        for (std::size_t reg = 0U; reg < state.r.size(); ++reg)
+            state.r[reg] = 0xa5000000U + static_cast<std::uint32_t>(reg);
+        state.r[1] = mode == 1U ? 0x40000000U : ram + 4U;
+        state.r[4] = (flags & 1U) ? 0x80000001U : 0x40000000U;
+        state.r[6] = (flags & 2U) ? 3U : 2U;
+        state.r[15] = 0xfeed0010U; state.instruction_address = 0xfeed0020U;
+        state.xpsr = xpsr_t | xpsr_q | xpsr_ge_mask | (flags << 28U)
+            | ((flags & 4U) ? 3U : 0U);
+        state.control = 2U;
+        state.msp = mode == 2U ? 0x40000040U : ram + 64U;
+        state.psp = mode == 2U ? 0x40000060U : ram + 96U;
+        auto reference = state;
+        NativeExecutionContext actual{&state, &memory, limit, credit};
+        NativeExecutionContext expected{&reference, &oracle, limit, credit};
+        actual.charged_cycles = expected.charged_cycles = costs.data();
+        actual.charged_cycles_count = expected.charged_cycles_count =
+            static_cast<std::uint32_t>(costs.size());
+        actual.current_instruction_pc = expected.current_instruction_pc = 0xaaaa5555U;
+        actual.failing_instruction_pc = expected.failing_instruction_pc = 0xbbbb6666U;
+        interpretNativeTrace(plan, expected); function(&actual);
+        EXPECT_EQ(actual.retired_count, expected.retired_count);
+        EXPECT_EQ(actual.retired_cycles, expected.retired_cycles);
+        EXPECT_EQ(actual.current_instruction_pc, expected.current_instruction_pc);
+        EXPECT_EQ(actual.failing_instruction_pc, expected.failing_instruction_pc);
+        EXPECT_EQ(actual.exit_reason, expected.exit_reason);
+        EXPECT_TRUE(bitwiseEqual(state, reference));
+        EXPECT_EQ(memory.readFootprint().words, oracle.readFootprint().words);
+        EXPECT_EQ(memory.mutationSequence(), oracle.mutationSequence());
+        for (std::uint32_t offset = 0U; offset < 128U; offset += 4U)
+            EXPECT_EQ(memory.read32(ram + offset).value(), oracle.read32(ram + offset).value());
+    }
+}
+
 TEST(NativeJitTest, TracePreservesHostCalleeSavedRegistersAcrossStackHelpers) {
 #if (defined(__x86_64__) || defined(__aarch64__)) && (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32)
     if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
