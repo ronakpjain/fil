@@ -4,8 +4,8 @@
 
 Use Release with supported IPO, automatic JIT, and ADC decimation 1 as the
 baseline. Network commands use eligible parallel board lanes by default, with a
-100000 ns (100 µs) cross-board synchronization window. This deliberately relaxes cross-board
-ordering; it does not skip local peripheral work. `--cross-board-window-ns 0`
+100000 ns (100 µs) cross-board synchronization window. This deliberately relaxes
+cross-board ordering; it does not skip local peripheral work. `--cross-board-window-ns 0`
 selects the exact scheduler with eligible guarded RAM capsules as a reference.
 Network loop batching is off;
 single-board `run` batches proven loops automatically. Diagnostic modes such as
@@ -40,6 +40,13 @@ conversion/skipped-scan landing) use allocation-free built-in callbacks: the
 slot stores a function pointer and device context instead of constructing a
 `std::function`, and a scheduled-handle trampoline retires the handle identity
 before the device callback runs.
+
+Parallel owner executors spin briefly at window rendezvous, then park using
+C++20 atomic wait/notify. Finishing a light lane does not leave its worker
+continuously competing for host execution resources while the ADC-heavy lanes
+finish. The coordinator also parks after its bounded spin. Window publication,
+completion, exception propagation, and shutdown retain release/acquire ordering;
+this changes host waiting only, not guest events or simulated timing.
 
 ## Execution optimizations
 
@@ -201,7 +208,37 @@ A bounded, immutable period certificate can avoid execution and replay for natur
 
 **Decimation changes firmware-visible behavior.** Keep N at 1 for full fidelity.
 
-## Measured six-board characteristics
+## Apple M3: bounded lane waiting
+
+The ADC-heavy driveline lanes can take much longer than the other four lanes.
+Previously, all waiting workers and the coordinator spun indefinitely (with
+periodic thread yields), competing with useful emulation. Bounded spinning
+followed by atomic parking reduces this contention without changing lane work.
+
+On the local Apple M3, matched Clang 23.1.4 Release builds used host-native
+optimization, IPO, and fresh source-specific PGO trained on one simulated second
+of the actual six-board network. Measurements alternate reference/candidate order,
+include startup, and use strict MMIO, ADC decimation 1, a 100000 ns window,
+quantum 1024, and no trace observers. No builds ran during timing.
+
+| 10 simulated seconds | Spinning reference | Bounded-wait candidate |
+| --- | ---: | ---: |
+| Pair 1 | 27.722 s | 18.876 s |
+| Pair 2 (candidate first) | 29.084 s | 20.266 s |
+| Pair 3 | 30.610 s | 28.538 s |
+| Median | 29.084 s | 20.266 s |
+
+The measured median improvement is 1.435x, or 0.493x real time. The substantial
+run-to-run drift means this is not a stable-speed guarantee, and it does **not**
+meet the faster-than-real-time target. Every run reached all six deadlines with
+2,691,840,851 instructions and 10,197,313,072 cycles at 10,000,000,000 ns.
+Separate 100 ms, 1 s, and 10 s comparisons matched complete CPU state, every RAM
+byte, per-board instruction/cycle/time totals, and selected event-loop/CAN counts.
+Those snapshots do not cover every peripheral's internal state or ordered event
+contents. Worker regressions cover uneven work, repeated windows, exceptions,
+empty/single pools, and idle destruction; Release and ASan/UBSan suites pass.
+
+## Historical Ryzen six-board characteristics
 
 Host: AMD Ryzen 9 4900HS (8 physical cores, 16 threads), PGO Release build,
 `configs/networks/per_vehicle.json`, ADC decimation 1. One simulated second of

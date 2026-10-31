@@ -21,9 +21,9 @@ inline void laneSpinPause() noexcept {
 #endif
 }
 
-// Persistent owner executors. The short window rendezvous uses release/acquire
-// publication, not two kernel-backed barriers per simulated microsecond. Long
-// waits yield periodically so startup/JIT compilation need not monopolize CPUs.
+// Persistent owner executors. Release/acquire publishes each window. Brief
+// waits spin, then park: lighter lanes must not compete with an event-heavy
+// lane for host CPU time while waiting for the next rendezvous.
 // Only the coordinator calls run(); work and lane storage stay fixed until join.
 class LaneWorkers {
 public:
@@ -40,7 +40,8 @@ public:
                         std::size_t spins = 0U;
                         std::uint64_t next;
                         while ((next = generation_.load(std::memory_order_acquire)) == observed) {
-                            pause(spins);
+                            if (spins++ < spin_limit) laneSpinPause();
+                            else generation_.wait(observed, std::memory_order_acquire);
                         }
                         observed = next;
                         if (stopping_.load(std::memory_order_relaxed)) return;
@@ -49,7 +50,8 @@ public:
                         } catch (...) {
                             failures_[index] = std::current_exception();
                         }
-                        remaining_.fetch_sub(1U, std::memory_order_acq_rel);
+                        if (remaining_.fetch_sub(1U, std::memory_order_acq_rel) == 1U)
+                            remaining_.notify_one();
                     }
                 });
             }
@@ -66,6 +68,7 @@ public:
     ~LaneWorkers() {
         stopping_.store(true, std::memory_order_relaxed);
         generation_.fetch_add(1U, std::memory_order_release);
+        generation_.notify_all();
         threads_.clear();
     }
 
@@ -75,8 +78,13 @@ public:
     void run() {
         remaining_.store(count_, std::memory_order_relaxed);
         generation_.fetch_add(1U, std::memory_order_release);
+        generation_.notify_all();
         std::size_t spins = 0U;
-        while (remaining_.load(std::memory_order_acquire) != 0U) pause(spins);
+        for (auto remaining = remaining_.load(std::memory_order_acquire); remaining != 0U;
+             remaining = remaining_.load(std::memory_order_acquire)) {
+            if (spins++ < spin_limit) laneSpinPause();
+            else remaining_.wait(remaining, std::memory_order_acquire);
+        }
         for (auto& failure : failures_) {
             if (failure) {
                 auto captured = std::exchange(failure, {});
@@ -86,13 +94,7 @@ public:
     }
 
 private:
-    static void pause(std::size_t& spins) noexcept {
-        laneSpinPause();
-        if (++spins == 4096U) {
-            spins = 0U;
-            std::this_thread::yield();
-        }
-    }
+    static constexpr std::size_t spin_limit = 64U;
 
     std::function<void(std::size_t)> work_;
     std::vector<std::exception_ptr> failures_;

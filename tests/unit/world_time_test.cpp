@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <filesystem>
 #include <limits>
 #include <sstream>
@@ -1003,6 +1004,29 @@ TEST(WorldTimeTest, PersistentLaneWorkersJoinEveryWindowAndPropagateExceptions) 
     fail = false;
     workers.run();
     EXPECT_EQ(counts, (std::vector<std::size_t>{12U, 12U, 12U}));
+}
+
+TEST(WorldTimeTest, PersistentLaneWorkersWakeAfterUnbalancedWindows) {
+    std::vector<std::size_t> counts(3U, 0U);
+    {
+        fil::sim::detail::LaneWorkers workers(counts.size(), [&](const auto index) {
+            // Give the coordinator and lighter lanes time to park, then
+            // verify all participants finish every subsequent window.
+            if (index == 0U) std::this_thread::sleep_for(std::chrono::milliseconds{1});
+            ++counts[index];
+        });
+        for (std::size_t window = 0U; window < 32U; ++window) workers.run();
+        EXPECT_EQ(counts, (std::vector<std::size_t>{32U, 32U, 32U}));
+    } // Destruction must also wake idle workers before joining them.
+    fil::sim::detail::LaneWorkers empty(0U, [](auto) { ADD_FAILURE(); });
+    empty.run();
+    std::size_t single_count = 0U;
+    fil::sim::detail::LaneWorkers single(1U, [&](auto) { ++single_count; });
+    for (std::size_t window = 0U; window < 32U; ++window) single.run();
+    EXPECT_EQ(single_count, 32U);
+    for (const auto count : {0U, 1U, 3U}) {
+        fil::sim::detail::LaneWorkers idle(count, [](auto) { ADD_FAILURE(); });
+    } // Also join workers that may not yet have observed startup completion.
 }
 
 TEST(WorldTimeTest, ParallelOwnerWindowsMatchSerialOwnerExecution) {
