@@ -66,7 +66,7 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
     e.load(9U, 0U, offsetof(NativeExecutionContext, cpu_state), true);
     e.cbzX(9U, early);
     // x19=context, x20=CPU, x21=current cost survive all scalar helpers.
-    // 32 bytes of nonvolatile saves plus 16 bytes for load output/padding.
+    // 48 bytes of nonvolatile saves plus 16 bytes for load output/padding.
     e.sub64Imm(31U, 31U, 64U);
     e.store(19U, 31U, 0U, true); e.store(20U, 31U, 8U, true);
     e.store(21U, 31U, 16U, true); e.store(30U, 31U, 24U, true);
@@ -77,8 +77,9 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
     e.load(9U, ctx, offsetof(NativeExecutionContext, admitted_cycle_prefix), true);
     e.cbzX(9U, checked_table); // Null hints retain the original no-helper path.
     e.movX(0U, ctx); e.call(reinterpret_cast<std::uintptr_t>(&nativeAdmittedCyclePrefixValid));
+    e.andImm(0U, 0U, 0U, 7U); // Only the bool result byte is defined by the ABI.
     e.cmpImm(0U, 0U); // Normalize the scalar bool to 0/1 in x22.
-    e.emit(0x9A9F17F6U); // csinc x22, xzr, xzr, ne (cinc x22, xzr, ne)
+    e.emit(0x9A9F07F6U); // csinc x22, xzr, xzr, eq (cset x22, ne)
     e.cbzX(22U, checked_table);
     e.load(23U, ctx, offsetof(NativeExecutionContext, admitted_cycle_prefix), true);
     e.b(checked_table);
@@ -97,13 +98,12 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
         e.storeImm(ctx, offsetof(NativeExecutionContext, current_instruction_pc), m.pc);
         e.load(9U, ctx, offsetof(NativeExecutionContext, instruction_limit));
         e.cmpImm(9U, static_cast<std::uint32_t>(i + 1U)); e.cond(3U, instruction_exit); // lo
-        const auto checked_cycle_admission = e.makeLabel();
-        e.cbzX(22U, checked_cycle_admission);
+        // Both admission modes need the per-instruction charge table. Reload
+        // it here: integer stencils and scalar helpers may clobber x11.
         e.load(11U, ctx, offsetof(NativeExecutionContext, charged_cycles), true);
         e.cbzX(11U, unsupported_exit);
         e.load(9U, ctx, offsetof(NativeExecutionContext, charged_cycles_count));
         e.cmpImm(9U, static_cast<std::uint32_t>(i + 1U)); e.cond(3U, unsupported_exit);
-        e.bindLabel(checked_cycle_admission);
 
         const bool blx_reg = m.kind == NativeOp::blx_reg;
         const bool compare_branch = m.kind == NativeOp::integer
@@ -186,7 +186,7 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
             const bool load = nativeOpIsLoad(m.kind);
             const auto width = nativeOpWidth(m.kind);
             e.movX(0U, ctx); e.movImm(1U, m.pc);
-            if (load) e.emit(0x910083E3U); // add x3, sp, #32 (output)
+            if (load) e.emit(0x9100C3E3U); // add x3, sp, #48 (output)
             else e.load(3U, cpu, r + m.rd * 4U);
             const auto helper = width == 1U
                 ? (load ? reinterpret_cast<std::uintptr_t>(&nativeRead8) : reinterpret_cast<std::uintptr_t>(&nativeWrite8))
@@ -197,7 +197,7 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
             // Only the bool result byte is guaranteed by the scalar ABI.
             e.andImm(0U, 0U, 0U, 7U); e.cbzW(0U, helper_exit);
             if (load) {
-                e.load(9U, 31U, 32U);
+                e.load(9U, 31U, 48U);
                 if (m.kind == NativeOp::load_byte_signed) e.sbfm(9U, 9U, 0U, 7U);
                 if (m.kind == NativeOp::load_half_signed) e.sbfm(9U, 9U, 0U, 15U);
                 e.store(9U, cpu, r + m.rd * 4U);
