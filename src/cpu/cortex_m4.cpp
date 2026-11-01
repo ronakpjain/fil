@@ -2131,7 +2131,30 @@ std::optional<FastStepResult> CortexM4::tryStepCommittedRamSpan(
     if (!inItBlock(state_.it_state) && native_memory_jit_enabled_) {
         if (auto trace = tryStepNativeTrace(max_instructions, budget, nullptr, true)) return trace;
     }
-    return tryStepBudgetedReversibleJitBlockImpl<false>(max_instructions, budget, false, true);
+    auto result = inItBlock(state_.it_state)
+        ? tryStepItScalarFallback<false>(&budget, false)
+        : tryStepBudgetedReversibleJitBlockImpl<false>(max_instructions, budget, false, true);
+    if (!result) return std::nullopt;
+    auto instructions = result->instructions;
+    std::uint32_t cycles = result->cycles;
+    // An admitted pure IT instruction cannot schedule events or change an
+    // interrupt boundary. Retire the rest of its safe scalar block under the
+    // same exact credit instead of making the host re-enter for every MOV.
+    // Unsafe/memory forms still cut before executing and retain checked paths.
+    while (budget.fetch_stall == nullptr && inItBlock(state_.it_state)
+        && instructions < max_instructions
+        && budget.remaining_cycles <= std::numeric_limits<std::uint16_t>::max() - cycles) {
+        // Total pipeline cycles cannot exceed the admitted cycle credit, so
+        // this bound also keeps the compact aggregate representable.
+        const auto next = tryStepItScalarFallback<false>(&budget, false);
+        if (!next) break;
+        ++instructions;
+        cycles += next->cycles;
+        result = next;
+    }
+    result->instructions = instructions;
+    result->cycles = static_cast<std::uint16_t>(cycles);
+    return result;
 }
 
 template <bool Detailed>
@@ -2167,7 +2190,11 @@ auto CortexM4::tryStepItScalarFallback(
         default: break;
         }
     }
-    if (!safe_it && !safe_alu) return std::nullopt;
+    const bool plain_mov = in_it && kind == InstrKind::mov && decoded->rd < 13U
+        && (decoded->form == OperandForm::immediate
+            || (decoded->form == OperandForm::register_value && decoded->rm < 13U
+                && decoded->shift_type == ShiftType::lsl && decoded->shift_amount == 0U));
+    if (!safe_it && !safe_alu && !plain_mov) return std::nullopt;
 
     const bool sequential = budget && budget->have_fetch && pc == budget->fetch_end;
     const std::uint16_t stall = budget ? budget->fetchStallCycles(pc, sequential) : 0U;
@@ -2178,11 +2205,37 @@ auto CortexM4::tryStepItScalarFallback(
     if (budget && (bound > budget->remaining_cycles
         || bound > std::numeric_limits<std::uint16_t>::max())) return std::nullopt;
 
-    const CpuState before = state_;
-    const FastStepResult stepped = stepFast();
-    if (stepped.reason != StopReason::step_complete || stepped.instructions != 1U) {
-        state_ = before;
-        return std::nullopt;
+    FastStepResult stepped;
+    if (safe_it || plain_mov) {
+        // These forms cannot fault, branch or touch memory. All admission
+        // guards have already succeeded, so no architectural rollback copy or
+        // second fetch/decode through stepFast is necessary. MOV's implicit
+        // NZCV update is suppressed inside IT, exactly as in checked execution.
+        stepped.reason = StopReason::step_complete;
+        stepped.instruction_address = pc;
+        stepped.raw = raw;
+        stepped.instruction_size = size;
+        stepped.instructions = 1U;
+        stepped.cycles = 1U;
+        state_.instruction_address = pc;
+        state_.r[15] = pc + size;
+        if (safe_it) {
+            state_.setItState(static_cast<std::uint8_t>(decoded->imm));
+        } else {
+            if (conditionPasses(currentItCondition(state_.it_state), state_.xpsr)) {
+                state_.r[decoded->rd] = decoded->form == OperandForm::immediate
+                    ? decoded->imm : state_.r[decoded->rm];
+                stepped.cycles = basePipelineCycles(*decoded);
+            }
+            state_.advanceIt();
+        }
+    } else {
+        const CpuState before = state_;
+        stepped = stepFast();
+        if (stepped.reason != StopReason::step_complete || stepped.instructions != 1U) {
+            state_ = before;
+            return std::nullopt;
+        }
     }
     if constexpr (Detailed) {
         TimedJitStepOutcome timed{};

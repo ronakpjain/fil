@@ -2049,7 +2049,7 @@ TEST(JitTest, CompleteItBlocksMatchStepFastAcrossMasksConditionsAndFlags) {
                 }
                 cpu.state().xpsr = reference.state().xpsr = fil::cpu::xpsr_t | apsr;
                 ASSERT_EQ(reference.stepFast().reason, fil::cpu::StopReason::step_complete);
-                ASSERT_EQ(cpu.stepFast().reason, fil::cpu::StopReason::step_complete);
+                ASSERT_TRUE(cpu.tryStepReversibleJitBlock(1U));
                 ASSERT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()));
                 while (fil::cpu::inItBlock(reference.state().it_state)) {
                     const auto expected = reference.stepFast();
@@ -2063,6 +2063,112 @@ TEST(JitTest, CompleteItBlocksMatchStepFastAcrossMasksConditionsAndFlags) {
                     EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()))
                         << "mask=" << mask << " cond=" << condition
                         << " flags=" << combination;
+                }
+            }
+        }
+    }
+}
+
+TEST(JitTest, CommittedItBundleMatchesEachCheckedEndpointAndFetchCharge) {
+    for (const bool zero : {false, true}) {
+        for (std::uint64_t credit = 0U; credit < 14U; ++credit) {
+            for (std::size_t limit = 1U; limit <= 5U; ++limit) {
+                auto bus = basicBus();
+                ASSERT_TRUE(bus.loadBytes(flash_base,
+                    halfwords({0xbf0cU, 0x2001U, 0x4608U, 0xbe00U}))); // ITE EQ
+                bus.setReversibleRamOnly(true);
+                bus.setAllMmioTrapping(true);
+                fil::cpu::CortexM4 cpu(bus), reference(bus);
+                prepare(cpu); prepare(reference);
+                cpu.state().r[1] = reference.state().r[1] = 0x80000000U;
+                cpu.state().xpsr = reference.state().xpsr = fil::cpu::xpsr_t
+                    | fil::cpu::xpsr_c | (zero ? fil::cpu::xpsr_z : 0U);
+                const auto before = cpu.state();
+                fil::cpu::CortexM4::ReversibleCycleBudget budget;
+                budget.remaining_cycles = credit;
+                budget.fetch_timing = {flash_base, flash_base + 256U, 0U, 0U, 2U, 1U};
+                budget.total_instruction_cycles.fill(0xcafeU);
+                const auto actual = cpu.tryStepCommittedRamSpan(limit, budget);
+                if (credit < 3U) {
+                    EXPECT_FALSE(actual);
+                    EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), before));
+                    continue;
+                }
+                ASSERT_TRUE(actual);
+                const auto count = std::min<std::size_t>({limit, 3U, 1U + (credit - 3U) / 2U});
+                EXPECT_EQ(actual->instructions, count);
+                std::uint32_t cycles = 0U;
+                fil::cpu::FastStepResult expected;
+                for (std::size_t n = 0U; n < actual->instructions; ++n) {
+                    expected = reference.stepFast();
+                    ASSERT_EQ(expected.reason, fil::cpu::StopReason::step_complete);
+                    cycles += expected.cycles;
+                }
+                EXPECT_EQ(actual->cycles, cycles);
+                EXPECT_EQ(actual->raw, expected.raw);
+                EXPECT_EQ(actual->instruction_address, expected.instruction_address);
+                EXPECT_EQ(budget.remaining_cycles, credit - cycles - count - 1U);
+                EXPECT_EQ(budget.fetch_end, reference.state().r[15]);
+                EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()));
+                EXPECT_TRUE(std::all_of(budget.total_instruction_cycles.begin(),
+                    budget.total_instruction_cycles.end(), [](auto value) { return value == 0xcafeU; }));
+            }
+        }
+    }
+}
+
+TEST(JitTest, ItMovOperandsMatchCheckedAcrossPredicatesAndBudgetCuts) {
+    // Low/high-register aliases, immediate Thumb-16, wide MOV and MOVS.
+    constexpr std::array<std::array<std::uint16_t, 2U>, 5U> forms{{
+        {0x4608U, 0xbf00U}, {0x4688U, 0xbf00U}, {0x2001U, 0xbf00U},
+        {0xf04fU, 0x0001U}, {0xf05fU, 0x0001U}}};
+    for (const auto& form : forms) {
+        SCOPED_TRACE(form[0]);
+        for (const bool zero : {false, true}) {
+            for (const bool detailed : {false, true}) {
+                for (std::uint64_t credit = 0U; credit < 5U; ++credit) {
+                    auto bus = basicBus();
+                    ASSERT_TRUE(bus.loadBytes(flash_base,
+                        halfwords({0xbf08U, form[0], form[1], 0xbf00U}))); // IT EQ
+                    bus.setReversibleRamOnly(true);
+                    bus.setAllMmioTrapping(true);
+                    fil::cpu::CortexM4 cpu(bus), reference(bus);
+                    prepare(cpu); prepare(reference);
+                    cpu.state().r[0] = reference.state().r[0] = 0xffffffffU;
+                    cpu.state().r[1] = reference.state().r[1] = 0x80000001U;
+                    cpu.state().xpsr = reference.state().xpsr = fil::cpu::xpsr_t
+                        | fil::cpu::xpsr_n | fil::cpu::xpsr_c | fil::cpu::xpsr_v
+                        | (zero ? fil::cpu::xpsr_z : 0U);
+                    ASSERT_EQ(cpu.stepFast().reason, fil::cpu::StopReason::step_complete);
+                    ASSERT_EQ(reference.stepFast().reason, fil::cpu::StopReason::step_complete);
+                    const auto before = cpu.state();
+                    fil::cpu::CortexM4::ReversibleCycleBudget budget;
+                    budget.remaining_cycles = credit;
+                    budget.fetch_timing = {flash_base, flash_base + 256U, 0U, 0U, 2U, 2U};
+                    budget.total_instruction_cycles.fill(0xcafeU);
+                    std::optional<fil::cpu::FastStepResult> actual;
+                    if (detailed) {
+                        if (auto result = cpu.tryStepBudgetedReversibleJitBlock(1U, budget))
+                            actual = result->execution.result;
+                    } else {
+                        actual = cpu.tryStepCommittedRamSpan(1U, budget);
+                    }
+                    if (credit < 3U) {
+                        EXPECT_FALSE(actual);
+                        EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), before));
+                        EXPECT_EQ(budget.remaining_cycles, credit);
+                    } else {
+                        ASSERT_TRUE(actual);
+                        const auto expected = reference.stepFast();
+                        EXPECT_EQ(actual->raw, expected.raw);
+                        EXPECT_EQ(actual->cycles, expected.cycles);
+                        EXPECT_EQ(actual->instruction_size, expected.instruction_size);
+                        EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), reference.state()));
+                        EXPECT_EQ(budget.remaining_cycles, credit - expected.cycles - 2U);
+                        EXPECT_EQ(budget.fetch_end, flash_base + 2U + expected.instruction_size);
+                        EXPECT_EQ(budget.total_instruction_cycles[0], detailed
+                            ? expected.cycles + 2U : 0xcafeU);
+                    }
                 }
             }
         }
