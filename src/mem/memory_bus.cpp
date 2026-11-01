@@ -603,7 +603,8 @@ bool MemoryBus::tryFastRead32(
 bool MemoryBus::tryFastWrite32(
     const std::uint32_t address,
     const std::uint32_t value,
-    const AccessContext context
+    const AccessContext context,
+    const bool require_nonexecutable_ram
 ) noexcept {    Region* region = find(address);
     if (region == nullptr
         || (region->info.kind != RegionKind::ram
@@ -611,7 +612,7 @@ bool MemoryBus::tryFastWrite32(
             && region->info.kind != RegionKind::flash)
         || !region->info.writable
         || !region->containsRange(address, sizeof(value))
-        || (reversible_ram_only_
+        || ((reversible_ram_only_ || require_nonexecutable_ram)
             && (region->info.kind != RegionKind::ram || region->info.executable))) {
         return false;
     }
@@ -687,7 +688,8 @@ bool MemoryBus::tryFastWrite(
     const std::uint32_t address,
     const AccessSize size,
     const std::uint64_t value,
-    const AccessContext context
+    const AccessContext context,
+    const bool require_nonexecutable_ram
 ) noexcept {
     const std::uint32_t width = static_cast<std::uint32_t>(size);
     if (width != 1U && width != 2U && width != 4U) return false;
@@ -698,7 +700,7 @@ bool MemoryBus::tryFastWrite(
             && region->info.kind != RegionKind::flash)
         || !region->info.writable
         || !region->containsRange(address, width)
-        || (reversible_ram_only_
+        || ((reversible_ram_only_ || require_nonexecutable_ram)
             && (region->info.kind != RegionKind::ram || region->info.executable))) {
         return false;
     }
@@ -766,7 +768,8 @@ bool MemoryBus::tryFastWriteWords(
     const std::uint32_t address,
     const std::uint32_t count,
     const std::uint32_t* values,
-    const AccessContext context
+    const AccessContext context,
+    const bool require_nonexecutable_ram
 ) noexcept {
     if (count == 0U || values == nullptr) return false;
     const std::uint64_t span = static_cast<std::uint64_t>(count) * 4U;
@@ -778,7 +781,7 @@ bool MemoryBus::tryFastWriteWords(
             && region->info.kind != RegionKind::flash)
         || !region->info.writable
         || !region->containsRange(address, static_cast<std::uint32_t>(span))
-        || (reversible_ram_only_
+        || ((reversible_ram_only_ || require_nonexecutable_ram)
             && (region->info.kind != RegionKind::ram || region->info.executable))) {
         return false;
     }

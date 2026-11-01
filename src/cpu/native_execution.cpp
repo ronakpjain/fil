@@ -32,12 +32,9 @@ bool nativeWrite32(
     NativeExecutionContext* const context, const std::uint32_t instruction_pc,
     const std::uint32_t address, const std::uint32_t value
 ) noexcept {
-    if (context == nullptr || context->memory_bus == nullptr
-        || !context->memory_bus->isReversibleRamTarget(address)) {
-        return false;
-    }
+    if (context == nullptr || context->memory_bus == nullptr) return false;
     return context->memory_bus->tryFastWrite32(
-        address, value, {mem::AccessType::data_write, instruction_pc});
+        address, value, {mem::AccessType::data_write, instruction_pc}, true);
 }
 
 bool nativeRead8(
@@ -61,13 +58,10 @@ bool nativeWrite8(
     NativeExecutionContext* const context, const std::uint32_t instruction_pc,
     const std::uint32_t address, const std::uint32_t value
 ) noexcept {
-    if (context == nullptr || context->memory_bus == nullptr
-        || !context->memory_bus->isReversibleRamTarget(address)) {
-        return false;
-    }
+    if (context == nullptr || context->memory_bus == nullptr) return false;
     return context->memory_bus->tryFastWrite(
         address, mem::AccessSize::byte, value & 0xffU,
-        {mem::AccessType::data_write, instruction_pc});
+        {mem::AccessType::data_write, instruction_pc}, true);
 }
 
 bool nativeRead16(
@@ -91,13 +85,10 @@ bool nativeWrite16(
     NativeExecutionContext* const context, const std::uint32_t instruction_pc,
     const std::uint32_t address, const std::uint32_t value
 ) noexcept {
-    if (context == nullptr || context->memory_bus == nullptr
-        || !context->memory_bus->isReversibleRamTarget(address)) {
-        return false;
-    }
+    if (context == nullptr || context->memory_bus == nullptr) return false;
     return context->memory_bus->tryFastWrite(
         address, mem::AccessSize::halfword, value & 0xffffU,
-        {mem::AccessType::data_write, instruction_pc});
+        {mem::AccessType::data_write, instruction_pc}, true);
 }
 
 } // namespace fil::cpu

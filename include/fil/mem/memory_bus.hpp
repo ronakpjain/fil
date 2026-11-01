@@ -303,7 +303,8 @@ public:
      * false for MMIO, read-only, or faulting addresses with no state change.
      */
     [[nodiscard]] bool tryFastWrite32(
-        std::uint32_t address, std::uint32_t value, AccessContext context) noexcept;
+        std::uint32_t address, std::uint32_t value, AccessContext context,
+        bool require_nonexecutable_ram = false) noexcept;
     /**
      * @brief Side-effect-free backed-range probe for multi-word fast paths.
      *
@@ -333,20 +334,22 @@ public:
         AccessContext context) const noexcept;
     [[nodiscard]] bool tryFastWrite(
         std::uint32_t address, AccessSize size, std::uint64_t value,
-        AccessContext context) noexcept;
+        AccessContext context, bool require_nonexecutable_ram = false) noexcept;
     /**
      * @brief Single-probe bulk word transfer for multi-register handlers.
      *
      * One region lookup covers `count` consecutive words; false leaves all
      * state untouched, success performs every word (journal/footprint per
-     * word, identical to sequential tryFastWrite32/Read32 calls).
+     * word, identical to sequential tryFastWrite32/Read32 calls). Restricted
+     * stores (`require_nonexecutable_ram`) validate writable non-executable
+     * RAM in that same lookup, independently of the reversible-memory mode.
      */
     [[nodiscard]] bool tryFastReadWords(
         std::uint32_t address, std::uint32_t count, std::uint32_t* values_out,
         AccessContext context) const noexcept;
     [[nodiscard]] bool tryFastWriteWords(
         std::uint32_t address, std::uint32_t count, const std::uint32_t* values,
-        AccessContext context) noexcept;
+        AccessContext context, bool require_nonexecutable_ram = false) noexcept;
 
     /** @brief Gets mapped ranges sorted by base address. */
     [[nodiscard]] std::vector<MemoryRegionInfo> regions() const;

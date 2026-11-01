@@ -871,6 +871,39 @@ TEST(MemoryBusTest, ReversibleRamOnlyRejectsNonRamStoresBeforeMutation) {
         << "disabling restriction restores ordinary writable-flash semantics";
 }
 
+TEST(MemoryBusTest, RestrictedFastStoresProbeNonExecutableRamBeforeAnyEffects) {
+    using namespace fil::mem;
+    for (const bool reversible : {false, true}) {
+        MemoryBus bus;
+        ASSERT_TRUE(bus.mapRam(0x20000000U, 16U, "data"));
+        ASSERT_TRUE(bus.mapRam(0x20000100U, 16U, "code", true));
+        ASSERT_TRUE(bus.mapFlash(0x08000000U, 16U, "flash"));
+        bus.setReversibleRamOnly(reversible);
+        const AccessContext context{AccessType::data_write, 0x08001000U};
+        const std::uint32_t words[]{0x11223344U, 0x55667788U};
+        for (const auto address : {0x20000100U, 0x08000000U, 0x40000000U, 0x2000000eU}) {
+            const auto before = bus.sideEffectCheckpoint();
+            const auto generation = bus.executionGeneration();
+            MemoryBus::StoreFootprintScope tracking(bus);
+            const auto footprint = bus.readFootprint();
+            EXPECT_FALSE(bus.tryFastWrite32(address, words[0], context, true));
+            EXPECT_FALSE(bus.tryFastWriteWords(address, 2U, words, context, true));
+            // The final RAM address can fit a byte/halfword, so use only
+            // non-RAM addresses for the narrow rejection checks.
+            if (address != 0x2000000eU) {
+                EXPECT_FALSE(bus.tryFastWrite(address, AccessSize::byte, 1U, context, true));
+                EXPECT_FALSE(bus.tryFastWrite(address, AccessSize::halfword, 1U, context, true));
+            }
+            EXPECT_EQ(bus.sideEffectCheckpoint().mutation_sequence, before.mutation_sequence);
+            EXPECT_EQ(bus.executionGeneration(), generation);
+            EXPECT_EQ(bus.readFootprint().words, footprint.words);
+        }
+        EXPECT_TRUE(bus.tryFastWriteWords(0x20000000U, 2U, words, context, true));
+        EXPECT_EQ(bus.read32(0x20000000U).value(), words[0]);
+        EXPECT_EQ(bus.read32(0x20000004U).value(), words[1]);
+    }
+}
+
 TEST(MemoryBusTest, TrapsSharedMmioBeforeDeviceSideEffects) {
     fil::mem::MemoryBus bus;
     fil::mem::MmioRouter router(0x40000000U, 0x1000U, "peripherals");

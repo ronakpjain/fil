@@ -19,9 +19,7 @@ NativeStackResult nativeStackTransfer(NativeExecutionContext* c, std::uint32_t p
     const std::uint32_t old_sp = s.readRegister(13U);
     const std::uint32_t start = is_push ? old_sp - static_cast<std::uint32_t>(bytes) : old_sp;
     if (is_push) {
-        if (old_sp < bytes || static_cast<std::uint64_t>(start) + bytes > (std::uint64_t{1} << 32U)
-            || !c->memory_bus->isReversibleRamTarget(start)
-            || !c->memory_bus->containsWritableRamRange(start, bytes)) return NativeStackResult::memory_declined;
+        if (old_sp < bytes) return NativeStackResult::memory_declined;
         // Only the first `count` entries are written and read; clearing all
         // sixteen would cost a 64-byte store per transferred stack frame.
         std::array<std::uint32_t, 16> values;
@@ -30,7 +28,7 @@ NativeStackResult nativeStackTransfer(NativeExecutionContext* c, std::uint32_t p
             const auto r = static_cast<std::uint32_t>(std::countr_zero(bits));
             values[n++] = s.r[r];
         }
-        if (!c->memory_bus->tryFastWriteWords(start, count, values.data(), {mem::AccessType::data_write, pc}))
+        if (!c->memory_bus->tryFastWriteWords(start, count, values.data(), {mem::AccessType::data_write, pc}, true))
             return NativeStackResult::memory_declined;
         s.writeRegister(13U, start);
         return NativeStackResult::success;
