@@ -871,6 +871,42 @@ TEST(MemoryBusTest, ReversibleRamOnlyRejectsNonRamStoresBeforeMutation) {
         << "disabling restriction restores ordinary writable-flash semantics";
 }
 
+TEST(MemoryBusTest, WordReadCachePreservesBoundsPermissionsAndUpdatedBacking) {
+    using namespace fil::mem;
+    MemoryBus bus;
+    ASSERT_TRUE(bus.mapRam(0x20000000U, 8U, "data"));
+    ASSERT_TRUE(bus.mapRam(0x20000100U, 8U, "code", true));
+    ASSERT_TRUE(bus.mapRam(0xfffffff8U, 8U, "top"));
+    ASSERT_TRUE(bus.mapRam(0x20000200U, 3U, "tiny"));
+    const AccessContext data{AccessType::data_read, 0x08001000U};
+    const AccessContext fetch{AccessType::instruction_fetch, 0x08001000U};
+    std::uint32_t value = 0xfeedfaceU;
+    for (unsigned pass = 0; pass < 3U; ++pass) {
+        ASSERT_TRUE(bus.tryFastRead32(0x20000004U, value, data));
+        EXPECT_EQ(value, 0U);
+        EXPECT_FALSE(bus.tryFastRead32(0x20000004U, value, fetch));
+        EXPECT_TRUE(bus.tryFastRead32(0x20000104U, value, fetch));
+        ASSERT_TRUE(bus.write32(0xfffffffCU, pass + 1U));
+        EXPECT_TRUE(bus.tryFastRead32(0xfffffffCU, value, data));
+        EXPECT_EQ(value, pass + 1U);
+        for (const auto address : {0x20000005U, 0x20000008U, 0x20000200U, 0xfffffffdU, 0U}) {
+            value = 0xfeedfaceU;
+            EXPECT_FALSE(bus.tryFastRead32(address, value, data));
+            EXPECT_EQ(value, 0xfeedfaceU);
+        }
+    }
+    // Warm backing views must see new data without caching loaded values.
+    ASSERT_TRUE(bus.write32(0x20000000U, 0x11223344U));
+    ASSERT_TRUE(bus.tryFastRead32(0x20000000U, value, data));
+    const auto before = bus.sideEffectCheckpoint();
+    ASSERT_TRUE(bus.write32(0x20000000U, 0xaabbccddU));
+    ASSERT_TRUE(bus.tryFastRead32(0x20000000U, value, data));
+    EXPECT_EQ(value, 0xaabbccddU);
+    ASSERT_TRUE(bus.restoreSideEffects(before));
+    ASSERT_TRUE(bus.tryFastRead32(0x20000000U, value, data));
+    EXPECT_EQ(value, 0x11223344U);
+}
+
 TEST(MemoryBusTest, JournalRingRetainsExactCapacityAndRefillsRolledBackSuffix) {
     using namespace fil::mem;
     MemoryBus bus;
