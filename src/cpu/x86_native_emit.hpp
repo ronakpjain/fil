@@ -22,6 +22,9 @@
 
 class X86Emitter {
 public:
+    // Trace kernels keep flags in callee-saved registers across RAM helpers;
+    // arithmetic-only stencils retain their caller-saved, stack-free ABI.
+    std::uint32_t nzcv{8U};
     std::vector<std::uint8_t> code;
     struct Fixup {
         std::size_t pos{0}; // offset of the rel32 field
@@ -323,10 +326,10 @@ inline void endAddSub(X86Emitter& e, const Offsets& o, bool is_sub,
     e.aluRR(1U, kEcx, kEdx);
     e.aluRR(1U, kEcx, kR10);
     e.aluRR(1U, kEcx, kEax);
-    e.movRR(kNzcv, kEcx);
+    e.movRR(e.nzcv, kEcx);
 }
 
-// Rebuilds guest NZCV from a logical/shift result into r8d, optionally committing
+// Rebuilds guest NZCV from a logical/shift result, optionally committing
 // the result first (TST has no destination; stores leave flags untouched). V is
 // always preserved; C is preserved or taken from ecx (0/1) when new_carry.
 // The V/C extraction reuses eax once the result is committed and tested.
@@ -342,18 +345,18 @@ inline void endLogic(X86Emitter& e, const Offsets& o, bool new_carry, std::uint8
     e.shImm(4U, kR10, 30U);
     if (new_carry) {
         e.shImm(4U, kEcx, 29U);
-        e.movRR(kEax, kNzcv);
+        e.movRR(kEax, e.nzcv);
         e.aluRImm(4U, kEax, kFlagV); // preserved V from old NZCV
         e.aluRR(1U, kEcx, kEax);
         e.aluRR(1U, kEcx, kEdx);
         e.aluRR(1U, kEcx, kR10);
-        e.movRR(kNzcv, kEcx);
+        e.movRR(e.nzcv, kEcx);
     } else {
-        e.movRR(kEax, kNzcv);
+        e.movRR(kEax, e.nzcv);
         e.aluRImm(4U, kEax, kFlagC | kFlagV); // preserved C/V
         e.aluRR(1U, kEax, kEdx);
         e.aluRR(1U, kEax, kR10);
-        e.movRR(kNzcv, kEax);
+        e.movRR(e.nzcv, kEax);
     }
 }
 
@@ -401,7 +404,7 @@ inline bool shiftValue(X86Emitter& e, std::uint32_t dst, const Offsets& o,
     case ShiftType::rrx:
         // (oldC << 31) | (value >> 1); old C is guest C in r8d.
         loadGuest(e, dst, o, src);
-        e.movRR(kEcx, kNzcv);
+        e.movRR(kEcx, e.nzcv);
         e.shImm(5U, kEcx, 29U);
         e.aluRImm(4U, kEcx, 1U);
         e.shImm(5U, dst, 1U);
@@ -427,8 +430,8 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
             if (op.carry_valid && op.carry) set |= kFlagC;
             if ((op.imm & kFlagN) != 0U) set |= kFlagN;
             if (op.imm == 0U) set |= kFlagZ;
-            e.aluRImm(4U, kNzcv, keep);
-            if (set != 0U) e.aluRImm(1U, kNzcv, set);
+            e.aluRImm(4U, e.nzcv, keep);
+            if (set != 0U) e.aluRImm(1U, e.nzcv, set);
         }
         return true;
     case MicroOp::mov_reg:
@@ -710,7 +713,7 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
             e.movRR(kEcx, kEax);
             e.aluRImm(4U, kEcx, 1U); // new carry = old bit 0
             e.shImm(5U, kEax, 1U);
-            e.movRR(kEdx, kNzcv);
+            e.movRR(kEdx, e.nzcv);
             e.aluRImm(4U, kEdx, kFlagC);
             e.shImm(4U, kEdx, 2U); // old C (bit 29) -> bit 31
             e.aluRR(1U, kEax, kEdx);
@@ -742,12 +745,12 @@ inline bool emitX86CondTaken(X86Emitter& e, Condition cond, std::uint32_t op_ind
     const auto markFailed = [&]() {
         e.aluRImm(1U, kFailed, 1U << op_index);
     };
-    const auto testFlag = [&](std::uint32_t mask) { e.testRImm(kNzcv, mask); };
+    const auto testFlag = [&](std::uint32_t mask) { e.testRImm(e.nzcv, mask); };
     // Extracts N (bit 31) and V (bit 28) into eax/ecx bit 0 and compares.
     const auto cmpNv = [&]() {
-        e.movRR(kEax, kNzcv);
+        e.movRR(kEax, e.nzcv);
         e.shImm(5U, kEax, 31U);
-        e.movRR(kEcx, kNzcv);
+        e.movRR(kEcx, e.nzcv);
         e.shImm(5U, kEcx, 28U);
         e.aluRImm(4U, kEcx, 1U);
         e.aluRR(7U, kEax, kEcx); // cmp eax, ecx

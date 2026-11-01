@@ -1591,6 +1591,9 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
         static_cast<std::uint32_t>(offsetof(CpuState, xpsr)),
         static_cast<std::uint32_t>(offsetof(CpuState, instruction_address))};
     constexpr std::uint32_t ctx = 13U, costs = 14U, cpu = 12U;
+    // The prologue already saves RBX/R15. Keeping guest flags there avoids
+    // four moves (or stack spills) around every RAM/stack helper invocation.
+    constexpr std::uint32_t kNzcv = 3U, kRetain = 15U;
     const auto off = [](std::size_t n) { return static_cast<std::uint32_t>(n); };
     const auto retired = off(offsetof(NativeExecutionContext, retired_count));
     const auto limit = off(offsetof(NativeExecutionContext, instruction_limit));
@@ -1602,6 +1605,7 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     const auto charged_count = off(offsetof(NativeExecutionContext, charged_cycles_count));
     const auto kAdmittedMode = off(offsetof(NativeExecutionContext, admitted_cycle_mode));
     X86Emitter e;
+    e.nzcv = kNzcv;
     const auto done = e.makeLabel(), early = e.makeLabel();
     e.pushReg(3U); e.pushReg(12U); e.pushReg(13U); e.pushReg(14U); e.pushReg(15U);
     e.pushReg(5U); e.pushReg(10U); e.subRsp16();
@@ -1690,13 +1694,12 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
             if (inst.op == MicroOp::bl || op.native.kind == NativeOp::blx_reg)
                 e.movM32Imm(kState, offsets.r + 56U, (op.pc + op.size) | 1U);
             if (op.decoded.kind == InstrKind::push || op.decoded.kind == InstrKind::pop) {
-                e.movM32R(4U, 0U, kNzcv); e.movM32R(4U, 4U, kRetain);
                 e.movRR64(7U, ctx); e.movR32Imm(6U, op.pc);
                 e.movR32Imm(kEdx, op.decoded.register_list);
                 e.movR32Imm(1U, op.decoded.kind == InstrKind::push ? 1U : 0U);
                 e.movR32Imm(8U, op.expected_next_pc);
                 e.movR64Imm(kEax, reinterpret_cast<std::uintptr_t>(&nativeStackTransfer)); e.callReg(kEax);
-                e.movR32M(kNzcv, 4U, 0U); e.movR32M(kRetain, 4U, 4U); e.movRR64(7U, cpu);
+                e.movRR64(7U, cpu);
                 if (op.decoded.kind == InstrKind::pop && (op.decoded.register_list & 0x8000U)) {
                     e.cmpR32Imm(kEax, static_cast<std::uint32_t>(NativeStackResult::dynamic_return));
                     e.jcc(4U, exits[i].dynamic_return);
@@ -1724,7 +1727,7 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
                 const bool t_load = nativeOpIsLoad(m.kind);
                 const std::uint32_t t_width = nativeOpWidth(m.kind);
                 if (!t_load) loadGuest(e,valuereg,offsets,m.rd);
-                e.movRR(3U,kNzcv); e.movRR(15U,kRetain); e.movRR64(7U,ctx); e.movR32Imm(6U,op.pc); e.movRR(kEdx,addrreg);
+                e.movRR64(7U,ctx); e.movR32Imm(6U,op.pc); e.movRR(kEdx,addrreg);
                 if (t_load) e.leaR64(1U,4U,0U);
                 const auto helper = t_width == 1U
                     ? (t_load ? reinterpret_cast<std::uintptr_t>(&nativeRead8) : reinterpret_cast<std::uintptr_t>(&nativeWrite8))
@@ -1732,7 +1735,7 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
                     ? (t_load ? reinterpret_cast<std::uintptr_t>(&nativeRead16) : reinterpret_cast<std::uintptr_t>(&nativeWrite16))
                     : (t_load ? reinterpret_cast<std::uintptr_t>(&nativeRead32) : reinterpret_cast<std::uintptr_t>(&nativeWrite32));
                 e.movR64Imm(kEax,helper); e.callReg(kEax);
-                e.movRR(kNzcv,3U); e.movRR(kRetain,15U); e.movRR64(7U,cpu);
+                e.movRR64(7U,cpu);
                 e.u8(0x84U); e.u8(0xc0U); e.jcc(4U,exits[i].helper);
                 if (t_load) {
                     e.movR32M(kEax,4U,0U);
