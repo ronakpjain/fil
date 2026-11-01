@@ -851,6 +851,12 @@ FastStepResult CortexM4::stepFastImpl(const bool use_jit, bool fast_handler_decl
             ++jit_stats_.single_decline;
         }
         if (!jit_handled) stop = execute(*decoded, last_diagnostic_);
+        // BLX-register remains on the checked executor, but a successful
+        // checked transfer supplies the observed edge needed by trace stitching.
+        if (native_memory_jit_enabled_ && stop == StopReason::step_complete
+            && decoded->kind == InstrKind::blx && instruction_size == 2U
+            && !state_.pending_exc_return && !state_.pending_exception)
+            observeNativeTraceReturn(pc, state_.r[15]);
         // Coverage accounting (one predictable counter per retired op).
         if (use_jit && !was_in_it && condition_passed) {
             if (jit_handled) ++jit_stats_.single_fast;
@@ -1764,11 +1770,12 @@ bool CortexM4::prepareNativeTrace(NativeTraceCacheEntry& entry) {
         const bool return_pop = decoded->kind == InstrKind::pop
             && (decoded->register_list & (std::uint16_t{1U} << 15U)) != 0U;
         const bool return_bx_lr = lowered.kind == NativeOp::bx_lr;
+        const bool call_blx_reg = lowered.kind == NativeOp::blx_reg;
         const bool branch = decoded->kind == InstrKind::b || decoded->kind == InstrKind::bl
-            || return_pop || return_bx_lr;
+            || return_pop || return_bx_lr || call_blx_reg;
         bool taken = branch;
         std::uint32_t return_target = 0U;
-        if (return_pop || return_bx_lr) {
+        if (return_pop || return_bx_lr || call_blx_reg) {
             const auto& profile = native_branches_[jitBlockIndex(pc) & (native_branch_entries - 1U)];
             if (!profile.valid || profile.pc != pc || profile.generation != entry.generation) break;
             return_target = profile.target;
@@ -1787,7 +1794,7 @@ bool CortexM4::prepareNativeTrace(NativeTraceCacheEntry& entry) {
         op.size = size;
         op.expected_taken = taken;
         const auto sequential = pc + size;
-        op.expected_next_pc = (return_pop || return_bx_lr) ? return_target : taken ? static_cast<std::uint32_t>(
+        op.expected_next_pc = (return_pop || return_bx_lr || call_blx_reg) ? return_target : taken ? static_cast<std::uint32_t>(
             static_cast<std::int64_t>(pc) + 4 + decoded->branch_offset) & ~std::uint32_t{1U}
             : sequential;
         op.execution_cycles = branch && !taken ? 1U : basePipelineCycles(*decoded);
@@ -2518,8 +2525,9 @@ auto CortexM4::executeTrustedReversibleJitBlockImpl(
             && (op.register_list & (std::uint16_t{1U} << 15U)) != 0U;
         const bool returned_from_bx_lr = op.kind == InstrKind::bx && op.rm == 14U
             && (state_.r[14] & 1U) != 0U;
+        const bool called_via_blx_reg = op.kind == InstrKind::blx && size == 2U;
         if (native_memory_jit_enabled_ && condition_passed
-            && (returned_from_pop_pc || returned_from_bx_lr)
+            && (returned_from_pop_pc || returned_from_bx_lr || called_via_blx_reg)
             && !state_.pending_exc_return && !state_.pending_exception)
             observeNativeTraceReturn(pc, state_.r[15]);
         if (condition_passed && state_.r[15] != pc + size) {

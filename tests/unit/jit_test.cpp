@@ -607,6 +607,118 @@ TEST(JitTest, WarmedNativeTraceStitchesRealBlBxLrAndMatchesCheckedCuts) {
     EXPECT_TRUE(observed_trace);
 }
 
+TEST(JitTest, CheckedBlxSeedsObservedEdgeAndNativeTraceExecutesTheCall) {
+    if (!fil::cpu::MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
+    constexpr std::uint32_t call_pc = flash_base;
+    constexpr std::uint32_t callee = flash_base + 0x42U; // exercise target bit 1
+    auto words = std::vector<std::uint16_t>(64U, 0xbf00U);
+    words[0] = 0x4780U; // BLX r0
+    words[0x21U + 8U] = 0x4770U; // BX LR after eight callee NOPs
+    std::vector<std::uint8_t> code;
+    code.reserve(words.size() * 2U);
+    for (const auto word : words) {
+        code.push_back(static_cast<std::uint8_t>(word));
+        code.push_back(static_cast<std::uint8_t>(word >> 8U));
+    }
+    auto bus = basicBus(), oracle = basicBus();
+    ASSERT_TRUE(bus.loadBytes(flash_base, code));
+    ASSERT_TRUE(oracle.loadBytes(flash_base, code));
+    bus.setReversibleRamOnly(true); bus.setAllMmioTrapping(true);
+    oracle.setReversibleRamOnly(true); oracle.setAllMmioTrapping(true);
+    fil::cpu::CortexM4 candidate(bus), checked(oracle);
+    prepare(candidate); prepare(checked); checked.setNativeMemoryJitEnabled(false);
+    candidate.state().r[0] = checked.state().r[0] = callee | 1U;
+
+    // Execute both edges through the checked architectural executor first.
+    auto call = candidate.stepFast();
+    ASSERT_EQ(call.reason, fil::cpu::StopReason::step_complete);
+    EXPECT_EQ(candidate.state().r[15], callee);
+    for (unsigned i = 0U; i < 9U; ++i) {
+        auto result = candidate.stepFast();
+        ASSERT_EQ(result.reason, fil::cpu::StopReason::step_complete);
+    }
+    ASSERT_EQ(candidate.state().r[15], call_pc + 2U);
+
+    // The successful checked BLX must have recorded its actual aligned PC edge.
+    // Warm the real call-site entry (the trace cache requires 64 visits), while
+    // executing the callee through checked instructions between visits.
+    auto initial = candidate.state();
+    initial.r[15] = call_pc;
+    initial.r[14] = 0U;
+    initial.r[0] = callee | 1U;
+    candidate.state() = checked.state() = initial;
+    for (unsigned visit = 0U; visit < 96U && candidate.jitStats().trace_executions == 0U; ++visit) {
+        candidate.state().r[15] = call_pc;
+        fil::cpu::CortexM4::ReversibleCycleBudget warm; warm.remaining_cycles = 1000U;
+        const auto warmed = candidate.tryStepBudgetedReversibleJitBlock(64U, warm);
+        if (!warmed && candidate.state().r[15] == call_pc)
+            ASSERT_EQ(candidate.stepFast().reason, fil::cpu::StopReason::step_complete);
+        if (candidate.state().r[15] == callee) {
+            for (unsigned i = 0U; i < 9U; ++i)
+                ASSERT_EQ(candidate.stepFast().reason, fil::cpu::StopReason::step_complete);
+        }
+    }
+    ASSERT_GT(candidate.jitStats().trace_executions, 0U)
+        << "checked BLX profile did not seed a caller/callee trace";
+    EXPECT_GT(candidate.jitStats().trace_instructions, 0U);
+
+    candidate.state() = checked.state() = initial;
+    fil::cpu::CortexM4::ReversibleCycleBudget budget;
+    budget.remaining_cycles = 1000U;
+    const auto native = candidate.tryStepBudgetedReversibleJitBlock(64U, budget);
+    ASSERT_TRUE(native);
+    ASSERT_GT(native->execution.count, 0U);
+
+    for (std::size_t i = 0U; i < native->execution.count; ++i) {
+        const auto expected = checked.stepFast();
+        ASSERT_EQ(expected.reason, fil::cpu::StopReason::step_complete);
+        EXPECT_EQ(native->execution.pcs[i], expected.instruction_address);
+        EXPECT_EQ(native->instruction_cycles[i], expected.cycles);
+    }
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.state(), checked.state()));
+
+    // A changed, non-Thumb operand must leave native execution before BLX
+    // retirement; the checked fallback then writes LR before reporting fault.
+    auto fault_start = initial;
+    fault_start.r[0] = callee; // bit 0 clear
+    fault_start.r[14] = 0x12345678U;
+    candidate.state() = checked.state() = fault_start;
+    fil::cpu::CortexM4::ReversibleCycleBudget mismatch_budget;
+    mismatch_budget.remaining_cycles = 1000U;
+    const auto mismatch = candidate.tryStepBudgetedReversibleJitBlock(64U, mismatch_budget);
+    EXPECT_GT(candidate.jitStats().trace_guard_mismatches, 0U);
+    const auto actual_reason = mismatch ? mismatch->execution.result.reason
+                                        : candidate.stepFast().reason;
+    const auto expected = checked.stepFast();
+    EXPECT_EQ(actual_reason, expected.reason);
+    EXPECT_NE(expected.reason, fil::cpu::StopReason::step_complete);
+    EXPECT_EQ(candidate.state().r[14], (call_pc + 2U) | 1U);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.state(), checked.state()));
+
+    // An EXC_RETURN-shaped odd operand is not a BLX exception return. The
+    // checked fallback preserves BLX's LR-before-target-fetch behavior, then
+    // both CPUs fault identically when fetching from the token-shaped address.
+    auto exc_start = initial;
+    exc_start.r[0] = 0xfffffff1U;
+    exc_start.r[14] = 0x87654321U;
+    candidate.state() = checked.state() = exc_start;
+    fil::cpu::CortexM4::ReversibleCycleBudget exc_budget;
+    exc_budget.remaining_cycles = 1000U;
+    const auto exc_attempt = candidate.tryStepBudgetedReversibleJitBlock(64U, exc_budget);
+    const auto actual_call_reason = exc_attempt ? exc_attempt->execution.result.reason
+                                                : candidate.stepFast().reason;
+    const auto expected_call = checked.stepFast();
+    EXPECT_EQ(actual_call_reason, expected_call.reason);
+    EXPECT_EQ(candidate.state().r[15], 0xfffffff0U);
+    EXPECT_EQ(candidate.state().r[14], (call_pc + 2U) | 1U);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.state(), checked.state()));
+    const auto actual_fetch = candidate.stepFast();
+    const auto expected_fetch = checked.stepFast();
+    EXPECT_EQ(actual_fetch.reason, expected_fetch.reason);
+    EXPECT_NE(actual_fetch.reason, fil::cpu::StopReason::step_complete);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.state(), checked.state()));
+}
+
 TEST(JitTest, NativeTraceMatchesCheckedPrefixesBudgetsAndChangedBranchInputs) {
     if (!fil::cpu::MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
     const auto code = halfwords({0xbf00U, 0x6008U, 0x680aU, 0x3202U, 0x2a03U,

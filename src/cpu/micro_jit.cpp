@@ -859,13 +859,17 @@ namespace {
         const auto& inst = op.native.integer;
         const bool is_cond = inst.op == MicroOp::b_cond;
         const bool bx_lr = op.native.kind == NativeOp::bx_lr;
-        const bool taken = bx_lr || inst.op == MicroOp::b || inst.op == MicroOp::bl
+        const bool blx_reg = op.native.kind == NativeOp::blx_reg;
+        const auto blx_target = blx_reg ? state.r[op.native.rn] : 0U;
+        const bool taken = bx_lr || blx_reg || inst.op == MicroOp::b || inst.op == MicroOp::bl
             || (is_cond && conditionPasses(inst.condition, state.xpsr));
         if (((inst.op == MicroOp::b || is_cond || inst.op == MicroOp::bl)
              && taken != op.expected_taken)
             || (bx_lr && ((state.r[14] & 1U) == 0U
                 || state.r[14] != (op.expected_next_pc | 1U)
-                || (state.r[14] & 0xfffffff0U) == 0xfffffff0U))) {
+                || (state.r[14] & 0xfffffff0U) == 0xfffffff0U))
+            || (blx_reg && (blx_target != (op.expected_next_pc | 1U)
+                || (blx_target & 0xfffffff0U) == 0xfffffff0U))) {
             ctx->failing_instruction_pc = op.pc;
             ctx->exit_reason = NativeExitReason::branch_mismatch;
             break;
@@ -917,6 +921,8 @@ namespace {
             // architectural exception-return token range before any effects.
         } else if (inst.op == MicroOp::b || is_cond || inst.op == MicroOp::bl) {
             if (inst.op == MicroOp::bl) state.r[14] = (op.pc + op.size) | 1U;
+        } else if (blx_reg) {
+            state.r[14] = (op.pc + op.size) | 1U;
         } else if (!stack_op && op.native.kind == NativeOp::integer) {
             MicroCpu guest;
             for (std::size_t r = 0; r < guest.r.size(); ++r) guest.r[r] = state.r[r];
@@ -1209,12 +1215,12 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
     auto expected_pc = block.entry_pc;
     for (std::size_t i = 0; i < block.ops.size(); ++i) {
         const auto& op = block.ops[i];
-        if (op.kind == NativeOp::bx_lr) {
-            error = "native-jit: BX LR is trace-only";
+        if (op.kind == NativeOp::bx_lr || op.kind == NativeOp::blx_reg) {
+            error = "native-jit: indirect branch is trace-only";
             return nullptr;
         }
         if (op.pc != expected_pc
-            || static_cast<unsigned>(op.kind) > static_cast<unsigned>(NativeOp::bx_lr)) {
+            || static_cast<unsigned>(op.kind) > static_cast<unsigned>(NativeOp::blx_reg)) {
             error = "native-jit: invalid opcode or discontinuous block";
             return nullptr;
         }
@@ -1240,7 +1246,7 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
             error = "native-jit: branch or malformed op declined";
             return nullptr;
         }
-        if (op.kind != NativeOp::integer && op.kind != NativeOp::bx_lr
+        if (op.kind != NativeOp::integer && op.kind != NativeOp::bx_lr && op.kind != NativeOp::blx_reg
             && (op.rd >= 13U || (!op.absolute && op.rn > 13U))) {
             error = "native-jit: invalid memory register";
             return nullptr;
@@ -1523,6 +1529,11 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
             e.movR32M(kEax, cpu, offsets.r + 56U);
             e.cmpR32Imm(kEax, op.expected_next_pc | 1U);
             e.jcc(5U, exits[i].mismatch);
+        } else if (op.native.kind == NativeOp::blx_reg) {
+            e.movR32M(kEax, cpu, offsets.r + op.native.rn * 4U);
+            e.cmpR32Imm(kEax, op.expected_next_pc | 1U); e.jcc(5U, exits[i].mismatch);
+            e.movRR(kEcx, kEax); e.aluRImm(4U, kEcx, 0xfffffff0U);
+            e.cmpR32Imm(kEcx, 0xfffffff0U); e.jcc(4U, exits[i].mismatch);
         }
         if (conditional) {
             const auto actually_taken = e.makeLabel(), guard_done = e.makeLabel();
@@ -1537,7 +1548,8 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
         e.movR32M(kEax, costs, static_cast<std::uint32_t>(i * sizeof(std::uint32_t)));
         e.movRR64(kEdx, 5U); e.addR64R64(kEdx, kEax);
         e.jcc(2U, exits[i].cycle); e.cmpR64M(kEdx, ctx, cycle_limit); e.jcc(7U, exits[i].cycle);
-        if (inst.op == MicroOp::bl) e.movM32Imm(kState, offsets.r + 56U, (op.pc + op.size) | 1U);
+        if (inst.op == MicroOp::bl || op.native.kind == NativeOp::blx_reg)
+            e.movM32Imm(kState, offsets.r + 56U, (op.pc + op.size) | 1U);
         if (op.decoded.kind == InstrKind::push || op.decoded.kind == InstrKind::pop) {
             e.movM32R(4U, 0U, kNzcv); e.movM32R(4U, 4U, kRetain);
             e.movRR64(7U, ctx); e.movR32Imm(6U, op.pc);
@@ -1549,10 +1561,10 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
             e.cmpR32Imm(kEax, static_cast<std::uint32_t>(NativeStackResult::branch_mismatch));
             e.jcc(4U, exits[i].mismatch);
             e.testRR(kEax, kEax); e.jcc(5U, exits[i].helper);
-        } else if (!(bx_lr || conditional || inst.op == MicroOp::b || inst.op == MicroOp::bl)
+        } else if (!(bx_lr || op.native.kind == NativeOp::blx_reg || conditional || inst.op == MicroOp::b || inst.op == MicroOp::bl)
                    && op.native.kind == NativeOp::integer) {
             if (!emitX86Op(e, offsets, inst, error)) { impl_->trace_cache.pop_back(); return nullptr; }
-        } else if (!(bx_lr || conditional || inst.op == MicroOp::b || inst.op == MicroOp::bl)) {
+        } else if (!(bx_lr || op.native.kind == NativeOp::blx_reg || conditional || inst.op == MicroOp::b || inst.op == MicroOp::bl)) {
             const auto& m = op.native; constexpr std::uint32_t addrreg = 2U, valuereg = 1U;
             if (m.absolute) e.movR32Imm(addrreg, m.absolute_address);
             else {

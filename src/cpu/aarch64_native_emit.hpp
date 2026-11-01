@@ -88,8 +88,9 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
         e.load(9U, ctx, offsetof(NativeExecutionContext, charged_cycles_count));
         e.cmpImm(9U, static_cast<std::uint32_t>(i + 1U)); e.cond(3U, unsupported_exit);
 
-        const bool branch = m.kind == NativeOp::integer
-            && (inst.op == MicroOp::b || inst.op == MicroOp::bl || inst.op == MicroOp::b_cond);
+        const bool blx_reg = m.kind == NativeOp::blx_reg;
+        const bool branch = blx_reg || (m.kind == NativeOp::integer
+            && (inst.op == MicroOp::b || inst.op == MicroOp::bl || inst.op == MicroOp::b_cond));
         if (op.trace && branch && inst.op == MicroOp::b_cond) {
             // ARM and AArch64 use identical condition encodings (AL/NV handled explicitly).
             if (inst.condition == Condition::al) {
@@ -101,6 +102,12 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
                 const auto condition = static_cast<std::uint32_t>(inst.condition);
                 e.cond(op.expected_taken ? (condition ^ 1U) : condition, mismatch_exit);
             }
+        }
+        if (blx_reg) {
+            e.load(9U, cpu, r + m.rn * 4U);
+            e.movImm(10U, op.next_pc | 1U); e.cmpW(9U, 10U); e.cond(1U, mismatch_exit);
+            e.movImm(10U, 0xfffffff0U); e.logicReg(0U, 9U, 9U, 10U);
+            e.cmpW(9U, 10U); e.cond(0U, mismatch_exit);
         }
         if (m.kind == NativeOp::bx_lr) {
             e.load(9U, cpu, r + 56U);
@@ -162,7 +169,8 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
                 e.store(9U, cpu, r + m.rd * 4U);
             }
         } else if (branch) {
-            if (inst.op == MicroOp::bl) e.storeImm(cpu, r + 56U, (m.pc + m.size) | 1U);
+            if (inst.op == MicroOp::bl || blx_reg)
+                e.storeImm(cpu, r + 56U, (m.pc + m.size) | 1U);
         } else if (m.kind == NativeOp::integer) {
             // Reuse exactly the same integer stencils as the pure backend.
             // Guest flags are materialized at every commit/helper boundary;
