@@ -352,6 +352,18 @@ public:
         std::size_t max_instructions, ReversibleCycleBudget& budget);
 
     /**
+     * @brief Executes exactly one authoritative checked instruction under a budget.
+     *
+     * Admission mirrors the budgeted IT fallback: the instruction must decode,
+     * be immediately executable, and its conservative CPU-plus-fetch cost must
+     * fit the remaining credit before any state is committed. Exact charged
+     * cycles are debited and fetch sequencing updated, so a caller may interleave
+     * this with span execution and still stop strictly before its horizon.
+     */
+    [[nodiscard]] std::optional<FastStepResult> tryStepCheckedSingle(
+        ReversibleCycleBudget& budget);
+
+    /**
      * @brief Predicts, without executing or mutating state, whether a trusted
      * reversible block attempt at the current PC would execute no instruction.
      *

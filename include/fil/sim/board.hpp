@@ -326,6 +326,9 @@ private:
     // Profitability hints only: a deferred discovery always executes normally.
     std::array<LocalPrefixProbe, 256U> local_prefix_probes_{};
     bool owner_slice_active_{false};
+    // Cycles a committed span already applied to the board clock so a checked
+    // single step could observe exact time; the caller advances only the rest.
+    std::uint64_t span_accounted_cycles_{0U};
 
     [[nodiscard]] static bool appendReversibleChunk(
         ReversibleRamPrefix::ReversibleExecution& aggregate,

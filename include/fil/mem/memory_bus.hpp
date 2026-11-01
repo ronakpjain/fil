@@ -417,6 +417,17 @@ public:
         return side_effect_generation_;
     }
 
+    /**
+     * @brief Generation of peripheral (MMIO) accesses only.
+     *
+     * Unlike `sideEffectGeneration`, a plain backed-memory write leaves it
+     * unchanged, so a caller can tell whether a committed step reached a device
+     * and may therefore have retimed one, without walking any journal.
+     */
+    [[nodiscard]] std::uint64_t mmioGeneration() const noexcept {
+        return mmio_generation_;
+    }
+
     /** @brief Captures a marker for exact reversible-memory/MMIO loop proof. */
     [[nodiscard]] SideEffectCheckpoint sideEffectCheckpoint() const noexcept;
 

@@ -2267,29 +2267,118 @@ std::optional<cpu::FastStepResult> Board::stepCommittedLocal(
         cached_fetch_timing_valid_ = true;
     }
     budget.fetch_timing = cached_fetch_timing_;
-    // Reuse the checked RAM-only executor, not speculative admission: all
-    // effects commit once, with no journal, snapshot, restore, or replay.
-    // Traps prevent any MMIO or executable write inside the native span.
-    ReversibleMemoryGuard guard(memory_);
+    // Re-derives the cycle credit still available to this span. A checked single
+    // step may commit MMIO, which can schedule or cancel device events or
+    // reprogram SysTick, so the bound is recomputed from the current clock with
+    // the same formula as admission.
+    const auto remainingCredit = [&]() -> std::uint64_t {
+        auto horizon = deadline;
+        if (const auto event = event_loop_->nextScheduledTime(event_loop_->activeOwner());
+            event && (!horizon || *event < *horizon)) horizon = event;
+        const auto current = event_loop_->now();
+        if (horizon && *horizon <= current) return 0U;
+        const auto systick_now = system_->cyclesUntilSysTickInterrupt();
+        if (systick_now && *systick_now == 0U) return 0U;
+        auto credit_now = systick_now ? *systick_now - 1U
+            : std::numeric_limits<std::uint64_t>::max();
+        if (horizon
+            && *horizon - current <= std::numeric_limits<std::uint64_t>::max() / frequency) {
+            const auto numerator = (*horizon - current) * frequency - 1U;
+            credit_now = std::min(credit_now, numerator >= time_fraction_
+                ? (numerator - time_fraction_) / nanoseconds_per_second : 0U);
+        }
+        return std::min<std::uint64_t>(credit_now,
+            std::numeric_limits<std::uint16_t>::max());
+    };
+    // A batched step skips the memoized-certificate attempt the scheduler would
+    // otherwise make at this pc. That is sound only when the attempt is provably
+    // a no-op for the probe's own accounting: otherwise the span returns to the
+    // caller so idle-loop discovery, certificate reuse and their clock jumps
+    // keep happening at the same cadence and phase as unbatched execution.
+    const auto batchableMemoizedProbe = [&]() -> bool {
+        if (!memory_.writeJournalTracking()) return true;
+        const auto pc = cpu_->state().r[15];
+        auto& probe = local_prefix_probes_[((pc >> 1U) ^ (pc >> 9U))
+            & (local_prefix_probes_.size() - 1U)];
+        if (probe.pc != pc) probe = {pc, 0U, 0U};
+        const auto visits = probe.visits++;
+        const bool discovery = visits < transition_hotness_threshold
+            || (visits & 63U) == 0U;
+        return !discovery && probe.misses >= transition_hotness_threshold;
+    };
     cpu::FastStepResult result;
     std::uint32_t instructions = 0U;
     bool suppress_loop_observation = false;
+    // Cycles charged inside this span, and how many of them have already been
+    // applied to the board clock. Keeping these separate lets the span retire
+    // one checked instruction after a decline without ever letting an MMIO read
+    // observe stale simulated time, while the caller still reports and advances
+    // the full span charge exactly once.
+    std::uint64_t consumed_cycles = 0U;
+    std::uint64_t accounted_cycles = 0U;
+    std::uint64_t reconciled_mmio_generation = memory_.mmioGeneration();
     while (instructions < max_instructions) {
         const auto request = std::min<std::size_t>(max_instructions - instructions,
             cpu::NativeTracePlan::max_ops);
-        const auto executed = cpu_->tryStepCommittedRamSpan(request, budget);
-        if (!executed || executed->instructions == 0U) break;
-        instructions += executed->instructions;
-        suppress_loop_observation |= executed->suppress_loop_observation;
-        result = *executed;
+        std::optional<cpu::FastStepResult> executed;
+        {
+            // Traps and the reversible-RAM restriction apply only to the
+            // speculative span; the checked step below runs outside them so its
+            // MMIO effects commit once, exactly as the scheduler fallback did.
+            ReversibleMemoryGuard guard(memory_);
+            const auto before_credit = budget.remaining_cycles;
+            executed = cpu_->tryStepCommittedRamSpan(request, budget);
+            consumed_cycles += before_credit - budget.remaining_cycles;
+        }
+        if (executed && executed->instructions != 0U) {
+            instructions += executed->instructions;
+            suppress_loop_observation |= executed->suppress_loop_observation;
+            result = *executed;
+            if (result.reason != cpu::StopReason::step_complete || blockBoundaryPending()) break;
+            continue;
+        }
+        // A declined span retires one checked instruction so a single declined
+        // op no longer costs a full scheduler round trip. Everything retired so
+        // far must already be on the board clock first: the step may read a
+        // time-dependent register.
+        if (!batchableMemoizedProbe()) break;
+        if (consumed_cycles != accounted_cycles) {
+            // The span credit is bounded below the next owner event and below
+            // SysTick, so this advance dispatches nothing; it exists only so the
+            // checked step below observes the exact simulated time.
+            static_cast<void>(advanceTime(consumed_cycles - accounted_cycles));
+            accounted_cycles = consumed_cycles;
+            // Advancing the clock can make an interrupt takable; the scheduler
+            // fallback this replaces always observed that boundary before
+            // retiring another instruction.
+            if (blockBoundaryPending()) break;
+        }
+        // A committed MMIO access may have retimed the device or the clock. Only
+        // then is the cached bound re-derived: the common checked step touches
+        // no peripheral, and re-reading the horizon and SysTick every time would
+        // cost more than the round trip this batching removes.
+        if (memory_.mmioGeneration() != reconciled_mmio_generation) {
+            if (peripherals_->rcc().systemClockHz() != frequency
+                || peripherals_->flash().acrGeneration() != timing_generation) break;
+            reconciled_mmio_generation = memory_.mmioGeneration();
+            budget.remaining_cycles = std::min(budget.remaining_cycles, remainingCredit());
+            if (budget.remaining_cycles == 0U) break;
+        }
+        const auto before_credit = budget.remaining_cycles;
+        const auto single = cpu_->tryStepCheckedSingle(budget);
+        if (!single) break;
+        consumed_cycles += before_credit - budget.remaining_cycles;
+        ++instructions;
+        result = *single;
         if (result.reason != cpu::StopReason::step_complete || blockBoundaryPending()) break;
     }
     if (instructions == 0U) return std::nullopt;
     result.instructions = instructions;
     result.suppress_loop_observation = suppress_loop_observation;
-    result.cycles = static_cast<std::uint16_t>(credit - budget.remaining_cycles);
+    result.cycles = static_cast<std::uint16_t>(consumed_cycles);
     have_last_fetch_ = budget.have_fetch;
     last_fetch_end_ = budget.fetch_end;
+    span_accounted_cycles_ = accounted_cycles;
     return result;
 }
 
@@ -2330,6 +2419,7 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
                                     : cpu::CortexM4::JitStepOutcome::max_block));
         const auto limit_time = deadline == 0U
             ? std::nullopt : std::optional<SimTimeNs>{deadline};
+        span_accounted_cycles_ = 0U;
         const auto memoized = owner_slice_active_ && jit_ok
             ? stepMemoizedLocal(static_cast<std::size_t>(std::min<std::uint64_t>(
                 options.max_instructions - aggregate.instructions,
@@ -2362,7 +2452,12 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
                 saturatingAdd(event_loop_->now(), memoized->elapsed_ns));
             if (events.same_time_limit_hit) throw std::runtime_error("owner event livelock");
         } else {
-            static_cast<void>(advanceTime(result.cycles));
+            // A committed span may have already applied part of its charge to the
+            // board clock so a checked single step could observe exact time;
+            // advance only the remainder.
+            const auto preaccounted = std::exchange(span_accounted_cycles_, 0U);
+            static_cast<void>(advanceTime(result.cycles > preaccounted
+                ? result.cycles - preaccounted : 0U));
         }
         if (result.reason != cpu::StopReason::step_complete) {
             BoardRunResult failure = cpuFailure(result);

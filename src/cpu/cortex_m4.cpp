@@ -2069,6 +2069,36 @@ auto CortexM4::tryStepBudgetedReversibleJitBlockImpl(
     return executeTrustedReversibleJitBlockImpl<Detailed>(max_instructions, &budget);
 }
 
+std::optional<FastStepResult> CortexM4::tryStepCheckedSingle(
+    ReversibleCycleBudget& budget) {
+    if (state_.halted || !state_.thumb || (state_.xpsr & xpsr_t) == 0U
+        || (state_.r[15] & 1U) != 0U || state_.pending_exception
+        || state_.pending_exc_return) return std::nullopt;
+    const std::uint32_t pc = state_.r[15];
+    std::uint32_t raw = 0U;
+    std::uint8_t size = 0U;
+    const auto decoded = fetchDecode(pc, raw, size);
+    if (!decoded) return std::nullopt;
+    const bool sequential = budget.have_fetch && pc == budget.fetch_end;
+    const std::uint16_t stall = budget.fetchStallCycles(pc, sequential);
+    // Conservative admission before commit, exactly like the IT fallback.
+    const std::uint32_t bound = static_cast<std::uint32_t>(basePipelineCycles(*decoded))
+        + stall;
+    if (bound > budget.remaining_cycles
+        || bound > std::numeric_limits<std::uint16_t>::max()) return std::nullopt;
+    const CpuState before = state_;
+    const FastStepResult stepped = stepFast();
+    if (stepped.reason != StopReason::step_complete || stepped.instructions != 1U) {
+        state_ = before;
+        return std::nullopt;
+    }
+    const std::uint32_t charged = static_cast<std::uint32_t>(stepped.cycles) + stall;
+    budget.remaining_cycles -= charged;
+    budget.have_fetch = true;
+    budget.fetch_end = pc + stepped.instruction_size;
+    return stepped;
+}
+
 std::optional<FastStepResult> CortexM4::tryStepCommittedRamSpan(
     const std::size_t max_instructions, ReversibleCycleBudget& budget) {
     if (max_instructions == 0U || !memory_.reversibleRamOnly()

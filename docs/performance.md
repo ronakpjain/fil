@@ -45,11 +45,18 @@ slot stores a function pointer and device context instead of constructing a
 `std::function`, and a scheduled-handle trampoline retires the handle identity
 before the device callback runs.
 
-Parallel owner executors spin briefly at window rendezvous, then park using
-C++20 atomic wait/notify. Finishing a light lane does not leave its worker
-continuously competing for host execution resources while the ADC-heavy lanes
-finish. The coordinator also parks after its bounded spin. Window publication,
-completion, exception propagation, and shutdown retain release/acquire ordering.
+Parallel owner executors spin at window rendezvous, then park using C++20
+atomic wait/notify. The spin length is selected per pool: when the host has at
+least two cores beyond the active executors, an idle executor spins for a full
+window (32K pause instructions) before parking, because a bounded cross-board
+window synchronizes every `cross_board_window_ns` and the park/wake latency is
+paid on the critical path of each one while the parked executors would otherwise
+be idle; without that slack the conservative park-first budget is kept so the
+spin cannot compete with a working lane. Finishing a light lane does not leave
+its worker continuously competing for host execution resources while the
+ADC-heavy lanes finish. The coordinator also parks after its bounded spin.
+Window publication, completion, exception propagation, and shutdown retain
+release/acquire ordering.
 Owner costs are measured each window and expensive jobs start first. The pool
 limits active executors using the ceiling of total owner cost divided by the
 largest owner cost, bounded by available execution slots; balanced workloads
@@ -69,7 +76,7 @@ changes host scheduling only, not guest events or simulated timing.
 | Event-aware scheduling | Bounds execution by events, interrupts, instruction budgets, and simulated-time deadlines. Event insertion prunes retired owner-queue heads so global-only dispatch does not retain every completed ADC callback until shutdown; live event ordering and conversion effects are unchanged. |
 | Loop batching | Single-board `run` automatically batches proven repeated loops; network commands do not. Unproven paths execute normally; tracing retains instruction-level execution. |
 | Cached JIT handlers | JIT is automatic. Specialized handlers and prepared blocks fall back for unsupported or unsafe operations. |
-| Owner-local committed RAM spans | Owner slices retain validated period/transition certificate hits, but sample speculative discovery using bounded PC-local profitability hints. A discovery miss can execute ordinary RAM spans directly, chaining prepared blocks under one exact instruction/cycle/fetch budget that ends strictly before events, SysTick, and the slice deadline. MMIO, executable writes, unsupported work, and pending architectural boundaries return to checked execution. Sampling affects optimization opportunities only; it never suppresses guest instructions or peripheral work. |
+| Owner-local committed RAM spans | Owner slices retain validated period/transition certificate hits, but sample speculative discovery using bounded PC-local profitability hints. A discovery miss can execute ordinary RAM spans directly, chaining prepared blocks under one exact instruction/cycle/fetch budget that ends strictly before events, SysTick, and the slice deadline. A declined span no longer costs a scheduler round trip: the same budget retires one checked instruction and continues, advancing the board clock over everything already retired first so a time-dependent MMIO read never observes stale simulated time, and re-deriving the horizon and SysTick bound only after a peripheral access actually happened. Batching is refused whenever the memoized probe at that pc could still admit a certificate, so idle-loop discovery and its clock jumps keep engaging. MMIO, executable writes, unsupported work, and pending architectural boundaries still return to checked execution. Sampling affects optimization opportunities only; it never suppresses guest instructions or peripheral work. |
 | Compact committed fallback | Compile-time detailed/compact specializations share checked execution, admission, and decline logic. The compact result avoids exporting per-instruction reversible metadata, while updating exact remaining cycle credit and fetch state in place. Detailed callers retain their output arrays; committed callers leave those arrays untouched. IT and custom fetch-timing callbacks keep checked semantics and callback order. |
 | Bespoke stencil JIT | Compiles straight-line integer superblocks (ALU, shifts, conditional branches, terminal calls) directly to host machine code: one stencil per guest op in a bump-allocated arena, with scheduler prefix limits and taken-branch exits reported back to dispatch. A bounded exact-key cache reuses immutable kernels after decoded-block eviction, avoiding repeated emission and executable-memory permission changes. Register transfers are limited to the block's referenced and modified registers, preserving values across partial-prefix exits. Unshifted core-register MOVs are native, including N/Z updates that preserve C/V. Blocks with memory suffixes can use a native pure-integer leading prefix; every memory operation remains in checked handlers. Serves plain, trusted, and budgeted reversible block paths with identical guest state, cycles, and event ordering; unsupported, memory/MMIO, system, and floating-point work retains existing paths. Disabled with `FIL_ENABLE_MICRO_JIT=OFF`. |
 | Guarded native traces | Hot generation-tagged traces stitch supported integer/byte/word-memory operations, register compares, byte/halfword extends and bitfield extracts, direct calls/branches, guarded profiled register BLX calls, profiled conditional edges, and narrow PUSH/POP across basic blocks. Both x86-64 and AArch64 emit direct integer, guard, and memory stencils; memory and stack transfers call checked scalar helpers. The trace builder admits these extra integer operations explicitly, so enum placement does not silently exclude them from the supported set. Conditional mismatches exit before the branch retires; predicted POP targets are validated before register/SP commit. Whole-span stack stores retain journal and store-footprint tracking. Repeated PCs can be unrolled up to 64 operations in compact committed execution; the detailed reversible API remains capped at its 16-entry metadata capacity. Timing plans cache the full flash-timing snapshot and entry fetch sequencing, with prefix sums for aggregate retirement. Every represented instruction executes individually under exact instruction/cycle credit, and retirement metadata comes from the trace plan rather than a basic-block slot. AArch64 shares its integer stencils with the pure backend and publishes CPU metadata, NZCV and progress after each committed instruction. x86-64 retains committed cycles in a callee-saved register and publishes PC, diagnostic address, NZCV and progress once at the selected exit; guest register, LR, SP and RAM effects remain immediate. This requires synchronous RAM-only helpers that do not inspect deferred CPU/progress metadata; new PC/flag-reading operands or observers require materialization first. Plans, profiles, compilation attempts and executable storage are bounded; unsupported forms, changed generations, IT, pending exceptions and custom fetch callbacks keep checked execution. Trace diagnostics count actual native work, including speculative certificate replay, not a speed guarantee. |
@@ -77,6 +84,23 @@ changes host scheduling only, not guest events or simulated timing.
 | Validated network fast path | Plain `run-network` uses compact single-instruction dispatch without loop-proof state. Networks of up to eight boards use a fixed-width timestamp reduction, retaining all tied completions and deterministic board ordering. |
 | Guarded RAM capsules | Reversible private-RAM capsules are automatic on eligible network work. Preliminary safety checks resolve the first journal entry of each touched address with a single generation-stamped address set rather than rescanning the window per mutation, so multi-mutation windows stay linear. Capturing the speculative pass directly into the published evaluation record avoids a second per-instruction metadata copy. Observation barriers, bounded native prefixes, and rollback preserve modeled effects; validate changes against capsules-disabled execution. |
 | Build optimization | Release, supported IPO/LTO, and representative optional Clang PGO reduce host overhead without changing modeled ADC fidelity. |
+
+## Bounded-window attribution
+
+The bounded cross-board window is a real semantic boundary, not only a host
+scheduling choice. In the owner-lane path a board retires straight-line work in
+committed spans and yields to the coordinator only where the span budget ends,
+so the memoized idle-loop certificates are offered at fewer instruction
+boundaries than in the exact lockstep scheduler used by
+`cross_board_window_ns = 0`. Both paths reach the same simulated deadline and
+consume the same cycles (measured within 0.003% on the six-board PER network at
+ADC decimation 1), but the *reported* instruction count can differ because idle
+fast-forwarding engages later. Treat exact counter equality as an invariant
+between parallel lanes and the same window executed serially, which is still
+asserted, rather than between the windowed path and the exact lockstep
+reference. `tools/bench_full_network.sh --reference-binary` compares counters and
+will therefore reject a cross-scheduler pair; give it two builds of the same
+scheduler when checking a change.
 
 Native kernel admission is performance-based rather than a minimum-length
 heuristic beyond the existing two-instruction compilation floor. Each new
