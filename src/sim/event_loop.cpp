@@ -93,7 +93,13 @@ struct EventLoop::Impl {
         return ids;
     }();
     std::atomic<std::size_t> active_lane_scopes{0U};
-    std::array<std::atomic<bool>, dense_owner_count> lane_owner_active{};
+    // One cache line per owner: these flags are acquired and released once per
+    // lane job, and packing 64 atomics into a single line would make every lane
+    // job an RMW on a line all other lanes are also writing.
+    struct alignas(64) OwnerFlag {
+        std::atomic<bool> value{false};
+    };
+    std::array<OwnerFlag, dense_owner_count> lane_owner_active{};
     std::recursive_mutex coordinator_gate_mutex;
 
     static constexpr std::uint64_t lane_id_marker = std::uint64_t{1U} << 63U;
@@ -787,17 +793,26 @@ EventLoop::LaneDomainScope::LaneDomainScope(
         throw std::logic_error("cannot nest lane domains from different EventLoops");
     }
     Impl& root = *loop.impl_;
-    // The gate excludes concurrent coordinator operations, but is independent
-    // of the root mutex so a coordinator-held root exclusive lease is harmless.
-    std::lock_guard<std::recursive_mutex> gate(root.coordinator_gate_mutex);
-    if (!root.lane_domains_active || owner >= root.lane_owner_count) {
-        throw std::logic_error("requested lane domain is not active");
-    }
     if (previous_loop_ == &loop) {
         throw std::logic_error("lane domain scopes cannot be nested");
     }
+    // The gate excludes concurrent coordinator operations, but is independent
+    // of the root mutex so a coordinator-held root exclusive lease is harmless.
+    // Only the first active lane scope of a window has to take it: a coordinator
+    // root operation refuses to start while any scope is active, and one already
+    // in flight holds the gate, so this load either sees that count and skips the
+    // mutex safely or takes the gate and serializes behind the coordinator. The
+    // session's lane-domain table is immutable for as long as the session is
+    // open, and the session is only closed while no scope is active.
+    std::unique_lock<std::recursive_mutex> gate;
+    if (root.active_lane_scopes.load(std::memory_order_acquire) == 0U) {
+        gate = std::unique_lock<std::recursive_mutex>(root.coordinator_gate_mutex);
+    }
+    if (!root.lane_domains_active || owner >= root.lane_owner_count) {
+        throw std::logic_error("requested lane domain is not active");
+    }
     bool expected = false;
-    if (!root.lane_owner_active[owner].compare_exchange_strong(
+    if (!root.lane_owner_active[owner].value.compare_exchange_strong(
             expected, true, std::memory_order_acq_rel)) {
         throw std::logic_error("lane owner already has an active worker");
     }
@@ -813,7 +828,7 @@ EventLoop::LaneDomainScope::~LaneDomainScope() noexcept {
     EventLoop::laneBindingLoop() = static_cast<EventLoop*>(previous_loop_);
     EventLoop::laneBindingImpl() = previous_impl_;
     Impl& root = *loop_->impl_;
-    root.lane_owner_active[owner_].store(false, std::memory_order_release);
+    root.lane_owner_active[owner_].value.store(false, std::memory_order_release);
     root.active_lane_scopes.fetch_sub(1U, std::memory_order_acq_rel);
 }
 
