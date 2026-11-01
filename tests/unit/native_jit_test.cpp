@@ -527,6 +527,48 @@ TEST(NativeJitTest, GuardedDecodedBranchTraceRetiresOnlyMatchingEdge) {
     EXPECT_EQ(ctx.failing_instruction_pc, pc); EXPECT_EQ(cpu.r[15], pc);
 }
 
+TEST(NativeJitTest, CompareBranchTraceGuardsBothEdgesWithoutChangingFlags) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
+    constexpr std::uint32_t pc = 0x08000000U;
+    std::string creation_error;
+    auto jit = MicroJit::create(creation_error);
+    ASSERT_NE(jit, nullptr) << creation_error;
+    for (const auto raw : {0xb100U, 0xb900U}) { // CBZ/CBNZ r0, pc + 4
+        const auto decoded = decode16(static_cast<std::uint16_t>(raw));
+        ASSERT_TRUE(decoded);
+        for (const bool expected_taken : {false, true}) {
+            NativeTraceOp op{};
+            op.decoded = *decoded; op.raw = raw; op.pc = pc; op.size = 2U;
+            op.expected_taken = expected_taken;
+            op.expected_next_pc = pc + (expected_taken ? 4U : 2U);
+            op.execution_cycles = expected_taken ? 2U : 1U;
+            NativeTracePlan plan; std::string error;
+            ASSERT_TRUE(buildNativeTrace({&op, 1U}, plan, error)) << error;
+            const auto fn = jit->compileNativeTrace(plan, error);
+            ASSERT_NE(fn, nullptr) << error;
+            const std::array<std::uint32_t, 1> costs{op.execution_cycles};
+            for (const auto value : {0U, 1U, 0x80000000U}) {
+                CpuState actual_cpu; actual_cpu.r[0] = value; actual_cpu.r[15] = pc;
+                actual_cpu.xpsr = xpsr_t | xpsr_n | xpsr_c | xpsr_v;
+                CpuState expected_cpu = actual_cpu;
+                fil::mem::MemoryBus bus;
+                NativeExecutionContext actual{&actual_cpu, &bus, 1U, 3U};
+                actual.charged_cycles = costs.data(); actual.charged_cycles_count = 1U;
+                auto expected = actual; expected.cpu_state = &expected_cpu;
+                interpretNativeTrace(plan, expected); fn(&actual);
+                const bool taken = (value == 0U) == (raw == 0xb100U);
+                EXPECT_EQ(actual.retired_count, taken == expected_taken ? 1U : 0U);
+                EXPECT_EQ(actual.exit_reason, expected.exit_reason);
+                EXPECT_EQ(actual.retired_cycles, expected.retired_cycles);
+                EXPECT_EQ(actual_cpu.r, expected_cpu.r);
+                EXPECT_EQ(actual_cpu.xpsr, xpsr_t | xpsr_n | xpsr_c | xpsr_v);
+            }
+            op.expected_next_pc ^= 8U;
+            EXPECT_FALSE(buildNativeTrace({&op, 1U}, plan, error));
+        }
+    }
+}
+
 TEST(NativeJitTest, FlagProducerPrecedesGuardAndBLCommitsDirectEdge) {
     if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
     constexpr std::uint32_t pc = 0x08011000U;

@@ -105,8 +105,16 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
         e.bindLabel(checked_cycle_admission);
 
         const bool blx_reg = m.kind == NativeOp::blx_reg;
-        const bool branch = blx_reg || (m.kind == NativeOp::integer
+        const bool compare_branch = m.kind == NativeOp::integer
+            && (inst.op == MicroOp::cbz || inst.op == MicroOp::cbnz);
+        const bool branch = blx_reg || compare_branch || (m.kind == NativeOp::integer
             && (inst.op == MicroOp::b || inst.op == MicroOp::bl || inst.op == MicroOp::b_cond));
+        if (op.trace && compare_branch) {
+            e.load(9U, cpu, r + inst.rn * 4U);
+            const bool expect_zero = op.expected_taken == (inst.op == MicroOp::cbz);
+            if (expect_zero) e.cbnzW(9U, mismatch_exit);
+            else e.cbzW(9U, mismatch_exit);
+        }
         if (op.trace && branch && inst.op == MicroOp::b_cond) {
             // ARM and AArch64 use identical condition encodings (AL/NV handled explicitly).
             if (inst.condition == Condition::al) {

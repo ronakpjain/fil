@@ -860,12 +860,14 @@ namespace {
         }
         const auto cycles = admitted ? 0U : ctx->charged_cycles[i];
         const auto& inst = op.native.integer;
-        const bool is_cond = inst.op == MicroOp::b_cond;
+        const bool compare_branch = inst.op == MicroOp::cbz || inst.op == MicroOp::cbnz;
+        const bool is_cond = inst.op == MicroOp::b_cond || compare_branch;
         const bool bx_lr = op.native.kind == NativeOp::bx_lr;
         const bool blx_reg = op.native.kind == NativeOp::blx_reg;
         const auto blx_target = blx_reg ? state.r[op.native.rn] : 0U;
         const bool taken = bx_lr || blx_reg || inst.op == MicroOp::b || inst.op == MicroOp::bl
-            || (is_cond && conditionPasses(inst.condition, state.xpsr));
+            || (compare_branch ? ((state.readRegister(inst.rn) == 0U) == (inst.op == MicroOp::cbz))
+                               : (is_cond && conditionPasses(inst.condition, state.xpsr)));
         if (((inst.op == MicroOp::b || is_cond || inst.op == MicroOp::bl)
              && taken != op.expected_taken)
             || (bx_lr && ((state.r[14] & 1U) == 0U
@@ -1595,7 +1597,8 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
                 e.cmpR64Imm8(costs, 0U); e.jcc(4U, exits[i].unsupported);
             }
             const bool bx_lr = op.native.kind == NativeOp::bx_lr;
-            const auto conditional = inst.op == MicroOp::b_cond;
+            const bool compare_branch = inst.op == MicroOp::cbz || inst.op == MicroOp::cbnz;
+            const auto conditional = inst.op == MicroOp::b_cond || compare_branch;
             if (bx_lr) {
                 e.movR32M(kEax, cpu, offsets.r + 56U);
                 e.cmpR32Imm(kEax, op.expected_next_pc | 1U);
@@ -1608,7 +1611,11 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
             }
             if (conditional) {
                 const auto actually_taken = e.makeLabel(), guard_done = e.makeLabel();
-                if (!emitX86CondTaken(e, inst.condition, 0U, actually_taken, error)) {
+                if (compare_branch) {
+                    loadGuest(e, kEax, offsets, inst.rn);
+                    e.testRR(kEax, kEax);
+                    e.jcc(inst.op == MicroOp::cbz ? 4U : 5U, actually_taken);
+                } else if (!emitX86CondTaken(e, inst.condition, 0U, actually_taken, error)) {
                     impl_->trace_cache.pop_back(); return nullptr;
                 }
                 if (op.expected_taken) e.jmp(exits[i].mismatch); else e.jmp(guard_done);

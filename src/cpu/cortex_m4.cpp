@@ -1771,21 +1771,20 @@ bool CortexM4::prepareNativeTrace(NativeTraceCacheEntry& entry) {
             && (decoded->register_list & (std::uint16_t{1U} << 15U)) != 0U;
         const bool return_bx_lr = lowered.kind == NativeOp::bx_lr;
         const bool call_blx_reg = lowered.kind == NativeOp::blx_reg;
+        const bool compare_branch = decoded->kind == InstrKind::cbz || decoded->kind == InstrKind::cbnz;
         const bool branch = decoded->kind == InstrKind::b || decoded->kind == InstrKind::bl
-            || return_pop || return_bx_lr || call_blx_reg;
+            || compare_branch || return_pop || return_bx_lr || call_blx_reg;
         bool taken = branch;
         std::uint32_t return_target = 0U;
         if (return_pop || return_bx_lr || call_blx_reg) {
             const auto& profile = native_branches_[jitBlockIndex(pc) & (native_branch_entries - 1U)];
             if (!profile.valid || profile.pc != pc || profile.generation != entry.generation) break;
             return_target = profile.target;
-        } else if (decoded->kind == InstrKind::b && decoded->condition != Condition::al) {
+        } else if (compare_branch
+                   || (decoded->kind == InstrKind::b && decoded->condition != Condition::al)) {
             const auto& profile = native_branches_[jitBlockIndex(pc) & (native_branch_entries - 1U)];
             if (!profile.valid || profile.pc != pc || profile.generation != entry.generation) break;
             taken = profile.taken;
-        } else if (lowered.kind == NativeOp::integer
-            && (lowered.integer.op == MicroOp::cbz || lowered.integer.op == MicroOp::cbnz)) {
-            break;
         }
         NativeTraceOp op;
         op.decoded = *decoded;
@@ -1795,7 +1794,8 @@ bool CortexM4::prepareNativeTrace(NativeTraceCacheEntry& entry) {
         op.expected_taken = taken;
         const auto sequential = pc + size;
         op.expected_next_pc = (return_pop || return_bx_lr || call_blx_reg) ? return_target : taken ? static_cast<std::uint32_t>(
-            static_cast<std::int64_t>(pc) + 4 + decoded->branch_offset) & ~std::uint32_t{1U}
+            static_cast<std::int64_t>(pc) + 4
+            + (compare_branch ? static_cast<std::int64_t>(decoded->imm) : decoded->branch_offset)) & ~std::uint32_t{1U}
             : sequential;
         op.execution_cycles = branch && !taken ? 1U : basePipelineCycles(*decoded);
         if (branch && taken && op.expected_next_pc != sequential)
@@ -2385,9 +2385,16 @@ auto CortexM4::executeTrustedReversibleJitBlockImpl(
                 const auto retired_u8 = static_cast<std::uint8_t>(retired);
                 if (native_memory_jit_enabled_) {
                     for (std::uint8_t j = 0U; j < retired_u8; ++j) {
-                        if (slot.ops[j].kind == InstrKind::b
-                            && slot.ops[j].condition != Condition::al)
+                        const auto& op = slot.ops[j];
+                        if (op.kind == InstrKind::b && op.condition != Condition::al)
                             observeNativeTraceBranch(slot.pcs[j], ((failed >> j) & 1U) == 0U);
+                        else if (op.kind == InstrKind::cbz || op.kind == InstrKind::cbnz) {
+                            // Compare-and-branch is terminal and preserves its
+                            // source register; the flag-failure mask does not encode
+                            // its outcome, so sample the committed source value.
+                            observeNativeTraceBranch(slot.pcs[j], (state_.readRegister(op.rn) == 0U)
+                                == (op.kind == InstrKind::cbz));
+                        }
                     }
                 }
                 if (failed != 0U) {
@@ -2577,8 +2584,13 @@ auto CortexM4::executeTrustedReversibleJitBlockImpl(
             break;
         }
         if (compact) state_.instruction_address = pc;
-        if (native_memory_jit_enabled_ && op.kind == InstrKind::b && op.condition != Condition::al)
-            observeNativeTraceBranch(pc, condition_passed);
+        if (native_memory_jit_enabled_) {
+            if (op.kind == InstrKind::b && op.condition != Condition::al)
+                observeNativeTraceBranch(pc, condition_passed);
+            else if (op.kind == InstrKind::cbz || op.kind == InstrKind::cbnz)
+                observeNativeTraceBranch(pc, (state_.readRegister(op.rn) == 0U)
+                    == (op.kind == InstrKind::cbz));
+        }
         const bool returned_from_pop_pc = op.kind == InstrKind::pop
             && (op.register_list & (std::uint16_t{1U} << 15U)) != 0U;
         const bool returned_from_bx_lr = op.kind == InstrKind::bx && op.rm == 14U

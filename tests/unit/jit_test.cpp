@@ -944,6 +944,48 @@ TEST(JitTest, CheckedSingleAdmitsDataDependentDivideBeforeCommit) {
     EXPECT_EQ(budget.remaining_cycles, 0U);
 }
 
+TEST(JitTest, CompareBranchCommittedSpansMatchCheckedInstructionCycles) {
+    if (!fil::cpu::MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
+    // LDR r2,[r1]; CBZ/CBNZ r2,skip; ADDS r3,#1; STR r3,[r1,#4]; B loop.
+    for (const auto branch : {0xb102U, 0xb902U}) {
+        const auto code = halfwords({0x680aU, static_cast<std::uint16_t>(branch),
+            0x3301U, 0x604bU, 0xe7faU});
+        auto bus = basicBus(), oracle = basicBus();
+        ASSERT_TRUE(bus.loadBytes(flash_base, code));
+        ASSERT_TRUE(oracle.loadBytes(flash_base, code));
+        bus.setReversibleRamOnly(true); bus.setAllMmioTrapping(true);
+        fil::cpu::CortexM4 candidate(bus), checked(oracle);
+        prepare(candidate); candidate.state().r[1] = ram_base;
+        for (unsigned i = 0; i < 4000U; ++i) {
+            fil::cpu::CortexM4::ReversibleCycleBudget warm; warm.remaining_cycles = 128U;
+            if (!candidate.tryStepCommittedRamSpan(64U, warm))
+                ASSERT_EQ(candidate.stepFast().reason, fil::cpu::StopReason::step_complete);
+        }
+        ASSERT_GT(candidate.jitStats().trace_instructions, 0U);
+        for (const auto value : {0U, 1U}) {
+            for (std::size_t limit = 1; limit <= 64; ++limit) {
+                prepare(candidate); prepare(checked);
+                candidate.state().r[1] = checked.state().r[1] = ram_base;
+                ASSERT_TRUE(bus.write32(ram_base, value));
+                ASSERT_TRUE(oracle.write32(ram_base, value));
+                ASSERT_TRUE(bus.write32(ram_base + 4U, 0U));
+                ASSERT_TRUE(oracle.write32(ram_base + 4U, 0U));
+                fil::cpu::CortexM4::ReversibleCycleBudget budget; budget.remaining_cycles = 10000U;
+                const auto span = candidate.tryStepCommittedRamSpan(limit, budget);
+                if (!span) continue;
+                std::uint64_t cycles = 0U;
+                for (std::size_t i = 0; i < span->instructions; ++i) {
+                    const auto step = checked.stepFast();
+                    ASSERT_EQ(step.reason, fil::cpu::StopReason::step_complete);
+                    cycles += step.cycles;
+                }
+                EXPECT_EQ(10000U - budget.remaining_cycles, cycles) << branch << '/' << value << '/' << limit;
+                EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.state(), checked.state()));
+            }
+        }
+    }
+}
+
 TEST(JitTest, CommittedRamSpanUnrollsLoopsWithEveryIterationRetired) {
     if (!fil::cpu::MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
     // LDR r2,[r1]; ADDS r2,#1; STR r2,[r1]; CMP r2,r0; BCC loop; BKPT.

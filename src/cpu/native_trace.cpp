@@ -59,19 +59,23 @@ bool buildNativeTrace(std::span<const NativeTraceOp> sources, NativeTracePlan& o
         const auto op = lowered.integer.op;
         const bool bx_lr = lowered.kind == NativeOp::bx_lr;
         const bool blx_reg = lowered.kind == NativeOp::blx_reg;
-        const bool branch = bx_lr || blx_reg || (lowered.kind == NativeOp::integer
+        const bool compare_branch = lowered.kind == NativeOp::integer
+            && (op == MicroOp::cbz || op == MicroOp::cbnz);
+        const bool branch = bx_lr || blx_reg || compare_branch || (lowered.kind == NativeOp::integer
             && (op == MicroOp::b || op == MicroOp::b_cond || op == MicroOp::bl));
         // Extend and bitfield-extract sit after the contiguous shift/branch
         // range in the enum but are fully emitted; admit them explicitly.
         const bool extra_integer = lowered.kind == NativeOp::integer
             && (op == MicroOp::extend || op == MicroOp::ubfx);
-        if (!blx_reg && !(op <= MicroOp::bl || op == MicroOp::b_cond || extra_integer)) {
+        if (!blx_reg && !compare_branch && !(op <= MicroOp::bl || op == MicroOp::b_cond || extra_integer)) {
             error = "native-trace: unsupported operation";
             return false;
         }
         const std::uint32_t sequential = src.pc + src.size;
         const std::uint32_t target = static_cast<std::uint32_t>(
-            static_cast<std::int64_t>(src.pc) + 4 + lowered.integer.branch_offset) & ~1U;
+            static_cast<std::int64_t>(src.pc) + 4
+            + (compare_branch ? static_cast<std::int64_t>(lowered.integer.imm)
+                              : lowered.integer.branch_offset)) & ~1U;
         if (bx_lr) {
             const auto canonical = src.size == 2U ? decode16(static_cast<std::uint16_t>(src.raw))
                                                    : std::optional<DecodedInstruction>{};
@@ -99,6 +103,11 @@ bool buildNativeTrace(std::span<const NativeTraceOp> sources, NativeTracePlan& o
             if (src.decoded.condition != Condition::al || src.expected_next_pc != target
                 || !src.expected_taken) {
                 error = "native-trace: invalid unconditional branch edge";
+                return false;
+            }
+        } else if (compare_branch) {
+            if (src.expected_next_pc != (src.expected_taken ? target : sequential)) {
+                error = "native-trace: compare branch edge mismatch";
                 return false;
             }
         } else if (op == MicroOp::b_cond) {
