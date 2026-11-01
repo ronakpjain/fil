@@ -709,11 +709,13 @@ private:
         bool valid{false};
         bool taken{true};
     };
-    static constexpr std::size_t native_trace_entries = 256U;
+    // Preserve the prepared block index: truncation repeatedly evicts hot
+    // trace candidates before they can reach the compilation threshold.
+    static constexpr std::size_t native_trace_entries = jit_block_entries;
     static constexpr std::uint8_t native_decline_streak_limit = 8U;
     static constexpr std::uint8_t reversible_decline_streak_limit = 4U;
     static constexpr std::size_t native_branch_entries = 1024U;
-    std::array<NativeTraceCacheEntry, native_trace_entries> native_traces_{};
+    std::unique_ptr<std::array<NativeTraceCacheEntry, native_trace_entries>> native_traces_;
     std::array<NativeBranchProfile, native_branch_entries> native_branches_{};
     void observeNativeTraceBranch(std::uint32_t pc, bool taken) noexcept;
     void observeNativeTraceReturn(std::uint32_t pc, std::uint32_t target) noexcept;

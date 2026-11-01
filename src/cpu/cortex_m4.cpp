@@ -1878,7 +1878,9 @@ std::optional<FastStepResult> CortexM4::tryStepNativeTrace(
     if (!MicroJit::hostSupported() || state_.halted || !state_.thumb
         || (state_.xpsr & xpsr_t) == 0U || (pc & 1U) != 0U
         || state_.pending_exception || state_.pending_exc_return) return std::nullopt;
-    auto& entry = native_traces_[jitBlockIndex(pc) & (native_trace_entries - 1U)];
+    if (!native_traces_)
+        native_traces_ = std::make_unique<std::array<NativeTraceCacheEntry, native_trace_entries>>();
+    auto& entry = (*native_traces_)[jitBlockIndex(pc)];
     const auto generation = memory_.executionGeneration();
     if (entry.pc != pc || entry.generation != generation) entry.retarget(pc, generation);
     if (!entry.plan) {

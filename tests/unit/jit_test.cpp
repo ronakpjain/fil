@@ -905,6 +905,39 @@ TEST(JitTest, NativeTraceCachesValidChargePrefixAcrossTimingKeys) {
     }
 }
 
+TEST(JitTest, NativeTraceCacheKeepsAlternatingHotBlockIndicesDistinct) {
+    if (!fil::cpu::MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
+    fil::mem::MemoryBus bus;
+    ASSERT_TRUE(bus.mapRom(flash_base, 2048U, "trace-cache-flash"));
+    ASSERT_TRUE(bus.mapRam(ram_base, 256U, "trace-cache-ram"));
+    // These three prepared-block indices differ only in bits discarded by a
+    // 256-slot trace cache. Alternation must not continually reset hotness.
+    const std::array<std::uint32_t, 3U> entries{
+        flash_base, flash_base + 512U, flash_base + 1024U};
+    const auto code = halfwords({0x6808U, 0x3001U, 0x6008U, 0xe7fbU});
+    for (const auto pc : entries) ASSERT_TRUE(bus.loadBytes(pc, code));
+    bus.setReversibleRamOnly(true);
+    bus.setAllMmioTrapping(true);
+    fil::cpu::CortexM4 cpu(bus);
+    for (unsigned visit = 0U; visit < 256U; ++visit) {
+        for (const auto pc : entries) {
+            prepare(cpu, pc);
+            cpu.state().r[1] = ram_base;
+            fil::cpu::CortexM4::ReversibleCycleBudget budget;
+            budget.remaining_cycles = 1000U;
+            const auto result = cpu.tryStepCommittedRamSpan(64U, budget);
+            if (visit >= 128U) {
+                ASSERT_TRUE(result);
+                EXPECT_EQ(result->reason, fil::cpu::StopReason::step_complete);
+                EXPECT_EQ(result->instructions, 64U);
+                EXPECT_EQ(cpu.state().r[15], pc);
+            }
+        }
+    }
+    EXPECT_EQ(cpu.jitStats().trace_compilations, entries.size());
+    EXPECT_GT(cpu.jitStats().trace_instructions, 0U);
+}
+
 TEST(JitTest, NativeTraceFirstFetchBiasMatchesCheckedCostsAcrossEntryModes) {
     if (!fil::cpu::MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
     // LDR r0,[r1]; ADDS r2,#1; B loop: supported memory and pure operations.
