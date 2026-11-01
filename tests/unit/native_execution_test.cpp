@@ -69,6 +69,74 @@ TEST(NativeExecutionTest, DeclinesFaultsAndMmioWithoutDispatchOrOutputMutation) 
     EXPECT_FALSE(fil::cpu::nativeRead32(&context, 0U, 0U, nullptr));
 }
 
+TEST(NativeExecutionTest, MmioBridgeKeepsReadBoundariesAndAlwaysStopsAfterWrites) {
+    class Mmio final : public fil::mem::MmioDevice {
+    public:
+        fil::mem::MemoryResult<std::uint64_t> read(
+            std::uint32_t, fil::mem::AccessSize, const fil::mem::AccessContext&) override {
+            ++reads;
+            return std::uint64_t{0x1234U};
+        }
+        fil::mem::MemoryResult<std::uint64_t> write(
+            std::uint32_t, fil::mem::AccessSize, std::uint64_t,
+            const fil::mem::AccessContext&) override {
+            ++writes;
+            return std::uint64_t{0U};
+        }
+        std::string_view name() const noexcept override { return "bridge-mmio"; }
+        int reads{0}, writes{0};
+    } device;
+    struct Host {
+        std::uint64_t prefix{0U};
+        std::uint32_t pc{0U};
+        bool write{false}, stop{false}, allow{true};
+    } host;
+    fil::cpu::NativeMmioBridge bridge{
+        &host,
+        [](void* context, std::uint64_t prefix, std::uint32_t pc) noexcept {
+            auto& host = *static_cast<Host*>(context);
+            host.prefix = prefix;
+            host.pc = pc;
+            return host.allow;
+        },
+        [](void* context, bool write) noexcept {
+            auto& host = *static_cast<Host*>(context);
+            host.write = write;
+            return host.stop;
+        }};
+    fil::mem::MemoryBus bus;
+    ASSERT_TRUE(bus.mapMmio(0x40000000U, 4U, device, "mmio"));
+    bus.setAllMmioTrapping(true);
+    bus.setReversibleRamOnly(true);
+    fil::cpu::NativeExecutionContext context;
+    context.memory_bus = &bus;
+    context.mmio_bridge = &bridge;
+    context.retired_cycles = 17U;
+    context.mmio_prefix_bias = 3U;
+    std::uint32_t value = 0U;
+    ASSERT_TRUE(fil::cpu::nativeRead32(&context, 0x08000006U, 0x40000000U, &value));
+    EXPECT_EQ(value, 0x1234U);
+    EXPECT_EQ(host.prefix, 20U);
+    EXPECT_EQ(host.pc, 0x08000006U);
+    EXPECT_FALSE(host.write);
+    EXPECT_FALSE(context.boundary_stop);
+    host.stop = true;
+    ASSERT_TRUE(fil::cpu::nativeRead16(&context, 0x08000008U, 0x40000000U, &value));
+    EXPECT_TRUE(context.boundary_stop);
+    host.stop = false;
+    context.boundary_stop = false;
+    ASSERT_TRUE(fil::cpu::nativeWrite8(&context, 0x0800000aU, 0x40000000U, 1U));
+    EXPECT_TRUE(host.write);
+    EXPECT_TRUE(context.boundary_stop);
+    EXPECT_EQ(device.reads, 2);
+    EXPECT_EQ(device.writes, 1);
+    host.allow = false;
+    value = 0xfeedU;
+    EXPECT_FALSE(fil::cpu::nativeRead32(&context, 0x0800000cU, 0x40000000U, &value));
+    EXPECT_EQ(value, 0xfeedU);
+    EXPECT_EQ(device.reads, 2);
+}
+
 TEST(NativeExecutionTest, CheckedStackTransferOrdersWordsAndKeepsDeclinesAtomic) {
     using namespace fil::cpu;
     fil::mem::MemoryBus bus;

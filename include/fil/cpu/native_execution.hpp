@@ -65,6 +65,8 @@ struct NativeExecutionContext {
     const NativeMmioBridge* mmio_bridge{nullptr};
     /** Set by an MMIO helper when the kernel must retire and stop after the op. */
     bool boundary_stop{false};
+    /** Entry-fetch bias excluded from the normalized native cycle table. */
+    std::uint32_t mmio_prefix_bias{0U};
 };
 
 /** @brief Validate aggregate cycle admission without observing deferred progress. */

@@ -2223,7 +2223,9 @@ bool Board::nativeMmioBegin(
     auto& self = *static_cast<Board*>(context);
     if (self.blockBoundaryPending()) return false;
     const std::uint64_t absolute = self.span_prior_cycles_ + prefix_cycles;
-    const std::uint64_t already = self.span_bridge_cycles_;
+    // A checked fallback may already have advanced the real board clock.
+    // Do not charge that prefix to SysTick/DWT a second time on re-entry.
+    const std::uint64_t already = std::max(self.span_bridge_cycles_, self.span_accounted_cycles_);
     if (absolute > already) {
         const std::uint64_t delta = absolute - already;
         // Advance SystemControl (SysTick/DWT) exactly like the checked path so
@@ -2236,23 +2238,25 @@ bool Board::nativeMmioBegin(
     // Read-only offset: devices read the exact guest time; the dispatch clock
     // advances only at the span boundary, preserving interrupt/SysTick phase.
     try {
-        self.event_loop_->setReadOffset(self.elapsedForCycles(absolute));
+        self.event_loop_->setReadOffset(self.elapsedForCycles(absolute - self.span_accounted_cycles_));
     } catch (...) {
         return false;
     }
     return true;
 }
 
-bool Board::nativeMmioMustStop(void* const context) noexcept {
+bool Board::nativeMmioMustStop(void* const context, const bool write) noexcept {
     auto& self = *static_cast<Board*>(context);
-    if (self.blockBoundaryPending()) {
+    if (write || self.blockBoundaryPending()) {
         self.mmio_boundary_stop_ = true;
         return true;
     }
     if (self.span_horizon_ns_ == 0U) return false;
     try {
         const auto next = self.event_loop_->nextScheduledTime(self.event_loop_->activeOwner());
-        if (next.has_value() && *next <= self.span_horizon_ns_) {
+        // Admission already ends strictly before the original horizon. Only a
+        // newly earlier event invalidates it; an unchanged event is not a cut.
+        if (next.has_value() && *next < self.span_horizon_ns_) {
             self.mmio_boundary_stop_ = true;
             return true;
         }
@@ -2413,6 +2417,7 @@ std::optional<cpu::FastStepResult> Board::stepCommittedLocal(
             // checked step below observes the exact simulated time.
             static_cast<void>(advanceTime(consumed_cycles - accounted_cycles));
             accounted_cycles = consumed_cycles;
+            span_accounted_cycles_ = accounted_cycles;
             // Advancing the clock can make an interrupt takable; the scheduler
             // fallback this replaces always observed that boundary before
             // retiring another instruction.

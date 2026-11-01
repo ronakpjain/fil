@@ -46,6 +46,18 @@ range/tracking caches. Write-journal bookkeeping is the largest removable
 host-side cost (about 12-15% when disabled), but it is required for reversible
 RAM spans and transaction validation, so it cannot simply be dropped.
 
+### Committed MMIO read continuation
+
+Committed native spans may continue after a peripheral read when the next event
+is unchanged from their admitted horizon. Admission already ends strictly before
+that horizon; only a newly earlier event or pending interrupt requires a cut.
+Peripheral writes always end the span because they can retime FLASH, RCC or
+SysTick without scheduling an earlier device event. Every access still executes
+through the checked peripheral bus at its exact guest time. Re-entry after a
+checked fallback subtracts the already-accounted prefix from both the clock offset
+and SysTick/DWT advance, and normalized trace timing includes its entry-fetch bias
+when invoking the MMIO bridge. Speculative certificate execution has no bridge.
+
 ## Event-loop overhead
 
 Relative scheduling and relative clock advancement avoid redundant recursive

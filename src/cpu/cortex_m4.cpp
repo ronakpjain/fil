@@ -1981,6 +1981,7 @@ std::optional<FastStepResult> CortexM4::executeNativeTrace(
     context.admitted_cycle_prefix = charged_prefix;
     context.admitted_cycle_prefix_count = static_cast<std::uint32_t>(available + 1U);
     context.allow_dynamic_returns = true;
+    context.mmio_prefix_bias = first_extra;
     context.mmio_bridge = committed_mmio ? mmio_bridge_ : nullptr;
     plan.function(&context);
     if (context.retired_count > planned)

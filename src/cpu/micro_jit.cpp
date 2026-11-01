@@ -902,7 +902,7 @@ namespace {
     for (std::size_t i = 0; i < plan->ops.size(); ++i) {
         const auto& op = plan->ops[i];
         ctx->current_instruction_pc = op.pc;
-        if (ctx->retired_count >= ctx->instruction_limit) {
+        if (ctx->retired_count >= ctx->instruction_limit || ctx->boundary_stop) {
             ctx->exit_reason = NativeExitReason::instruction_limit; break;
         }
         if (!admitted && (ctx->charged_cycles == nullptr || i >= ctx->charged_cycles_count)) {
@@ -953,6 +953,9 @@ namespace {
             }
         }
         if (!stack_op && nativeOpIsMemory(op.native.kind)) {
+            // The MMIO bridge observes exact progress even when the admitted
+            // kernel otherwise defers cumulative cycle publication to exit.
+            if (admitted) ctx->retired_cycles = ctx->admitted_cycle_prefix[i];
             const auto& memop = op.native;
             const std::uint32_t addr = memop.absolute ? memop.absolute_address
                 : state.readRegister(memop.rn) + memop.offset;

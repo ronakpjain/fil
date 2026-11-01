@@ -1259,6 +1259,58 @@ TEST(WorldTimeTest, OwnerRamRunnerMatchesCheckedMmioAndInterruptsAfterWarmup) {
     }
 }
 
+TEST(WorldTimeTest, OwnerMmioReadsKeepUnchangedEventHorizonAndExactClock) {
+    for (const auto flash_acr : {0U, 0x102U}) {
+        SCOPED_TRACE(flash_acr);
+        TempWorldTimeConfigs files;
+        const auto config = files.network({files.writeBoard("alpha.json", "alpha")});
+        auto exact = fil::sim::World::load(config);
+        auto jit = fil::sim::World::load(config);
+        ASSERT_TRUE(exact && jit);
+        for (auto* world : {exact.value().get(), jit.value().get()}) {
+            ASSERT_TRUE(configureZeroWaitFixture(*world));
+            auto& board = *world->board("alpha");
+            const auto start = board.cpu().state().r[15];
+            const std::vector<std::uint8_t> code{
+                0x01U, 0x30U, // adds r0, #1
+                0x01U, 0x30U, // adds r0, #1
+                0x0aU, 0x68U, // ldr r2, [r1] (DWT_CYCCNT)
+                0xfbU, 0xe7U, // b start
+            };
+            ASSERT_TRUE(board.memory().loadBytes(start, code));
+            ASSERT_TRUE(board.memory().write32(0xe0001000U, 1U));
+            ASSERT_TRUE(board.memory().write32(0x40022000U, flash_acr));
+            board.cpu().state().r[1] = 0xe0001004U;
+            // This event is already part of admission; a read must not stop a
+            // trace merely because the same future event remains scheduled.
+            auto owner = world->eventLoop().useOwner(0U);
+            static_cast<void>(world->eventLoop().scheduleAt(10'000'000U, [] {}));
+            world->setDiagnosticsEnabled(false);
+        }
+        auto options = runOptions(1'000'000U);
+        options.max_instructions_per_board = 20'003U;
+        options.cross_board_window_ns = 100'000U;
+        options.enable_jit = false;
+        const auto reference = exact.value()->run(options);
+        options.enable_jit = true;
+        const auto result = jit.value()->run(options);
+        ASSERT_TRUE(reference && result);
+        EXPECT_EQ(result.value().reason, reference.value().reason);
+        EXPECT_EQ(result.value().instructions, reference.value().instructions);
+        EXPECT_EQ(result.value().cycles, reference.value().cycles);
+        EXPECT_EQ(result.value().end_time_ns, reference.value().end_time_ns);
+        auto& a = *jit.value()->board("alpha");
+        auto& b = *exact.value()->board("alpha");
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(a.cpu().state(), b.cpu().state()));
+        EXPECT_EQ(a.cpu().state().r, b.cpu().state().r);
+        EXPECT_EQ(a.cpu().state().xpsr, b.cpu().state().xpsr);
+        const auto stats = a.cpu().jitStats();
+        if (stats.trace_executions != 0U)
+            EXPECT_GT(stats.trace_instructions, 8U * stats.trace_executions)
+                << "unchanged horizon allows traces across multiple MMIO reads";
+    }
+}
+
 TEST(WorldTimeTest, IndependentWindowsPreserveLocalInterruptsAndInstructionBudgets) {
     TempWorldTimeConfigs files;
     const auto alpha = files.writeBoard("alpha.json", "alpha");

@@ -21,8 +21,8 @@ bool mmioRead(NativeExecutionContext* const context, const std::uint32_t instruc
         return false;
     }
     // The host advances/validates the exact guest time before the access.
-    if (!context->mmio_bridge->begin(
-            context->mmio_bridge->context, context->retired_cycles, instruction_pc)) {
+    if (!context->mmio_bridge->begin(context->mmio_bridge->context,
+            context->retired_cycles + context->mmio_prefix_bias, instruction_pc)) {
         return false;
     }
     const auto result = context->memory_bus->readMmioChecked(
@@ -30,7 +30,7 @@ bool mmioRead(NativeExecutionContext* const context, const std::uint32_t instruc
     if (!result) return false;
     *value_out = static_cast<std::uint32_t>(result.value());
     if (context->mmio_bridge->must_stop != nullptr
-        && context->mmio_bridge->must_stop(context->mmio_bridge->context)) {
+        && context->mmio_bridge->must_stop(context->mmio_bridge->context, false)) {
         context->boundary_stop = true;
     }
     return true;
@@ -42,17 +42,18 @@ bool mmioWrite(NativeExecutionContext* const context, const std::uint32_t instru
         || !context->memory_bus->isMmioRange(address, mmioWidth(size))) {
         return false;
     }
-    if (!context->mmio_bridge->begin(
-            context->mmio_bridge->context, context->retired_cycles, instruction_pc)) {
+    if (!context->mmio_bridge->begin(context->mmio_bridge->context,
+            context->retired_cycles + context->mmio_prefix_bias, instruction_pc)) {
         return false;
     }
     const auto result = context->memory_bus->writeMmioChecked(
         address, size, value, {mem::AccessType::data_write, instruction_pc});
     if (!result) return false;
-    if (context->mmio_bridge->must_stop != nullptr
-        && context->mmio_bridge->must_stop(context->mmio_bridge->context)) {
-        context->boundary_stop = true;
-    }
+    // Writes can retime the clock, flash or SysTick without moving the next
+    // device event. Retire the write once, then let the host re-admit work.
+    context->boundary_stop = true;
+    if (context->mmio_bridge->must_stop != nullptr)
+        static_cast<void>(context->mmio_bridge->must_stop(context->mmio_bridge->context, true));
     return true;
 }
 

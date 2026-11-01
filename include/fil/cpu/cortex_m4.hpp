@@ -139,13 +139,14 @@ enum class StopReason : std::uint8_t {
  * `begin` advances the host clock to `prefix_cycles` past the span entry so
  * devices observe the exact guest time, returning false when the access must be
  * declined and handled by the checked path instead. `must_stop` reports, after
- * the access, whether the span must retire and exit immediately. Both are null
+ * the access, whether the span must retire and exit immediately; `write`
+ * distinguishes accesses that may retime clocks or interrupt admission. Both are null
  * for speculative/certificate execution.
  */
 struct NativeMmioBridge {
     void* context{nullptr};
     bool (*begin)(void* context, std::uint64_t prefix_cycles, std::uint32_t pc) noexcept{nullptr};
-    bool (*must_stop)(void* context) noexcept{nullptr};
+    bool (*must_stop)(void* context, bool write) noexcept{nullptr};
 };
 
 struct DiagnosticSnapshot {

@@ -346,7 +346,7 @@ private:
     bool mmio_boundary_stop_{false};
     static bool nativeMmioBegin(
         void* context, std::uint64_t prefix_cycles, std::uint32_t pc) noexcept;
-    static bool nativeMmioMustStop(void* context) noexcept;
+    static bool nativeMmioMustStop(void* context, bool write) noexcept;
 
     [[nodiscard]] static bool appendReversibleChunk(
         ReversibleRamPrefix::ReversibleExecution& aggregate,
