@@ -56,6 +56,18 @@ inline std::size_t laneActiveExecutionSlots(const std::vector<std::uint64_t>& co
     return std::min(max_slots, static_cast<std::size_t>(slots));
 }
 
+// Selects how long an idle executor spins before parking on the generation
+// counter. A cross-board window is short, so parking and waking every window
+// costs more wall time than the idle spin it saves, but only when the host has
+// spare cores: with no slack the spin would compete with a working lane, so the
+// conservative park-first budget is kept there.
+inline std::size_t laneSpinBudget(
+    const std::size_t executors, const std::size_t max_slots) noexcept {
+    const auto slots = laneExecutionSlots();
+    const auto used = std::min(executors, max_slots);
+    return slots >= used + 2U ? 32U * 1024U : 64U;
+}
+
 // Persistent owner executors. Release/acquire publishes each window's active
 // executor count. Jobs keep original owner IDs, but need not return to the same
 // host thread. Every worker acknowledges every window before shared mutation.
@@ -68,7 +80,8 @@ public:
     LaneWorkers(std::size_t count, std::function<void(std::size_t)> work,
                 std::size_t background_workers)
         : work_(std::move(work)), failures_(count), order_(count), costs_(count), count_(count),
-          worker_count_(std::min(count, background_workers)) {
+          worker_count_(std::min(count, background_workers)),
+          spin_limit_(laneSpinBudget(count, count == 0U ? 0U : count - 1U)) {
         for (std::size_t index = 0U; index < count_; ++index) order_[index] = index;
         threads_.reserve(worker_count_);
         try {
@@ -81,7 +94,7 @@ public:
                         std::size_t spins = 0U;
                         std::uint64_t next;
                         while ((next = generation_.load(std::memory_order_acquire)) == observed) {
-                            if (spins++ < spin_limit) laneSpinPause();
+                            if (spins++ < spin_limit_) laneSpinPause();
                             else generation_.wait(observed, std::memory_order_acquire);
                         }
                         observed = next;
@@ -131,7 +144,7 @@ public:
         std::size_t spins = 0U;
         for (auto remaining = remaining_.load(std::memory_order_acquire); remaining != 0U;
              remaining = remaining_.load(std::memory_order_acquire)) {
-            if (spins++ < spin_limit) laneSpinPause();
+            if (spins++ < spin_limit_) laneSpinPause();
             else remaining_.wait(remaining, std::memory_order_acquire);
         }
         // Clear every slot before throwing, including simultaneous failures at
@@ -163,14 +176,13 @@ private:
         }
     }
 
-    static constexpr std::size_t spin_limit = 64U;
-
     std::function<void(std::size_t)> work_;
     std::vector<std::exception_ptr> failures_;
     std::vector<std::size_t> order_;
     std::vector<std::uint64_t> costs_;
     std::size_t count_;
     std::size_t worker_count_;
+    std::size_t spin_limit_;
     std::size_t execution_slots_ = 1U;
     alignas(64) std::atomic<std::uint64_t> generation_{0U};
     alignas(64) std::atomic<std::size_t> remaining_{0U};
