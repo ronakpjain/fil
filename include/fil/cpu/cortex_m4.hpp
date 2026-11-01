@@ -488,6 +488,8 @@ public:
         std::uint64_t span_skip_clock{0};
         std::uint64_t span_skip_env{0};    ///< reversibleRamOnly/allMmioTrapping not set
         std::uint64_t span_skip_retire{0}; ///< ran but retired nothing
+        // TEMP trace-build diagnostics.
+        std::uint64_t tb_fetch{0}, tb_lower{0}, tb_profile{0}, tb_limit{0}, tb_ok{0}, tb_ops{0};
     };
     [[nodiscard]] JitStats jitStats() const noexcept { return jit_stats_; }
     /// Mutable stats accessor for the scheduler's own span diagnostics.

@@ -1763,10 +1763,10 @@ bool CortexM4::prepareNativeTrace(NativeTraceCacheEntry& entry) {
         std::uint32_t raw = 0U;
         std::uint8_t size = 0U;
         const auto decoded = fetchDecode(pc, raw, size);
-        if (!decoded) break;
+        if (!decoded) { ++jit_stats_.tb_fetch; break; }
         NativeInst lowered;
         const bool stack = decoded->kind == InstrKind::push || decoded->kind == InstrKind::pop;
-        if (!stack && !tryLowerNativeInst({*decoded, pc, size}, lowered).ok) break;
+        if (!stack && !tryLowerNativeInst({*decoded, pc, size}, lowered).ok) { ++jit_stats_.tb_lower; break; }
         const bool return_pop = decoded->kind == InstrKind::pop
             && (decoded->register_list & (std::uint16_t{1U} << 15U)) != 0U;
         const bool return_bx_lr = lowered.kind == NativeOp::bx_lr;
@@ -1778,12 +1778,12 @@ bool CortexM4::prepareNativeTrace(NativeTraceCacheEntry& entry) {
         std::uint32_t return_target = 0U;
         if (return_pop || return_bx_lr || call_blx_reg) {
             const auto& profile = native_branches_[jitBlockIndex(pc) & (native_branch_entries - 1U)];
-            if (!profile.valid || profile.pc != pc || profile.generation != entry.generation) break;
+            if (!profile.valid || profile.pc != pc || profile.generation != entry.generation) { ++jit_stats_.tb_profile; break; }
             return_target = profile.target;
         } else if (compare_branch
                    || (decoded->kind == InstrKind::b && decoded->condition != Condition::al)) {
             const auto& profile = native_branches_[jitBlockIndex(pc) & (native_branch_entries - 1U)];
-            if (!profile.valid || profile.pc != pc || profile.generation != entry.generation) break;
+            if (!profile.valid || profile.pc != pc || profile.generation != entry.generation) { ++jit_stats_.tb_profile; break; }
             taken = profile.taken;
         }
         NativeTraceOp op;
@@ -1808,7 +1808,9 @@ bool CortexM4::prepareNativeTrace(NativeTraceCacheEntry& entry) {
     }
     // Tiny kernels cannot amortize the checked-call ABI. Leave pure straight
     // line arithmetic to its existing calibrated stencil backend as well.
+    if (sources.size() >= trace_limit) ++jit_stats_.tb_limit;
     if (sources.size() < 8U || !has_memory_or_branch || !ensureMicroJit()) return false;
+    ++jit_stats_.tb_ok; jit_stats_.tb_ops += sources.size();
     auto plan = std::make_shared<NativeTracePlan>();
     if (!buildNativeTrace(sources, *plan, micro_jit_error_)) return false;
     plan->generation = entry.generation;

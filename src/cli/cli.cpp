@@ -662,6 +662,9 @@ void printJitStats(std::ostream& out, const cpu::CortexM4& cpu, const std::strin
         << " span_skip_boundary=" << stats.span_skip_boundary
         << " span_skip_clock=" << stats.span_skip_clock
         << " span_skip_credit=" << stats.span_skip_credit
+        << " tb_fetch=" << stats.tb_fetch << " tb_lower=" << stats.tb_lower
+        << " tb_profile=" << stats.tb_profile << " tb_limit=" << stats.tb_limit
+        << " tb_ok=" << stats.tb_ok << " tb_ops=" << stats.tb_ops
         << " span_skip_env=" << stats.span_skip_env
         << " span_skip_retire=" << stats.span_skip_retire
         << " single_fast=" << stats.single_fast
