@@ -62,6 +62,16 @@ void stopBoard(
     output.terminal = true;
 }
 
+// Marks the calling worker thread as executing one lane for trace routing and
+// clears it eagerly on exit, including when a lane throws.
+class LaneTraceScope {
+public:
+    explicit LaneTraceScope(std::size_t lane) noexcept { TraceRecorder::setCurrentLane(lane); }
+    ~LaneTraceScope() { TraceRecorder::clearCurrentLane(); }
+    LaneTraceScope(const LaneTraceScope&) = delete;
+    LaneTraceScope& operator=(const LaneTraceScope&) = delete;
+};
+
 void accumulate(
     WorldBoardRunResult& aggregate,
     const BoardRunResult& slice
@@ -278,7 +288,6 @@ Result<WorldRunResult> World::runIndependent(const WorldRunOptions& options) {
     devices::DeferredCanOutbox pending;
     const bool parallel = options.enable_parallel_lanes && boards_.size() > 1U
         && boards_.size() <= 64U && std::thread::hardware_concurrency() > 1U
-        && !trace_.enabled() && !trace_.hasObserver()
         && !event_loop_.hasObservationBarrier();
     std::vector<std::unique_ptr<mem::MemoryBus::TrackingScope>> tracking;
     tracking.reserve(boards_.size());
@@ -298,6 +307,7 @@ Result<WorldRunResult> World::runIndependent(const WorldRunOptions& options) {
     auto domains = parallel ? std::unique_ptr<EventLoop::LaneDomainsScope>(
         new EventLoop::LaneDomainsScope(event_loop_.useLaneDomains(boards_.size()))) : nullptr;
     const auto execute_lane = [&](const std::size_t i) {
+            const LaneTraceScope trace_lane(i);
             auto owner = event_loop_.useOwner(static_cast<EventOwner>(i));
             devices::DeferredCanScope communications(outboxes[i], static_cast<std::uint32_t>(i),
                 event_loop_, static_cast<EventOwner>(i));
@@ -350,7 +360,13 @@ Result<WorldRunResult> World::runIndependent(const WorldRunOptions& options) {
         if (end == now) return argumentError("independent scheduler clock overflow");
         ++output.rounds;
         if (workers) {
-            workers->run(); // All lanes are parked before any shared mutation.
+            // Lane-local records are buffered per lane while workers run; the
+            // coordinator merges them in (time, lane) order before shared events
+            // so observers never run on a worker thread.
+            const bool capture = trace_.enabled();
+            if (capture) trace_.beginLaneCapture(boards_.size());
+            workers->run();
+            if (capture) trace_.flushLaneCapture();
         } else {
             for (std::size_t i = 0; i < boards_.size(); ++i) {
                 execute_lane(i);

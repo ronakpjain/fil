@@ -1073,10 +1073,45 @@ private:
     sim::TraceRecorder* trace_;
 };
 
+/** @brief Types that must be recorded to evaluate the given expectation checks. */
+std::vector<std::string> expectationRecordTypes(
+    const std::vector<sim::ExpectationCheck>& expectations
+) {
+    std::vector<std::string> types{
+        "expectation_pending", "expectation_pass", "expectation_fail", "expectation_incomplete",
+    };
+    const auto add = [&](const std::string_view type) {
+        if (std::find(types.begin(), types.end(), type) == types.end()) types.emplace_back(type);
+    };
+    for (const auto& check : expectations) {
+        std::visit([&](const auto& specific) {
+            using Specific = std::decay_t<decltype(specific)>;
+            add(std::is_same_v<Specific, sim::CanExpectation> ? "can_tx" : "gpio_output");
+        }, check.expectation);
+    }
+    return types;
+}
+
+/** @brief One-line human-readable name for an expectation check's target. */
+std::string describeExpectation(const sim::Expectation& expectation) {
+    return std::visit([](const auto& specific) -> std::string {
+        using Specific = std::decay_t<decltype(specific)>;
+        std::ostringstream text;
+        if constexpr (std::is_same_v<Specific, sim::CanExpectation>) {
+            text << "CAN " << specific.bus << " id=0x" << std::hex << specific.id;
+        } else {
+            text << "GPIO " << specific.board << '.' << specific.port << " pin "
+                 << static_cast<unsigned>(specific.pin) << " level "
+                 << (specific.level ? "1" : "0");
+        }
+        return text.str();
+    }, expectation);
+}
+
 Result<void> scheduleConfiguredStimuli(
     const config::NetworkConfig& network,
     sim::World& world,
-    std::vector<sim::CanExpectationCheck>& expectations
+    std::vector<sim::ExpectationCheck>& expectations
 ) {
     for (std::size_t stimulus_index = 0; stimulus_index < network.stimulus_paths.size(); ++stimulus_index) {
         const std::filesystem::path& path = network.stimulus_paths[stimulus_index];
@@ -1085,7 +1120,7 @@ Result<void> scheduleConfiguredStimuli(
         auto scheduled = sim::scheduleStimulusScript(script.value(), world);
         if (!scheduled) return scheduled.error();
         for (std::size_t index = 0; index < script.value().expect.size(); ++index) {
-            expectations.push_back(sim::CanExpectationCheck{
+            expectations.push_back(sim::ExpectationCheck{
                 script.value().name, index, script.value().expect[index], stimulus_index
             });
         }
@@ -1191,15 +1226,24 @@ ExitCode runNetworkCommand(
         return world.error().category == ErrorCategory::config
             ? ExitCode::config_error : ExitCode::runtime_error;
     }
-    std::vector<sim::CanExpectationCheck> expectations;
+    std::vector<sim::ExpectationCheck> expectations;
     auto scheduled_stimuli = scheduleConfiguredStimuli(network_config.value(), *world.value(), expectations);
     if (!scheduled_stimuli) {
         err << "fil: " << formatError(scheduled_stimuli.error()) << '\n';
         return ExitCode::config_error;
     }
     // Expectations need trace recording even without a requested trace artifact.
-    world.value()->setDiagnosticsEnabled(trace_path.has_value() || !expectations.empty());
-    sim::CanExpectationEvaluator expectation_evaluator(world.value()->trace(), expectations);
+    // An expectation-only run selects just the records the evaluator consumes;
+    // lane-local records (for example gpio_output) are buffered per lane and
+    // merged on the coordinator, so the parallel scheduler stays eligible.
+    const bool expectation_only_trace = !expectations.empty() && !trace_path.has_value();
+    world.value()->setDiagnosticsEnabled(trace_path.has_value());
+    world.value()->trace().setEnabled(trace_path.has_value() || !expectations.empty());
+    if (expectation_only_trace) {
+        world.value()->trace().setTypeAllowlist(expectationRecordTypes(expectations));
+        world.value()->trace().setRetainRecords(false);
+    }
+    sim::ExpectationEvaluator expectation_evaluator(world.value()->trace(), expectations);
     ScopedTraceObserverReset observer_reset(world.value()->trace());
     if (!expectations.empty()) {
         world.value()->trace().setObserver([&expectation_evaluator](const sim::TraceRecord& record) {
@@ -1278,16 +1322,17 @@ ExitCode runNetworkCommand(
     const bool unmet_expectation = expectation_evaluator.hasFailures();
     for (std::size_t index = 0; index < expectations.size(); ++index) {
         const auto& check = expectations[index];
-        out << "expect " << check.script << " CAN " << check.expectation.bus << " id=0x"
-            << std::hex << check.expectation.id << std::dec << " window_ms=["
-            << check.expectation.at_ms << ','
-            << (check.expectation.at_ms + check.expectation.window_ms) << "]: "
+        const std::uint64_t at_ms = sim::expectationStartMs(check.expectation);
+        out << "expect " << check.script << ' ' << describeExpectation(check.expectation)
+            << " window_ms=[" << at_ms << ','
+            << (at_ms + sim::expectationWindowMs(check.expectation)) << "]: "
             << expectation_evaluator.status(index) << '\n';
         if (expectation_evaluator.status(index) == "fail"
             || expectation_evaluator.status(index) == "incomplete") {
-            err << "fil: unmet CAN output expectation in stimulus '" << check.script
-                << "' for bus '" << check.expectation.bus << "' id 0x" << std::hex
-                << check.expectation.id << std::dec << '\n';
+            const std::string_view kind = std::holds_alternative<sim::CanExpectation>(check.expectation)
+                ? "CAN" : "GPIO";
+            err << "fil: unmet " << kind << " output expectation in stimulus '"
+                << check.script << "': " << describeExpectation(check.expectation) << '\n';
         }
     }
     for (const auto& board : result.value().boards) {
@@ -1453,7 +1498,7 @@ ExitCode networkMonitorCommand(
             ? ExitCode::config_error : ExitCode::runtime_error;
     }
 
-    std::vector<sim::CanExpectationCheck> expectations;
+    std::vector<sim::ExpectationCheck> expectations;
     auto scheduled_stimuli = scheduleConfiguredStimuli(
         network_config.value(), *world.value(), expectations
     );
@@ -1463,17 +1508,17 @@ ExitCode networkMonitorCommand(
     }
     world.value()->setDiagnosticsEnabled(true);
     world.value()->trace().setRetainRecords(!binary_protocol);
-    sim::CanExpectationEvaluator expectation_evaluator(world.value()->trace(), expectations);
+    sim::ExpectationEvaluator expectation_evaluator(world.value()->trace(), expectations);
     ScopedTraceObserverReset observer_reset(world.value()->trace());
     std::vector<std::string> recorded_types = live_filters;
     if (!expectations.empty()) {
-        // CAN transmit records are evaluator input even when the live display
-        // filter excludes them; lifecycle records remain serializable/selectable.
-        recorded_types.emplace_back("can_tx");
-        recorded_types.emplace_back("expectation_pending");
-        recorded_types.emplace_back("expectation_pass");
-        recorded_types.emplace_back("expectation_fail");
-        recorded_types.emplace_back("expectation_incomplete");
+        // Expectation input records are always recorded even when the live
+        // display filter excludes them; lifecycle records stay selectable.
+        for (const std::string& type : expectationRecordTypes(expectations)) {
+            if (std::find(recorded_types.begin(), recorded_types.end(), type) == recorded_types.end()) {
+                recorded_types.push_back(type);
+            }
+        }
     }
     world.value()->trace().setTypeAllowlist(std::move(recorded_types));
     bool protocol_output_failed = false;

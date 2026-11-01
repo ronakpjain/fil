@@ -75,12 +75,25 @@ struct CanExpectation {
     std::uint64_t window_ms{0};      ///< Inclusive end offset from at_ms.
 };
 
+/** @brief Expected firmware-driven GPIO output transition within an inclusive interval. */
+struct GpioExpectation {
+    std::string board;          ///< Board instance name.
+    std::string port;           ///< GPIO port such as `GPIOB`.
+    std::uint8_t pin{0};        ///< Pin number from 0 through 15.
+    bool level{false};          ///< Expected driven level asserted in the window.
+    std::uint64_t at_ms{0};     ///< Inclusive start relative to simulation time zero.
+    std::uint64_t window_ms{0}; ///< Inclusive end offset from at_ms.
+};
+
+/** @brief One supported firmware output requirement. */
+using Expectation = std::variant<CanExpectation, GpioExpectation>;
+
 /** @brief A deterministic, timed input script attached to a network. */
 struct StimulusScript {
     std::string name;                     ///< Stable script name.
     std::filesystem::path source_path;    ///< Absolute source file path.
     std::vector<StimulusEvent> events;    ///< Timed external inputs.
-    std::vector<CanExpectation> expect;   ///< Optional firmware output requirements.
+    std::vector<Expectation> expect;      ///< Optional firmware output requirements.
 };
 
 /** @brief Loads and validates a versioned timed input script. */
@@ -92,29 +105,41 @@ struct StimulusScript {
 /** @brief Tests a CAN transmit trace record against exact bus/origin/frame/window criteria. */
 [[nodiscard]] bool matchesCanExpectation(const CanExpectation& expectation, const TraceRecord& record);
 
+/** @brief Tests a GPIO output trace record against exact board/port/pin/level/window criteria. */
+[[nodiscard]] bool matchesGpioExpectation(const GpioExpectation& expectation, const TraceRecord& record);
+
+/** @brief Tests any supported expectation against one trace record. */
+[[nodiscard]] bool matchesExpectation(const Expectation& expectation, const TraceRecord& record);
+
+/** @brief Inclusive-window start of any supported expectation. */
+[[nodiscard]] std::uint64_t expectationStartMs(const Expectation& expectation) noexcept;
+
+/** @brief Inclusive-window width of any supported expectation. */
+[[nodiscard]] std::uint64_t expectationWindowMs(const Expectation& expectation) noexcept;
+
 /** @brief Stable script/check pair used by CLI expectation evaluation. */
-struct CanExpectationCheck {
+struct ExpectationCheck {
     std::string script;
     std::size_t index{0};
-    CanExpectation expectation;
+    Expectation expectation;
     std::size_t stimulus_index{0}; ///< Zero-based attachment position in the network config.
 };
 
 /**
- * @brief Emits and tracks live CAN expectation lifecycle trace records.
+ * @brief Emits and tracks live expectation lifecycle trace records.
  *
  * The referenced TraceRecorder and EventLoop must outlive this evaluator.
  * The evaluator is non-copyable/non-movable because deadline callbacks refer to
  * its stable address; destruction cancels any outstanding callbacks.
  */
-class CanExpectationEvaluator {
+class ExpectationEvaluator {
 public:
-    CanExpectationEvaluator(TraceRecorder& trace, std::vector<CanExpectationCheck> checks);
-    ~CanExpectationEvaluator();
-    CanExpectationEvaluator(const CanExpectationEvaluator&) = delete;
-    CanExpectationEvaluator& operator=(const CanExpectationEvaluator&) = delete;
-    CanExpectationEvaluator(CanExpectationEvaluator&&) = delete;
-    CanExpectationEvaluator& operator=(CanExpectationEvaluator&&) = delete;
+    ExpectationEvaluator(TraceRecorder& trace, std::vector<ExpectationCheck> checks);
+    ~ExpectationEvaluator();
+    ExpectationEvaluator(const ExpectationEvaluator&) = delete;
+    ExpectationEvaluator& operator=(const ExpectationEvaluator&) = delete;
+    ExpectationEvaluator(ExpectationEvaluator&&) = delete;
+    ExpectationEvaluator& operator=(ExpectationEvaluator&&) = delete;
 
     void begin(std::uint64_t now_ns, EventLoop& loop);
     void observe(const TraceRecord& record);
@@ -125,7 +150,7 @@ public:
 
 private:
     struct CheckState {
-        CanExpectationCheck check;
+        ExpectationCheck check;
         std::string status{"pending"};
     };
 

@@ -30,6 +30,14 @@ total-order tie breaker. The recorder emits records in insertion order; `clear()
 empties the trace and restarts sequence numbering at zero. Identical inputs and run
 options produce byte-identical normalized output.
 
+When parallel board lanes run, records emitted by a worker thread are buffered
+per lane instead of written to the shared recorder. After every lane parks, the
+coordinator merges the buffers in `(time_ns, lane index)` order, assigns sequence
+numbers, and invokes observers on its own thread before shared events at the same
+window boundary run. The merge is stable and deterministic, so lane-local events
+such as `gpio_output`, `adc_sample`, and `exception_*` are preserved while lanes
+run concurrently. Observers therefore never execute on a worker thread.
+
 For example:
 
 ```json

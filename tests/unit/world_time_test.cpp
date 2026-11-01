@@ -1334,8 +1334,13 @@ TEST(WorldTimeTest, IndependentFailureStopsBeforeLaterLanesAndSharedCallbacks) {
     static_cast<void>(world.value()->eventLoop().scheduleAt(250U, [&] { called = true; }));
     auto options = runOptions(10'000U);
     options.cross_board_window_ns = 1'000U;
+    // The "later lanes never run" guarantee is specific to the serial
+    // independent scheduler; parallel lanes execute their window concurrently
+    // and observe a peer failure only at the next rendezvous.
+    options.enable_parallel_lanes = false;
     const auto result = world.value()->run(options);
     ASSERT_TRUE(result);
+    EXPECT_EQ(result.value().parallel_lanes, 0U);
     EXPECT_EQ(result.value().reason, fil::sim::WorldStopReason::board_failure);
     EXPECT_FALSE(called);
     EXPECT_EQ(result.value().boards[1].result.instructions, 0U);

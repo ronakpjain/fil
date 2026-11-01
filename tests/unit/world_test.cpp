@@ -646,6 +646,31 @@ TEST(WorldTest, NestedBusInjectionDoesNotSatisfyParentBusExpectation) {
     EXPECT_NE(err.str().find("unmet CAN output expectation"), std::string::npos);
 }
 
+TEST(WorldTest, RunNetworkEvaluatesGpioExpectationWithParallelLanes) {
+    if (std::thread::hardware_concurrency() <= 1U) GTEST_SKIP();
+    TempWorldConfigs files;
+    const auto stimulus = files.writeStimulus(R"({
+  "schema_version": 1, "name": "gpio-expect", "events": [
+    {"type":"gpio","at_ms":0,"board":"gpio-par-a","pin":"PB14","value":true}
+  ], "expect": [
+    {"type":"gpio","board":"gpio-par-a","pin":"PB14","value":true,"at_ms":0,"window_ms":0}
+  ]
+})");
+    const auto network_path = files.writeNetwork(
+        {files.writeBoard("gpio-par-a.json", "gpio-par-a"),
+         files.writeBoard("gpio-par-b.json", "gpio-par-b")}, stimulus);
+    const std::string path = network_path.string();
+    const std::string_view args[]{"run-network", path, "--duration-ms", "0",
+        "--max-instructions", "10"};
+    std::ostringstream out;
+    std::ostringstream err;
+    EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::runtime_error);
+    EXPECT_NE(out.str().find("parallel_lanes: 2"), std::string::npos);
+    EXPECT_NE(out.str().find("GPIO gpio-par-a.GPIOB pin 14 level 1"), std::string::npos);
+    EXPECT_NE(out.str().find("window_ms=[0,0]: fail"), std::string::npos);
+    EXPECT_NE(err.str().find("unmet GPIO output expectation"), std::string::npos);
+}
+
 TEST(WorldTest, CanOutputTraceCarriesExactBusAndFirmwareOrigin) {
     TempWorldConfigs files;
     auto network = files.network({files.writeBoard("nested.json", "nested", "vehicle/sub")});

@@ -10,8 +10,12 @@ selects the exact scheduler with eligible guarded RAM capsules as a reference.
 Network loop batching is off;
 single-board `run` batches proven loops automatically. Diagnostic modes such as
 instruction tracing and spin detection retain safe correctness fallbacks and
-may disable optimized paths. Experimental scheduler implementations remain
-internal APIs, not CLI modes. Prefer strict MMIO for validation, although
+may disable optimized paths. Expectation-only `run-network` keeps parallel lanes:
+lane-local records are captured per lane and merged deterministically on the
+coordinator, so observers run single-threaded without serializing board execution.
+A requested `--trace` artifact now also traces lanes this way; `--trace-instr`
+still selects the serial instruction path. Experimental scheduler implementations
+remain internal APIs, not CLI modes. Prefer strict MMIO for validation, although
 compatibility-oriented CLI parsing defaults to lenient MMIO. Keep instruction
 tracing and spin detection off for throughput; keep wall pacing on for
 interactive monitoring. See [CLI options](options.md) for runtime controls and defaults;

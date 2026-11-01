@@ -14,10 +14,12 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include <variant>
 
 namespace fil::sim {
 namespace {
@@ -262,44 +264,80 @@ Result<StimulusEvent> parseEvent(const JsonValue& value, const std::filesystem::
     return event;
 }
 
-Result<CanExpectation> parseExpectation(const JsonValue& value, const std::filesystem::path& path) {
-    auto object = requireObject(value, path, "CAN output expectation");
+bool representableExpectationWindow(
+    const std::uint64_t at_ms,
+    const std::uint64_t window_ms
+) {
+    return at_ms <= std::numeric_limits<std::uint64_t>::max() / ns_per_ms
+        && window_ms <= std::numeric_limits<std::uint64_t>::max() / ns_per_ms - at_ms;
+}
+
+Result<Expectation> parseExpectation(const JsonValue& value, const std::filesystem::path& path) {
+    auto object = requireObject(value, path, "firmware output expectation");
     if (!object) return object.error();
-    auto unknown = rejectUnknown(*object.value(), path,
-        {"type", "bus", "id", "data", "extended", "at_ms", "window_ms"});
-    if (!unknown) return unknown.error();
     auto type = requireString(*object.value(), path, "type");
-    auto bus = requireString(*object.value(), path, "bus");
-    auto id = requireUnsigned(*object.value(), path, "id");
-    auto data_field = requireField(*object.value(), path, "data");
-    auto at_ms = requireUnsigned(*object.value(), path, "at_ms");
-    auto window_ms = requireUnsigned(*object.value(), path, "window_ms");
     if (!type) return type.error();
-    if (!bus) return bus.error();
-    if (!id) return id.error();
-    if (!data_field) return data_field.error();
-    if (!at_ms) return at_ms.error();
-    if (!window_ms) return window_ms.error();
-    if (type.value() != "can" || id.value() > 0x1fffffffU
-        || at_ms.value() > std::numeric_limits<std::uint64_t>::max() / ns_per_ms
-        || window_ms.value() > std::numeric_limits<std::uint64_t>::max() / ns_per_ms - at_ms.value()) {
-        return configError(path, "CAN expectation requires type 'can', a 29-bit ID, and a representable inclusive time window");
+    if (type.value() == "can") {
+        auto unknown = rejectUnknown(*object.value(), path,
+            {"type", "bus", "id", "data", "extended", "at_ms", "window_ms"});
+        if (!unknown) return unknown.error();
+        auto bus = requireString(*object.value(), path, "bus");
+        auto id = requireUnsigned(*object.value(), path, "id");
+        auto data_field = requireField(*object.value(), path, "data");
+        auto at_ms = requireUnsigned(*object.value(), path, "at_ms");
+        auto window_ms = requireUnsigned(*object.value(), path, "window_ms");
+        if (!bus) return bus.error();
+        if (!id) return id.error();
+        if (!data_field) return data_field.error();
+        if (!at_ms) return at_ms.error();
+        if (!window_ms) return window_ms.error();
+        if (id.value() > 0x1fffffffU
+            || !representableExpectationWindow(at_ms.value(), window_ms.value())) {
+            return configError(path, "CAN expectation requires type 'can', a 29-bit ID, and a representable inclusive time window");
+        }
+        auto data = parseBytes(*data_field.value(), path, "data", 64U);
+        if (!data) return data.error();
+        bool extended = id.value() > 0x7ffU;
+        if (const JsonValue* field = find(*object.value(), "extended")) {
+            auto parsed = booleanValue(*field, path, "extended");
+            if (!parsed) return parsed.error();
+            extended = parsed.value();
+        }
+        if ((!extended && id.value() > 0x7ffU)) return configError(path, "standard CAN identifiers must fit in 11 bits");
+        const std::size_t length = data.value().size();
+        const bool valid_fd_length = length <= 8U || length == 12U || length == 16U || length == 20U
+            || length == 24U || length == 32U || length == 48U || length == 64U;
+        if (!valid_fd_length) return configError(path, "CAN expectation payload length must be classic 0..8 or a legal CAN-FD length");
+        return Expectation{CanExpectation{std::move(bus).value(),
+            static_cast<std::uint32_t>(id.value()), extended, std::move(data).value(),
+            at_ms.value(), window_ms.value()}};
     }
-    auto data = parseBytes(*data_field.value(), path, "data", 64U);
-    if (!data) return data.error();
-    bool extended = id.value() > 0x7ffU;
-    if (const JsonValue* field = find(*object.value(), "extended")) {
-        auto parsed = booleanValue(*field, path, "extended");
-        if (!parsed) return parsed.error();
-        extended = parsed.value();
+    if (type.value() == "gpio") {
+        auto unknown = rejectUnknown(*object.value(), path,
+            {"type", "board", "pin", "value", "at_ms", "window_ms"});
+        if (!unknown) return unknown.error();
+        auto board = requireString(*object.value(), path, "board");
+        auto pin_name = requireString(*object.value(), path, "pin");
+        auto value_field = requireField(*object.value(), path, "value");
+        auto at_ms = requireUnsigned(*object.value(), path, "at_ms");
+        auto window_ms = requireUnsigned(*object.value(), path, "window_ms");
+        if (!board) return board.error();
+        if (!pin_name) return pin_name.error();
+        if (!value_field) return value_field.error();
+        if (!at_ms) return at_ms.error();
+        if (!window_ms) return window_ms.error();
+        if (!representableExpectationWindow(at_ms.value(), window_ms.value())) {
+            return configError(path, "GPIO expectation requires a representable inclusive time window");
+        }
+        auto pin = parsePin(pin_name.value(), path);
+        if (!pin) return pin.error();
+        auto level = booleanValue(*value_field.value(), path, "value");
+        if (!level) return level.error();
+        return Expectation{GpioExpectation{std::move(board).value(),
+            std::move(pin.value().first), pin.value().second, level.value(),
+            at_ms.value(), window_ms.value()}};
     }
-    if ((!extended && id.value() > 0x7ffU)) return configError(path, "standard CAN identifiers must fit in 11 bits");
-    const std::size_t length = data.value().size();
-    const bool valid_fd_length = length <= 8U || length == 12U || length == 16U || length == 20U
-        || length == 24U || length == 32U || length == 48U || length == 64U;
-    if (!valid_fd_length) return configError(path, "CAN expectation payload length must be classic 0..8 or a legal CAN-FD length");
-    return CanExpectation{std::move(bus).value(), static_cast<std::uint32_t>(id.value()), extended,
-        std::move(data).value(), at_ms.value(), window_ms.value()};
+    return configError(path, "unsupported expectation type '" + type.value() + "'");
 }
 
 Error targetError(const StimulusScript& script, std::string message) {
@@ -445,9 +483,24 @@ Result<void> scheduleStimulusScript(const StimulusScript& script, World& world) 
         });
     }
 
-    for (const CanExpectation& expectation : script.expect) {
-        if (world.canBus(expectation.bus) == nullptr) {
-            return targetError(script, "stimulus '" + script.name + "' expectation names undeclared CAN bus '" + expectation.bus + "'");
+    for (const Expectation& expectation : script.expect) {
+        const std::optional<std::string> failure = std::visit([&](const auto& specific) -> std::optional<std::string> {
+            using Specific = std::decay_t<decltype(specific)>;
+            if constexpr (std::is_same_v<Specific, CanExpectation>) {
+                if (world.canBus(specific.bus) == nullptr) {
+                    return "expectation names undeclared CAN bus '" + specific.bus + "'";
+                }
+            } else {
+                Board* board = world.board(specific.board);
+                if (board == nullptr || board->peripherals().gpio(specific.port) == nullptr) {
+                    return "expectation names unknown GPIO port '" + specific.port
+                        + "' on board '" + specific.board + "'";
+                }
+            }
+            return std::nullopt;
+        }, expectation);
+        if (failure.has_value()) {
+            return targetError(script, "stimulus '" + script.name + "' " + failure.value());
         }
     }
 
@@ -489,33 +542,73 @@ bool matchesCanExpectation(const CanExpectation& expectation, const TraceRecord&
         && *data == TraceRecorder::hexBytes(expectation.data);
 }
 
-CanExpectationEvaluator::CanExpectationEvaluator(
+bool matchesGpioExpectation(const GpioExpectation& expectation, const TraceRecord& record) {
+    if (expectation.at_ms > std::numeric_limits<std::uint64_t>::max() / ns_per_ms
+        || expectation.window_ms > std::numeric_limits<std::uint64_t>::max() / ns_per_ms - expectation.at_ms) {
+        return false;
+    }
+    const std::uint64_t start_ns = expectation.at_ms * ns_per_ms;
+    const std::uint64_t end_ns = (expectation.at_ms + expectation.window_ms) * ns_per_ms;
+    if (record.type != "gpio_output" || record.time_ns < start_ns || record.time_ns > end_ns) return false;
+    if (record.source != expectation.board + "." + expectation.port) return false;
+    const auto field = [&](const std::string_view name) -> const std::string* {
+        const auto found = std::find_if(record.fields.begin(), record.fields.end(),
+            [&](const TraceField& item) { return item.first == name; });
+        return found == record.fields.end() ? nullptr : &found->second;
+    };
+    const std::string* pin = field("pin");
+    const std::string* value = field("value");
+    return pin != nullptr && value != nullptr
+        && *pin == std::to_string(expectation.pin)
+        && *value == (expectation.level ? "1" : "0");
+}
+
+bool matchesExpectation(const Expectation& expectation, const TraceRecord& record) {
+    return std::visit([&](const auto& specific) {
+        using Specific = std::decay_t<decltype(specific)>;
+        if constexpr (std::is_same_v<Specific, CanExpectation>) {
+            return matchesCanExpectation(specific, record);
+        } else {
+            return matchesGpioExpectation(specific, record);
+        }
+    }, expectation);
+}
+
+std::uint64_t expectationStartMs(const Expectation& expectation) noexcept {
+    return std::visit([](const auto& specific) { return specific.at_ms; }, expectation);
+}
+
+std::uint64_t expectationWindowMs(const Expectation& expectation) noexcept {
+    return std::visit([](const auto& specific) { return specific.window_ms; }, expectation);
+}
+
+ExpectationEvaluator::ExpectationEvaluator(
     TraceRecorder& trace,
-    std::vector<CanExpectationCheck> checks
+    std::vector<ExpectationCheck> checks
 ) : trace_(&trace) {
     checks_.reserve(checks.size());
-    for (CanExpectationCheck& check : checks) {
-        const CanExpectation& expectation = check.expectation;
-        if (expectation.at_ms > std::numeric_limits<std::uint64_t>::max() / ns_per_ms
-            || expectation.window_ms
-                > std::numeric_limits<std::uint64_t>::max() / ns_per_ms - expectation.at_ms) {
-            throw std::invalid_argument("CAN expectation time window overflows simulated time");
+    for (ExpectationCheck& check : checks) {
+        const std::uint64_t at_ms = expectationStartMs(check.expectation);
+        const std::uint64_t window_ms = expectationWindowMs(check.expectation);
+        if (at_ms > std::numeric_limits<std::uint64_t>::max() / ns_per_ms
+            || window_ms > std::numeric_limits<std::uint64_t>::max() / ns_per_ms - at_ms) {
+            throw std::invalid_argument("expectation time window overflows simulated time");
         }
-        const std::uint64_t end_ns = (expectation.at_ms + expectation.window_ms) * ns_per_ms;
+        const std::uint64_t end_ns = (at_ms + window_ms) * ns_per_ms;
         if (end_ns == std::numeric_limits<std::uint64_t>::max()) {
-            throw std::invalid_argument("CAN expectation deadline overflows simulated time");
+            throw std::invalid_argument("expectation deadline overflows simulated time");
         }
         checks_.push_back(CheckState{std::move(check), "pending"});
     }
 }
 
-CanExpectationEvaluator::~CanExpectationEvaluator() {
+ExpectationEvaluator::~ExpectationEvaluator() {
     cancelDeadlines();
 }
 
-void CanExpectationEvaluator::begin(const std::uint64_t now_ns, EventLoop& loop) {
+void ExpectationEvaluator::begin(const std::uint64_t now_ns, EventLoop& loop) {
     if (now_ns != loop.now()) {
-        throw std::invalid_argument("CAN expectation start time must equal the event-loop time");
+        throw std::invalid_argument("expectation start time must equal the event-loop time");
     }
     if (started_ || finished_) return;
     started_ = true;
@@ -523,8 +616,8 @@ void CanExpectationEvaluator::begin(const std::uint64_t now_ns, EventLoop& loop)
     for (std::size_t index = 0; index < checks_.size(); ++index) {
         CheckState& state = checks_[index];
         emit(state, "pending", loop.now());
-        const std::uint64_t end_ns = (state.check.expectation.at_ms
-            + state.check.expectation.window_ms) * ns_per_ms;
+        const std::uint64_t end_ns = (expectationStartMs(state.check.expectation)
+            + expectationWindowMs(state.check.expectation)) * ns_per_ms;
         // Window endpoints are inclusive; finalize at the next representable ns.
         const std::uint64_t deadline_ns = end_ns + 1U;
         if (deadline_ns > loop.now()) {
@@ -537,28 +630,31 @@ void CanExpectationEvaluator::begin(const std::uint64_t now_ns, EventLoop& loop)
     advance(loop.now());
 }
 
-void CanExpectationEvaluator::observe(const TraceRecord& record) {
-    if (!started_ || finished_ || record.type != "can_tx") return;
+void ExpectationEvaluator::observe(const TraceRecord& record) {
+    if (!started_ || finished_) return;
+    // Only expectation-relevant record types reach the check scan; the trace may
+    // carry unrelated event streams under a full allowlist.
+    if (record.type != "can_tx" && record.type != "gpio_output") return;
     // Emitting lifecycle records can grow/reallocate the recorder's vector;
     // keep a stable snapshot while callbacks recurse through the observer.
     const TraceRecord snapshot = record;
     for (CheckState& state : checks_) {
         if (state.status != "pending"
-            || !matchesCanExpectation(state.check.expectation, snapshot)) continue;
+            || !matchesExpectation(state.check.expectation, snapshot)) continue;
         state.status = "pass";
         emit(state, "pass", snapshot.time_ns, &snapshot);
     }
 }
 
-void CanExpectationEvaluator::advance(const std::uint64_t now_ns) {
+void ExpectationEvaluator::advance(const std::uint64_t now_ns) {
     if (!started_ || finished_) return;
     if (loop_ != nullptr && now_ns != loop_->now()) {
-        throw std::invalid_argument("CAN expectation advance time must equal the event-loop time");
+        throw std::invalid_argument("expectation advance time must equal the event-loop time");
     }
     for (CheckState& state : checks_) {
         if (state.status != "pending") continue;
-        const std::uint64_t end_ns = (state.check.expectation.at_ms
-            + state.check.expectation.window_ms) * ns_per_ms;
+        const std::uint64_t end_ns = (expectationStartMs(state.check.expectation)
+            + expectationWindowMs(state.check.expectation)) * ns_per_ms;
         if (now_ns > end_ns) {
             state.status = "fail";
             emit(state, "fail", now_ns);
@@ -566,10 +662,10 @@ void CanExpectationEvaluator::advance(const std::uint64_t now_ns) {
     }
 }
 
-void CanExpectationEvaluator::finish(const std::uint64_t now_ns) {
+void ExpectationEvaluator::finish(const std::uint64_t now_ns) {
     if (!started_ || finished_) return;
     if (loop_ != nullptr && now_ns != loop_->now()) {
-        throw std::invalid_argument("CAN expectation finish time must equal the event-loop time");
+        throw std::invalid_argument("expectation finish time must equal the event-loop time");
     }
     advance(loop_ == nullptr ? now_ns : loop_->now());
     for (CheckState& state : checks_) {
@@ -581,32 +677,29 @@ void CanExpectationEvaluator::finish(const std::uint64_t now_ns) {
     cancelDeadlines();
 }
 
-bool CanExpectationEvaluator::hasFailures() const noexcept {
+bool ExpectationEvaluator::hasFailures() const noexcept {
     return std::any_of(checks_.begin(), checks_.end(), [](const CheckState& state) {
         return state.status == "fail" || state.status == "incomplete";
     });
 }
 
-std::string_view CanExpectationEvaluator::status(const std::size_t index) const noexcept {
+std::string_view ExpectationEvaluator::status(const std::size_t index) const noexcept {
     return index < checks_.size() ? std::string_view{checks_[index].status} : std::string_view{};
 }
 
-void CanExpectationEvaluator::cancelDeadlines() noexcept {
+void ExpectationEvaluator::cancelDeadlines() noexcept {
     if (loop_ != nullptr) {
         for (const EventId id : deadline_events_) static_cast<void>(loop_->cancel(id));
     }
     deadline_events_.clear();
 }
 
-void CanExpectationEvaluator::emit(
+void ExpectationEvaluator::emit(
     CheckState& state,
     const std::string_view status,
     const std::uint64_t time_ns,
     const TraceRecord* matched
 ) {
-    std::ostringstream expected_id;
-    expected_id << "0x" << std::hex << state.check.expectation.id;
-    const CanExpectation& expectation = state.check.expectation;
     std::vector<TraceField> fields{
         {"check_id", "stimulus/" + std::to_string(state.check.stimulus_index) + "/"
             + state.check.script + "/expect/" + std::to_string(state.check.index)},
@@ -614,23 +707,40 @@ void CanExpectationEvaluator::emit(
         {"stimulus_index", std::to_string(state.check.stimulus_index)},
         {"expect_index", std::to_string(state.check.index)},
         {"status", std::string(status)},
-        {"expected_bus", expectation.bus},
-        {"expected_id", expected_id.str()},
-        {"expected_extended", expectation.extended ? "true" : "false"},
-        {"expected_data", TraceRecorder::hexBytes(expectation.data)},
-        {"window_start_ns", std::to_string(expectation.at_ms * ns_per_ms)},
-        {"window_end_ns", std::to_string((expectation.at_ms + expectation.window_ms) * ns_per_ms)},
     };
+    std::visit([&](const auto& expectation) {
+        using Specific = std::decay_t<decltype(expectation)>;
+        if constexpr (std::is_same_v<Specific, CanExpectation>) {
+            std::ostringstream expected_id;
+            expected_id << "0x" << std::hex << expectation.id;
+            fields.emplace_back("expected_bus", expectation.bus);
+            fields.emplace_back("expected_id", expected_id.str());
+            fields.emplace_back("expected_extended", expectation.extended ? "true" : "false");
+            fields.emplace_back("expected_data", TraceRecorder::hexBytes(expectation.data));
+        } else {
+            fields.emplace_back("expected_board", expectation.board);
+            fields.emplace_back("expected_port", expectation.port);
+            fields.emplace_back("expected_pin", std::to_string(expectation.pin));
+            fields.emplace_back("expected_level", expectation.level ? "1" : "0");
+        }
+        fields.emplace_back("window_start_ns", std::to_string(expectation.at_ms * ns_per_ms));
+        fields.emplace_back("window_end_ns",
+            std::to_string((expectation.at_ms + expectation.window_ms) * ns_per_ms));
+    }, state.check.expectation);
     if (matched != nullptr) {
         const auto field = [&](const std::string_view name) -> std::string {
             const auto found = std::find_if(matched->fields.begin(), matched->fields.end(),
                 [&](const TraceField& item) { return item.first == name; });
             return found == matched->fields.end() ? std::string{} : found->second;
         };
+        fields.emplace_back("matched_type", matched->type);
+        fields.emplace_back("matched_source", matched->source);
         fields.emplace_back("matched_bus", field("bus"));
         fields.emplace_back("matched_id", field("id"));
         fields.emplace_back("matched_data", field("data"));
         fields.emplace_back("matched_origin", field("origin"));
+        fields.emplace_back("matched_pin", field("pin"));
+        fields.emplace_back("matched_value", field("value"));
         fields.emplace_back("matched_time_ns", std::to_string(matched->time_ns));
     }
     static_cast<void>(trace_->record(time_ns, "expectation/" + state.check.script,

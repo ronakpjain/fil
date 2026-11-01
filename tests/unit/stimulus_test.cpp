@@ -116,9 +116,10 @@ TEST(StimulusTest, ParsesCanOutputExpectationsAndRejectsInvalidWindows) {
     const auto script = fil::sim::loadStimulusScript(path);
     ASSERT_TRUE(script.hasValue()) << script.error().message;
     ASSERT_EQ(script.value().expect.size(), 1U);
-    EXPECT_EQ(script.value().expect[0].id, 0x321U);
-    EXPECT_EQ(script.value().expect[0].at_ms, 10U);
-    EXPECT_EQ(script.value().expect[0].window_ms, 5U);
+    const auto& parsed = std::get<fil::sim::CanExpectation>(script.value().expect[0]);
+    EXPECT_EQ(parsed.id, 0x321U);
+    EXPECT_EQ(parsed.at_ms, 10U);
+    EXPECT_EQ(parsed.window_ms, 5U);
 
     const auto invalid = files.write("bad-window.json", R"({
   "schema_version": 1, "name": "bad-window", "events": [{"type":"usart","at_ms":0,"board":"a","instance":"USART1","bytes":[]}],
@@ -142,14 +143,85 @@ TEST(StimulusTest, ExpectationMatchesExactBusAndFirmwareOrigin) {
     EXPECT_FALSE(fil::sim::matchesCanExpectation(expected, nested_injection));
 }
 
+TEST(StimulusTest, ParsesGpioOutputExpectations) {
+    TempStimulusFiles files;
+    const auto path = files.write("gpio-expect.json", R"({
+  "schema_version": 1, "name": "gpio-outputs", "events": [{"type":"usart","at_ms":0,"board":"a","instance":"USART1","bytes":[]}],
+  "expect": [{"type":"gpio","board":"dashboard","pin":"PB14","value":true,"at_ms":2500,"window_ms":10}]
+})");
+    const auto script = fil::sim::loadStimulusScript(path);
+    ASSERT_TRUE(script.hasValue()) << script.error().message;
+    ASSERT_EQ(script.value().expect.size(), 1U);
+    const auto& parsed = std::get<fil::sim::GpioExpectation>(script.value().expect[0]);
+    EXPECT_EQ(parsed.board, "dashboard");
+    EXPECT_EQ(parsed.port, "GPIOB");
+    EXPECT_EQ(parsed.pin, 14U);
+    EXPECT_TRUE(parsed.level);
+    EXPECT_EQ(parsed.at_ms, 2500U);
+    EXPECT_EQ(parsed.window_ms, 10U);
+
+    const auto invalid = files.write("bad-gpio.json", R"({
+  "schema_version": 1, "name": "bad-gpio", "events": [{"type":"usart","at_ms":0,"board":"a","instance":"USART1","bytes":[]}],
+  "expect": [{"type":"gpio","board":"dashboard","pin":"PZ9","value":true,"at_ms":0,"window_ms":1}]
+})");
+    EXPECT_FALSE(fil::sim::loadStimulusScript(invalid).hasValue());
+}
+
+TEST(StimulusTest, GpioExpectationMatchesFirmwareOutputRecord) {
+    const fil::sim::GpioExpectation expectation{"dashboard", "GPIOB", 14U, true, 2U, 1U};
+    const fil::sim::TraceRecord output{3'000'000U, 0U, "dashboard.GPIOB", "gpio_output", {
+        {"pin", "14"}, {"value", "1"},
+    }};
+    EXPECT_TRUE(fil::sim::matchesGpioExpectation(expectation, output));
+    EXPECT_TRUE(fil::sim::matchesExpectation(fil::sim::Expectation{expectation}, output));
+
+    auto wrong_level = output;
+    wrong_level.fields[1].second = "0";
+    EXPECT_FALSE(fil::sim::matchesGpioExpectation(expectation, wrong_level));
+    auto wrong_port = output;
+    wrong_port.source = "dashboard.GPIOA";
+    EXPECT_FALSE(fil::sim::matchesGpioExpectation(expectation, wrong_port));
+    auto wrong_time = output;
+    wrong_time.time_ns = 4'000'000U;
+    EXPECT_FALSE(fil::sim::matchesGpioExpectation(expectation, wrong_time));
+    auto wrong_type = output;
+    wrong_type.type = "gpio_input";
+    EXPECT_FALSE(fil::sim::matchesGpioExpectation(expectation, wrong_type));
+}
+
+TEST(StimulusTest, EvaluatorEmitsPassForGpioOutput) {
+    fil::sim::TraceRecorder trace;
+    trace.setTypeAllowlist({"gpio_output", "expectation_pending", "expectation_pass"});
+    fil::sim::EventLoop loop;
+    fil::sim::ExpectationEvaluator evaluator(trace, {{
+        "gpio", 0U, fil::sim::GpioExpectation{"dashboard", "GPIOB", 14U, true, 2U, 4U}
+    }});
+    std::vector<std::string> observed;
+    trace.setObserver([&](const fil::sim::TraceRecord& record) {
+        evaluator.observe(record);
+        if (record.type.starts_with("expectation_")) observed.push_back(record.type);
+    });
+    evaluator.begin(0U, loop);
+    ASSERT_EQ(observed, (std::vector<std::string>{"expectation_pending"}));
+
+    static_cast<void>(trace.record(3'000'000U, "dashboard.GPIOB", "gpio_output",
+        {{"pin", "14"}, {"value", "1"}}));
+    EXPECT_EQ(evaluator.status(0U), "pass");
+    EXPECT_EQ(std::count(observed.begin(), observed.end(), "expectation_pass"), 1);
+    EXPECT_FALSE(evaluator.hasFailures());
+    const std::string jsonl = trace.jsonLines();
+    EXPECT_NE(jsonl.find("\"expected_port\":\"GPIOB\""), std::string::npos);
+    EXPECT_NE(jsonl.find("\"matched_pin\":\"14\""), std::string::npos);
+}
+
 TEST(StimulusTest, EvaluatorEmitsLivePendingThenPassAndEscapedTrace) {
     fil::sim::TraceRecorder trace;
     trace.setTypeAllowlist({"expectation_pending", "expectation_pass", "expectation_fail", "expectation_incomplete", "can_tx"});
-    const fil::sim::CanExpectationCheck check{
+    const fil::sim::ExpectationCheck check{
         "script\"one", 3U, fil::sim::CanExpectation{"vehicle", 0x123U, false, {0x01U, 0xffU}, 2U, 4U}
     };
     fil::sim::EventLoop loop;
-    fil::sim::CanExpectationEvaluator evaluator(trace, {check});
+    fil::sim::ExpectationEvaluator evaluator(trace, {check});
     std::vector<std::string> observed;
     trace.setObserver([&](const fil::sim::TraceRecord& record) {
         evaluator.observe(record);
@@ -179,7 +251,7 @@ TEST(StimulusTest, EvaluatorEmitsLivePendingThenPassAndEscapedTrace) {
 TEST(StimulusTest, EvaluatorFailsOnlyAfterInclusiveWindowAndCanFinishIncomplete) {
     fil::sim::TraceRecorder trace;
     fil::sim::EventLoop loop;
-    fil::sim::CanExpectationEvaluator evaluator(trace, {{
+    fil::sim::ExpectationEvaluator evaluator(trace, {{
         "deadline", 0U, fil::sim::CanExpectation{"vehicle", 0x123U, false, {1U}, 1U, 2U}
     }});
     evaluator.begin(0U, loop);
@@ -193,7 +265,7 @@ TEST(StimulusTest, EvaluatorFailsOnlyAfterInclusiveWindowAndCanFinishIncomplete)
     }), 1);
     EXPECT_TRUE(evaluator.hasFailures());
 
-    fil::sim::CanExpectationEvaluator early(trace, {{
+    fil::sim::ExpectationEvaluator early(trace, {{
         "early", 0U, fil::sim::CanExpectation{"vehicle", 0x321U, false, {}, 50U, 1U}
     }});
     early.begin(loop.now(), loop);
@@ -206,7 +278,7 @@ TEST(StimulusTest, EvaluatorCancelsDeadlinesOnFinishAndDestruction) {
     fil::sim::TraceRecorder trace;
     fil::sim::EventLoop loop;
     {
-        fil::sim::CanExpectationEvaluator evaluator(trace, {{
+        fil::sim::ExpectationEvaluator evaluator(trace, {{
             "finish", 0U, fil::sim::CanExpectation{"vehicle", 0x123U, false, {}, 10U, 1U}
         }});
         evaluator.begin(loop.now(), loop);
@@ -216,7 +288,7 @@ TEST(StimulusTest, EvaluatorCancelsDeadlinesOnFinishAndDestruction) {
     }
     EXPECT_EQ(trace.records().back().type, "expectation_incomplete");
     {
-        fil::sim::CanExpectationEvaluator evaluator(trace, {{
+        fil::sim::ExpectationEvaluator evaluator(trace, {{
             "destroy", 0U, fil::sim::CanExpectation{"vehicle", 0x123U, false, {}, 20U, 1U}
         }});
         evaluator.begin(loop.now(), loop);
@@ -232,7 +304,7 @@ TEST(StimulusTest, EvaluatorResolvesAlreadyExpiredWindowWithoutPastCallback) {
     fil::sim::TraceRecorder trace;
     fil::sim::EventLoop loop;
     static_cast<void>(loop.runDueEvents(3'000'001U));
-    fil::sim::CanExpectationEvaluator evaluator(trace, {{
+    fil::sim::ExpectationEvaluator evaluator(trace, {{
         "late", 0U, fil::sim::CanExpectation{"vehicle", 0x123U, false, {}, 1U, 2U}
     }});
     evaluator.begin(loop.now(), loop);
@@ -246,9 +318,9 @@ TEST(StimulusTest, EvaluatorResolvesAlreadyExpiredWindowWithoutPastCallback) {
 TEST(StimulusTest, EvaluatorValidatesTimeAndDirectWindowOverflow) {
     fil::sim::TraceRecorder trace;
     fil::sim::EventLoop loop;
-    fil::sim::CanExpectationEvaluator evaluator(trace, {});
+    fil::sim::ExpectationEvaluator evaluator(trace, {});
     EXPECT_THROW(evaluator.begin(1U, loop), std::invalid_argument);
-    EXPECT_THROW((fil::sim::CanExpectationEvaluator(trace, {{
+    EXPECT_THROW((fil::sim::ExpectationEvaluator(trace, {{
         "overflow", 0U, fil::sim::CanExpectation{"vehicle", 1U, false, {},
             std::numeric_limits<std::uint64_t>::max(), 0U}
     }})), std::invalid_argument);

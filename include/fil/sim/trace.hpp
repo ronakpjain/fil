@@ -59,6 +59,38 @@ public:
     /** @brief Whether trace emission can invoke an arbitrary external observer. */
     [[nodiscard]] bool hasObserver() const noexcept { return static_cast<bool>(observer_); }
 
+    /** @brief Sentinel used for records emitted outside any parallel lane. */
+    static constexpr std::size_t coordinator_lane = static_cast<std::size_t>(-1);
+
+    /** @brief Associates the calling worker thread with one parallel lane. */
+    static void setCurrentLane(std::size_t lane) noexcept;
+
+    /** @brief Clears the calling thread's parallel-lane association. */
+    static void clearCurrentLane() noexcept;
+
+    /** @brief Reports the calling thread's lane, or coordinator_lane outside a lane. */
+    [[nodiscard]] static std::size_t currentLane() noexcept;
+
+    /**
+     * @brief Begins buffering lane-local records until flushLaneCapture().
+     *
+     * The recorder is not synchronized, so a parallel scheduler must keep worker
+     * threads off the shared record vector. While capture is active, records
+     * emitted from a thread marked with setCurrentLane() are buffered per lane
+     * without touching the global sequence, history, or observer. The scheduler
+     * calls flushLaneCapture() once every lane has parked; the coordinator then
+     * merges the buffers in (time, lane) order and dispatches observers on its
+     * own thread, so any record type, including lane-local GPIO or ADC records,
+     * can be traced while lanes run in parallel.
+     */
+    void beginLaneCapture(std::size_t lane_count);
+
+    /** @brief Merges captured lane records into the global stream in time order. */
+    void flushLaneCapture();
+
+    /** @brief Whether lane capture is currently buffering worker records. */
+    [[nodiscard]] bool capturingLanes() const noexcept { return capturing_; }
+
     /**
      * @brief Restricts recorded types to an allowlist (empty allows all).
      *
@@ -114,10 +146,14 @@ public:
     [[nodiscard]] static std::string hexBytes(std::span<const std::uint8_t> bytes);
 
 private:
+    void appendRecord(TraceRecord record);
+
     bool enabled_{true};
     bool retain_records_{true};
+    bool capturing_{false};
     std::uint64_t next_sequence_{0};
     std::vector<TraceRecord> records_;
+    std::vector<std::vector<TraceRecord>> lane_records_;
     std::vector<std::string> allowlist_;
     Observer observer_;
 };
