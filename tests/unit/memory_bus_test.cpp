@@ -871,6 +871,46 @@ TEST(MemoryBusTest, ReversibleRamOnlyRejectsNonRamStoresBeforeMutation) {
         << "disabling restriction restores ordinary writable-flash semantics";
 }
 
+TEST(MemoryBusTest, JournalRingRetainsExactCapacityAndRefillsRolledBackSuffix) {
+    using namespace fil::mem;
+    MemoryBus bus;
+    ASSERT_TRUE(bus.mapRam(0x20000000U, 16U, "data"));
+    const auto origin = bus.sideEffectCheckpoint();
+    const auto capacity = MemoryBus::mutationJournalCapacity();
+    const auto mutate = [&](const std::size_t count) {
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto old = bus.read8(0x20000000U).value();
+            ASSERT_TRUE(bus.write8(0x20000000U, old == 1U ? 2U : 1U));
+        }
+    };
+    mutate(capacity);
+    EXPECT_EQ(bus.mutationSequence() - origin.mutation_sequence, capacity);
+    EXPECT_TRUE(bus.canRestoreSideEffects(origin));
+    EXPECT_FALSE(bus.sideEffectsRestoredSince(origin));
+    const auto future = bus.sideEffectCheckpoint();
+    ASSERT_TRUE(bus.restoreSideEffects(origin));
+    EXPECT_EQ(bus.read8(0x20000000U).value(), 0U);
+    EXPECT_FALSE(bus.canRestoreSideEffects(future));
+    mutate(33U);
+    const auto middle = bus.sideEffectCheckpoint();
+    const auto middle_value = bus.read8(0x20000000U).value();
+    mutate(65U);
+    ASSERT_TRUE(bus.restoreSideEffects(middle));
+    EXPECT_EQ(bus.read8(0x20000000U).value(), middle_value);
+    mutate(17U);
+    ASSERT_TRUE(bus.restoreSideEffects(origin));
+    EXPECT_EQ(bus.read8(0x20000000U).value(), 0U);
+    mutate(capacity + 1U);
+    EXPECT_FALSE(bus.canRestoreSideEffects(origin));
+    EXPECT_FALSE(bus.restoreSideEffects(origin));
+    EXPECT_FALSE(bus.sideEffectsRestoredSince(origin));
+    bus.setWriteJournalTracking(false);
+    const auto untracked = bus.sideEffectCheckpoint();
+    mutate(1U);
+    bus.setWriteJournalTracking(true);
+    EXPECT_FALSE(bus.canRestoreSideEffects(untracked));
+}
+
 TEST(MemoryBusTest, RestrictedFastStoresProbeNonExecutableRamBeforeAnyEffects) {
     using namespace fil::mem;
     for (const bool reversible : {false, true}) {

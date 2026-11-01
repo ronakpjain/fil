@@ -483,12 +483,16 @@ public:
 
 private:
     struct Region;
+    // Slot identity is implicit: while tracking, each mutation writes exactly
+    // (sequence - 1) % capacity. Readers reject expired windows and tracking
+    // generation changes before touching the ring. Rollback discards a suffix;
+    // subsequent writes refill that suffix before its sequences can be read.
     struct BackedMutation {
-        std::uint64_t sequence{0};
         std::uint32_t address{0};
         std::uint8_t old_value{0};
         bool external{false};
     };
+    static_assert(sizeof(BackedMutation) == 8U);
 
     static void addReadFootprint(ReadFootprint& footprint, std::uint32_t address) noexcept;
     void addAccessFootprint(std::uint32_t address, std::uint32_t width) const noexcept;

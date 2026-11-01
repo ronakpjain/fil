@@ -118,7 +118,7 @@ void MemoryBus::recordMutation(
     ++mutation_sequence_;
     if (write_journal_tracking_) {
         mutation_journal_[(mutation_sequence_ - 1U) % mutation_journal_capacity] =
-            BackedMutation{mutation_sequence_, address, old_value, external};
+            BackedMutation{address, old_value, external};
     }
 }
 
@@ -922,7 +922,6 @@ bool MemoryBus::sideEffectsRestoredSince(const SideEffectCheckpoint checkpoint) 
          sequence <= mutation_sequence_; ++sequence) {
         const BackedMutation& current =
             mutation_journal_[(sequence - 1U) % mutation_journal_capacity];
-        if (current.sequence != sequence) return false;
         bool first_for_address = true;
         for (std::uint64_t prior_sequence = checkpoint.mutation_sequence + 1U;
              prior_sequence < sequence; ++prior_sequence) {
@@ -961,7 +960,6 @@ bool MemoryBus::sideEffectsCompatibleSince(
          sequence <= mutation_sequence_; ++sequence) {
         const BackedMutation& first =
             mutation_journal_[(sequence - 1U) % mutation_journal_capacity];
-        if (first.sequence != sequence) return false;
         bool first_for_address = true;
         bool only_external = first.external;
         for (std::uint64_t prior = checkpoint.mutation_sequence + 1U;
@@ -1018,12 +1016,11 @@ bool MemoryBus::ramInputsCompatibleSince(
     for (std::uint64_t sequence = checkpoint.mutation_sequence + 1U;
          sequence <= mutation_sequence_; ++sequence) {
         const BackedMutation& mutation = mutation_journal_[(sequence - 1U) % mutation_journal_capacity];
-        if (mutation.sequence != sequence) return false;
         if (region == nullptr || !region->contains(mutation.address))
             region = find(mutation.address);
         if (region == nullptr || region->info.kind == RegionKind::mmio
             || region->info.kind == RegionKind::alias) return false;
-        // Journal identity and backing are still checked for every mutation.
+        // Window validity was checked above; backing is checked per mutation.
         // Only footprint candidates need earliest-old-value reconstruction;
         // unrelated bytes cannot affect this immutable certificate.
         if (!footprintContains(footprint, mutation.address)) continue;
@@ -1056,7 +1053,6 @@ bool MemoryBus::restoreSideEffects(const SideEffectCheckpoint checkpoint) {
          sequence > checkpoint.mutation_sequence; --sequence) {
         BackedMutation& mutation =
             mutation_journal_[(sequence - 1U) % mutation_journal_capacity];
-        if (mutation.sequence != sequence) return false;
         Region* const region = find(mutation.address);
         if (region == nullptr || region->info.kind == RegionKind::mmio
             || region->info.kind == RegionKind::alias) {
