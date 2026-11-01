@@ -1575,114 +1575,114 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     for (std::size_t i=0; i<n; ++i)
         exits.push_back({e.makeLabel(),e.makeLabel(),e.makeLabel(),e.makeLabel(),e.makeLabel()});
     const auto normal = e.makeLabel();
-    for (std::size_t i = 0; i < n; ++i) {
-        const auto& op = entry.plan.ops[i];
-        const auto& inst = op.native.integer;
-        e.movR32M(kEax, ctx, limit); e.cmpR32Imm(kEax, static_cast<std::uint32_t>(i));
-        e.jcc(6U, exits[i].instruction); // i >= instruction_limit before all other admissions
-        // Admitted mode skips only the per-op cost table and cycle-budget
-        // machinery; branch/indirect guards still run so a changed edge
-        // declines exactly as in checked mode.
-        const auto checked_cost_table = e.makeLabel();
-        e.movR32M(kEax, ctx, kAdmittedMode);
-        e.testRR(kEax, kEax); e.jcc(5U, checked_cost_table);
-        e.movR32M(kEax, ctx, charged_count);
-        e.cmpR32Imm(kEax, static_cast<std::uint32_t>(i + 1U));
-        e.jcc(2U, exits[i].unsupported);
-        e.cmpR64Imm8(costs, 0U); e.jcc(4U, exits[i].unsupported);
-        e.bindLabel(checked_cost_table);
-        const bool bx_lr = op.native.kind == NativeOp::bx_lr;
-        const auto conditional = inst.op == MicroOp::b_cond;
-        if (bx_lr) {
-            e.movR32M(kEax, cpu, offsets.r + 56U);
-            e.cmpR32Imm(kEax, op.expected_next_pc | 1U);
-            e.jcc(5U, exits[i].mismatch);
-        } else if (op.native.kind == NativeOp::blx_reg) {
-            e.movR32M(kEax, cpu, offsets.r + op.native.rn * 4U);
-            e.cmpR32Imm(kEax, op.expected_next_pc | 1U); e.jcc(5U, exits[i].mismatch);
-            e.movRR(kEcx, kEax); e.aluRImm(4U, kEcx, 0xfffffff0U);
-            e.cmpR32Imm(kEcx, 0xfffffff0U); e.jcc(4U, exits[i].mismatch);
-        }
-        if (conditional) {
-            const auto actually_taken = e.makeLabel(), guard_done = e.makeLabel();
-            if (!emitX86CondTaken(e, inst.condition, 0U, actually_taken, error)) {
-                impl_->trace_cache.pop_back(); return nullptr;
+    const auto checked_kernel = e.makeLabel();
+    e.movR32M(kEax, ctx, kAdmittedMode);
+    e.testRR(kEax, kEax); e.jcc(4U, checked_kernel);
+    // Select cycle admission once per invocation, not three times per guest
+    // instruction. Both kernels share exact-prefix exit publication and retain
+    // instruction-limit, control-flow and RAM-helper guards.
+    for (const bool admitted_kernel : {true, false}) {
+        if (!admitted_kernel) e.bindLabel(checked_kernel);
+        for (std::size_t i = 0; i < n; ++i) {
+            const auto& op = entry.plan.ops[i];
+            const auto& inst = op.native.integer;
+            e.movR32M(kEax, ctx, limit); e.cmpR32Imm(kEax, static_cast<std::uint32_t>(i));
+            e.jcc(6U, exits[i].instruction); // i >= instruction_limit before all other admissions
+            if (!admitted_kernel) {
+                e.movR32M(kEax, ctx, charged_count);
+                e.cmpR32Imm(kEax, static_cast<std::uint32_t>(i + 1U));
+                e.jcc(2U, exits[i].unsupported);
+                e.cmpR64Imm8(costs, 0U); e.jcc(4U, exits[i].unsupported);
             }
-            if (op.expected_taken) e.jmp(exits[i].mismatch); else e.jmp(guard_done);
-            e.bindLabel(actually_taken);
-            if (op.expected_taken) e.jmp(guard_done); else e.jmp(exits[i].mismatch);
-            e.bindLabel(guard_done);
-        }
-        const auto skip_cycle_math = e.makeLabel();
-        e.movR32M(kEax, ctx, kAdmittedMode);
-        e.testRR(kEax, kEax); e.jcc(5U, skip_cycle_math);
-        e.movR32M(kEax, costs, static_cast<std::uint32_t>(i * sizeof(std::uint32_t)));
-        e.movRR64(kEdx, 5U); e.addR64R64(kEdx, kEax);
-        e.jcc(2U, exits[i].cycle); e.cmpR64M(kEdx, ctx, cycle_limit); e.jcc(7U, exits[i].cycle);
-        e.bindLabel(skip_cycle_math);
-        if (inst.op == MicroOp::bl || op.native.kind == NativeOp::blx_reg)
-            e.movM32Imm(kState, offsets.r + 56U, (op.pc + op.size) | 1U);
-        if (op.decoded.kind == InstrKind::push || op.decoded.kind == InstrKind::pop) {
-            e.movM32R(4U, 0U, kNzcv); e.movM32R(4U, 4U, kRetain);
-            e.movRR64(7U, ctx); e.movR32Imm(6U, op.pc);
-            e.movR32Imm(kEdx, op.decoded.register_list);
-            e.movR32Imm(1U, op.decoded.kind == InstrKind::push ? 1U : 0U);
-            e.movR32Imm(8U, op.expected_next_pc);
-            e.movR64Imm(kEax, reinterpret_cast<std::uintptr_t>(&nativeStackTransfer)); e.callReg(kEax);
-            e.movR32M(kNzcv, 4U, 0U); e.movR32M(kRetain, 4U, 4U); e.movRR64(7U, cpu);
-            e.cmpR32Imm(kEax, static_cast<std::uint32_t>(NativeStackResult::branch_mismatch));
-            e.jcc(4U, exits[i].mismatch);
-            e.testRR(kEax, kEax); e.jcc(5U, exits[i].helper);
-        } else if (!(bx_lr || op.native.kind == NativeOp::blx_reg || conditional || inst.op == MicroOp::b || inst.op == MicroOp::bl)
-                   && op.native.kind == NativeOp::integer) {
-            if (!emitX86Op(e, offsets, inst, error)) { impl_->trace_cache.pop_back(); return nullptr; }
-        } else if (!(bx_lr || op.native.kind == NativeOp::blx_reg || conditional || inst.op == MicroOp::b || inst.op == MicroOp::bl)) {
-            const auto& m = op.native; constexpr std::uint32_t addrreg = 2U, valuereg = 1U;
-            if (m.absolute) e.movR32Imm(addrreg, m.absolute_address);
-            else {
-                if (m.rn == 13U) {
-                    const auto use_msp=e.makeLabel(), have_sp=e.makeLabel();
-                    e.movR32M(kEax,cpu,offsets.xpsr); e.aluRImm(4U,kEax,xpsr_ipsr_mask); e.jcc(5U,use_msp);
-                    e.movR32M(kEax,cpu,off(offsetof(CpuState,control))); e.aluRImm(4U,kEax,2U); e.jcc(4U,use_msp);
-                    e.movR32M(kEax,cpu,off(offsetof(CpuState,psp))); e.jmp(have_sp); e.bindLabel(use_msp);
-                    e.movR32M(kEax,cpu,off(offsetof(CpuState,msp))); e.bindLabel(have_sp);
-                } else loadGuest(e,kEax,offsets,m.rn);
-                if (m.offset != 0U) e.aluRImm(0U,kEax,m.offset);
-                e.movRR(addrreg,kEax);
+            const bool bx_lr = op.native.kind == NativeOp::bx_lr;
+            const auto conditional = inst.op == MicroOp::b_cond;
+            if (bx_lr) {
+                e.movR32M(kEax, cpu, offsets.r + 56U);
+                e.cmpR32Imm(kEax, op.expected_next_pc | 1U);
+                e.jcc(5U, exits[i].mismatch);
+            } else if (op.native.kind == NativeOp::blx_reg) {
+                e.movR32M(kEax, cpu, offsets.r + op.native.rn * 4U);
+                e.cmpR32Imm(kEax, op.expected_next_pc | 1U); e.jcc(5U, exits[i].mismatch);
+                e.movRR(kEcx, kEax); e.aluRImm(4U, kEcx, 0xfffffff0U);
+                e.cmpR32Imm(kEcx, 0xfffffff0U); e.jcc(4U, exits[i].mismatch);
             }
-            const bool t_load = nativeOpIsLoad(m.kind);
-            const std::uint32_t t_width = nativeOpWidth(m.kind);
-            if (!t_load) loadGuest(e,valuereg,offsets,m.rd);
-            e.movRR(3U,kNzcv); e.movRR(15U,kRetain); e.movRR64(7U,ctx); e.movR32Imm(6U,op.pc); e.movRR(kEdx,addrreg);
-            if (t_load) e.leaR64(1U,4U,0U);
-            const auto helper = t_width == 1U
-                ? (t_load ? reinterpret_cast<std::uintptr_t>(&nativeRead8) : reinterpret_cast<std::uintptr_t>(&nativeWrite8))
-                : t_width == 2U
-                ? (t_load ? reinterpret_cast<std::uintptr_t>(&nativeRead16) : reinterpret_cast<std::uintptr_t>(&nativeWrite16))
-                : (t_load ? reinterpret_cast<std::uintptr_t>(&nativeRead32) : reinterpret_cast<std::uintptr_t>(&nativeWrite32));
-            e.movR64Imm(kEax,helper); e.callReg(kEax);
-            e.movRR(kNzcv,3U); e.movRR(kRetain,15U); e.movRR64(7U,cpu);
-            e.u8(0x84U); e.u8(0xc0U); e.jcc(4U,exits[i].helper);
-            if (t_load) {
-                e.movR32M(kEax,4U,0U);
-                if (m.kind == NativeOp::load_byte_signed) {
-                    e.shImm(4U, kEax, 24U); e.shImm(7U, kEax, 24U);
-                } else if (m.kind == NativeOp::load_half_signed) {
-                    e.shImm(4U, kEax, 16U); e.shImm(7U, kEax, 16U);
+            if (conditional) {
+                const auto actually_taken = e.makeLabel(), guard_done = e.makeLabel();
+                if (!emitX86CondTaken(e, inst.condition, 0U, actually_taken, error)) {
+                    impl_->trace_cache.pop_back(); return nullptr;
                 }
-                storeGuest(e,offsets,m.rd,kEax);
+                if (op.expected_taken) e.jmp(exits[i].mismatch); else e.jmp(guard_done);
+                e.bindLabel(actually_taken);
+                if (op.expected_taken) e.jmp(guard_done); else e.jmp(exits[i].mismatch);
+                e.bindLabel(guard_done);
+            }
+            if (!admitted_kernel) {
+                e.movR32M(kEax, costs, static_cast<std::uint32_t>(i * sizeof(std::uint32_t)));
+                e.movRR64(kEdx, 5U); e.addR64R64(kEdx, kEax);
+                e.jcc(2U, exits[i].cycle); e.cmpR64M(kEdx, ctx, cycle_limit); e.jcc(7U, exits[i].cycle);
+            }
+            if (inst.op == MicroOp::bl || op.native.kind == NativeOp::blx_reg)
+                e.movM32Imm(kState, offsets.r + 56U, (op.pc + op.size) | 1U);
+            if (op.decoded.kind == InstrKind::push || op.decoded.kind == InstrKind::pop) {
+                e.movM32R(4U, 0U, kNzcv); e.movM32R(4U, 4U, kRetain);
+                e.movRR64(7U, ctx); e.movR32Imm(6U, op.pc);
+                e.movR32Imm(kEdx, op.decoded.register_list);
+                e.movR32Imm(1U, op.decoded.kind == InstrKind::push ? 1U : 0U);
+                e.movR32Imm(8U, op.expected_next_pc);
+                e.movR64Imm(kEax, reinterpret_cast<std::uintptr_t>(&nativeStackTransfer)); e.callReg(kEax);
+                e.movR32M(kNzcv, 4U, 0U); e.movR32M(kRetain, 4U, 4U); e.movRR64(7U, cpu);
+                e.cmpR32Imm(kEax, static_cast<std::uint32_t>(NativeStackResult::branch_mismatch));
+                e.jcc(4U, exits[i].mismatch);
+                e.testRR(kEax, kEax); e.jcc(5U, exits[i].helper);
+            } else if (!(bx_lr || op.native.kind == NativeOp::blx_reg || conditional || inst.op == MicroOp::b || inst.op == MicroOp::bl)
+                       && op.native.kind == NativeOp::integer) {
+                if (!emitX86Op(e, offsets, inst, error)) { impl_->trace_cache.pop_back(); return nullptr; }
+            } else if (!(bx_lr || op.native.kind == NativeOp::blx_reg || conditional || inst.op == MicroOp::b || inst.op == MicroOp::bl)) {
+                const auto& m = op.native; constexpr std::uint32_t addrreg = 2U, valuereg = 1U;
+                if (m.absolute) e.movR32Imm(addrreg, m.absolute_address);
+                else {
+                    if (m.rn == 13U) {
+                        const auto use_msp=e.makeLabel(), have_sp=e.makeLabel();
+                        e.movR32M(kEax,cpu,offsets.xpsr); e.aluRImm(4U,kEax,xpsr_ipsr_mask); e.jcc(5U,use_msp);
+                        e.movR32M(kEax,cpu,off(offsetof(CpuState,control))); e.aluRImm(4U,kEax,2U); e.jcc(4U,use_msp);
+                        e.movR32M(kEax,cpu,off(offsetof(CpuState,psp))); e.jmp(have_sp); e.bindLabel(use_msp);
+                        e.movR32M(kEax,cpu,off(offsetof(CpuState,msp))); e.bindLabel(have_sp);
+                    } else loadGuest(e,kEax,offsets,m.rn);
+                    if (m.offset != 0U) e.aluRImm(0U,kEax,m.offset);
+                    e.movRR(addrreg,kEax);
+                }
+                const bool t_load = nativeOpIsLoad(m.kind);
+                const std::uint32_t t_width = nativeOpWidth(m.kind);
+                if (!t_load) loadGuest(e,valuereg,offsets,m.rd);
+                e.movRR(3U,kNzcv); e.movRR(15U,kRetain); e.movRR64(7U,ctx); e.movR32Imm(6U,op.pc); e.movRR(kEdx,addrreg);
+                if (t_load) e.leaR64(1U,4U,0U);
+                const auto helper = t_width == 1U
+                    ? (t_load ? reinterpret_cast<std::uintptr_t>(&nativeRead8) : reinterpret_cast<std::uintptr_t>(&nativeWrite8))
+                    : t_width == 2U
+                    ? (t_load ? reinterpret_cast<std::uintptr_t>(&nativeRead16) : reinterpret_cast<std::uintptr_t>(&nativeWrite16))
+                    : (t_load ? reinterpret_cast<std::uintptr_t>(&nativeRead32) : reinterpret_cast<std::uintptr_t>(&nativeWrite32));
+                e.movR64Imm(kEax,helper); e.callReg(kEax);
+                e.movRR(kNzcv,3U); e.movRR(kRetain,15U); e.movRR64(7U,cpu);
+                e.u8(0x84U); e.u8(0xc0U); e.jcc(4U,exits[i].helper);
+                if (t_load) {
+                    e.movR32M(kEax,4U,0U);
+                    if (m.kind == NativeOp::load_byte_signed) {
+                        e.shImm(4U, kEax, 24U); e.shImm(7U, kEax, 24U);
+                    } else if (m.kind == NativeOp::load_half_signed) {
+                        e.shImm(4U, kEax, 16U); e.shImm(7U, kEax, 16U);
+                    }
+                    storeGuest(e,offsets,m.rd,kEax);
+                }
+            }
+            // Only the live cycle accumulator advances here. RAM-only helpers
+            // consume explicit PCs and no pending NZCV/PC/progress metadata; the
+            // selected exit stub publishes the exact committed prefix once.
+            if (!admitted_kernel) {
+                e.movR32M(kEax,costs,static_cast<std::uint32_t>(i*4U)); e.addR64R64(5U,kEax);
             }
         }
-        // Only the live cycle accumulator advances here. RAM-only helpers
-        // consume explicit PCs and no pending NZCV/PC/progress metadata; the
-        // selected exit stub publishes the exact committed prefix once.
-        const auto skip_cycle_add = e.makeLabel();
-        e.movR32M(kEax, ctx, kAdmittedMode);
-        e.testRR(kEax, kEax); e.jcc(5U, skip_cycle_add);
-        e.movR32M(kEax,costs,static_cast<std::uint32_t>(i*4U)); e.addR64R64(5U,kEax);
-        e.bindLabel(skip_cycle_add);
+        e.jmp(normal);
     }
-    e.jmp(normal);
     const auto publish = [&](std::size_t i, NativeExitReason why, bool failed) {
         e.movM32Imm(ctx,retired,static_cast<std::uint32_t>(i));
         const auto publish_checked_cycles = e.makeLabel(), cycles_published = e.makeLabel();

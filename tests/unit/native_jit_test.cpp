@@ -144,6 +144,66 @@ TEST(NativeJitTest, AdmittedCyclePrefixMatchesCheckedInterpreterAtEveryCut) {
     EXPECT_EQ(biased.admitted_cycle_mode, 0U);
 }
 
+TEST(NativeJitTest, CycleKernelSelectionPreservesGuardAndHelperExitPrefixes) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
+    constexpr std::uint32_t pc = 0x08003000U, ram = 0x20000000U;
+    // ADDS r0,#1; STR r0,[r1]; BEQ pc+8 (expect fallthrough); LDR r2,[r3].
+    const std::array<std::uint16_t, 4> raw{0x3001U, 0x6008U, 0xd000U, 0x681aU};
+    std::array<NativeTraceOp, 4> ops{};
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+        const auto decoded = decode16(raw[i]); ASSERT_TRUE(decoded);
+        ops[i].decoded = *decoded; ops[i].raw = raw[i];
+        ops[i].pc = pc + static_cast<std::uint32_t>(2U * i);
+        ops[i].size = 2U; ops[i].expected_next_pc = ops[i].pc + 2U;
+    }
+    NativeTracePlan plan; std::string error;
+    ASSERT_TRUE(buildNativeTrace(ops, plan, error)) << error;
+    auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    const auto function = jit->compileNativeTrace(plan, error);
+    ASSERT_NE(function, nullptr) << error;
+    const std::array<std::uint32_t, 4> costs{1U, 2U, 1U, 2U};
+    const std::array<std::uint32_t, 5> prefix{0U, 1U, 3U, 4U, 6U};
+    for (const bool hint : {false, true}) {
+        for (const bool mismatch : {false, true}) {
+            for (const bool helper_declines : {false, true}) {
+                for (std::uint32_t limit = 0; limit <= ops.size(); ++limit) {
+                    for (std::uint64_t credit = 0; credit <= 7U; ++credit) {
+                        SCOPED_TRACE(::testing::Message() << hint << '/' << mismatch << '/'
+                            << helper_declines << '/' << limit << '/' << credit);
+                        fil::mem::MemoryBus expected_bus, actual_bus;
+                        ASSERT_TRUE(expected_bus.mapRam(ram, 16U, "ram"));
+                        ASSERT_TRUE(actual_bus.mapRam(ram, 16U, "ram"));
+                        CpuState expected_cpu;
+                        expected_cpu.r[0] = mismatch ? 0xffffffffU : 0U;
+                        expected_cpu.r[1] = ram;
+                        expected_cpu.r[3] = helper_declines ? 0x40000000U : ram;
+                        expected_cpu.r[15] = pc; expected_cpu.xpsr = xpsr_t;
+                        auto actual_cpu = expected_cpu;
+                        NativeExecutionContext expected{&expected_cpu, &expected_bus, limit, credit};
+                        expected.charged_cycles = costs.data();
+                        expected.charged_cycles_count = costs.size();
+                        auto actual = expected;
+                        actual.cpu_state = &actual_cpu; actual.memory_bus = &actual_bus;
+                        if (hint) {
+                            actual.admitted_cycle_prefix = prefix.data();
+                            actual.admitted_cycle_prefix_count = prefix.size();
+                        }
+                        interpretNativeTrace(plan, expected); function(&actual);
+                        EXPECT_TRUE(bitwiseEqual(actual_cpu, expected_cpu));
+                        EXPECT_EQ(actual.retired_count, expected.retired_count);
+                        EXPECT_EQ(actual.retired_cycles, expected.retired_cycles);
+                        EXPECT_EQ(actual.exit_reason, expected.exit_reason);
+                        EXPECT_EQ(actual.current_instruction_pc, expected.current_instruction_pc);
+                        EXPECT_EQ(actual.failing_instruction_pc, expected.failing_instruction_pc);
+                        EXPECT_EQ(actual.admitted_cycle_mode, 0U);
+                        EXPECT_EQ(actual_bus.read32(ram).value(), expected_bus.read32(ram).value());
+                    }
+                }
+            }
+        }
+    }
+}
+
 TEST(NativeJitTest, NativeTraceCheckedPushPopCommitAndGuardedPopPc) {
     if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
     constexpr std::uint32_t flash = 0x08000000U, ram = 0x20000000U;
