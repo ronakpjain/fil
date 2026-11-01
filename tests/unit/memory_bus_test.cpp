@@ -924,6 +924,35 @@ TEST(MemoryBusTest, RoutesMmioWindows) {
         << "faults on unknown MMIO in strict mode";
 }
 
+TEST(MemoryBusTest, RouterCacheKeepsFullWidthChecksAndMappingChanges) {
+    using fil::mem::AccessSize;
+    fil::mem::MmioRouter router(0x40000000U, 0x1000U, "peripherals", false);
+    RecordingMmio upper, lower, adjacent;
+    upper.shared = true;
+    ASSERT_TRUE(router.map(0x200U, 0x10U, upper, "upper"));
+    ASSERT_TRUE(router.read(0x204U, AccessSize::word, {}));
+    EXPECT_EQ(upper.last_offset, 4U);
+    ASSERT_TRUE(router.map(0x100U, 0x10U, lower, "lower"));
+    ASSERT_TRUE(router.map(0x110U, 0x10U, adjacent, "adjacent"));
+    ASSERT_TRUE(router.read(0x104U, AccessSize::word, {}));
+    EXPECT_EQ(lower.last_offset, 4U);
+    EXPECT_FALSE(router.read(0x10fU, AccessSize::word, {}));
+    EXPECT_EQ(adjacent.read_count, 0U);
+    ASSERT_TRUE(router.read(0x110U, AccessSize::word, {}));
+    EXPECT_EQ(adjacent.last_offset, 0U);
+    EXPECT_EQ(router.domain(0x204U, AccessSize::word), fil::mem::MmioDomain::shared);
+    EXPECT_EQ(router.domain(0x104U, AccessSize::word), fil::mem::MmioDomain::board_local);
+    EXPECT_FALSE(router.read(0U, AccessSize::word, {}));
+    EXPECT_FALSE(router.read(0xfffU, AccessSize::word, {}));
+    router.setLenient(true);
+    ASSERT_TRUE(router.read(0x300U, AccessSize::word, {}));
+    ASSERT_TRUE(router.map(0x300U, 0x10U, lower, "formerly-unknown"));
+    ASSERT_TRUE(router.write(0x304U, AccessSize::word, 7U, {}));
+    EXPECT_EQ(lower.write_count, 1U);
+    EXPECT_EQ(lower.last_offset, 4U);
+    EXPECT_EQ(router.unknownAccesses().size(), 1U);
+}
+
 /** @brief Verifies ELF bytes load at physical addresses without initializing runtime SRAM. */
 TEST(MemoryBusTest, MaterializesElfLoadImage) {
     const auto fixture = std::filesystem::path(FIL_SOURCE_DIR) / "tests/fixtures/elf/split_image.elf";
