@@ -2081,9 +2081,14 @@ std::optional<FastStepResult> CortexM4::tryStepCheckedSingle(
     if (!decoded) return std::nullopt;
     const bool sequential = budget.have_fetch && pc == budget.fetch_end;
     const std::uint16_t stall = budget.fetchStallCycles(pc, sequential);
-    // Conservative admission before commit, exactly like the IT fallback.
-    const std::uint32_t bound = static_cast<std::uint32_t>(basePipelineCycles(*decoded))
-        + stall;
+    // Admit the complete pipeline charge before committing any MMIO effect.
+    // The base table omits taken-branch refill and data-dependent divide costs;
+    // subtracting those after a base-only check can wrap the remaining credit.
+    // Memory-loaded control-flow targets cannot be predicted without an access,
+    // so leave them to the ordinary scheduler rather than speculating here.
+    std::uint16_t pipeline_cycles = 0U;
+    if (!peekPredictableCycles(pipeline_cycles)) return std::nullopt;
+    const std::uint32_t bound = static_cast<std::uint32_t>(pipeline_cycles) + stall;
     if (bound > budget.remaining_cycles
         || bound > std::numeric_limits<std::uint16_t>::max()) return std::nullopt;
     const CpuState before = state_;

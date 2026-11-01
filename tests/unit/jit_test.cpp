@@ -905,6 +905,45 @@ TEST(JitTest, NativeTraceCachesValidChargePrefixAcrossTimingKeys) {
     }
 }
 
+TEST(JitTest, CheckedSingleAdmitsTakenBranchRefillBeforeCommit) {
+    auto bus = basicBus();
+    // B . has base cost 2 plus a taken-path refill of 2 cycles.
+    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0xe7feU})));
+    fil::cpu::CortexM4 candidate(bus);
+    prepare(candidate);
+    const auto before = candidate.state();
+    fil::cpu::CortexM4::ReversibleCycleBudget budget;
+    budget.remaining_cycles = 3U;
+    EXPECT_FALSE(candidate.tryStepCheckedSingle(budget));
+    EXPECT_EQ(budget.remaining_cycles, 3U);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.state(), before));
+    budget.remaining_cycles = 4U;
+    const auto result = candidate.tryStepCheckedSingle(budget);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->cycles, 4U);
+    EXPECT_EQ(budget.remaining_cycles, 0U);
+    EXPECT_EQ(candidate.state().r[15], flash_base);
+}
+
+TEST(JitTest, CheckedSingleAdmitsDataDependentDivideBeforeCommit) {
+    auto bus = basicBus();
+    // UDIV r0,r1,r2; divisor with no leading zeros takes the full 12 cycles.
+    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0xfbb1U, 0xf0f2U})));
+    fil::cpu::CortexM4 candidate(bus);
+    prepare(candidate); candidate.state().r[1] = 42U; candidate.state().r[2] = 0x80000000U;
+    const auto before = candidate.state();
+    fil::cpu::CortexM4::ReversibleCycleBudget budget;
+    budget.remaining_cycles = 11U;
+    EXPECT_FALSE(candidate.tryStepCheckedSingle(budget));
+    EXPECT_EQ(budget.remaining_cycles, 11U);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.state(), before));
+    budget.remaining_cycles = 12U;
+    const auto result = candidate.tryStepCheckedSingle(budget);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->cycles, 12U);
+    EXPECT_EQ(budget.remaining_cycles, 0U);
+}
+
 TEST(JitTest, CommittedRamSpanUnrollsLoopsWithEveryIterationRetired) {
     if (!fil::cpu::MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
     // LDR r2,[r1]; ADDS r2,#1; STR r2,[r1]; CMP r2,r0; BCC loop; BKPT.
