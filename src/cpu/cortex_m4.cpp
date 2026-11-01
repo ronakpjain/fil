@@ -1922,32 +1922,36 @@ std::optional<FastStepResult> CortexM4::executeNativeTrace(
             && cached.nonsequential_stall == timing.nonsequential_stall
             && cached.sequential_stall == timing.sequential_stall;
     };
-    if (!entry.charges_valid || entry.charges_first_sequential != first_sequential
-        || !same_timing()) {
-        bool have_fetch = first_sequential;
+    if (!entry.charges_valid || !same_timing()) {
+        const auto nonsequential = timing.stall(plan.ops.front().pc, false);
+        const auto sequential = timing.stall(plan.ops.front().pc, true);
+        const auto first_stall = std::min(nonsequential, sequential);
+        entry.first_fetch_extra[0] = nonsequential - first_stall;
+        entry.first_fetch_extra[1] = sequential - first_stall;
         auto fetch_end = plan.ops.front().pc;
         entry.charged_prefix[0] = 0U;
         entry.execution_prefix[0] = 0U;
         entry.charges_valid_prefix_count = 0U;
         for (std::size_t i = 0U; i < plan.ops.size(); ++i) {
             const auto& op = plan.ops[i];
-            const bool sequential = i == 0U ? first_sequential
-                : have_fetch && op.pc == fetch_end;
             entry.charges[i] = static_cast<std::uint32_t>(op.execution_cycles)
-                + timing.stall(op.pc, sequential);
+                + (i == 0U ? first_stall : timing.stall(op.pc, op.pc == fetch_end));
             if (entry.charges_valid_prefix_count == i
                 && entry.charges[i] <= std::numeric_limits<std::uint16_t>::max()) {
                 ++entry.charges_valid_prefix_count;
             }
             entry.charged_prefix[i + 1U] = entry.charged_prefix[i] + entry.charges[i];
             entry.execution_prefix[i + 1U] = entry.execution_prefix[i] + op.execution_cycles;
-            have_fetch = true;
             fetch_end = op.pc + op.size;
         }
         entry.charges_timing = timing;
-        entry.charges_first_sequential = first_sequential;
         entry.charges_valid = true;
     }
+    const auto first_extra = entry.first_fetch_extra[first_sequential];
+    if (first_extra > budget.remaining_cycles
+        || entry.charges[0] + first_extra > std::numeric_limits<std::uint16_t>::max())
+        return std::nullopt;
+    const auto normalized_credit = budget.remaining_cycles - first_extra;
     const auto available = std::min(limit,
         static_cast<std::size_t>(entry.charges_valid_prefix_count));
     // The cumulative table includes fetch stalls and execution cycles. Admit
@@ -1957,7 +1961,7 @@ std::optional<FastStepResult> CortexM4::executeNativeTrace(
     const auto prefix_end = entry.charged_prefix.begin()
         + static_cast<std::ptrdiff_t>(available + 1U);
     const auto admitted_end = std::upper_bound(entry.charged_prefix.begin(), prefix_end,
-        budget.remaining_cycles);
+        normalized_credit);
     const auto planned = static_cast<std::size_t>(admitted_end - entry.charged_prefix.begin() - 1);
     if (planned == 0U) return std::nullopt;
     const auto* charges = entry.charges.data();
@@ -1966,7 +1970,7 @@ std::optional<FastStepResult> CortexM4::executeNativeTrace(
     context.cpu_state = &state_;
     context.memory_bus = &memory_;
     context.instruction_limit = static_cast<std::uint32_t>(planned);
-    context.cycle_limit = budget.remaining_cycles;
+    context.cycle_limit = normalized_credit;
     context.charged_cycles = charges;
     context.charged_cycles_count = static_cast<std::uint32_t>(planned);
     context.admitted_cycle_prefix = charged_prefix;
@@ -2003,7 +2007,7 @@ std::optional<FastStepResult> CortexM4::executeNativeTrace(
     }
     if (context.retired_count == 0U) return std::nullopt;
     const auto execution_cycles = entry.execution_prefix[context.retired_count];
-    const auto charged_cycles = entry.charged_prefix[context.retired_count];
+    const auto charged_cycles = entry.charged_prefix[context.retired_count] + first_extra;
     if (detailed != nullptr) {
         for (std::size_t i = 0U; i < context.retired_count; ++i) {
             const auto& op = plan.ops[i];
@@ -2013,14 +2017,15 @@ std::optional<FastStepResult> CortexM4::executeNativeTrace(
             detailed->execution.memory_free &= op.decoded.kind != InstrKind::ldr
                 && op.decoded.kind != InstrKind::str && op.decoded.kind != InstrKind::push
                 && op.decoded.kind != InstrKind::pop;
-            budget.total_instruction_cycles[i] = static_cast<std::uint16_t>(charges[i]);
+            budget.total_instruction_cycles[i] = static_cast<std::uint16_t>(
+                charges[i] + (i == 0U ? first_extra : 0U));
         }
     }
     const auto& last = plan.ops[context.retired_count - 1U];
     budget.remaining_cycles -= charged_cycles;
     budget.have_fetch = true;
     budget.fetch_end = last.pc + last.size;
-    if (context.retired_cycles != charged_cycles || state_.r[15] != last.expected_next_pc
+    if (context.retired_cycles + first_extra != charged_cycles || state_.r[15] != last.expected_next_pc
         || state_.instruction_address != last.pc)
         throw std::logic_error("native trace retirement metadata differs");
     FastStepResult result;

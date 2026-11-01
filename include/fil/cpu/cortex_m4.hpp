@@ -669,7 +669,9 @@ private:
         bool charges_valid{false};
         /// Leading cached charges representable by NativeExecution's uint16_t input.
         std::uint8_t charges_valid_prefix_count{0U};
-        bool charges_first_sequential{false};
+        // The cached first charge uses the cheaper first-fetch mode. Only
+        // its one-off admission/retirement bias differs between entry modes.
+        std::array<std::uint16_t, 2U> first_fetch_extra{};
         ReversibleCycleBudget::FetchTiming charges_timing{};
         std::array<std::uint32_t, NativeTracePlan::max_ops> charges{};
         std::array<std::uint32_t, NativeTracePlan::max_ops + 1U> charged_prefix{};
@@ -691,7 +693,7 @@ private:
             decline_streak = 0U;
             charges_valid = false;
             charges_valid_prefix_count = 0U;
-            charges_first_sequential = false;
+            first_fetch_extra = {};
             charges_timing = {};
         }
     };

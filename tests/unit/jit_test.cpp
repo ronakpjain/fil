@@ -905,6 +905,92 @@ TEST(JitTest, NativeTraceCachesValidChargePrefixAcrossTimingKeys) {
     }
 }
 
+TEST(JitTest, NativeTraceFirstFetchBiasMatchesCheckedCostsAcrossEntryModes) {
+    if (!fil::cpu::MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
+    // LDR r0,[r1]; ADDS r2,#1; B loop: supported memory and pure operations.
+    const auto code = halfwords({0x6808U, 0x3201U, 0xe7fcU});
+    auto bus = basicBus(), oracle = basicBus();
+    ASSERT_TRUE(bus.loadBytes(flash_base, code));
+    ASSERT_TRUE(oracle.loadBytes(flash_base, code));
+    bus.setReversibleRamOnly(true);
+    bus.setAllMmioTrapping(true);
+    fil::cpu::CortexM4 candidate(bus), checked(oracle);
+    prepare(candidate);
+    candidate.state().r[1] = ram_base;
+    for (unsigned i = 0U; i < 4000U; ++i) {
+        fil::cpu::CortexM4::ReversibleCycleBudget warm;
+        warm.remaining_cycles = 1000U;
+        if (!candidate.tryStepCommittedRamSpan(64U, warm))
+            ASSERT_EQ(candidate.stepFast().reason, fil::cpu::StopReason::step_complete);
+    }
+    ASSERT_GT(candidate.jitStats().trace_instructions, 0U);
+    for (const auto stalls : std::array<std::array<std::uint16_t, 2U>, 7U>{{
+            {9U, 0U}, {0U, 9U}, {7U, 2U}, {2U, 7U}, {0U, 0U},
+            {65535U, 0U}, {0U, 65535U}}}) {
+        // Alternate modes without changing timing: the cached normalized table
+        // must work in either direction, including a more costly sequential fetch.
+        for (const auto credit : {0U, 1U, 2U, 5U, 12U, 40U, 128U, 65535U, 100000U}) {
+            for (const bool detailed : {false, true}) {
+                for (const bool sequential : {false, true, false, true}) {
+                    SCOPED_TRACE(::testing::Message() << stalls[0] << '/' << stalls[1]
+                        << " credit=" << credit << " sequential=" << sequential
+                        << " detailed=" << detailed);
+                    prepare(candidate); prepare(checked);
+                    candidate.state().r[1] = checked.state().r[1] = ram_base;
+                    fil::cpu::CortexM4::ReversibleCycleBudget budget;
+                    budget.remaining_cycles = credit;
+                    budget.have_fetch = sequential;
+                    budget.fetch_end = flash_base;
+                    budget.fetch_timing = {flash_base, flash_base + 128U, 0U, 0U,
+                        stalls[0], stalls[1]};
+                    budget.total_instruction_cycles.fill(0xBEEFU);
+                    const auto limit = detailed ? 1U : 64U;
+                    std::uint64_t charged = 0U;
+                    std::uint64_t execution = 0U;
+                    unsigned count = 0U;
+                    auto fetch_end = flash_base;
+                    bool have_fetch = sequential;
+                    std::uint16_t first_charge = 0U;
+                    while (count < limit) {
+                        const auto before = checked.state();
+                        const auto pc = before.r[15];
+                        const auto step = checked.stepFast();
+                        ASSERT_EQ(step.reason, fil::cpu::StopReason::step_complete);
+                        const auto cost = static_cast<std::uint32_t>(step.cycles)
+                            + stalls[have_fetch && pc == fetch_end ? 1U : 0U];
+                        if (cost > std::numeric_limits<std::uint16_t>::max()
+                            || charged + cost > credit) {
+                            checked.state() = before;
+                            break;
+                        }
+                        if (count == 0U) first_charge = static_cast<std::uint16_t>(cost);
+                        charged += cost;
+                        execution += step.cycles;
+                        ++count;
+                        have_fetch = true;
+                        fetch_end = pc + step.instruction_size;
+                    }
+                    const auto result = detailed
+                        ? [&]() -> std::optional<fil::cpu::FastStepResult> {
+                            auto out = candidate.tryStepBudgetedReversibleJitBlock(limit, budget);
+                            if (!out) return std::nullopt;
+                            return out->execution.result;
+                        }()
+                        : candidate.tryStepCommittedRamSpan(limit, budget);
+                    ASSERT_EQ(result.has_value(), count != 0U);
+                    if (result) {
+                        EXPECT_EQ(result->instructions, count);
+                        EXPECT_EQ(result->cycles, execution);
+                        if (detailed) EXPECT_EQ(budget.total_instruction_cycles[0], first_charge);
+                    }
+                    EXPECT_EQ(budget.remaining_cycles, credit - charged);
+                    EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.state(), checked.state()));
+                }
+            }
+        }
+    }
+}
+
 TEST(JitTest, CheckedSingleAdmitsTakenBranchRefillBeforeCommit) {
     auto bus = basicBus();
     // B . has base cost 2 plus a taken-path refill of 2 cycles.
