@@ -287,11 +287,27 @@ not firmware symbols or function names.
 ## Control-flow and MMIO boundaries
 
 Prepared blocks end at control-flow terminators. Guarded native traces can
-stitch supported branches, calls, and returns across blocks, but checked memory
-helpers decline MMIO: peripheral side effects cannot be journaled or replayed
-by a RAM-only executor. Unsupported or declined work retains checked execution.
-Execution must honor event, SysTick, interrupt, and instruction-budget boundaries;
-batching cannot move peripheral effects ahead of their simulated instruction time.
+stitch supported branches, calls, and returns across blocks. Speculative work
+(certificate discovery and any rollback-capable span) keeps strict reversible-RAM
+semantics: checked memory helpers decline MMIO, because peripheral side effects
+cannot be journaled or replayed by a RAM-only executor.
+
+A **committed** span (the ordinary board owner-slice path, which never rolls
+back) may execute MMIO directly. The Board installs a bridge that, before each
+access, advances SystemControl (SysTick/DWT) to the instruction's exact cycle
+and installs a thread-local read-only clock offset so devices reading the event
+clock observe the exact simulated time; the dispatch clock and event queue move
+only at the span boundary, so interrupt and SysTick phase are unchanged. The
+span stops before the next instruction when an interrupt becomes pending or an
+earlier event was scheduled, and the memory bus performs the real peripheral
+access with the reversible trap flags bypassed. This is exact: the six-board
+PER network reproduces identical instruction and cycle counts against a
+capsule-disabled reference. It is currently performance-neutral on that
+workload, since MMIO declines were not the bottleneck.
+
+Unsupported or declined work retains checked execution. Execution must honor
+event, SysTick, interrupt, and instruction-budget boundaries; batching cannot
+move peripheral effects ahead of their simulated instruction time.
 
 Native trace return stitching is limited to the canonical 16-bit `BX LR`
 encoding. It may follow a previously observed Thumb return target only when its
