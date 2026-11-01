@@ -991,6 +991,18 @@ TEST(WorldTimeTest, CompactExactSchedulerPreservesFailureDrainingAndBudgets) {
     }
 }
 
+TEST(WorldTimeTest, AdaptiveLaneSlotPolicyUsesMeasuredWorkAndSafeFallbacks) {
+    using fil::sim::detail::laneActiveExecutionSlots;
+    EXPECT_EQ(laneActiveExecutionSlots({}, 8U), 0U);
+    EXPECT_EQ(laneActiveExecutionSlots({10U, 10U, 10U, 10U}, 8U), 4U);
+    EXPECT_EQ(laneActiveExecutionSlots({100U, 100U, 10U, 10U, 10U, 10U}, 8U), 3U);
+    EXPECT_EQ(laneActiveExecutionSlots({100U, 1U, 1U, 1U}, 3U), 2U);
+    EXPECT_EQ(laneActiveExecutionSlots({1U, 2U, 3U}, 2U), 2U);
+    EXPECT_EQ(laneActiveExecutionSlots({0U, 100U}, 8U), 8U);
+    EXPECT_EQ(laneActiveExecutionSlots({UINT64_MAX, 1U}, 8U), 8U);
+    EXPECT_EQ(laneActiveExecutionSlots({100U, 100U}, 0U), 0U);
+}
+
 TEST(WorldTimeTest, PersistentLaneWorkersJoinEveryWindowAndPropagateExceptions) {
     std::vector<std::size_t> counts(3U, 0U);
     bool fail = false;

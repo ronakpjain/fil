@@ -39,9 +39,26 @@ inline std::size_t laneExecutionSlots() noexcept {
     return std::max(1U, std::thread::hardware_concurrency());
 }
 
-// Persistent owner executors. Release/acquire publishes each window. Jobs keep
-// their original owner IDs, but need not return to the same host thread. The
-// coordinator participates, then joins every consumer before shared mutation.
+// Estimate the useful number of concurrent executors from measured per-owner
+// work. Saturating/zero measurements deliberately choose the full available
+// budget rather than serializing owners on incomplete timing information.
+inline std::size_t laneActiveExecutionSlots(const std::vector<std::uint64_t>& costs,
+                                           const std::size_t max_slots) noexcept {
+    if (costs.empty() || max_slots == 0U) return 0U;
+    std::uint64_t total = 0U;
+    std::uint64_t largest = 0U;
+    for (const auto cost : costs) {
+        if (cost == 0U || total > UINT64_MAX - cost) return max_slots;
+        total += cost;
+        largest = std::max(largest, cost);
+    }
+    const auto slots = total / largest + (total % largest != 0U ? 1U : 0U);
+    return std::min(max_slots, static_cast<std::size_t>(slots));
+}
+
+// Persistent owner executors. Release/acquire publishes each window's active
+// executor count. Jobs keep original owner IDs, but need not return to the same
+// host thread. Every worker acknowledges every window before shared mutation.
 // Only the coordinator calls run(); work and lane storage stay fixed until join.
 class LaneWorkers {
 public:
@@ -51,13 +68,12 @@ public:
     LaneWorkers(std::size_t count, std::function<void(std::size_t)> work,
                 std::size_t background_workers)
         : work_(std::move(work)), failures_(count), order_(count), costs_(count), count_(count),
-          worker_count_(std::min(count, background_workers)),
-          prioritize_(count_ - worker_count_ > 1U) {
+          worker_count_(std::min(count, background_workers)) {
         for (std::size_t index = 0U; index < count_; ++index) order_[index] = index;
         threads_.reserve(worker_count_);
         try {
             for (std::size_t worker = 0U; worker < worker_count_; ++worker) {
-                threads_.emplace_back([this] {
+                threads_.emplace_back([this, worker] {
                     ready_.wait(false, std::memory_order_acquire);
                     if (startup_failed_.load(std::memory_order_relaxed)) return;
                     std::uint64_t observed = 0U;
@@ -70,7 +86,7 @@ public:
                         }
                         observed = next;
                         if (stopping_.load(std::memory_order_relaxed)) return;
-                        drain();
+                        if (worker + 1U < execution_slots_) drain();
                         // Acknowledge only after the final queue access and all
                         // per-job scopes unwind. Last-job completion alone is
                         // insufficient: another consumer may still claim work.
@@ -100,14 +116,13 @@ public:
     LaneWorkers& operator=(const LaneWorkers&) = delete;
 
     void run() {
-        // Start previously expensive owners first, rather than putting them
-        // behind a wave of short jobs. Costs are host-only scheduling hints;
+        // Start expensive owners first. Costs are host-only scheduling hints;
         // every owner still executes exactly once and keeps its original ID.
-        if (prioritize_) {
-            std::sort(order_.begin(), order_.end(), [&](auto a, auto b) {
-                return costs_[a] != costs_[b] ? costs_[a] > costs_[b] : a < b;
-            });
-        }
+        std::sort(order_.begin(), order_.end(), [&](auto a, auto b) {
+            return costs_[a] != costs_[b] ? costs_[a] > costs_[b] : a < b;
+        });
+        execution_slots_ = laneActiveExecutionSlots(
+            costs_, std::min(count_, worker_count_ + 1U));
         next_index_.store(0U, std::memory_order_relaxed);
         remaining_.store(worker_count_, std::memory_order_relaxed);
         generation_.fetch_add(1U, std::memory_order_release);
@@ -135,19 +150,16 @@ private:
             const auto position = next_index_.fetch_add(1U, std::memory_order_relaxed);
             if (position >= count_) return;
             const auto index = order_[position];
-            const auto start = prioritize_ ? std::chrono::steady_clock::now()
-                                          : std::chrono::steady_clock::time_point{};
+            const auto start = std::chrono::steady_clock::now();
             try {
                 work_(index);
             } catch (...) {
                 failures_[index] = std::current_exception();
             }
-            if (prioritize_) {
-                const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - start).count();
-                const auto cost = elapsed > 0 ? static_cast<std::uint64_t>(elapsed) : 0U;
-                costs_[index] = std::max(costs_[index] / 2U, cost);
-            }
+            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            const auto cost = elapsed > 0 ? static_cast<std::uint64_t>(elapsed) : 0U;
+            costs_[index] = std::max(costs_[index] / 2U, cost);
         }
     }
 
@@ -159,7 +171,7 @@ private:
     std::vector<std::uint64_t> costs_;
     std::size_t count_;
     std::size_t worker_count_;
-    bool prioritize_;
+    std::size_t execution_slots_ = 1U;
     alignas(64) std::atomic<std::uint64_t> generation_{0U};
     alignas(64) std::atomic<std::size_t> remaining_{0U};
     alignas(64) std::atomic<std::size_t> next_index_{0U};

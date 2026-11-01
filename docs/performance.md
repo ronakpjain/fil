@@ -45,8 +45,13 @@ Parallel owner executors spin briefly at window rendezvous, then park using
 C++20 atomic wait/notify. Finishing a light lane does not leave its worker
 continuously competing for host execution resources while the ADC-heavy lanes
 finish. The coordinator also parks after its bounded spin. Window publication,
-completion, exception propagation, and shutdown retain release/acquire ordering;
-this changes host waiting only, not guest events or simulated timing.
+completion, exception propagation, and shutdown retain release/acquire ordering.
+Owner costs are measured each window and expensive jobs start first. The pool
+limits active executors using the ceiling of total owner cost divided by the
+largest owner cost, bounded by available execution slots; balanced workloads
+retain full parallelism. Inactive workers still acknowledge every generation,
+so joins and deterministic exception handling retain the same guarantees. This
+changes host scheduling only, not guest events or simulated timing.
 
 ## Execution optimizations
 
