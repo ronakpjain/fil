@@ -1,6 +1,7 @@
 #include "fil/cpu/native_stack.hpp"
 #include <array>
 #include <bit>
+#include <optional>
 
 namespace fil::cpu {
 NativeStackResult nativeStackTransfer(NativeExecutionContext* c, std::uint32_t pc,
@@ -34,28 +35,35 @@ NativeStackResult nativeStackTransfer(NativeExecutionContext* c, std::uint32_t p
         s.writeRegister(13U, start);
         return NativeStackResult::success;
     }
-    const auto footprint = c->memory_bus->readFootprint();
+    // PC, when present, is always the last bit in the register list, so its
+    // slot is the final transferred word. Resolving it arithmetically keeps
+    // the pop path to a single walk over the mask.
+    std::uint32_t target = 0;
+    std::uint32_t pc_slot = 0U;
+    if (loads_pc) {
+        pc_slot = count - 1U;
+    }
+    // The pre-read footprint copy exists only to undo the speculative read on
+    // the two rejection paths below. Snapshotting it up front charged every
+    // successful pop a 32-byte copy even though the snapshot is discarded on
+    // success, so it is only taken for pops that load the PC.
+    std::optional<mem::MemoryBus::ReadFootprint> footprint;
+    if (loads_pc) footprint = c->memory_bus->readFootprint();
     std::array<std::uint32_t, 16> values;
     if (!c->memory_bus->tryFastReadWords(start, count, values.data(), {mem::AccessType::data_read, pc}))
         return NativeStackResult::memory_declined;
-    std::uint32_t n = 0;
-    std::uint32_t target = 0;
-    for (std::uint32_t bits = mask; bits != 0U; bits &= bits - 1U) {
-        const auto r = static_cast<std::uint32_t>(std::countr_zero(bits));
-        if (r == 15U) target = values[n];
-        ++n;
-    }
     if (loads_pc) {
+        target = values[pc_slot];
         if ((target & 0xfffffff0U) == 0xfffffff0U || (target & 1U) == 0U) {
-            c->memory_bus->restoreReadFootprint(footprint);
+            c->memory_bus->restoreReadFootprint(*footprint);
             return NativeStackResult::memory_declined;
         }
         if ((target & ~1U) != expected_pc) {
-            c->memory_bus->restoreReadFootprint(footprint);
+            c->memory_bus->restoreReadFootprint(*footprint);
             return NativeStackResult::branch_mismatch;
         }
     }
-    n = 0;
+    std::uint32_t n = 0;
     for (std::uint32_t bits = mask; bits != 0U; bits &= bits - 1U) {
         const auto r = static_cast<std::uint32_t>(std::countr_zero(bits));
         if (r != 15U) s.r[r] = values[n];

@@ -2435,6 +2435,8 @@ auto CortexM4::executeTrustedReversibleJitBlockImpl(
             out.count = first_cached;
     }
 
+    // Set when cycle credit, not block validity, ended the prefix.
+    bool budget_truncated = false;
     for (std::uint8_t i = first_cached; i < cached_limit; ++i) {
         const DecodedInstruction& op = slot.ops[i];
         const std::uint32_t pc = slot.pcs[i];
@@ -2465,8 +2467,17 @@ auto CortexM4::executeTrustedReversibleJitBlockImpl(
         const std::uint32_t worst_cycles = static_cast<std::uint32_t>(cycles)
             + (condition_passed && !compact ? slot.branch_penalty[i] : 0U)
             + fetch_stall;
-        if (budget && (worst_cycles > budget->remaining_cycles
-            || worst_cycles > std::numeric_limits<std::uint16_t>::max())) break;
+        // A prefix cut short by insufficient cycle credit says nothing about
+        // whether the block is executable. Event-dense firmware narrows the
+        // budget to the next event boundary, so a block can be truncated at
+        // its first instruction on every visit while remaining perfectly
+        // valid. Such truncations must not count toward the decline streak
+        // that eventually retires the block from fast execution.
+        if (budget && worst_cycles > budget->remaining_cycles) {
+            budget_truncated = true;
+            break;
+        }
+        if (budget && worst_cycles > std::numeric_limits<std::uint16_t>::max()) break;
 
         // Compact reversible handlers neither read architectural PC nor need
         // instruction_address while executing. Defer that metadata store until
@@ -2558,7 +2569,8 @@ auto CortexM4::executeTrustedReversibleJitBlockImpl(
     if (out.count == 0U) {
         ++jit_stats_.fallbacks;
         ++jit_stats_.block_decline_empty;
-        if (slot.reversible_decline_streak != std::numeric_limits<std::uint8_t>::max()) {
+        if (!budget_truncated
+            && slot.reversible_decline_streak != std::numeric_limits<std::uint8_t>::max()) {
             ++slot.reversible_decline_streak;
         }
         return std::nullopt;
