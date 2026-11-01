@@ -526,6 +526,45 @@ MemoryResult<std::uint32_t> MemoryBus::read32(
     return static_cast<std::uint32_t>(result.value());
 }
 
+bool MemoryBus::isMmioRange(
+    const std::uint32_t address, const std::uint32_t size
+) const noexcept {
+    if (size == 0U) return false;
+    const Region* region = find(address);
+    return region != nullptr && region->info.kind == RegionKind::mmio
+        && region->containsRange(address, size);
+}
+
+MemoryResult<std::uint64_t> MemoryBus::readMmioChecked(
+    const std::uint32_t address, const AccessSize size, const AccessContext& context
+) {
+    // The reversible-span flags keep speculative RAM kernels off peripherals.
+    // A committed span calls this only after establishing the exact guest time,
+    // so the real access must proceed.
+    const bool trap = trap_all_mmio_;
+    const bool reversible = reversible_ram_only_;
+    trap_all_mmio_ = false;
+    reversible_ram_only_ = false;
+    auto result = read(address, size, context, 0U);
+    trap_all_mmio_ = trap;
+    reversible_ram_only_ = reversible;
+    return result;
+}
+
+MemoryResult<std::uint64_t> MemoryBus::writeMmioChecked(
+    const std::uint32_t address, const AccessSize size, const std::uint64_t value,
+    const AccessContext& context
+) {
+    const bool trap = trap_all_mmio_;
+    const bool reversible = reversible_ram_only_;
+    trap_all_mmio_ = false;
+    reversible_ram_only_ = false;
+    auto result = write(address, size, value, context, 0U);
+    trap_all_mmio_ = trap;
+    reversible_ram_only_ = reversible;
+    return result;
+}
+
 MemoryResult<std::uint64_t> MemoryBus::read64(
     const std::uint32_t address,
     const AccessContext context

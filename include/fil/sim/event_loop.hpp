@@ -236,6 +236,9 @@ public:
     /** @brief Gets one owner's local clock without changing scheduling context. */
     [[nodiscard]] SimTimeNs now(EventOwner owner) const;
 
+    /** @brief Installs a temporary read-only clock offset for the active domain. */
+    void setReadOffset(SimTimeNs offset);
+
     /** @brief Gets the number of live, non-cancelled events. */
     [[nodiscard]] std::size_t pending() const;
 

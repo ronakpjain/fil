@@ -578,6 +578,23 @@ public:
         return mutation_journal_capacity;
     }
 
+    /** @brief True when [address, address+size) lies wholly inside one MMIO region. */
+    [[nodiscard]] bool isMmioRange(std::uint32_t address, std::uint32_t size) const noexcept;
+
+    /**
+     * @brief Performs one checked MMIO access ignoring reversible-span traps.
+     *
+     * Only call when isMmioRange() is true. A committed native span calls this
+     * at the exact simulated time of the guest instruction, so the reversible
+     * and trap flags used to decline speculative RAM must not hide the access.
+     */
+    [[nodiscard]] MemoryResult<std::uint64_t> readMmioChecked(
+        std::uint32_t address, AccessSize size, const AccessContext& context
+    );
+    [[nodiscard]] MemoryResult<std::uint64_t> writeMmioChecked(
+        std::uint32_t address, AccessSize size, std::uint64_t value, const AccessContext& context
+    );
+
 private:
     std::uint64_t journal_generation_{1};
     std::uint64_t restoration_generation_{0};

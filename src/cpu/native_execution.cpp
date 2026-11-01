@@ -1,6 +1,62 @@
 #include "fil/cpu/native_execution.hpp"
 
 namespace fil::cpu {
+namespace {
+
+constexpr std::uint32_t mmioWidth(const mem::AccessSize size) noexcept {
+    switch (size) {
+    case mem::AccessSize::byte: return 1U;
+    case mem::AccessSize::halfword: return 2U;
+    default: return 4U;
+    }
+}
+
+// Committed-span MMIO fallback. Only reachable when the host installed a
+// bridge; speculative/certificate spans keep the strict reversible-RAM ABI.
+bool mmioRead(NativeExecutionContext* const context, const std::uint32_t instruction_pc,
+    const std::uint32_t address, const mem::AccessSize size,
+    std::uint32_t* const value_out) {
+    if (context->mmio_bridge == nullptr || context->mmio_bridge->begin == nullptr
+        || !context->memory_bus->isMmioRange(address, mmioWidth(size))) {
+        return false;
+    }
+    // The host advances/validates the exact guest time before the access.
+    if (!context->mmio_bridge->begin(
+            context->mmio_bridge->context, context->retired_cycles, instruction_pc)) {
+        return false;
+    }
+    const auto result = context->memory_bus->readMmioChecked(
+        address, size, {mem::AccessType::data_read, instruction_pc});
+    if (!result) return false;
+    *value_out = static_cast<std::uint32_t>(result.value());
+    if (context->mmio_bridge->must_stop != nullptr
+        && context->mmio_bridge->must_stop(context->mmio_bridge->context)) {
+        context->boundary_stop = true;
+    }
+    return true;
+}
+
+bool mmioWrite(NativeExecutionContext* const context, const std::uint32_t instruction_pc,
+    const std::uint32_t address, const mem::AccessSize size, const std::uint32_t value) {
+    if (context->mmio_bridge == nullptr || context->mmio_bridge->begin == nullptr
+        || !context->memory_bus->isMmioRange(address, mmioWidth(size))) {
+        return false;
+    }
+    if (!context->mmio_bridge->begin(
+            context->mmio_bridge->context, context->retired_cycles, instruction_pc)) {
+        return false;
+    }
+    const auto result = context->memory_bus->writeMmioChecked(
+        address, size, value, {mem::AccessType::data_write, instruction_pc});
+    if (!result) return false;
+    if (context->mmio_bridge->must_stop != nullptr
+        && context->mmio_bridge->must_stop(context->mmio_bridge->context)) {
+        context->boundary_stop = true;
+    }
+    return true;
+}
+
+} // namespace
 
 bool nativeAdmittedCyclePrefixValid(const NativeExecutionContext* const context) noexcept {
     if (context == nullptr || context->admitted_cycle_prefix == nullptr
@@ -22,8 +78,11 @@ bool nativeRead32(
     // tryFastRead32 publishes its output only after every guard succeeds.
     // Forward the destination so the JIT helper needs no temporary stack slot
     // (and can tail-call the checked bus access).
-    return context->memory_bus->tryFastRead32(
-        address, *value_out, {mem::AccessType::data_read, instruction_pc});
+    if (context->memory_bus->tryFastRead32(
+            address, *value_out, {mem::AccessType::data_read, instruction_pc})) {
+        return true;
+    }
+    return mmioRead(context, instruction_pc, address, mem::AccessSize::word, value_out);
 }
 
 bool nativeWrite32(
@@ -31,8 +90,11 @@ bool nativeWrite32(
     const std::uint32_t address, const std::uint32_t value
 ) noexcept {
     if (context == nullptr || context->memory_bus == nullptr) return false;
-    return context->memory_bus->tryFastWrite32(
-        address, value, {mem::AccessType::data_write, instruction_pc}, true);
+    if (context->memory_bus->tryFastWrite32(
+            address, value, {mem::AccessType::data_write, instruction_pc}, true)) {
+        return true;
+    }
+    return mmioWrite(context, instruction_pc, address, mem::AccessSize::word, value);
 }
 
 bool nativeRead8(
@@ -43,13 +105,13 @@ bool nativeRead8(
         return false;
     }
     std::uint64_t value = 0U;
-    if (!context->memory_bus->tryFastRead(
+    if (context->memory_bus->tryFastRead(
             address, mem::AccessSize::byte, value,
             {mem::AccessType::data_read, instruction_pc})) {
-        return false;
+        *value_out = static_cast<std::uint32_t>(value & 0xffU);
+        return true;
     }
-    *value_out = static_cast<std::uint32_t>(value & 0xffU);
-    return true;
+    return mmioRead(context, instruction_pc, address, mem::AccessSize::byte, value_out);
 }
 
 bool nativeWrite8(
@@ -57,9 +119,12 @@ bool nativeWrite8(
     const std::uint32_t address, const std::uint32_t value
 ) noexcept {
     if (context == nullptr || context->memory_bus == nullptr) return false;
-    return context->memory_bus->tryFastWrite(
-        address, mem::AccessSize::byte, value & 0xffU,
-        {mem::AccessType::data_write, instruction_pc}, true);
+    if (context->memory_bus->tryFastWrite(
+            address, mem::AccessSize::byte, value & 0xffU,
+            {mem::AccessType::data_write, instruction_pc}, true)) {
+        return true;
+    }
+    return mmioWrite(context, instruction_pc, address, mem::AccessSize::byte, value);
 }
 
 bool nativeRead16(
@@ -70,13 +135,13 @@ bool nativeRead16(
         return false;
     }
     std::uint64_t value = 0U;
-    if (!context->memory_bus->tryFastRead(
+    if (context->memory_bus->tryFastRead(
             address, mem::AccessSize::halfword, value,
             {mem::AccessType::data_read, instruction_pc})) {
-        return false;
+        *value_out = static_cast<std::uint32_t>(value & 0xffffU);
+        return true;
     }
-    *value_out = static_cast<std::uint32_t>(value & 0xffffU);
-    return true;
+    return mmioRead(context, instruction_pc, address, mem::AccessSize::halfword, value_out);
 }
 
 bool nativeWrite16(
@@ -84,9 +149,12 @@ bool nativeWrite16(
     const std::uint32_t address, const std::uint32_t value
 ) noexcept {
     if (context == nullptr || context->memory_bus == nullptr) return false;
-    return context->memory_bus->tryFastWrite(
-        address, mem::AccessSize::halfword, value & 0xffffU,
-        {mem::AccessType::data_write, instruction_pc}, true);
+    if (context->memory_bus->tryFastWrite(
+            address, mem::AccessSize::halfword, value & 0xffffU,
+            {mem::AccessType::data_write, instruction_pc}, true)) {
+        return true;
+    }
+    return mmioWrite(context, instruction_pc, address, mem::AccessSize::halfword, value);
 }
 
 } // namespace fil::cpu

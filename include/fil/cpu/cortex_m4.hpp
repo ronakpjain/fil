@@ -133,6 +133,21 @@ enum class StopReason : std::uint8_t {
 };
 
 /** @brief Register and instruction snapshot captured at an execution boundary. */
+/**
+ * @brief Host bridge that lets a committed native span execute MMIO exactly.
+ *
+ * `begin` advances the host clock to `prefix_cycles` past the span entry so
+ * devices observe the exact guest time, returning false when the access must be
+ * declined and handled by the checked path instead. `must_stop` reports, after
+ * the access, whether the span must retire and exit immediately. Both are null
+ * for speculative/certificate execution.
+ */
+struct NativeMmioBridge {
+    void* context{nullptr};
+    bool (*begin)(void* context, std::uint64_t prefix_cycles, std::uint32_t pc) noexcept{nullptr};
+    bool (*must_stop)(void* context) noexcept{nullptr};
+};
+
 struct DiagnosticSnapshot {
     std::uint32_t instruction_address{0};
     std::uint32_t next_pc{0};
@@ -480,6 +495,8 @@ public:
 
     /** Mixed native reversible execution can be disabled for differential validation. */
     void setNativeMemoryJitEnabled(bool enabled) noexcept { native_memory_jit_enabled_ = enabled; }
+    /** Installs the committed-span MMIO bridge used by native trace/block helpers. */
+    void setMmioBridge(const NativeMmioBridge* bridge) noexcept { mmio_bridge_ = bridge; }
     [[nodiscard]] std::uint64_t nativeMemoryInstructions() const noexcept {
         return jit_stats_.native_instructions;
     }
@@ -722,10 +739,12 @@ private:
     [[nodiscard]] bool prepareNativeTrace(NativeTraceCacheEntry& entry);
     [[nodiscard]] std::optional<FastStepResult> tryStepNativeTrace(
         std::size_t max_instructions, ReversibleCycleBudget& budget,
-        TimedJitStepOutcome* detailed);
+        TimedJitStepOutcome* detailed, bool committed_mmio = false);
     [[nodiscard]] std::optional<FastStepResult> executeNativeTrace(
         NativeTraceCacheEntry& entry, std::size_t max_instructions,
-        ReversibleCycleBudget& budget, TimedJitStepOutcome* detailed);
+        ReversibleCycleBudget& budget, TimedJitStepOutcome* detailed,
+        bool committed_mmio = false);
+    const NativeMmioBridge* mmio_bridge_{nullptr};
     JitStats jit_stats_{};
     bool native_memory_jit_enabled_{true};
     static constexpr std::uint16_t jit_compile_threshold = 50U;
@@ -753,11 +772,13 @@ private:
     // Share execution/timing logic, but omit reversible output in committed mode.
     template <bool Detailed>
     [[nodiscard]] auto executeTrustedReversibleJitBlockImpl(
-        std::size_t max_instructions, ReversibleCycleBudget* budget)
+        std::size_t max_instructions, ReversibleCycleBudget* budget,
+        bool committed_mmio = false)
         -> std::optional<std::conditional_t<Detailed, TimedJitStepOutcome, FastStepResult>>;
     template <bool Detailed>
     [[nodiscard]] auto tryStepBudgetedReversibleJitBlockImpl(
-        std::size_t max_instructions, ReversibleCycleBudget& budget, bool try_native_trace)
+        std::size_t max_instructions, ReversibleCycleBudget& budget, bool try_native_trace,
+        bool committed_mmio = false)
         -> std::optional<std::conditional_t<Detailed, TimedJitStepOutcome, FastStepResult>>;
     template <bool Detailed>
     [[nodiscard]] auto tryStepItScalarFallback(

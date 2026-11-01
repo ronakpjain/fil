@@ -1870,7 +1870,7 @@ bool CortexM4::prepareNativeTrace(NativeTraceCacheEntry& entry) {
 
 std::optional<FastStepResult> CortexM4::tryStepNativeTrace(
     const std::size_t max_instructions, ReversibleCycleBudget& budget,
-    TimedJitStepOutcome* const detailed) {
+    TimedJitStepOutcome* const detailed, const bool committed_mmio) {
     // A callback is arbitrary (and may change its answer on every call), so
     // it cannot safely participate in the snapshot-keyed charge cache.
     if (budget.fetch_stall != nullptr) return std::nullopt;
@@ -1889,12 +1889,13 @@ std::optional<FastStepResult> CortexM4::tryStepNativeTrace(
         ++entry.attempts;
         if (!prepareNativeTrace(entry)) return std::nullopt;
     }
-    return executeNativeTrace(entry, max_instructions, budget, detailed);
+    return executeNativeTrace(entry, max_instructions, budget, detailed, committed_mmio);
 }
 
 std::optional<FastStepResult> CortexM4::executeNativeTrace(
     NativeTraceCacheEntry& entry, const std::size_t max_instructions,
-    ReversibleCycleBudget& budget, TimedJitStepOutcome* const detailed) {
+    ReversibleCycleBudget& budget, TimedJitStepOutcome* const detailed,
+    const bool committed_mmio) {
     const auto& plan = *entry.plan;
     if (plan.generation != memory_.executionGeneration() || plan.ops.empty()
         || plan.ops.front().pc != state_.r[15]) return std::nullopt;
@@ -1978,6 +1979,7 @@ std::optional<FastStepResult> CortexM4::executeNativeTrace(
     context.admitted_cycle_prefix = charged_prefix;
     context.admitted_cycle_prefix_count = static_cast<std::uint32_t>(available + 1U);
     context.allow_dynamic_returns = true;
+    context.mmio_bridge = committed_mmio ? mmio_bridge_ : nullptr;
     plan.function(&context);
     if (context.retired_count > planned)
         throw std::logic_error("native trace exceeded its admitted prefix");
@@ -2062,7 +2064,7 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::tryStepBudgetedReversible
 template <bool Detailed>
 auto CortexM4::tryStepBudgetedReversibleJitBlockImpl(
     const std::size_t max_instructions, ReversibleCycleBudget& budget,
-    const bool try_native_trace)
+    const bool try_native_trace, const bool committed_mmio)
     -> std::optional<std::conditional_t<Detailed, TimedJitStepOutcome, FastStepResult>> {
     if (max_instructions == 0U || !memory_.reversibleRamOnly()
         || !memory_.allMmioTrapping()) return std::nullopt;
@@ -2078,7 +2080,7 @@ auto CortexM4::tryStepBudgetedReversibleJitBlockImpl(
         ++jit_stats_.block_prepare_failed;
         return tryStepItScalarFallback<Detailed>(&budget, Detailed);
     }
-    return executeTrustedReversibleJitBlockImpl<Detailed>(max_instructions, &budget);
+    return executeTrustedReversibleJitBlockImpl<Detailed>(max_instructions, &budget, committed_mmio);
 }
 
 std::optional<FastStepResult> CortexM4::tryStepCheckedSingle(
@@ -2124,9 +2126,9 @@ std::optional<FastStepResult> CortexM4::tryStepCommittedRamSpan(
         return std::nullopt;
     }
     if (!inItBlock(state_.it_state) && native_memory_jit_enabled_) {
-        if (auto trace = tryStepNativeTrace(max_instructions, budget, nullptr)) return trace;
+        if (auto trace = tryStepNativeTrace(max_instructions, budget, nullptr, true)) return trace;
     }
-    return tryStepBudgetedReversibleJitBlockImpl<false>(max_instructions, budget, false);
+    return tryStepBudgetedReversibleJitBlockImpl<false>(max_instructions, budget, false, true);
 }
 
 template <bool Detailed>
@@ -2221,7 +2223,8 @@ std::optional<CortexM4::TimedJitStepOutcome> CortexM4::executeTrustedReversibleJ
 
 template <bool Detailed>
 auto CortexM4::executeTrustedReversibleJitBlockImpl(
-    const std::size_t max_instructions, ReversibleCycleBudget* budget)
+    const std::size_t max_instructions, ReversibleCycleBudget* budget,
+    const bool committed_mmio)
     -> std::optional<std::conditional_t<Detailed, TimedJitStepOutcome, FastStepResult>> {
     const std::uint32_t entry_pc = state_.r[15];
     auto& slot = (*jit_blocks_)[jitBlockIndex(entry_pc)];
@@ -2285,6 +2288,7 @@ auto CortexM4::executeTrustedReversibleJitBlockImpl(
             context.cycle_limit = budget->remaining_cycles;
             context.charged_cycles = charges.data();
             context.charged_cycles_count = planned;
+            context.mmio_bridge = committed_mmio ? mmio_bridge_ : nullptr;
             slot.native_function(&context);
             if (context.retired_count > planned) {
                 // Native stores may already have committed: never pretend this

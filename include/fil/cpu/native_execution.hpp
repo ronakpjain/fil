@@ -61,6 +61,10 @@ struct NativeExecutionContext {
     std::uint32_t admitted_cycle_mode{0};
     /** Trace-only opt-in: retire a valid alternative POP PC and exit immediately. */
     bool allow_dynamic_returns{false};
+    /** Committed-span MMIO bridge; null keeps strict reversible-RAM semantics. */
+    const NativeMmioBridge* mmio_bridge{nullptr};
+    /** Set by an MMIO helper when the kernel must retire and stop after the op. */
+    bool boundary_stop{false};
 };
 
 /** @brief Validate aggregate cycle admission without observing deferred progress. */

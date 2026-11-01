@@ -907,6 +907,37 @@ TEST(MemoryBusTest, WordReadFastPathPreservesBoundsPermissionsAndUpdatedBacking)
     EXPECT_EQ(value, 0x11223344U);
 }
 
+TEST(MemoryBusTest, CheckedMmioAccessBypassesReversibleSpanTraps) {
+    using namespace fil::mem;
+    for (const bool reversible : {false, true}) {
+        MemoryBus bus;
+        RecordingMmio device;
+        ASSERT_TRUE(bus.mapRam(0x20000000U, 16U, "data"));
+        ASSERT_TRUE(bus.mapMmio(0x40000000U, 16U, device, "device"));
+        bus.setAllMmioTrapping(true);
+        bus.setReversibleRamOnly(reversible);
+
+        EXPECT_TRUE(bus.isMmioRange(0x40000000U, 4U));
+        EXPECT_TRUE(bus.isMmioRange(0x40000004U, 2U));
+        EXPECT_FALSE(bus.isMmioRange(0x20000000U, 4U));
+        EXPECT_FALSE(bus.isMmioRange(0x4000000eU, 4U)); // crosses the region end
+        EXPECT_FALSE(bus.isMmioRange(0x40000000U, 0U));
+
+        const AccessContext context{AccessType::data_read, 0x08001000U};
+        const auto read = bus.readMmioChecked(0x40000000U, AccessSize::word, context);
+        ASSERT_TRUE(read.hasValue());
+        EXPECT_EQ(device.read_count, 1U);
+        const auto write = bus.writeMmioChecked(
+            0x40000000U, AccessSize::word, 0x11223344U, {AccessType::data_write, 0x08001010U});
+        ASSERT_TRUE(write.hasValue());
+        EXPECT_EQ(device.write_count, 1U);
+
+        // The reversible-span restrictions are restored after the checked access.
+        EXPECT_TRUE(bus.allMmioTrapping());
+        EXPECT_EQ(bus.reversibleRamOnly(), reversible);
+    }
+}
+
 TEST(MemoryBusTest, JournalRingRetainsExactCapacityAndRefillsRolledBackSuffix) {
     using namespace fil::mem;
     MemoryBus bus;

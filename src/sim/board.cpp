@@ -250,7 +250,9 @@ Result<void> Board::reset() {
 }
 
 SimTimeNs Board::accountCycles(const std::uint64_t cycles) {
-    system_->advanceCycles(cycles);
+    const std::uint64_t applied = std::min(system_credit_applied_, cycles);
+    system_credit_applied_ -= applied;
+    system_->advanceCycles(cycles - applied);
     // Cached-clock fast path: the RCC value changes only on firmware clock
     // writes, so the common case is one inline load plus one compare.
     // Small cycle counts convert divide-free via the remainder table
@@ -2216,6 +2218,51 @@ std::optional<Board::ConcurrentStepResult> Board::stepMemoizedLocal(
     return materializeReversibleRamPrefix(*local_prefix_, local_prefix_->count);
 }
 
+bool Board::nativeMmioBegin(
+    void* const context, const std::uint64_t prefix_cycles, const std::uint32_t) noexcept {
+    auto& self = *static_cast<Board*>(context);
+    if (self.blockBoundaryPending()) return false;
+    const std::uint64_t absolute = self.span_prior_cycles_ + prefix_cycles;
+    const std::uint64_t already = self.span_bridge_cycles_;
+    if (absolute > already) {
+        const std::uint64_t delta = absolute - already;
+        // Advance SystemControl (SysTick/DWT) exactly like the checked path so
+        // time-dependent register reads are correct. advanceCycles is
+        // chunk-independent and the span credit keeps SysTick from firing here.
+        self.system_->advanceCycles(delta);
+        self.system_credit_applied_ += delta;
+        self.span_bridge_cycles_ = absolute;
+    }
+    // Read-only offset: devices read the exact guest time; the dispatch clock
+    // advances only at the span boundary, preserving interrupt/SysTick phase.
+    try {
+        self.event_loop_->setReadOffset(self.elapsedForCycles(absolute));
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+bool Board::nativeMmioMustStop(void* const context) noexcept {
+    auto& self = *static_cast<Board*>(context);
+    if (self.blockBoundaryPending()) {
+        self.mmio_boundary_stop_ = true;
+        return true;
+    }
+    if (self.span_horizon_ns_ == 0U) return false;
+    try {
+        const auto next = self.event_loop_->nextScheduledTime(self.event_loop_->activeOwner());
+        if (next.has_value() && *next <= self.span_horizon_ns_) {
+            self.mmio_boundary_stop_ = true;
+            return true;
+        }
+    } catch (...) {
+        self.mmio_boundary_stop_ = true;
+        return true;
+    }
+    return false;
+}
+
 std::optional<cpu::FastStepResult> Board::stepCommittedLocal(
     const std::size_t max_instructions, const std::optional<SimTimeNs> deadline) {
     if (max_instructions < 2U || blockBoundaryPending()) {
@@ -2267,6 +2314,14 @@ std::optional<cpu::FastStepResult> Board::stepCommittedLocal(
         cached_fetch_timing_valid_ = true;
     }
     budget.fetch_timing = cached_fetch_timing_;
+    // Committed spans may execute MMIO inline through this bridge. Speculative
+    // certificate paths pass committed_mmio=false and never see it.
+    mmio_bridge_ = cpu::NativeMmioBridge{this, &Board::nativeMmioBegin, &Board::nativeMmioMustStop};
+    cpu_->setMmioBridge(&mmio_bridge_);
+    span_horizon_ns_ = horizon ? *horizon : 0U;
+    span_prior_cycles_ = 0U;
+    span_bridge_cycles_ = 0U;
+    mmio_boundary_stop_ = false;
     // Re-derives the cycle credit still available to this span. A checked single
     // step may commit MMIO, which can schedule or cancel device events or
     // reprogram SysTick, so the bound is recomputed from the current clock with
@@ -2326,15 +2381,25 @@ std::optional<cpu::FastStepResult> Board::stepCommittedLocal(
             // speculative span; the checked step below runs outside them so its
             // MMIO effects commit once, exactly as the scheduler fallback did.
             ReversibleMemoryGuard guard(memory_);
+            // The bridge installs a thread-local read offset; always clear it,
+            // even if span execution throws.
+            struct ReadOffsetGuard {
+                EventLoop* loop;
+                ~ReadOffsetGuard() { loop->setReadOffset(0); }
+            } offset_guard{event_loop_};
             const auto before_credit = budget.remaining_cycles;
+            span_prior_cycles_ = consumed_cycles;
             executed = cpu_->tryStepCommittedRamSpan(request, budget);
             consumed_cycles += before_credit - budget.remaining_cycles;
         }
+        // An inline MMIO may have advanced part of the span's clock already.
+        if (span_accounted_cycles_ > accounted_cycles) accounted_cycles = span_accounted_cycles_;
         if (executed && executed->instructions != 0U) {
             instructions += executed->instructions;
             suppress_loop_observation |= executed->suppress_loop_observation;
             result = *executed;
-            if (result.reason != cpu::StopReason::step_complete || blockBoundaryPending()) break;
+            if (result.reason != cpu::StopReason::step_complete || blockBoundaryPending()
+                || mmio_boundary_stop_) break;
             continue;
         }
         // A declined span retires one checked instruction so a single declined

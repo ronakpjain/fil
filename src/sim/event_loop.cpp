@@ -15,6 +15,12 @@
 #include <vector>
 
 namespace fil::sim {
+namespace {
+// Temporary read-only clock offset for the calling thread. Only the board
+// thread that installed it reads now() during a native committed span.
+thread_local SimTimeNs g_read_offset = 0;
+} // namespace
+
 struct EventLoop::Impl {
     /**
      * @brief Callback storage for one scheduled event.
@@ -183,14 +189,14 @@ struct EventLoop::Impl {
     }
 
     [[nodiscard]] SimTimeNs timeFor(const EventOwner owner) const noexcept {
-        if (owner == shared_event_owner) return shared_now;
+        if (owner == shared_event_owner) return shared_now + g_read_offset;
         if (owner < dense_owner_count) {
             const auto& local_time = dense_owner_now[owner];
-            if (!local_time) return shared_now;
-            return std::max(*local_time, shared_now);
+            if (!local_time) return shared_now + g_read_offset;
+            return std::max(*local_time, shared_now) + g_read_offset;
         }
         const auto found = owner_now.find(owner);
-        if (found == owner_now.end()) return shared_now;
+        if (found == owner_now.end()) return shared_now + g_read_offset;
         // Owner clocks never read behind the shared clock: runDueEvents used
         // to force every owner forward on each call, which cost a map walk
         // per scheduler frontier. Clamping here returns the same value that
@@ -198,7 +204,7 @@ struct EventLoop::Impl {
         // a rewind and the next frontier advance without passing through a
         // runDueEvents that re-syncs first), while frontiers with no owner
         // activity skip the walk entirely.
-        return std::max(found->second, shared_now);
+        return std::max(found->second, shared_now) + g_read_offset;
     }
 
     void setTime(const EventOwner owner, const SimTimeNs time) {
@@ -1208,6 +1214,10 @@ SimTimeNs EventLoop::now(const EventOwner owner) const {
     }
     Impl::Lock lock(*state);
     return state->timeFor(owner);
+}
+
+void EventLoop::setReadOffset(const SimTimeNs offset) {
+    g_read_offset = offset;
 }
 
 std::size_t EventLoop::pending() const {

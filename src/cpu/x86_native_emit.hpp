@@ -181,6 +181,14 @@ public:
         mem(7U, base & 7U, disp);
         u8(imm);
     }
+    // Exact one-byte compare. cmpMImm8 encodes a 32-bit operand, which would
+    // read the padding after a bool flag and could observe uninitialized bytes.
+    void cmpM8Imm8(std::uint32_t base, std::uint32_t disp, std::uint8_t imm) {
+        if ((base & 8U) != 0U) u8(0x41U);
+        u8(0x80U);
+        mem(7U, base & 7U, disp);
+        u8(imm);
+    }
     void cmpR32Imm(std::uint32_t r, std::uint32_t imm) { aluRImm(7U, r, imm); }
     void cmpR64Imm8(std::uint32_t r, std::uint8_t imm) {
         u8(rex(true, false, (r & 8U) != 0U));

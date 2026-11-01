@@ -329,6 +329,24 @@ private:
     // Cycles a committed span already applied to the board clock so a checked
     // single step could observe exact time; the caller advances only the rest.
     std::uint64_t span_accounted_cycles_{0U};
+    // Committed-span MMIO bridge: advances the real clock to each MMIO
+    // instruction's exact time before the access, and reports when the span
+    // must stop. Speculative paths never receive this bridge pointer.
+    cpu::NativeMmioBridge mmio_bridge_{};
+    // Cycles retired in earlier spans of the current stepCommittedLocal call.
+    // Each native span counts cycles from its own entry, so the absolute
+    // progress is span_prior_cycles_ + the kernel's published prefix.
+    std::uint64_t span_prior_cycles_{0};
+    // SystemControl cycles already advanced mid-span by the MMIO bridge, so the
+    // boundary advance applies only the remainder without changing SysTick phase.
+    std::uint64_t system_credit_applied_{0};
+    // Highest bridge prefix already processed (offset + SystemControl) this span set.
+    std::uint64_t span_bridge_cycles_{0};
+    SimTimeNs span_horizon_ns_{0};
+    bool mmio_boundary_stop_{false};
+    static bool nativeMmioBegin(
+        void* context, std::uint64_t prefix_cycles, std::uint32_t pc) noexcept;
+    static bool nativeMmioMustStop(void* context) noexcept;
 
     [[nodiscard]] static bool appendReversibleChunk(
         ReversibleRamPrefix::ReversibleExecution& aggregate,

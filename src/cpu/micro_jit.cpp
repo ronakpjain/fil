@@ -1349,6 +1349,7 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
     constexpr auto kReason = ctx_off(offsetof(NativeExecutionContext, exit_reason));
     constexpr auto kChargedCount = ctx_off(offsetof(NativeExecutionContext, charged_cycles_count));
     constexpr auto kAdmittedMode = ctx_off(offsetof(NativeExecutionContext, admitted_cycle_mode));
+    constexpr auto kBoundaryStop = ctx_off(offsetof(NativeExecutionContext, boundary_stop));
     X86Emitter e;
     const auto instruction_exit = e.makeLabel();
     const auto cycle_exit = e.makeLabel();
@@ -1390,6 +1391,10 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
         e.movR32M(kScratch, kCtx, kRetired);
         e.aluRM(7U, kScratch, kCtx, kLimit);
         e.jcc(3U, instruction_exit); // retired >= limit
+        // A committed-span MMIO that must stop exits here before running the
+        // next op, so the retired prefix already includes that instruction.
+        e.cmpM8Imm8(kCtx, kBoundaryStop, 0U);
+        e.jcc(5U, instruction_exit);
         e.movR32M(kScratch, kCtx, kChargedCount);
         e.cmpR32Imm(kScratch, static_cast<std::uint32_t>(i + 1U));
         e.jcc(2U, unsupported_exit);
@@ -1438,6 +1443,15 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
             const bool mem_load = nativeOpIsLoad(op.kind);
             const std::uint32_t mem_width = nativeOpWidth(op.kind);
             if (!mem_load) loadGuest(e, kValue, cpu_offsets, op.rd);
+            // A committed span's MMIO helper needs the exact prefix cycle count.
+            // Checked mode already accumulated it; admitted mode reads the
+            // certified cumulative table at this op index.
+            const auto skip_prefix_store = e.makeLabel();
+            e.movR32M(kScratch, kCtx, kAdmittedMode);
+            e.testRR(kScratch, kScratch); e.jcc(4U, skip_prefix_store);
+            e.movR32M(kScratch, kCosts, static_cast<std::uint32_t>(i * sizeof(std::uint32_t)));
+            e.movM64R(kCtx, kCycles, kScratch);
+            e.bindLabel(skip_prefix_store);
             // Preserve guest NZCV/retained xPSR across the C ABI helper.
             e.movRR(3U, kNzcv); e.movRR(15U, kRetain);
             e.movRR64(7U, kCtx); // RDI = helper context
@@ -1604,6 +1618,7 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     const auto reason = off(offsetof(NativeExecutionContext, exit_reason));
     const auto charged_count = off(offsetof(NativeExecutionContext, charged_cycles_count));
     const auto kAdmittedMode = off(offsetof(NativeExecutionContext, admitted_cycle_mode));
+    const auto boundary_stop_off = off(offsetof(NativeExecutionContext, boundary_stop));
     X86Emitter e;
     e.nzcv = kNzcv;
     const auto done = e.makeLabel(), early = e.makeLabel();
@@ -1653,6 +1668,10 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
             const auto& inst = op.native.integer;
             e.movR32M(kEax, ctx, limit); e.cmpR32Imm(kEax, static_cast<std::uint32_t>(i));
             e.jcc(6U, exits[i].instruction); // i >= instruction_limit before all other admissions
+            // Stop before the next op after a committed-span MMIO, so the
+            // retired prefix already includes the MMIO instruction.
+            e.cmpM8Imm8(ctx, boundary_stop_off, 0U);
+            e.jcc(5U, exits[i].instruction);
             if (!admitted_kernel) {
                 e.movR32M(kEax, ctx, charged_count);
                 e.cmpR32Imm(kEax, static_cast<std::uint32_t>(i + 1U));
@@ -1727,6 +1746,15 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
                 const bool t_load = nativeOpIsLoad(m.kind);
                 const std::uint32_t t_width = nativeOpWidth(m.kind);
                 if (!t_load) loadGuest(e,valuereg,offsets,m.rd);
+                // Publish the exact prefix cycle count for a committed-span MMIO
+                // helper: checked mode already accumulated RBP; admitted mode
+                // reads the certified cumulative table at this op index.
+                if (admitted_kernel) {
+                    e.movR32M(kEax, costs, static_cast<std::uint32_t>(i * sizeof(std::uint32_t)));
+                    e.movM64R(ctx, cycle_count, kEax);
+                } else {
+                    e.movM64R(ctx, cycle_count, 5U);
+                }
                 e.movRR64(7U,ctx); e.movR32Imm(6U,op.pc); e.movRR(kEdx,addrreg);
                 if (t_load) e.leaR64(1U,4U,0U);
                 const auto helper = t_width == 1U
@@ -1756,7 +1784,8 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
         }
         e.jmp(normal);
     }
-    const auto publish = [&](std::size_t i, NativeExitReason why, bool failed) {
+    const auto publish = [&](std::size_t i, NativeExitReason why, bool failed,
+                             std::size_t current_override = static_cast<std::size_t>(-1)) {
         e.movM32Imm(ctx,retired,static_cast<std::uint32_t>(i));
         const auto publish_checked_cycles = e.makeLabel(), cycles_published = e.makeLabel();
         e.movR32M(kEax, ctx, kAdmittedMode);
@@ -1766,7 +1795,9 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
         e.bindLabel(publish_checked_cycles); e.movM64R(ctx,cycle_count,5U);
         e.bindLabel(cycles_published);
         const bool dynamic_return = why == NativeExitReason::dynamic_return;
-        e.movM32Imm(ctx,current,entry.plan.ops[dynamic_return ? i - 1U : i].pc);
+        const std::size_t current_op = current_override != static_cast<std::size_t>(-1)
+            ? current_override : (dynamic_return ? i - 1U : i);
+        e.movM32Imm(ctx,current,entry.plan.ops[current_op].pc);
         if (failed) e.movM32Imm(ctx,failing,entry.plan.ops[i].pc);
         if (i != 0U) {
             const auto& prev=entry.plan.ops[i-1U];
