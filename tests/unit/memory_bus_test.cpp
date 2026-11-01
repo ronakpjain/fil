@@ -871,7 +871,7 @@ TEST(MemoryBusTest, ReversibleRamOnlyRejectsNonRamStoresBeforeMutation) {
         << "disabling restriction restores ordinary writable-flash semantics";
 }
 
-TEST(MemoryBusTest, WordReadCachePreservesBoundsPermissionsAndUpdatedBacking) {
+TEST(MemoryBusTest, WordReadFastPathPreservesBoundsPermissionsAndUpdatedBacking) {
     using namespace fil::mem;
     MemoryBus bus;
     ASSERT_TRUE(bus.mapRam(0x20000000U, 8U, "data"));
