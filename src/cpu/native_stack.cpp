@@ -47,19 +47,20 @@ NativeStackResult nativeStackTransfer(NativeExecutionContext* c, std::uint32_t p
     // successful pop a 32-byte copy even though the snapshot is discarded on
     // success, so it is only taken for pops that load the PC.
     std::optional<mem::MemoryBus::ReadFootprint> footprint;
-    if (loads_pc) footprint = c->memory_bus->readFootprint();
+    if (loads_pc && c->memory_bus->readFootprintTracking())
+        footprint = c->memory_bus->readFootprint();
     std::array<std::uint32_t, 16> values;
     if (!c->memory_bus->tryFastReadWords(start, count, values.data(), {mem::AccessType::data_read, pc}))
         return NativeStackResult::memory_declined;
     if (loads_pc) {
         target = values[pc_slot];
         if ((target & 0xfffffff0U) == 0xfffffff0U || (target & 1U) == 0U) {
-            c->memory_bus->restoreReadFootprint(*footprint);
+            if (footprint) c->memory_bus->restoreReadFootprint(*footprint);
             return NativeStackResult::memory_declined;
         }
         alternate_return = (target & ~1U) != expected_pc;
         if (alternate_return && !c->allow_dynamic_returns) {
-            c->memory_bus->restoreReadFootprint(*footprint);
+            if (footprint) c->memory_bus->restoreReadFootprint(*footprint);
             return NativeStackResult::branch_mismatch;
         }
     }

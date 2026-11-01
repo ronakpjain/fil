@@ -2207,6 +2207,9 @@ std::optional<Board::ConcurrentStepResult> Board::stepMemoizedLocal(
     auto horizon = saturatingAdd(event_loop_->now(),
         elapsedForCycles(std::numeric_limits<std::uint16_t>::max()));
     if (deadline) horizon = std::min(horizon, *deadline);
+    // Only discovery/materialization needs read dependencies. Owner-local
+    // execution outside this scope is committed, not a speculative prefix.
+    mem::MemoryBus::TrackingScope tracking(memory_, true, true);
     const bool prepared = prepareReversibleRamPrefix(
         *local_prefix_, max_instructions, horizon, false, true, !discovery);
     if (prepared && local_prefix_->memoized_count != 0U) {

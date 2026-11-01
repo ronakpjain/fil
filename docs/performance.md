@@ -58,6 +58,16 @@ checked fallback subtracts the already-accounted prefix from both the clock offs
 and SysTick/DWT advance, and normalized trace timing includes its entry-fetch bias
 when invoking the MMIO bridge. Speculative certificate execution has no bridge.
 
+### Owner-local read dependency tracking
+
+Independent owner lanes keep write journaling enabled throughout execution, but
+collect read footprints only while discovering and materializing reusable
+certificates. Committed instructions and owner-event callbacks need no speculative
+read dependencies. The discovery scope enables tracking and unwinds it on every
+return/exception; the outer run restores the caller's tracking modes. Certificate
+input validation still rejects changed RAM. POP PC also avoids a read-footprint
+snapshot when tracking is disabled, retaining atomic declines in both modes.
+
 ### Word-store journal bookkeeping
 
 Little-endian backed word stores compute a changed-byte mask from one word load.

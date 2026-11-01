@@ -874,6 +874,31 @@ TEST(WorldTimeTest, ExactSchedulerRestoresMemoryTrackingWhenCallbacksThrow) {
     EXPECT_EQ(memory.read32(0x20000000U).value(), 123U);
 }
 
+TEST(WorldTimeTest, IndependentSchedulerRestoresTrackingWhenCallbacksThrow) {
+    for (const bool previous_tracking : {false, true}) {
+        TempWorldTimeConfigs files;
+        auto world = fil::sim::World::load(files.network({files.writeBoard("alpha.json", "alpha")}));
+        ASSERT_TRUE(world);
+        ASSERT_TRUE(installIdleLoop(*world.value(), "alpha", 2U));
+        auto& memory = world.value()->board("alpha")->memory();
+        memory.setReadFootprintTracking(previous_tracking);
+        memory.setWriteJournalTracking(false);
+        {
+            auto owner = world.value()->eventLoop().useOwner(0U);
+            static_cast<void>(world.value()->eventLoop().scheduleAt(1U, [&memory] {
+                EXPECT_FALSE(memory.readFootprintTracking());
+                EXPECT_TRUE(memory.writeJournalTracking());
+                throw std::runtime_error("owner callback failure");
+            }));
+        }
+        auto options = runOptions(1'000U);
+        options.cross_board_window_ns = 100'000U;
+        EXPECT_THROW(static_cast<void>(world.value()->run(options)), std::runtime_error);
+        EXPECT_EQ(memory.readFootprintTracking(), previous_tracking);
+        EXPECT_FALSE(memory.writeJournalTracking());
+    }
+}
+
 TEST(WorldTimeTest, CompactExactSchedulerMatchesGeneralWithEventsAndZeroTimeSteps) {
     TempWorldTimeConfigs files;
     const auto config = files.network({
@@ -1256,6 +1281,50 @@ TEST(WorldTimeTest, OwnerRamRunnerMatchesCheckedMmioAndInterruptsAfterWarmup) {
                 }
             }
         }
+    }
+}
+
+TEST(WorldTimeTest, IndependentDiscoveryTracksReadsButCommittedEventsDoNot) {
+    for (const bool previous_tracking : {false, true}) {
+        TempWorldTimeConfigs files;
+        auto world = fil::sim::World::load(files.network({files.writeBoard("alpha.json", "alpha")}));
+        ASSERT_TRUE(world);
+        ASSERT_TRUE(configureZeroWaitFixture(*world.value()));
+        auto& board = *world.value()->board("alpha");
+        auto& memory = board.memory();
+        const auto start = board.cpu().state().r[15];
+        const std::vector<std::uint8_t> code{
+            0x08U, 0x68U, // ldr r0, [r1]
+            0x00U, 0x28U, // cmp r0, #0
+            0xfcU, 0xe7U, // b start
+        };
+        ASSERT_TRUE(memory.loadBytes(start, code));
+        ASSERT_TRUE(memory.write32(0x20000040U, 0U));
+        board.cpu().state().r[1] = 0x20000040U;
+        memory.setReadFootprintTracking(previous_tracking);
+        world.value()->setDiagnosticsEnabled(false);
+        bool observed = false;
+        {
+            auto owner = world.value()->eventLoop().useOwner(0U);
+            static_cast<void>(world.value()->eventLoop().scheduleAt(5'000'000U, [&] {
+                observed = true;
+                EXPECT_FALSE(memory.readFootprintTracking());
+                EXPECT_TRUE(memory.writeJournalTracking());
+                // A previously discovered constant loop must reject its cached
+                // dependency after this real external write.
+                EXPECT_TRUE(memory.write32(0x20000040U, 5U));
+            }));
+        }
+        auto options = runOptions(20'000'000U);
+        options.max_instructions_per_board = 1'000'000U;
+        options.cross_board_window_ns = 100'000U;
+        const auto result = world.value()->run(options);
+        ASSERT_TRUE(result);
+        EXPECT_TRUE(observed);
+        EXPECT_EQ(board.cpu().state().r[0], 5U);
+        EXPECT_GT(result.value().memoized_prefixes, 0U);
+        EXPECT_EQ(memory.readFootprintTracking(), previous_tracking);
+        EXPECT_TRUE(memory.writeJournalTracking());
     }
 }
 
