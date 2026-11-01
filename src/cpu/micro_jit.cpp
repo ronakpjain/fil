@@ -887,6 +887,13 @@ namespace {
         if (stack_op) {
             const auto result = nativeStackTransfer(ctx, op.pc, op.decoded.register_list,
                 op.decoded.kind == InstrKind::push ? 1U : 0U, op.expected_next_pc);
+            if (result == NativeStackResult::dynamic_return) {
+                state.instruction_address = op.pc;
+                if (!admitted) ctx->retired_cycles += cycles;
+                ++ctx->retired_count;
+                ctx->exit_reason = NativeExitReason::dynamic_return;
+                break;
+            }
             if (result != NativeStackResult::success) {
                 ctx->failing_instruction_pc = op.pc;
                 ctx->exit_reason = result == NativeStackResult::branch_mismatch
@@ -1572,10 +1579,10 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     e.aluRImm(4U, kRetain, ~(kFlagN | kFlagZ | kFlagC | kFlagV));
     e.aluRImm(4U, kNzcv, kFlagN | kFlagZ | kFlagC | kFlagV);
     const std::size_t n = entry.plan.ops.size();
-    struct ExitLabels { std::size_t instruction, cycle, unsupported, mismatch, helper; };
+    struct ExitLabels { std::size_t instruction, cycle, unsupported, mismatch, helper, dynamic_return; };
     std::vector<ExitLabels> exits; exits.reserve(n);
     for (std::size_t i=0; i<n; ++i)
-        exits.push_back({e.makeLabel(),e.makeLabel(),e.makeLabel(),e.makeLabel(),e.makeLabel()});
+        exits.push_back({e.makeLabel(),e.makeLabel(),e.makeLabel(),e.makeLabel(),e.makeLabel(),e.makeLabel()});
     const auto normal = e.makeLabel();
     const auto checked_kernel = e.makeLabel();
     e.movR32M(kEax, ctx, kAdmittedMode);
@@ -1638,6 +1645,10 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
                 e.movR32Imm(8U, op.expected_next_pc);
                 e.movR64Imm(kEax, reinterpret_cast<std::uintptr_t>(&nativeStackTransfer)); e.callReg(kEax);
                 e.movR32M(kNzcv, 4U, 0U); e.movR32M(kRetain, 4U, 4U); e.movRR64(7U, cpu);
+                if (op.decoded.kind == InstrKind::pop && (op.decoded.register_list & 0x8000U)) {
+                    e.cmpR32Imm(kEax, static_cast<std::uint32_t>(NativeStackResult::dynamic_return));
+                    e.jcc(4U, exits[i].dynamic_return);
+                }
                 e.cmpR32Imm(kEax, static_cast<std::uint32_t>(NativeStackResult::branch_mismatch));
                 e.jcc(4U, exits[i].mismatch);
                 e.testRR(kEax, kEax); e.jcc(5U, exits[i].helper);
@@ -1699,12 +1710,14 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
         e.movM64R(ctx, cycle_count, kEax); e.jmp(cycles_published);
         e.bindLabel(publish_checked_cycles); e.movM64R(ctx,cycle_count,5U);
         e.bindLabel(cycles_published);
-        e.movM32Imm(ctx,current,entry.plan.ops[i].pc);
+        const bool dynamic_return = why == NativeExitReason::dynamic_return;
+        e.movM32Imm(ctx,current,entry.plan.ops[dynamic_return ? i - 1U : i].pc);
         if (failed) e.movM32Imm(ctx,failing,entry.plan.ops[i].pc);
         if (i != 0U) {
             const auto& prev=entry.plan.ops[i-1U];
             e.movRR(kEax,kRetain); e.aluRR(1U,kEax,kNzcv); e.movM32R(kState,offsets.xpsr,kEax);
-            e.movM32Imm(kState,offsets.r+60U,prev.expected_next_pc); e.movM32Imm(kState,offsets.addr,prev.pc);
+            if (!dynamic_return) e.movM32Imm(kState,offsets.r+60U,prev.expected_next_pc);
+            e.movM32Imm(kState,offsets.addr,prev.pc);
         }
         e.movM32Imm(ctx,reason,static_cast<std::uint32_t>(why)); e.jmp(done);
     };
@@ -1714,6 +1727,17 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
         e.bindLabel(exits[i].unsupported); publish(i,NativeExitReason::unsupported_instruction,true);
         e.bindLabel(exits[i].mismatch); publish(i,NativeExitReason::branch_mismatch,true);
         e.bindLabel(exits[i].helper); publish(i,NativeExitReason::helper_declined,true);
+        e.bindLabel(exits[i].dynamic_return);
+        if (entry.plan.ops[i].decoded.kind == InstrKind::pop
+            && (entry.plan.ops[i].decoded.register_list & 0x8000U)) {
+            const auto dynamic_admitted = e.makeLabel();
+            e.movR32M(kEax, ctx, kAdmittedMode);
+            e.testRR(kEax, kEax); e.jcc(5U, dynamic_admitted);
+            e.movR32M(kEax, costs, static_cast<std::uint32_t>(i * sizeof(std::uint32_t)));
+            e.addR64R64(5U, kEax);
+            e.bindLabel(dynamic_admitted);
+            publish(i + 1U, NativeExitReason::dynamic_return, false);
+        }
     }
     e.bindLabel(normal);
     e.movM32Imm(ctx,retired,static_cast<std::uint32_t>(n));

@@ -39,6 +39,7 @@ NativeStackResult nativeStackTransfer(NativeExecutionContext* c, std::uint32_t p
     // slot is the final transferred word. Resolving it arithmetically keeps
     // the pop path to a single walk over the mask.
     std::uint32_t target = 0;
+    bool alternate_return = false;
     std::uint32_t pc_slot = 0U;
     if (loads_pc) {
         pc_slot = count - 1U;
@@ -58,7 +59,8 @@ NativeStackResult nativeStackTransfer(NativeExecutionContext* c, std::uint32_t p
             c->memory_bus->restoreReadFootprint(*footprint);
             return NativeStackResult::memory_declined;
         }
-        if ((target & ~1U) != expected_pc) {
+        alternate_return = (target & ~1U) != expected_pc;
+        if (alternate_return && !c->allow_dynamic_returns) {
             c->memory_bus->restoreReadFootprint(*footprint);
             return NativeStackResult::branch_mismatch;
         }
@@ -70,7 +72,7 @@ NativeStackResult nativeStackTransfer(NativeExecutionContext* c, std::uint32_t p
         ++n;
     }
     s.writeRegister(13U, old_sp + static_cast<std::uint32_t>(bytes));
-    if (loads_pc) s.r[15] = expected_pc;
-    return NativeStackResult::success;
+    if (loads_pc) s.r[15] = target & ~1U;
+    return alternate_return ? NativeStackResult::dynamic_return : NativeStackResult::success;
 }
 }

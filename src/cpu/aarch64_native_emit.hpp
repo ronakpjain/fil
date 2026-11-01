@@ -93,6 +93,7 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
         const auto instruction_exit = e.makeLabel(), cycle_exit = e.makeLabel();
         const auto unsupported_exit = e.makeLabel(), helper_exit = e.makeLabel();
         const auto mismatch_exit = e.makeLabel(), next = e.makeLabel();
+        const auto dynamic_return_exit = e.makeLabel();
         e.storeImm(ctx, offsetof(NativeExecutionContext, current_instruction_pc), m.pc);
         e.load(9U, ctx, offsetof(NativeExecutionContext, instruction_limit));
         e.cmpImm(9U, static_cast<std::uint32_t>(i + 1U)); e.cond(3U, instruction_exit); // lo
@@ -160,6 +161,10 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
             e.movImm(2U, op.register_list); e.movImm(3U, op.push ? 1U : 0U);
             e.movImm(4U, op.next_pc);
             e.call(reinterpret_cast<std::uintptr_t>(&nativeStackTransfer));
+            if (!op.push && (op.register_list & 0x8000U)) {
+                e.cmpImm(0U, static_cast<std::uint32_t>(NativeStackResult::dynamic_return));
+                e.cond(0U, dynamic_return_exit);
+            }
             e.cmpImm(0U, static_cast<std::uint32_t>(NativeStackResult::branch_mismatch));
             e.cond(0U, mismatch_exit);
             e.cbnzW(0U, helper_exit);
@@ -224,11 +229,21 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
         const auto exit = [&](std::size_t label, NativeExitReason why, bool failed, std::size_t retired_prefix) {
             e.bindLabel(label);
             if (failed) e.storeImm(ctx, failing, m.pc);
+            const bool dynamic_return = why == NativeExitReason::dynamic_return;
+            if (dynamic_return) {
+                e.storeImm(cpu, offsetof(CpuState, instruction_address), m.pc);
+                e.storeImm(ctx, retired, static_cast<std::uint32_t>(retired_prefix));
+            }
             const auto checked_cycles = e.makeLabel(), cycles_done = e.makeLabel();
             e.cbzX(22U, checked_cycles);
             e.load(9U, 23U, retired_prefix * sizeof(std::uint32_t));
             e.store(9U, ctx, cycles, true); e.b(cycles_done);
-            e.bindLabel(checked_cycles); e.bindLabel(cycles_done);
+            e.bindLabel(checked_cycles);
+            if (dynamic_return) {
+                e.load(9U, ctx, cycles, true); e.addX(9U, 9U, cost);
+                e.store(9U, ctx, cycles, true);
+            }
+            e.bindLabel(cycles_done);
             e.storeImm(ctx, reason, static_cast<std::uint32_t>(why)); e.b(done);
         };
         exit(instruction_exit, NativeExitReason::instruction_limit, false, i);
@@ -236,6 +251,9 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
         exit(unsupported_exit, NativeExitReason::unsupported_instruction, true, i);
         exit(helper_exit, NativeExitReason::helper_declined, true, i);
         exit(mismatch_exit, NativeExitReason::branch_mismatch, true, i);
+        if (op.stack && !op.push && (op.register_list & 0x8000U))
+            exit(dynamic_return_exit, NativeExitReason::dynamic_return, false, i + 1U);
+        else e.bindLabel(dynamic_return_exit);
         e.bindLabel(next);
     }
     const auto normal_checked_cycles = e.makeLabel();

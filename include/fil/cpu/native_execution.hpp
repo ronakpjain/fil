@@ -16,6 +16,7 @@ enum class NativeExitReason : std::uint32_t {
     branch_mismatch,
     control_flow,
     unsupported_instruction,
+    dynamic_return,
 };
 
 /**
@@ -58,6 +59,8 @@ struct NativeExecutionContext {
     std::uint32_t admitted_cycle_prefix_count{0};
     /** Native-kernel scratch, reset to zero before return. */
     std::uint32_t admitted_cycle_mode{0};
+    /** Trace-only opt-in: retire a valid alternative POP PC and exit immediately. */
+    bool allow_dynamic_returns{false};
 };
 
 /** @brief Validate aggregate cycle admission without observing deferred progress. */

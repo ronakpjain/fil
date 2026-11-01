@@ -912,20 +912,28 @@ TEST(NativeJitTest, EmittedStackReturnTraceMatchesPortableFallbackAtEveryBoundar
         ops[i].expected_next_pc = i == 2U ? pc + 16U : pcs[i] + 2U;
         ops[i].expected_taken = i == 2U;
     }
+    for (const auto plan_length : {3U, 5U}) {
     NativeTracePlan plan; std::string error;
-    ASSERT_TRUE(buildNativeTrace(ops, plan, error)) << error;
+    ASSERT_TRUE(buildNativeTrace(std::span(ops).first(plan_length), plan, error)) << error;
     auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
     const auto fn = jit->compileNativeTrace(plan, error); ASSERT_NE(fn, nullptr) << error;
+    const std::array<std::uint32_t, 6U> prefix{0U, 3U, 4U, 9U, 10U, 12U};
+    for (const bool dynamic_returns : {false, true})
+    for (const bool admitted : {false, true})
     for (unsigned mode = 0U; mode < 3U; ++mode) {
-        for (const bool mismatch : {false, true}) {
+        for (const auto target : {pc + 17U, pc + 19U, pc + 18U, 0xfffffff9U}) {
+            const bool mismatch = target != pc + 17U;
+            const bool valid_target = (target & 1U) != 0U && target < 0xfffffff0U;
             for (const bool bad_address : {false, true})
             for (std::uint32_t limit = 0U; limit <= ops.size(); ++limit) {
+                for (const auto initial_cycles : std::array<std::uint64_t, 3U>{0U, 2U, UINT64_MAX - 4U})
                 for (std::uint64_t credit = 0U; credit <= 12U; ++credit) {
                     fil::mem::MemoryBus memory, oracle;
                     ASSERT_TRUE(memory.mapRam(ram, 128U, "stack"));
                     ASSERT_TRUE(oracle.mapRam(ram, 128U, "stack"));
                     CpuState state;
-                    state.r[0] = 0x11223344U; state.r[14] = pc + (mismatch ? 19U : 17U);
+                    state.r[0] = 0x11223344U; state.r[14] = target;
+                    state.r[2] = 0xaabbccddU;
                     state.r[1] = bad_address ? 0x40000000U : ram;
                     state.r[15] = pc; state.instruction_address = pc + 64U;
                     state.msp = ram + 64U; state.psp = ram + 96U; state.r[13] = ram + 32U;
@@ -935,6 +943,12 @@ TEST(NativeJitTest, EmittedStackReturnTraceMatchesPortableFallbackAtEveryBoundar
                     auto reference = state;
                     NativeExecutionContext context{&state, &memory, limit, credit};
                     NativeExecutionContext expected{&reference, &oracle, limit, credit};
+                    context.retired_cycles = expected.retired_cycles = initial_cycles;
+                    context.allow_dynamic_returns = expected.allow_dynamic_returns = dynamic_returns;
+                    if (admitted) {
+                        context.admitted_cycle_prefix = expected.admitted_cycle_prefix = prefix.data();
+                        context.admitted_cycle_prefix_count = expected.admitted_cycle_prefix_count = prefix.size();
+                    }
                     context.charged_cycles = expected.charged_cycles = costs.data();
                     context.charged_cycles_count = expected.charged_cycles_count = costs.size();
                     interpretNativeTrace(plan, expected);
@@ -948,7 +962,18 @@ TEST(NativeJitTest, EmittedStackReturnTraceMatchesPortableFallbackAtEveryBoundar
                     EXPECT_EQ(memory.read32(stack).value(), oracle.read32(stack).value());
                     EXPECT_EQ(memory.read32(stack + 4U).value(), oracle.read32(stack + 4U).value());
                     EXPECT_EQ(context.current_instruction_pc, expected.current_instruction_pc);
-                    if (!mismatch && !bad_address && limit == 5U && credit == 12U) {
+                    if (dynamic_returns && mismatch && valid_target && limit >= 3U
+                        && initial_cycles <= credit && credit - initial_cycles >= 9U) {
+                        EXPECT_EQ(context.exit_reason, NativeExitReason::dynamic_return);
+                        EXPECT_EQ(context.retired_count, 3U);
+                        EXPECT_EQ(context.retired_cycles, initial_cycles + 9U);
+                        EXPECT_EQ(state.r[15], target & ~1U);
+                        EXPECT_EQ(state.r[0], 0x11223344U);
+                        EXPECT_EQ(state.r[2], 0xaabbccddU) << "predicted successor must not execute";
+                        EXPECT_EQ(state.readRegister(13U), stack + 8U);
+                    }
+                    if (plan_length == 5U && !mismatch && !bad_address && limit == 5U
+                        && credit == 12U && initial_cycles == 0U) {
                         EXPECT_EQ(context.retired_count, 5U);
                         EXPECT_EQ(state.r[15], pc + 20U);
                         EXPECT_NE(state.xpsr & xpsr_z, 0U);
@@ -958,6 +983,7 @@ TEST(NativeJitTest, EmittedStackReturnTraceMatchesPortableFallbackAtEveryBoundar
                 }
             }
         }
+    }
     }
 }
 

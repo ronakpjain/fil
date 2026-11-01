@@ -1975,6 +1975,7 @@ std::optional<FastStepResult> CortexM4::executeNativeTrace(
     context.charged_cycles_count = static_cast<std::uint32_t>(planned);
     context.admitted_cycle_prefix = charged_prefix;
     context.admitted_cycle_prefix_count = static_cast<std::uint32_t>(available + 1U);
+    context.allow_dynamic_returns = true;
     plan.function(&context);
     if (context.retired_count > planned)
         throw std::logic_error("native trace exceeded its admitted prefix");
@@ -2025,7 +2026,11 @@ std::optional<FastStepResult> CortexM4::executeNativeTrace(
     budget.remaining_cycles -= charged_cycles;
     budget.have_fetch = true;
     budget.fetch_end = last.pc + last.size;
-    if (context.retired_cycles + first_extra != charged_cycles || state_.r[15] != last.expected_next_pc
+    const bool dynamic_return = context.exit_reason == NativeExitReason::dynamic_return;
+    if (context.retired_cycles + first_extra != charged_cycles
+        || (!dynamic_return && state_.r[15] != last.expected_next_pc)
+        || (dynamic_return && (last.decoded.kind != InstrKind::pop
+            || (last.decoded.register_list & 0x8000U) == 0U))
         || state_.instruction_address != last.pc)
         throw std::logic_error("native trace retirement metadata differs");
     FastStepResult result;
