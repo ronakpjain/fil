@@ -21,6 +21,31 @@ tracing and spin detection off for throughput; keep wall pacing on for
 interactive monitoring. See [CLI options](options.md) for runtime controls and defaults;
 see the [README](../README.md) and `make help` for building.
 
+### Measured six-board PER throughput
+
+`tools/bench_full_network.sh --binary build-pgo/fil --duration-ms 1000 --reps 3`
+is the reproducible measurement for `configs/networks/per_vehicle.json` at
+`--adc-decimation 1 --strict-mmio --cross-board-window-ns 100000`. Every board
+reaches the simulated-time budget, so the wall-clock ratio is the honest
+throughput number. On a 16-thread AMD Ryzen 9 4900HS laptop (8 cores), a recent
+host-tuned PGO build measures roughly 0.5-0.65x real time: 268,870,014 retired
+instructions and 1,017,313,085 cycles per simulated second, reproduced across
+repetitions.
+
+The bound is `front_driveline`/`rear_driveline`, not the scheduler: each needs
+about 1.20-1.25 s of host CPU per simulated second alone (about 0.80x), and
+running all six boards concurrently adds another ~1.3x from host boost/power
+limits. ADC decimation 1 produces about 260k events per simulated second on
+those boards, so the cost is dominated by per-event scheduling and bounded-span
+bookkeeping rather than raw instruction execution; certificate replay covers
+only a few percent of retired instructions. Exceeding 1x at full ADC fidelity
+would therefore require a roughly 1.6x per-board improvement. Measured and
+ruled out on this workload: larger/smaller native-trace lengths, scheduling
+quantum changes, worker spin-budget changes, executor-count changes, and host
+range/tracking caches. Write-journal bookkeeping is the largest removable
+host-side cost (about 12-15% when disabled), but it is required for reversible
+RAM spans and transaction validation, so it cannot simply be dropped.
+
 ## Event-loop overhead
 
 Relative scheduling and relative clock advancement avoid redundant recursive
