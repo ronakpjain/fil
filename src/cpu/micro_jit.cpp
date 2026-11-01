@@ -221,7 +221,7 @@ public:
     struct BranchFixup {
         std::size_t word{0};
         std::size_t target{0};
-        std::uint8_t kind{0}; // 0=unused, 1=cbz/cbnz (imm19), 2=b (imm26)
+        std::uint8_t kind{0}; // 0=unused, 1=cbz/cbnz/b.cond (imm19), 2=b (imm26)
     };
     std::vector<BranchFixup> fixups;
     // Returns a label id bound to the NEXT emitted word.
@@ -342,6 +342,10 @@ public:
         }
         error = "micro-jit: unknown condition";
         return false;
+    }
+    void bCond(std::uint32_t condition, std::size_t label) {
+        fixups.push_back({words.size(), label, 1U});
+        emit(0x54000000U | (condition & 15U));
     }
     void b(std::size_t label) {
         fixups.push_back({words.size(), label, 2U});
@@ -523,6 +527,9 @@ bool emitOp(Emitter& e, const MicroInst& op, std::string& error) {
         // ADDS XZR, rn, rm: NZCV only, no register writeback.
         e.addSubReg(1U, 31U, wn, wm);
         return true;
+    case MicroOp::tst_reg:
+        e.andsKeepCv(31U, wn, wm);
+        return true;
     case MicroOp::extend: {
         // Rotate first, then extract: imms is an end bit, not a width;
         // a wrapping UBFM/SBFM bitfield is not a rotated extract.
@@ -591,7 +598,51 @@ bool emitOp(Emitter& e, const MicroInst& op, std::string& error) {
         else if (op.op == MicroOp::ror) type = ShiftType::ror;
         else type = ShiftType::rrx;
         if (!op.shift_immediate) {
-            // Register amount, no flags (lowering declines flags here).
+            if (op.set_flags && type != ShiftType::rrx) {
+                // x1 keeps amount[7:0], outgoing carry[8], and the old NZCV
+                // in its high word. Derive carry before committing wd so all
+                // source/destination aliases retain their architectural value.
+                e.andImm(1U, wm, 0U, 7U);
+                e.mrsNzcv(17U); e.bfi64(1U, 17U, 32U, 32U);
+                const auto zero = e.makeLabel(), finish = e.makeLabel(), done = e.makeLabel();
+                e.cbzW(1U, zero);
+                if (type == ShiftType::ror) {
+                    e.shiftV(3U, wd, wn, 1U);
+                    e.ubfm(17U, wd, 31U, 31U); e.bfi64(1U, 17U, 8U, 1U);
+                } else {
+                    const auto big = e.makeLabel();
+                    e.cmpImm(1U, 32U); e.bCond(2U, big); // HS: amount >=32
+                    if (type == ShiftType::lsl) {
+                        e.movImm(17U, 32U); e.addSubReg(2U, 17U, 17U, 1U);
+                    } else e.addSubImm(2U, 17U, 1U, 1U);
+                    e.shiftV(1U, 17U, wn, 17U); e.ubfm(17U, 17U, 0U, 0U);
+                    e.bfi64(1U, 17U, 8U, 1U);
+                    e.shiftV(type == ShiftType::lsl ? 0U : type == ShiftType::lsr ? 1U : 2U,
+                        wd, wn, 1U);
+                    e.b(finish);
+                    e.bindLabel(big);
+                    if (type == ShiftType::asr) {
+                        e.ubfm(17U, wn, 31U, 31U); e.bfi64(1U, 17U, 8U, 1U);
+                        e.sbfmAsr(wd, wn, 31U);
+                    } else {
+                        const auto oversized = e.makeLabel();
+                        e.bCond(8U, oversized); // HI: shifts >32 have zero carry.
+                        const auto bit = type == ShiftType::lsl ? 0U : 31U;
+                        e.ubfm(17U, wn, bit, bit); e.bfi64(1U, 17U, 8U, 1U);
+                        e.bindLabel(oversized);
+                        e.logicReg(2U, wd, 31U, 31U);
+                    }
+                }
+                e.bindLabel(finish);
+                e.lsr64(17U, 1U, 32U); e.msrNzcv(17U);
+                e.ubfm(1U, 1U, 8U, 8U); e.setNzCarry(wd, 1U); e.b(done);
+                e.bindLabel(zero);
+                e.logicReg(2U, wd, 31U, wn);
+                e.lsr64(17U, 1U, 32U); e.msrNzcv(17U); e.setNzKeepCv(wd);
+                e.bindLabel(done);
+                return true;
+            }
+            // Register amount without flags.
             // amount = rm & 0xff; fix up results where *v differs from shiftC.
             e.andImm(1U, wm, 0U, 7U); // w1 = amount
             if (type == ShiftType::ror) {
@@ -1059,7 +1110,8 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
         case MicroOp::movt: reads(op.rd); writes(op.rd); break;
         case MicroOp::add_imm: case MicroOp::sub_imm: reads(op.rn); writes(op.rd); break;
         case MicroOp::cmp_imm: case MicroOp::cmn_imm: reads(op.rn); break;
-        case MicroOp::cmp_reg: case MicroOp::cmn_reg: reads(op.rn); reads(op.rm); break;
+        case MicroOp::cmp_reg: case MicroOp::cmn_reg: case MicroOp::tst_reg:
+            reads(op.rn); reads(op.rm); break;
         case MicroOp::extend: reads(op.rm); writes(op.rd); break;
         case MicroOp::ubfx: reads(op.rn); writes(op.rd); break;
         case MicroOp::add_reg: case MicroOp::sub_reg:

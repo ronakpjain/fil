@@ -252,6 +252,109 @@ TEST(MicroJitEmitterTest, RegressionRegisterShiftsPreserveFlagsAndAliases) {
     }
 }
 
+TEST(MicroJitEmitterTest, RegisterTstPreservesRegistersAndCvAgainstCheckedExecution) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
+    Fixture fixture;
+    std::string error;
+    auto jit = MicroJit::create(error); ASSERT_TRUE(jit) << error;
+    for (const auto regs : {std::array<std::uint8_t, 2U>{0U, 1U},
+            {1U, 1U}, {7U, 0U}, {12U, 11U}}) {
+        for (const bool wide : {false, true}) {
+            if (!wide && (regs[0] > 7U || regs[1] > 7U)) continue;
+            const auto first = static_cast<std::uint16_t>(wide ? 0xea10U | regs[0]
+                : 0x4200U | (static_cast<std::uint32_t>(regs[1]) << 3U) | regs[0]);
+            const auto second = static_cast<std::uint16_t>(0x0f00U | regs[1]);
+            const auto decoded = wide ? fil::cpu::decode32(first, second) : fil::cpu::decode16(first);
+            ASSERT_TRUE(decoded);
+            ASSERT_EQ(decoded->kind, fil::cpu::InstrKind::tst);
+            const std::vector<std::uint16_t> words = wide
+                ? std::vector<std::uint16_t>{first, second} : std::vector<std::uint16_t>{first};
+            loadProgram(fixture, words);
+            const MicroSource source{*decoded, kFlash, static_cast<std::uint8_t>(wide ? 4U : 2U)};
+            MicroBlock block;
+            ASSERT_TRUE(fil::cpu::buildMicroBlock({&source, 1U}, block).ok);
+            ASSERT_EQ(block.ops[0].op, MicroOp::tst_reg);
+            const auto function = jit->compile(block, error); ASSERT_NE(function, nullptr) << error;
+            for (const auto lhs : {0U, 1U, 0x80000000U, 0x55aa55aaU, 0xffffffffU})
+            for (const auto rhs : {0U, 1U, 0x80000000U, 0xaa55aa55U, 0xffffffffU})
+            for (std::uint32_t flags = 0U; flags < 16U; ++flags) {
+                CpuState initial;
+                for (std::size_t r = 0U; r < 13U; ++r)
+                    initial.r[r] = 0x12340000U + static_cast<std::uint32_t>(r);
+                initial.r[regs[0]] = lhs; initial.r[regs[1]] = rhs;
+                initial.msp = initial.r[13] = kRam + 128U;
+                initial.r[15] = kFlash;
+                initial.xpsr = (flags << 28U) | 0x090f0003U;
+                auto actual = initial;
+                fixture.cpu.state() = initial;
+                ASSERT_EQ(fixture.cpu.stepFast().reason, fil::cpu::StopReason::step_complete);
+                ASSERT_EQ(function(&actual, 1U) & 0xffffffffU, 1U);
+                EXPECT_TRUE(fil::cpu::bitwiseEqual(actual, fixture.cpu.state()));
+                const auto value = initial.r[regs[0]] & initial.r[regs[1]];
+                const auto expected_flags = (initial.xpsr & 0x3fffffffU)
+                    | (value & 0x80000000U) | (value == 0U ? 0x40000000U : 0U);
+                EXPECT_EQ(actual.xpsr, expected_flags);
+                for (std::size_t r = 0U; r < 15U; ++r) EXPECT_EQ(actual.r[r], initial.r[r]);
+            }
+            for (unsigned invalid = 0U; invalid < 7U; ++invalid) {
+                auto malformed = *decoded;
+                switch (invalid) {
+                case 0U: malformed.rn = 13U; break;
+                case 1U: malformed.rm = 15U; break;
+                case 2U: malformed.shift_amount = 1U; break;
+                case 3U: malformed.immediate_carry_valid = true; break;
+                case 4U: malformed.set_flags = false; break;
+                case 5U: malformed.condition = fil::cpu::Condition::eq; break;
+                default: malformed.form = fil::cpu::OperandForm::immediate; break;
+                }
+                MicroInst lowered;
+                EXPECT_FALSE(fil::cpu::tryLowerMicroInst({malformed, kFlash, source.size}, lowered).ok);
+            }
+        }
+    }
+}
+
+TEST(MicroJitEmitterTest, RegisterFlagShiftsMatchOracleAcrossAmountsFlagsAndAliases) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
+    std::string error;
+    auto jit = MicroJit::create(error); ASSERT_TRUE(jit) << error;
+    for (const auto op : {MicroOp::lsl, MicroOp::lsr, MicroOp::asr, MicroOp::ror}) {
+        for (const auto regs : {std::array<std::uint8_t, 3>{3U, 1U, 2U},
+                std::array<std::uint8_t, 3>{1U, 1U, 2U},
+                std::array<std::uint8_t, 3>{2U, 1U, 2U},
+                std::array<std::uint8_t, 3>{1U, 1U, 1U},
+                std::array<std::uint8_t, 3>{3U, 1U, 1U}}) {
+            auto inst = oneOp(op, regs[0], regs[1], regs[2]);
+            inst.shift_immediate = false; inst.set_flags = true;
+            MicroBlock block; block.entry_pc = kFlash; block.ops.push_back(inst);
+            const auto function = jit->compile(block, error);
+            ASSERT_NE(function, nullptr) << error;
+            for (const auto value : {0U, 1U, 0x80000000U, 0x81234567U, 0xffffffffU}) {
+                for (const auto amount : {0U, 1U, 2U, 31U, 32U, 33U, 63U, 64U,
+                        65U, 255U, 256U, 257U, 0x80000020U, 0xffffffffU}) {
+                    for (std::uint32_t flags = 0U; flags < 16U; ++flags) {
+                        SCOPED_TRACE(::testing::Message() << static_cast<int>(op) << '/'
+                            << static_cast<int>(regs[0]) << '/' << static_cast<int>(regs[2])
+                            << '/' << value << '/' << amount << '/' << flags);
+                        CpuState actual;
+                        actual.r[inst.rn] = value; actual.r[inst.rm] = amount;
+                        actual.r[15] = kFlash; actual.xpsr = (flags << 28U) | 0x090f0000U;
+                        fil::cpu::MicroCpu expected;
+                        for (std::size_t r = 0U; r < expected.r.size(); ++r) expected.r[r] = actual.r[r];
+                        expected.lr = actual.r[14]; expected.pc = kFlash; expected.xpsr = actual.xpsr;
+                        ASSERT_EQ(fil::cpu::interpretMicroOps(block.ops, expected, 1U), 1U);
+                        ASSERT_EQ(function(&actual, 1U) & 0xffffffffU, 1U);
+                        for (std::size_t r = 0U; r < expected.r.size(); ++r)
+                            EXPECT_EQ(actual.r[r], expected.r[r]) << r;
+                        EXPECT_EQ(actual.xpsr, expected.xpsr);
+                        EXPECT_EQ(actual.r[15], expected.pc);
+                    }
+                }
+            }
+        }
+    }
+}
+
 TEST(MicroJitEmitterTest, RegressionShiftedAddSubRrxScratchAliases) {
     for (const auto op : {MicroOp::add_shift, MicroOp::sub_shift}) {
         for (const bool carry : {false, true}) {

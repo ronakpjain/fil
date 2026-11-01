@@ -326,12 +326,13 @@ inline void endAddSub(X86Emitter& e, const Offsets& o, bool is_sub,
     e.movRR(kNzcv, kEcx);
 }
 
-// Rebuilds guest NZCV from a logical/shift result into r8d and commits the
-// result to the guest register first (stores leave flags untouched). V is
+// Rebuilds guest NZCV from a logical/shift result into r8d, optionally committing
+// the result first (TST has no destination; stores leave flags untouched). V is
 // always preserved; C is preserved or taken from ecx (0/1) when new_carry.
 // The V/C extraction reuses eax once the result is committed and tested.
-inline void endLogic(X86Emitter& e, const Offsets& o, bool new_carry, std::uint8_t rd) {
-    e.movM32R(kState, guestDisp(o, rd), kEax);
+inline void endLogic(X86Emitter& e, const Offsets& o, bool new_carry, std::uint8_t rd,
+                     bool writeback = true) {
+    if (writeback) e.movM32R(kState, guestDisp(o, rd), kEax);
     e.aluRR(6U, kEdx, kEdx);
     e.aluRR(6U, kR10, kR10);
     e.testRR(kEax, kEax);
@@ -472,6 +473,11 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
         endAddSub(e, o, is_sub, 0U, false);
         return true;
     }
+    case MicroOp::tst_reg:
+        loadGuest(e, kEax, o, op.rn);
+        e.aluRM(4U, kEax, kState, guestDisp(o, op.rm));
+        endLogic(e, o, false, 0U, false);
+        return true;
     case MicroOp::extend: {
         const bool byte = op.extend_kind == ExtendKind::uxtb
             || op.extend_kind == ExtendKind::sxtb;
@@ -551,11 +557,45 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
         else if (op.op == MicroOp::ror) type = ShiftType::ror;
         else type = ShiftType::rrx;
         if (!op.shift_immediate) {
-            // Register amount, never flag-setting (lowering declines flags
-            // here; decline so the block keeps its cached-handler behavior).
-            if (op.set_flags) {
-                error = "register shift with flags unsupported";
-                return false;
+            if (op.set_flags && type != ShiftType::rrx) {
+                // Capture both inputs before writing rd: any of rd/rn/rm may
+                // alias. ARM takes the low byte, not x86's masked CL count.
+                loadGuest(e, kEax, o, op.rn);
+                loadGuest(e, kEcx, o, op.rm);
+                e.aluRImm(4U, kEcx, 0xffU);
+                const auto zero = e.makeLabel(), done = e.makeLabel();
+                e.testRR(kEcx, kEcx); e.jcc(4U, zero);
+                if (type == ShiftType::ror) {
+                    e.shCl(1U, kEax);
+                    // Nonzero multiples of 32 keep the value but still set
+                    // C from bit 31; x86's unchanged CF is not usable there.
+                    e.movRR(kEcx, kEax); e.shImm(5U, kEcx, 31U);
+                } else {
+                    const auto big = e.makeLabel(), carry_ready = e.makeLabel();
+                    e.cmpR32Imm(kEcx, 32U); e.jcc(3U, big);
+                    e.shCl(type == ShiftType::lsl ? 4U : type == ShiftType::lsr ? 5U : 7U, kEax);
+                    e.movR32Imm(kEcx, 0U); // MOV preserves the outgoing CF.
+                    e.setcc(2U, kEcx); e.jmp(carry_ready);
+                    e.bindLabel(big);
+                    if (type == ShiftType::asr) {
+                        e.movRR(kEcx, kEax); e.shImm(5U, kEcx, 31U);
+                        e.shImm(7U, kEax, 31U);
+                    } else {
+                        const auto oversized = e.makeLabel();
+                        e.jcc(7U, oversized); // CMP still distinguishes >32.
+                        e.movRR(kEcx, kEax);
+                        if (type == ShiftType::lsl) e.aluRImm(4U, kEcx, 1U);
+                        else e.shImm(5U, kEcx, 31U);
+                        e.aluRR(6U, kEax, kEax); e.jmp(carry_ready);
+                        e.bindLabel(oversized);
+                        e.aluRR(6U, kEax, kEax); e.aluRR(6U, kEcx, kEcx);
+                    }
+                    e.bindLabel(carry_ready);
+                }
+                endLogic(e, o, true, op.rd); e.jmp(done);
+                e.bindLabel(zero); endLogic(e, o, false, op.rd);
+                e.bindLabel(done);
+                return true;
             }
             if (type == ShiftType::rrx) {
                 error = "register rrx unsupported";

@@ -13,7 +13,8 @@
  *  Scope includes the admitted integer forms plus shifted register forms:
  *  NOP, MOV/MOVW/MOVT immediate, unshifted MOV register,
  *  ADD/SUB/CMP/CMN immediate, unshifted
- *  AND/ORR/EOR/BIC and ADD/SUB, shifted ADD/SUB, LSL/LSR/ASR/ROR/RRX,
+ *  AND/ORR/EOR/BIC, unshifted register TST and ADD/SUB, shifted ADD/SUB,
+ *  immediate/register LSL/LSR/ASR/ROR and immediate RRX,
  *  and a terminal unconditional B/BL. Everything else (memory/MMIO,
  *  ADC/SBC, SP/PC operands, IT, system, FP) stays on cached handlers.
  */
@@ -42,6 +43,7 @@ enum class MicroOp : std::uint8_t {
     cmn_imm,
     cmp_reg,
     cmn_reg,
+    tst_reg,
     add_reg,
     sub_reg,
     and_reg,

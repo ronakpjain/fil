@@ -185,6 +185,15 @@ MicroLowerResult tryLowerMicroInst(const MicroSource& source, MicroInst& out) no
         out = inst;
         return {true, MicroLowerReason::ok, {}};
     }
+    case InstrKind::tst:
+        if (!registerShape(d) || !coreReg(d.rn) || !coreReg(d.rm)
+            || !d.set_flags || d.shift_type != ShiftType::lsl || d.shift_amount != 0U)
+            return {false, MicroLowerReason::bad_shape, "tst reg shape"};
+        inst.op = MicroOp::tst_reg;
+        inst.rn = d.rn;
+        inst.rm = d.rm;
+        out = inst;
+        return {true, MicroLowerReason::ok, {}};
     case InstrKind::and_:
     case InstrKind::orr:
     case InstrKind::eor:
@@ -222,11 +231,8 @@ MicroLowerResult tryLowerMicroInst(const MicroSource& source, MicroInst& out) no
                 || !coreReg(d.rn) || !coreReg(d.rm)) {
                 return {false, MicroLowerReason::bad_shape, "shift reg form"};
             }
-            // Register-specified amount with flags needs a data-dependent
-            // carry sequence the stencil emitter does not cover yet; the
-            // block stays on the cached fast path instead.
-            if (d.set_flags) {
-                return {false, MicroLowerReason::bad_shape, "register shift with flags"};
+            if (d.kind == InstrKind::rrx) {
+                return {false, MicroLowerReason::bad_shape, "register rrx"};
             }
         }
         switch (d.kind) {
@@ -446,6 +452,9 @@ std::size_t interpretMicroOps(std::span<const MicroInst> ops, MicroCpu& cpu, std
             writeOp(cpu, op.rd, (readOp(cpu, op.rn) >> op.shift_amount) & mask);
             break;
         }
+        case MicroOp::tst_reg:
+            applyNz(cpu, readOp(cpu, op.rn) & readOp(cpu, op.rm), true);
+            break;
         case MicroOp::add_reg:
         case MicroOp::sub_reg:
         case MicroOp::and_reg:
