@@ -543,8 +543,8 @@ private:
     };
     mutable WindowAddressSet window_address_set_;
     void recordMutation(std::uint32_t address, std::uint8_t old_value, bool external) noexcept;
-    [[nodiscard]] bool storeUnjournaledWord(
-        Region& region, std::size_t offset, std::uint32_t value
+    [[nodiscard]] bool storeBackedWord(
+        Region& region, std::size_t offset, std::uint32_t value, bool external
     ) noexcept;
 
     [[nodiscard]] MemoryResult<std::uint64_t> read(

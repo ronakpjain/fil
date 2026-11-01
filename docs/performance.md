@@ -58,6 +58,15 @@ checked fallback subtracts the already-accounted prefix from both the clock offs
 and SysTick/DWT advance, and normalized trace timing includes its entry-fetch bias
 when invoking the MMIO bridge. Speculative certificate execution has no bridge.
 
+### Word-store journal bookkeeping
+
+Little-endian backed word stores compute a changed-byte mask from one word load.
+Only dirty lanes append rollback records, in ascending byte-address order, before
+one backing-word update. Mutation counts, old byte values, external-store tags,
+executable invalidation, store footprints, and every intermediate journal
+checkpoint retain byte-store semantics. Unchanged stores create no journal
+entries. Big-endian hosts retain the checked bytewise fallback.
+
 ## Event-loop overhead
 
 Relative scheduling and relative clock advancement avoid redundant recursive

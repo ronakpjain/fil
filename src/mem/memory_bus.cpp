@@ -122,22 +122,35 @@ void MemoryBus::recordMutation(
     }
 }
 
-bool MemoryBus::storeUnjournaledWord(
-    Region& region, const std::size_t offset, const std::uint32_t value
+bool MemoryBus::storeBackedWord(
+    Region& region, const std::size_t offset, const std::uint32_t value,
+    const bool external
 ) noexcept {
-    if (write_journal_tracking_) return false;
     if constexpr (std::endian::native == std::endian::little) {
         std::uint32_t old_value = 0U;
         std::memcpy(&old_value, region.bytes.data() + offset, sizeof(old_value));
         std::uint32_t difference = old_value ^ value;
-        std::uint64_t changed_bytes = 0U;
-        for (std::uint32_t byte = 0U; byte < sizeof(value); ++byte) {
-            changed_bytes += (difference & 0xffU) != 0U;
-            difference >>= 8U;
-        }
+        // One low bit per changed byte. Propagation never crosses the low
+        // bit of a byte, so adjacent bytes cannot create false mutations.
+        difference |= difference >> 4U;
+        difference |= difference >> 2U;
+        difference |= difference >> 1U;
+        std::uint32_t changed = difference & 0x01010101U;
+        const auto changed_bytes = static_cast<std::uint64_t>(std::popcount(changed));
         if (changed_bytes != 0U) {
+            if (write_journal_tracking_) {
+                // Keep byte-address order and exact old values for checkpoints,
+                // journal wrap and restoration, but inspect only dirty lanes.
+                while (changed != 0U) {
+                    const auto shift = static_cast<std::uint32_t>(std::countr_zero(changed));
+                    recordMutation(region.info.base + static_cast<std::uint32_t>(offset)
+                        + shift / 8U, static_cast<std::uint8_t>(old_value >> shift), external);
+                    changed &= changed - 1U;
+                }
+            } else {
+                mutation_sequence_ += changed_bytes;
+            }
             std::memcpy(region.bytes.data() + offset, &value, sizeof(value));
-            mutation_sequence_ += changed_bytes;
             side_effect_generation_ += changed_bytes;
         }
         return true;
@@ -657,7 +670,7 @@ bool MemoryBus::tryFastWrite32(
     }
     addStoreFootprint(address, sizeof(value), context);
     const std::size_t offset = address - region->info.base;
-    if (storeUnjournaledWord(*region, offset, value)) {
+    if (storeBackedWord(*region, offset, value, context.pc == 0U)) {
         if (region->info.executable) ++execution_generation_;
         return true;
     }
@@ -746,7 +759,7 @@ bool MemoryBus::tryFastWrite(
     addStoreFootprint(address, width, context);
     const std::size_t offset = address - region->info.base;
     if (width == sizeof(std::uint32_t)
-        && storeUnjournaledWord(*region, offset, static_cast<std::uint32_t>(value))) {
+        && storeBackedWord(*region, offset, static_cast<std::uint32_t>(value), context.pc == 0U)) {
         if (region->info.executable) ++execution_generation_;
         return true;
     }
@@ -829,7 +842,7 @@ bool MemoryBus::tryFastWriteWords(
     for (std::uint32_t w = 0U; w < count; ++w) {
         const std::uint32_t value = values[w];
         const std::size_t offset = base + w * 4U;
-        if (storeUnjournaledWord(*region, offset, value)) continue;
+        if (storeBackedWord(*region, offset, value, context.pc == 0U)) continue;
         for (std::uint32_t index = 0U; index < 4U; ++index) {
             const auto byte = static_cast<std::uint8_t>(value >> (index * 8U));
             const std::size_t at = base + w * 4U + index;

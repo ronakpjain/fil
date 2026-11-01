@@ -488,6 +488,53 @@ TEST(MemoryBusTest, UnjournaledWordStoresMatchBytewiseArchitecturalEffects) {
     EXPECT_EQ(unjournaled.read32(0x20000004U).value(), original_word);
 }
 
+TEST(MemoryBusTest, WordDirtyLanesMatchByteStoresAndEveryRollbackPrefix) {
+    using fil::mem::MemoryBus;
+    MemoryBus fast, bytes;
+    ASSERT_TRUE(fast.mapRam(0x20000000U, 32U, "ram"));
+    ASSERT_TRUE(bytes.mapRam(0x20000000U, 32U, "ram"));
+    for (std::uint32_t offset = 0U; offset < 4U; ++offset) {
+        for (std::uint32_t mask = 0U; mask < 16U; ++mask) {
+            for (std::uint32_t bit = 0U; bit < 8U; ++bit) {
+                for (unsigned method = 0U; method < 3U; ++method) {
+                    const auto address = 0x20000000U + offset;
+                    constexpr std::uint32_t original = 0x12345678U;
+                    ASSERT_TRUE(fast.write32(address, original));
+                    ASSERT_TRUE(bytes.write32(address, original));
+                    const auto checkpoint = fast.sideEffectCheckpoint();
+                    const auto effects = fast.sideEffectGeneration();
+                    auto value = original;
+                    std::array<std::uint32_t, 5U> prefixes{original};
+                    std::size_t changed = 0U;
+                    for (std::uint32_t lane = 0U; lane < 4U; ++lane) {
+                        if ((mask & (1U << lane)) == 0U) continue;
+                        value ^= 1U << (lane * 8U + bit);
+                        ASSERT_TRUE(bytes.write8(address + lane,
+                            static_cast<std::uint8_t>(value >> (lane * 8U))));
+                        prefixes[++changed] = value;
+                    }
+                    if (method == 0U) ASSERT_TRUE(fast.tryFastWrite32(address, value, {}));
+                    else if (method == 1U)
+                        ASSERT_TRUE(fast.tryFastWrite(address, fil::mem::AccessSize::word, value, {}));
+                    else ASSERT_TRUE(fast.tryFastWriteWords(address, 1U, &value, {}));
+                    EXPECT_EQ(fast.read32(address).value(), bytes.read32(address).value());
+                    EXPECT_EQ(fast.sideEffectGeneration() - effects, changed);
+                    EXPECT_EQ(fast.sideEffectCheckpoint().mutation_sequence
+                        - checkpoint.mutation_sequence, changed);
+                    // Each byte mutation remains an exact intermediate journal
+                    // checkpoint, even though backing is updated as one word.
+                    for (std::size_t keep = changed + 1U; keep-- > 0U;) {
+                        auto prefix = checkpoint;
+                        prefix.mutation_sequence += keep;
+                        ASSERT_TRUE(fast.restoreSideEffects(prefix));
+                        EXPECT_EQ(fast.read32(address).value(), prefixes[keep]);
+                    }
+                }
+            }
+        }
+    }
+}
+
 TEST(MemoryBusTest, StoreFootprintScopeTracksIdempotentAndAllStorePaths) {
     using fil::mem::AccessContext;
     using fil::mem::AccessType;
