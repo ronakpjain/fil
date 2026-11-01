@@ -19,13 +19,11 @@ bool nativeRead32(
     if (context == nullptr || context->memory_bus == nullptr || value_out == nullptr) {
         return false;
     }
-    std::uint32_t value = 0;
-    if (!context->memory_bus->tryFastRead32(
-            address, value, {mem::AccessType::data_read, instruction_pc})) {
-        return false;
-    }
-    *value_out = value;
-    return true;
+    // tryFastRead32 publishes its output only after every guard succeeds.
+    // Forward the destination so the JIT helper needs no temporary stack slot
+    // (and can tail-call the checked bus access).
+    return context->memory_bus->tryFastRead32(
+        address, *value_out, {mem::AccessType::data_read, instruction_pc});
 }
 
 bool nativeWrite32(
