@@ -71,6 +71,79 @@ TEST(NativeJitTest, DecodedLiteralAndStackAccessesMatchExactEveryPrefix) {
     }
 }
 
+TEST(NativeJitTest, AdmittedCyclePrefixMatchesCheckedInterpreterAtEveryCut) {
+    constexpr std::uint32_t pc = 0x08003000U;
+    const auto nop = decode16(0xbf00U); ASSERT_TRUE(nop);
+    std::array<NativeTraceOp, 3> ops{};
+    for (std::size_t i = 0U; i < ops.size(); ++i) {
+        ops[i].decoded = *nop; ops[i].raw = nop->raw;
+        ops[i].pc = pc + static_cast<std::uint32_t>(2U * i);
+        ops[i].size = 2U; ops[i].execution_cycles = static_cast<std::uint8_t>(i + 1U);
+        ops[i].expected_next_pc = ops[i].pc + 2U;
+    }
+    NativeTracePlan plan; std::string error;
+    ASSERT_TRUE(buildNativeTrace(ops, plan, error)) << error;
+    NativeFunction native = nullptr;
+    std::unique_ptr<MicroJit> jit;
+    if (MicroJit::hostSupported()) {
+        jit = MicroJit::create(error); ASSERT_TRUE(jit);
+        native = jit->compileNativeTrace(plan, error); ASSERT_NE(native, nullptr) << error;
+    }
+    const std::array<std::uint32_t, 3> costs{3U, 4U, 5U};
+    const std::array<std::uint32_t, 4> prefix{0U, 3U, 7U, 12U};
+    for (std::uint32_t limit = 0U; limit <= 3U; ++limit) {
+        for (std::uint64_t credit = 0U; credit <= 13U; ++credit) {
+            const auto admitted_limit = static_cast<std::uint32_t>(
+                std::upper_bound(prefix.begin(), prefix.begin() + limit + 1U, credit)
+                - prefix.begin() - 1);
+            CpuState checked, trusted, emitted; checked.r[15] = trusted.r[15] = emitted.r[15] = pc;
+            fil::mem::MemoryBus checked_bus, trusted_bus, emitted_bus;
+            NativeExecutionContext a{&checked, &checked_bus, limit, credit};
+            NativeExecutionContext b{&trusted, &trusted_bus, admitted_limit, credit};
+            NativeExecutionContext c{&emitted, &emitted_bus, admitted_limit, credit};
+            a.charged_cycles = b.charged_cycles = c.charged_cycles = costs.data();
+            a.charged_cycles_count = b.charged_cycles_count = c.charged_cycles_count = limit;
+            b.admitted_cycle_prefix = c.admitted_cycle_prefix = prefix.data();
+            b.admitted_cycle_prefix_count = c.admitted_cycle_prefix_count = prefix.size();
+            interpretNativeTrace(plan, a); interpretNativeTrace(plan, b);
+            if (native != nullptr) native(&c);
+            EXPECT_EQ(a.retired_count, b.retired_count) << limit << "," << credit;
+            EXPECT_EQ(a.retired_cycles, b.retired_cycles) << limit << "," << credit;
+            // A caller-admitted cut is represented as a smaller instruction
+            // limit, so its terminal reason can be instruction_limit where
+            // the fully checked path reports cycle_limit; retirement effects
+            // and exact charged cycles must still agree.
+            EXPECT_TRUE(bitwiseEqual(checked, trusted)) << limit << "," << credit;
+            if (native != nullptr) {
+                EXPECT_EQ(c.retired_count, b.retired_count) << limit << "," << credit;
+                EXPECT_EQ(c.retired_cycles, b.retired_cycles) << limit << "," << credit;
+                EXPECT_EQ(c.exit_reason, b.exit_reason) << limit << "," << credit;
+                EXPECT_TRUE(bitwiseEqual(emitted, trusted)) << limit << "," << credit;
+                EXPECT_EQ(c.admitted_cycle_mode, 0U);
+            }
+        }
+    }
+    // Malformed aggregate credit is not trusted: normal checked admission wins.
+    CpuState state; state.r[15] = pc;
+    fil::mem::MemoryBus bus;
+    NativeExecutionContext invalid{&state, &bus, 2U, 3U};
+    invalid.charged_cycles = costs.data(); invalid.charged_cycles_count = costs.size();
+    invalid.admitted_cycle_prefix = prefix.data(); invalid.admitted_cycle_prefix_count = prefix.size();
+    interpretNativeTrace(plan, invalid);
+    EXPECT_EQ(invalid.retired_count, 1U);
+    EXPECT_EQ(invalid.retired_cycles, 3U);
+    CpuState biased_state; biased_state.r[15] = pc;
+    fil::mem::MemoryBus biased_bus;
+    NativeExecutionContext biased{&biased_state, &biased_bus, 2U, 4U};
+    biased.retired_cycles = 1U;
+    biased.charged_cycles = costs.data(); biased.charged_cycles_count = costs.size();
+    biased.admitted_cycle_prefix = prefix.data(); biased.admitted_cycle_prefix_count = prefix.size();
+    if (native != nullptr) native(&biased); else interpretNativeTrace(plan, biased);
+    EXPECT_EQ(biased.retired_count, 1U);
+    EXPECT_EQ(biased.retired_cycles, 4U);
+    EXPECT_EQ(biased.admitted_cycle_mode, 0U);
+}
+
 TEST(NativeJitTest, NativeTraceCheckedPushPopCommitAndGuardedPopPc) {
     if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
     constexpr std::uint32_t flash = 0x08000000U, ram = 0x20000000U;

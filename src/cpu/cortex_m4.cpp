@@ -1948,10 +1948,20 @@ std::optional<FastStepResult> CortexM4::executeNativeTrace(
         entry.charges_first_sequential = first_sequential;
         entry.charges_valid = true;
     }
-    const auto planned = std::min(limit,
+    const auto available = std::min(limit,
         static_cast<std::size_t>(entry.charges_valid_prefix_count));
+    // The cumulative table includes fetch stalls and execution cycles. Admit
+    // the largest exact prefix that fits, so execution never needs to probe
+    // beyond an unaffordable instruction. Keep all cut/budget decisions here,
+    // after generation, fetch-timing, and native-plan guards have succeeded.
+    const auto prefix_end = entry.charged_prefix.begin()
+        + static_cast<std::ptrdiff_t>(available + 1U);
+    const auto admitted_end = std::upper_bound(entry.charged_prefix.begin(), prefix_end,
+        budget.remaining_cycles);
+    const auto planned = static_cast<std::size_t>(admitted_end - entry.charged_prefix.begin() - 1);
     if (planned == 0U) return std::nullopt;
     const auto* charges = entry.charges.data();
+    const auto* charged_prefix = entry.charged_prefix.data();
     NativeExecutionContext context;
     context.cpu_state = &state_;
     context.memory_bus = &memory_;
@@ -1959,6 +1969,8 @@ std::optional<FastStepResult> CortexM4::executeNativeTrace(
     context.cycle_limit = budget.remaining_cycles;
     context.charged_cycles = charges;
     context.charged_cycles_count = static_cast<std::uint32_t>(planned);
+    context.admitted_cycle_prefix = charged_prefix;
+    context.admitted_cycle_prefix_count = static_cast<std::uint32_t>(available + 1U);
     plan.function(&context);
     if (context.retired_count > planned)
         throw std::logic_error("native trace exceeded its admitted prefix");

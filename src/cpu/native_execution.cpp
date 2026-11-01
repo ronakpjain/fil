@@ -2,6 +2,16 @@
 
 namespace fil::cpu {
 
+bool nativeAdmittedCyclePrefixValid(const NativeExecutionContext* const context) noexcept {
+    if (context == nullptr || context->admitted_cycle_prefix == nullptr
+        || context->charged_cycles == nullptr
+        || context->instruction_limit > context->charged_cycles_count
+        || context->instruction_limit >= context->admitted_cycle_prefix_count
+        || context->retired_cycles != 0U) return false;
+    const auto* const prefix = context->admitted_cycle_prefix;
+    return prefix[0] == 0U && prefix[context->instruction_limit] <= context->cycle_limit;
+}
+
 bool nativeRead32(
     NativeExecutionContext* const context, const std::uint32_t instruction_pc,
     const std::uint32_t address, std::uint32_t* const value_out

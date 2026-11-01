@@ -47,7 +47,22 @@ struct NativeExecutionContext {
     /** Caller-precomputed total CPU cycles per candidate op, including fetch timing. */
     const std::uint32_t* charged_cycles{nullptr};
     std::uint32_t charged_cycles_count{0};
+    /**
+     * Optional caller-certified cumulative cycle prefix for this exact
+     * charged_cycles table. When non-null, entries [0, instruction_limit]
+     * must be live, entry 0 must be zero, and entry instruction_limit must be
+     * <= cycle_limit. Kernels may use that aggregate admission to avoid
+     * per-instruction cycle checks; default/null preserves checked semantics.
+     */
+    const std::uint32_t* admitted_cycle_prefix{nullptr};
+    std::uint32_t admitted_cycle_prefix_count{0};
+    /** Native-kernel scratch, reset to zero before return. */
+    std::uint32_t admitted_cycle_mode{0};
 };
+
+/** @brief Validate aggregate cycle admission without observing deferred progress. */
+[[nodiscard]] bool nativeAdmittedCyclePrefixValid(
+    const NativeExecutionContext* context) noexcept;
 
 /** @brief Nonthrowing scalar ABI: false declines without changing output/state. */
 [[nodiscard]] bool nativeRead32(

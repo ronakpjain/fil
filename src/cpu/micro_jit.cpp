@@ -845,17 +845,20 @@ namespace {
     ctx->retired_count = 0U;
     ctx->exit_reason = NativeExitReason::none;
     CpuState& state = *ctx->cpu_state;
+    // A non-null prefix is a public caller assertion, but still validate its
+    // complete selected range and aggregate credit before honoring it.
+    const bool admitted = nativeAdmittedCyclePrefixValid(ctx);
     for (std::size_t i = 0; i < plan->ops.size(); ++i) {
         const auto& op = plan->ops[i];
         ctx->current_instruction_pc = op.pc;
         if (ctx->retired_count >= ctx->instruction_limit) {
             ctx->exit_reason = NativeExitReason::instruction_limit; break;
         }
-        if (ctx->charged_cycles == nullptr || i >= ctx->charged_cycles_count) {
+        if (!admitted && (ctx->charged_cycles == nullptr || i >= ctx->charged_cycles_count)) {
             ctx->failing_instruction_pc = op.pc;
             ctx->exit_reason = NativeExitReason::unsupported_instruction; break;
         }
-        const auto cycles = ctx->charged_cycles[i];
+        const auto cycles = admitted ? 0U : ctx->charged_cycles[i];
         const auto& inst = op.native.integer;
         const bool is_cond = inst.op == MicroOp::b_cond;
         const bool bx_lr = op.native.kind == NativeOp::bx_lr;
@@ -874,8 +877,8 @@ namespace {
             ctx->exit_reason = NativeExitReason::branch_mismatch;
             break;
         }
-        if (ctx->retired_cycles > ctx->cycle_limit
-            || cycles > ctx->cycle_limit - ctx->retired_cycles) {
+        if (!admitted && (ctx->retired_cycles > ctx->cycle_limit
+            || cycles > ctx->cycle_limit - ctx->retired_cycles)) {
             ctx->exit_reason = NativeExitReason::cycle_limit; break;
         }
         const bool stack_op = op.decoded.kind == InstrKind::push || op.decoded.kind == InstrKind::pop;
@@ -933,9 +936,10 @@ namespace {
         }
         state.r[15] = op.expected_next_pc;
         state.instruction_address = op.pc;
-        ctx->retired_cycles += cycles;
+        if (!admitted) ctx->retired_cycles += cycles;
         ++ctx->retired_count;
     }
+    if (admitted) ctx->retired_cycles = ctx->admitted_cycle_prefix[ctx->retired_count];
 }
 
 bool sameNativeBlock(const NativeBlock& a, const NativeBlock& b) noexcept {
@@ -1283,6 +1287,7 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
     constexpr auto kFailing = ctx_off(offsetof(NativeExecutionContext, failing_instruction_pc));
     constexpr auto kReason = ctx_off(offsetof(NativeExecutionContext, exit_reason));
     constexpr auto kChargedCount = ctx_off(offsetof(NativeExecutionContext, charged_cycles_count));
+    constexpr auto kAdmittedMode = ctx_off(offsetof(NativeExecutionContext, admitted_cycle_mode));
     X86Emitter e;
     const auto instruction_exit = e.makeLabel();
     const auto cycle_exit = e.makeLabel();
@@ -1296,6 +1301,19 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
     e.movR64M(kCpu, 7U, ctx_off(offsetof(NativeExecutionContext, cpu_state)));
     e.movRR64(kCtx, 7U);
     e.movR64M(kCosts, 7U, ctx_off(offsetof(NativeExecutionContext, charged_cycles)));
+    // Null-hint callers jump directly to the unchanged checked path. Only a
+    // supplied hint pays the one-time robust validator call.
+    const auto checked_cost_table = e.makeLabel();
+    e.movM32Imm(kCtx, kAdmittedMode, 0U);
+    e.movR64M(kScratch, kCtx, ctx_off(offsetof(NativeExecutionContext, admitted_cycle_prefix)));
+    e.testRR(kScratch, kScratch); e.jcc(4U, checked_cost_table);
+    e.movRR64(7U, kCtx);
+    e.movR64Imm(kEax, reinterpret_cast<std::uintptr_t>(&nativeAdmittedCyclePrefixValid));
+    e.callReg(kEax);
+    e.movM32R(kCtx, kAdmittedMode, kEax);
+    e.testRR(kEax, kEax); e.jcc(4U, checked_cost_table);
+    e.movR64M(kCosts, kCtx, ctx_off(offsetof(NativeExecutionContext, admitted_cycle_prefix)));
+    e.bindLabel(checked_cost_table);
     e.movRR64(7U, kCpu);
     e.movM32Imm(kCtx, kRetired, 0U);
     e.movM32Imm(kCtx, kReason, static_cast<std::uint32_t>(NativeExitReason::none));
@@ -1314,12 +1332,18 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
         e.movR32M(kScratch, kCtx, kChargedCount);
         e.cmpR32Imm(kScratch, static_cast<std::uint32_t>(i + 1U));
         e.jcc(2U, unsupported_exit);
+        // Aggregate admission already certified that this op is affordable, so
+        // skip the per-op cost probe and cycle accumulation entirely.
+        const auto skip_cycle_probe = e.makeLabel();
+        e.movR32M(kScratch, kCtx, kAdmittedMode);
+        e.testRR(kScratch, kScratch); e.jcc(5U, skip_cycle_probe);
         e.movR32M(kAddr, kCosts, static_cast<std::uint32_t>(i * sizeof(std::uint32_t)));
         e.movR64M(kScratch, kCtx, kCycles);
         e.addR64R64(kScratch, kAddr);
         e.jcc(2U, cycle_exit); // carry: cycle sum overflow
         e.cmpR64M(kScratch, kCtx, kCycleLimit);
         e.jcc(7U, cycle_exit);
+        e.bindLabel(skip_cycle_probe);
         if (op.kind == NativeOp::integer) {
             if (!emitX86Op(e, cpu_offsets, op.integer, error)) {
                 impl_->native_cache.pop_back();
@@ -1391,10 +1415,16 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
         e.movM32R(kCpu, cpu_offsets.xpsr, kScratch);
         e.movM32Imm(kCpu, cpu_offsets.r + 60U, op.pc + op.size);
         e.movM32Imm(kCpu, cpu_offsets.addr, op.pc);
+        // Checked mode accumulates per-op charges; admitted mode publishes the
+        // certified cumulative prefix once at exit instead of accumulating.
+        const auto skip_cycle_commit = e.makeLabel();
+        e.movR32M(kScratch, kCtx, kAdmittedMode);
+        e.testRR(kScratch, kScratch); e.jcc(5U, skip_cycle_commit);
         e.movR64M(kScratch, kCtx, kCycles);
         e.movR32M(kAddr, kCosts, static_cast<std::uint32_t>(i * sizeof(std::uint32_t)));
         e.addR64R64(kScratch, kAddr);
         e.movM64R(kCtx, kCycles, kScratch);
+        e.bindLabel(skip_cycle_commit);
         e.movM32Imm(kCtx, kRetired, static_cast<std::uint32_t>(i + 1U));
     }
     e.jmp(finish);
@@ -1413,6 +1443,22 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
     emitExit(helper_exit, NativeExitReason::helper_declined);
     emitExit(unsupported_exit, NativeExitReason::unsupported_instruction);
     e.bindLabel(finish);
+    // Publish the committed prefix: admitted_mode uses the certified cumulative
+    // table indexed by retired_count; checked mode already accumulated it.
+    const auto skip_prefix_publish = e.makeLabel();
+    e.movR32M(kScratch, kCtx, kAdmittedMode);
+    e.testRR(kScratch, kScratch); e.jcc(4U, skip_prefix_publish);
+    // kAddr = kCosts + retired*4, then publish the zero-extended entry.
+    e.movR32M(kAddr, kCtx, kRetired);
+    e.movRR64(kScratch, kAddr);
+    e.addR64R64(kAddr, kScratch); // retired*2
+    e.addR64R64(kAddr, kScratch); // retired*3
+    e.addR64R64(kAddr, kScratch); // retired*4
+    e.addR64R64(kAddr, kCosts);
+    e.movR32M(kScratch, kAddr, 0U);
+    e.movM32R(kCtx, kCycles, kScratch);
+    e.movM32Imm(kCtx, kCycles + 4U, 0U);
+    e.bindLabel(skip_prefix_publish);
     e.addRsp16(); e.popReg(15U); e.popReg(14U); e.popReg(13U); e.popReg(12U); e.popReg(3U); e.ret();
     if (!e.patchBranches(error)) { impl_->native_cache.pop_back(); return nullptr; }
     code = std::move(e.code);
@@ -1493,15 +1539,30 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     const auto failing = off(offsetof(NativeExecutionContext, failing_instruction_pc));
     const auto reason = off(offsetof(NativeExecutionContext, exit_reason));
     const auto charged_count = off(offsetof(NativeExecutionContext, charged_cycles_count));
+    const auto kAdmittedMode = off(offsetof(NativeExecutionContext, admitted_cycle_mode));
     X86Emitter e;
-    const auto done = e.makeLabel();
+    const auto done = e.makeLabel(), early = e.makeLabel();
     e.pushReg(3U); e.pushReg(12U); e.pushReg(13U); e.pushReg(14U); e.pushReg(15U);
     e.pushReg(5U); e.pushReg(10U); e.subRsp16();
     e.movRR64(ctx, 7U);
-    e.cmpR64Imm8(ctx, 0U); e.jcc(4U, done);
+    e.cmpR64Imm8(ctx, 0U); e.jcc(4U, early);
     e.movR64M(cpu, ctx, off(offsetof(NativeExecutionContext, cpu_state)));
-    e.cmpR64Imm8(cpu, 0U); e.jcc(4U, done);
+    e.cmpR64Imm8(cpu, 0U); e.jcc(4U, early);
     e.movR64M(costs, ctx, off(offsetof(NativeExecutionContext, charged_cycles)));
+    // Null-hint callers jump directly to the unchanged checked path. Only a
+    // supplied hint pays the one-time robust validator call, which also admits
+    // the cumulative table (retaining per-op load/staged checks on decline).
+    const auto checked_cost_table = e.makeLabel();
+    e.movM32Imm(ctx, kAdmittedMode, 0U);
+    e.movR64M(3U, ctx, off(offsetof(NativeExecutionContext, admitted_cycle_prefix)));
+    e.testRR(3U, 3U); e.jcc(4U, checked_cost_table);
+    e.movRR64(7U, ctx);
+    e.movR64Imm(kEax, reinterpret_cast<std::uintptr_t>(&nativeAdmittedCyclePrefixValid));
+    e.callReg(kEax);
+    e.movM32R(ctx, kAdmittedMode, kEax);
+    e.testRR(kEax, kEax); e.jcc(4U, checked_cost_table);
+    e.movR64M(costs, ctx, off(offsetof(NativeExecutionContext, admitted_cycle_prefix)));
+    e.bindLabel(checked_cost_table);
     e.movRR64(7U, cpu);
     e.movM32Imm(ctx, retired, 0U); e.movM32Imm(ctx, reason, 0U);
     e.movR64M(5U, ctx, cycle_count); // RBP is live retired-cycle accumulator.
@@ -1519,10 +1580,17 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
         const auto& inst = op.native.integer;
         e.movR32M(kEax, ctx, limit); e.cmpR32Imm(kEax, static_cast<std::uint32_t>(i));
         e.jcc(6U, exits[i].instruction); // i >= instruction_limit before all other admissions
+        // Admitted mode skips only the per-op cost table and cycle-budget
+        // machinery; branch/indirect guards still run so a changed edge
+        // declines exactly as in checked mode.
+        const auto checked_cost_table = e.makeLabel();
+        e.movR32M(kEax, ctx, kAdmittedMode);
+        e.testRR(kEax, kEax); e.jcc(5U, checked_cost_table);
         e.movR32M(kEax, ctx, charged_count);
         e.cmpR32Imm(kEax, static_cast<std::uint32_t>(i + 1U));
         e.jcc(2U, exits[i].unsupported);
         e.cmpR64Imm8(costs, 0U); e.jcc(4U, exits[i].unsupported);
+        e.bindLabel(checked_cost_table);
         const bool bx_lr = op.native.kind == NativeOp::bx_lr;
         const auto conditional = inst.op == MicroOp::b_cond;
         if (bx_lr) {
@@ -1545,9 +1613,13 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
             if (op.expected_taken) e.jmp(guard_done); else e.jmp(exits[i].mismatch);
             e.bindLabel(guard_done);
         }
+        const auto skip_cycle_math = e.makeLabel();
+        e.movR32M(kEax, ctx, kAdmittedMode);
+        e.testRR(kEax, kEax); e.jcc(5U, skip_cycle_math);
         e.movR32M(kEax, costs, static_cast<std::uint32_t>(i * sizeof(std::uint32_t)));
         e.movRR64(kEdx, 5U); e.addR64R64(kEdx, kEax);
         e.jcc(2U, exits[i].cycle); e.cmpR64M(kEdx, ctx, cycle_limit); e.jcc(7U, exits[i].cycle);
+        e.bindLabel(skip_cycle_math);
         if (inst.op == MicroOp::bl || op.native.kind == NativeOp::blx_reg)
             e.movM32Imm(kState, offsets.r + 56U, (op.pc + op.size) | 1U);
         if (op.decoded.kind == InstrKind::push || op.decoded.kind == InstrKind::pop) {
@@ -1604,11 +1676,22 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
         // Only the live cycle accumulator advances here. RAM-only helpers
         // consume explicit PCs and no pending NZCV/PC/progress metadata; the
         // selected exit stub publishes the exact committed prefix once.
+        const auto skip_cycle_add = e.makeLabel();
+        e.movR32M(kEax, ctx, kAdmittedMode);
+        e.testRR(kEax, kEax); e.jcc(5U, skip_cycle_add);
         e.movR32M(kEax,costs,static_cast<std::uint32_t>(i*4U)); e.addR64R64(5U,kEax);
+        e.bindLabel(skip_cycle_add);
     }
     e.jmp(normal);
     const auto publish = [&](std::size_t i, NativeExitReason why, bool failed) {
-        e.movM32Imm(ctx,retired,static_cast<std::uint32_t>(i)); e.movM64R(ctx,cycle_count,5U);
+        e.movM32Imm(ctx,retired,static_cast<std::uint32_t>(i));
+        const auto publish_checked_cycles = e.makeLabel(), cycles_published = e.makeLabel();
+        e.movR32M(kEax, ctx, kAdmittedMode);
+        e.testRR(kEax, kEax); e.jcc(4U, publish_checked_cycles);
+        e.movR32M(kEax, costs, static_cast<std::uint32_t>(i * sizeof(std::uint32_t)));
+        e.movM64R(ctx, cycle_count, kEax); e.jmp(cycles_published);
+        e.bindLabel(publish_checked_cycles); e.movM64R(ctx,cycle_count,5U);
+        e.bindLabel(cycles_published);
         e.movM32Imm(ctx,current,entry.plan.ops[i].pc);
         if (failed) e.movM32Imm(ctx,failing,entry.plan.ops[i].pc);
         if (i != 0U) {
@@ -1626,13 +1709,24 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
         e.bindLabel(exits[i].helper); publish(i,NativeExitReason::helper_declined,true);
     }
     e.bindLabel(normal);
-    e.movM32Imm(ctx,retired,static_cast<std::uint32_t>(n)); e.movM64R(ctx,cycle_count,5U);
+    e.movM32Imm(ctx,retired,static_cast<std::uint32_t>(n));
+    const auto normal_checked_cycles = e.makeLabel(), normal_cycles_published = e.makeLabel();
+    e.movR32M(kEax, ctx, kAdmittedMode);
+    e.testRR(kEax, kEax); e.jcc(4U, normal_checked_cycles);
+    e.movR32M(kEax, costs, static_cast<std::uint32_t>(n * sizeof(std::uint32_t)));
+    e.movM64R(ctx, cycle_count, kEax); e.jmp(normal_cycles_published);
+    e.bindLabel(normal_checked_cycles); e.movM64R(ctx,cycle_count,5U);
+    e.bindLabel(normal_cycles_published);
     e.movM32Imm(ctx,current,entry.plan.ops.back().pc);
     e.movRR(kEax,kRetain); e.aluRR(1U,kEax,kNzcv); e.movM32R(kState,offsets.xpsr,kEax);
     e.movM32Imm(kState,offsets.r+60U,entry.plan.ops.back().expected_next_pc);
     e.movM32Imm(kState,offsets.addr,entry.plan.ops.back().pc);
     e.movM32Imm(ctx,reason,static_cast<std::uint32_t>(NativeExitReason::none)); e.jmp(done);
-    e.bindLabel(done); e.addRsp16(); e.popReg(10U); e.popReg(5U); e.popReg(15U); e.popReg(14U); e.popReg(13U); e.popReg(12U); e.popReg(3U); e.ret();
+    e.bindLabel(done);
+    e.movM32Imm(ctx, kAdmittedMode, 0U);
+    e.addRsp16(); e.popReg(10U); e.popReg(5U); e.popReg(15U); e.popReg(14U); e.popReg(13U); e.popReg(12U); e.popReg(3U); e.ret();
+    e.bindLabel(early);
+    e.addRsp16(); e.popReg(10U); e.popReg(5U); e.popReg(15U); e.popReg(14U); e.popReg(13U); e.popReg(12U); e.popReg(3U); e.ret();
     if (!e.patchBranches(error)) { impl_->trace_cache.pop_back(); return nullptr; }
     code = std::move(e.code);
 #elif defined(FIL_MICRO_JIT_AARCH64)

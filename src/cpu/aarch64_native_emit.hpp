@@ -67,10 +67,23 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
     e.cbzX(9U, early);
     // x19=context, x20=CPU, x21=current cost survive all scalar helpers.
     // 32 bytes of nonvolatile saves plus 16 bytes for load output/padding.
-    e.sub64Imm(31U, 31U, 48U);
+    e.sub64Imm(31U, 31U, 64U);
     e.store(19U, 31U, 0U, true); e.store(20U, 31U, 8U, true);
     e.store(21U, 31U, 16U, true); e.store(30U, 31U, 24U, true);
+    e.store(22U, 31U, 32U, true); e.store(23U, 31U, 40U, true);
     e.movX(ctx, 0U); e.movX(cpu, 9U);
+    e.movImm(22U, 0U); // x22 = 0 checked, 1 validated admission.
+    const auto checked_table = e.makeLabel();
+    e.load(9U, ctx, offsetof(NativeExecutionContext, admitted_cycle_prefix), true);
+    e.cbzX(9U, checked_table); // Null hints retain the original no-helper path.
+    e.movX(0U, ctx); e.call(reinterpret_cast<std::uintptr_t>(&nativeAdmittedCyclePrefixValid));
+    e.cmpImm(0U, 0U); // Normalize the scalar bool to 0/1 in x22.
+    e.emit(0x9A9F17F6U); // csinc x22, xzr, xzr, ne (cinc x22, xzr, ne)
+    e.cbzX(22U, checked_table);
+    e.load(23U, ctx, offsetof(NativeExecutionContext, admitted_cycle_prefix), true);
+    e.b(checked_table);
+    e.bindLabel(checked_table);
+    e.load(21U, ctx, offsetof(NativeExecutionContext, charged_cycles), true);
     e.store(31U, ctx, retired); e.store(31U, ctx, reason);
 
     for (std::size_t i = 0; i < ops.size(); ++i) {
@@ -83,10 +96,13 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
         e.storeImm(ctx, offsetof(NativeExecutionContext, current_instruction_pc), m.pc);
         e.load(9U, ctx, offsetof(NativeExecutionContext, instruction_limit));
         e.cmpImm(9U, static_cast<std::uint32_t>(i + 1U)); e.cond(3U, instruction_exit); // lo
+        const auto checked_cycle_admission = e.makeLabel();
+        e.cbzX(22U, checked_cycle_admission);
         e.load(11U, ctx, offsetof(NativeExecutionContext, charged_cycles), true);
         e.cbzX(11U, unsupported_exit);
         e.load(9U, ctx, offsetof(NativeExecutionContext, charged_cycles_count));
         e.cmpImm(9U, static_cast<std::uint32_t>(i + 1U)); e.cond(3U, unsupported_exit);
+        e.bindLabel(checked_cycle_admission);
 
         const bool blx_reg = m.kind == NativeOp::blx_reg;
         const bool branch = blx_reg || (m.kind == NativeOp::integer
@@ -119,12 +135,17 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
             e.cmpW(9U, 10U); e.cond(0U, mismatch_exit);
         }
         // Subtract before adding to avoid wrapping the cycle accumulator.
+        // Admitted mode skips only this cycle-budget probe; branch/indirect
+        // guards above still run so a changed edge declines as in checked mode.
+        const auto after_cycle_admission = e.makeLabel();
+        e.cbnzW(22U, after_cycle_admission);
         e.load(9U, ctx, cycles, true);
         e.load(10U, ctx, offsetof(NativeExecutionContext, cycle_limit), true);
         e.cmp64(9U, 10U); e.cond(8U, cycle_exit); // hi
         e.subX(10U, 10U, 9U);
         e.load(cost, 11U, i * sizeof(std::uint32_t));
         e.cmp64(cost, 10U); e.cond(8U, cycle_exit);
+        e.bindLabel(after_cycle_admission);
 
         if (op.stack) {
             e.movX(0U, ctx); e.movImm(1U, m.pc);
@@ -186,25 +207,39 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
         }
         e.storeImm(cpu, r + 60U, op.next_pc);
         e.storeImm(cpu, offsetof(CpuState, instruction_address), m.pc);
+        const auto skip_cycle_commit = e.makeLabel();
+        e.cbnzW(22U, skip_cycle_commit);
         e.load(9U, ctx, cycles, true); e.addX(9U, 9U, cost); e.store(9U, ctx, cycles, true);
+        e.bindLabel(skip_cycle_commit);
         e.storeImm(ctx, retired, static_cast<std::uint32_t>(i + 1U));
         e.b(next);
-        const auto exit = [&](std::size_t label, NativeExitReason why, bool failed) {
+        const auto exit = [&](std::size_t label, NativeExitReason why, bool failed, std::size_t retired_prefix) {
             e.bindLabel(label);
             if (failed) e.storeImm(ctx, failing, m.pc);
+            const auto checked_cycles = e.makeLabel(), cycles_done = e.makeLabel();
+            e.cbzX(22U, checked_cycles);
+            e.load(9U, 23U, retired_prefix * sizeof(std::uint32_t));
+            e.store(9U, ctx, cycles, true); e.b(cycles_done);
+            e.bindLabel(checked_cycles); e.bindLabel(cycles_done);
             e.storeImm(ctx, reason, static_cast<std::uint32_t>(why)); e.b(done);
         };
-        exit(instruction_exit, NativeExitReason::instruction_limit, false);
-        exit(cycle_exit, NativeExitReason::cycle_limit, false);
-        exit(unsupported_exit, NativeExitReason::unsupported_instruction, true);
-        exit(helper_exit, NativeExitReason::helper_declined, true);
-        exit(mismatch_exit, NativeExitReason::branch_mismatch, true);
+        exit(instruction_exit, NativeExitReason::instruction_limit, false, i);
+        exit(cycle_exit, NativeExitReason::cycle_limit, false, i);
+        exit(unsupported_exit, NativeExitReason::unsupported_instruction, true, i);
+        exit(helper_exit, NativeExitReason::helper_declined, true, i);
+        exit(mismatch_exit, NativeExitReason::branch_mismatch, true, i);
         e.bindLabel(next);
     }
+    const auto normal_checked_cycles = e.makeLabel();
+    e.cbzX(22U, normal_checked_cycles);
+    e.load(9U, 23U, ops.size() * sizeof(std::uint32_t));
+    e.store(9U, ctx, cycles, true);
+    e.bindLabel(normal_checked_cycles);
     e.bindLabel(done);
     e.load(19U, 31U, 0U, true); e.load(20U, 31U, 8U, true);
     e.load(21U, 31U, 16U, true); e.load(30U, 31U, 24U, true);
-    e.emit(0x9100C3FFU); // add sp, sp, #48
+    e.load(22U, 31U, 32U, true); e.load(23U, 31U, 40U, true);
+    e.emit(0x910103FFU); // add sp, sp, #64
     e.bindLabel(early); e.ret();
     if (!e.patchBranches(error)) return false;
     code.resize(e.words.size() * sizeof(std::uint32_t));
