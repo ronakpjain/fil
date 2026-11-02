@@ -1988,6 +1988,8 @@ std::optional<FastStepResult> CortexM4::executeNativeTrace(
     // kernel re-checks each address, so a miss simply uses the checked helper.
     (void)memory_.directReadWindow(state_.r[13], &context.fast_read_base,
         &context.fast_read_begin, &context.fast_read_size);
+    (void)memory_.directReadWindow(plan.ops.front().pc, &context.literal_read_base,
+        &context.literal_read_begin, &context.literal_read_size);
     plan.function(&context);
     if (context.retired_count > planned)
         throw std::logic_error("native trace exceeded its admitted prefix");

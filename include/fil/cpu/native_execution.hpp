@@ -76,6 +76,10 @@ struct NativeExecutionContext {
     const std::uint8_t* fast_read_base{nullptr};
     std::uint32_t fast_read_begin{0U};
     std::uint32_t fast_read_size{0U};
+    /** Same guarded ABI, probed at the trace PC for literal-pool loads. */
+    const std::uint8_t* literal_read_base{nullptr};
+    std::uint32_t literal_read_begin{0U};
+    std::uint32_t literal_read_size{0U};
 };
 
 /** @brief Validate aggregate cycle admission without observing deferred progress. */
