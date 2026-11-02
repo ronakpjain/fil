@@ -1809,11 +1809,11 @@ ExitCode networkMonitorCommand(
         if (stdin_eof) continue;
         pollfd input{STDIN_FILENO, POLLIN, 0};
         const bool buffered = !binary_protocol && std::cin.rdbuf()->in_avail() > 0;
-        // Wall pacing already waited; a blocking poll here would run the
-        // simulation slower than real time by one refresh window per slice.
+        // Pacing is handled above. Input polling must never add a wait to
+        // either paced or back-to-back slices.
         const std::int32_t ready = buffered
             ? 1
-            : ::poll(&input, 1, wall_pacing ? 0 : static_cast<std::int32_t>(refresh_ms));
+            : ::poll(&input, 1, 0);
         if (ready < 0) {
             if (binary_protocol && errno == EINTR) continue;
             if (!expectations.empty()) expectation_evaluator.finish(world.value()->eventLoop().now());
