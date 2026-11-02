@@ -1,5 +1,6 @@
 #include "fil/cpu/native_stack.hpp"
 #include <array>
+#include <cstring>
 #include <optional>
 
 namespace fil::cpu {
@@ -48,7 +49,19 @@ NativeStackResult nativeStackTransferPrepared(NativeExecutionContext* c, std::ui
     if (loads_pc && c->memory_bus->readFootprintTracking())
         footprint = c->memory_bus->readFootprint();
     std::array<std::uint32_t, 16> values;
-    if (!c->memory_bus->tryFastReadWords(start, count, values.data(), {mem::AccessType::data_read, pc}))
+    // Reuse the trace's direct-read window when it covers the whole frame: the
+    // window is only published with read-footprint tracking off, so a plain
+    // copy is identical to the checked bulk helper but skips its lookup.
+    bool fast_loaded = false;
+    if (c->fast_read_base != nullptr) {
+        const std::uint64_t off = static_cast<std::uint64_t>(start) - c->fast_read_begin;
+        if (off + bytes <= c->fast_read_size) {
+            std::memcpy(values.data(), c->fast_read_base + off, static_cast<std::size_t>(bytes));
+            fast_loaded = true;
+        }
+    }
+    if (!fast_loaded
+        && !c->memory_bus->tryFastReadWords(start, count, values.data(), {mem::AccessType::data_read, pc}))
         return NativeStackResult::memory_declined;
     if (loads_pc) {
         target = values[pc_slot];
