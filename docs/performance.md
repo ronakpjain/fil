@@ -141,6 +141,10 @@ with a separate credit check before each predicated instruction.
 Canonical narrow and wide PUSH/POP transfers validate the complete stack frame
 before effects and use the active stack bank. POP PC dispatches to the actual
 return target after checking Thumb state and excluding exception returns.
+The active guest SP stays in a host register between checked services. Stack
+writes are published to the selected bank and the r13 mirror at exits; reads
+alone preserve an untouched mirror. Checked resumption selects the active bank
+again, including after CONTROL writes.
 An eager program compiler decodes every aligned entry in bounded code windows
 and links those windows before execution. Native transfers share a register ABI,
 preserving live registers, flags, memory accounting and budgets across windows.

@@ -2083,7 +2083,7 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
     std::lock_guard lock(impl_->mutex);
     const auto entry_pc = plan.entry_pc;
     using namespace x86detail;
-    constexpr std::uint32_t ctx = 13U, cpu = 12U, nzcv = 3U, dirty = 15U;
+    constexpr std::uint32_t ctx = 13U, cpu = 7U, nzcv = 3U, dirty = 15U, sp = 12U;
     constexpr std::uint32_t count = 11U, cycles = 5U, fetch = 14U;
     const auto off = [](std::size_t value) { return static_cast<std::uint32_t>(value); };
     const Offsets offsets{off(offsetof(CpuState, r)), off(offsetof(CpuState, xpsr)),
@@ -2098,13 +2098,18 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
     for (std::size_t i = 0U; i < plan.count; ++i)
         labels[i] = {e.makeLabel(), e.makeLabel(), e.makeLabel(), e.makeLabel()};
     for (const auto reg : {3U,12U,13U,14U,15U,5U,10U}) e.pushReg(reg);
-    e.subRsp16(); // local spills for POP targets and memory writeback
+    e.subRsp16(); // POP/cycle spill [0..7], writeback [8..11], SP-written byte [12]
     e.movRR64(ctx, 7U);
     e.movR64Imm(kEax, reinterpret_cast<std::uintptr_t>(&nativeRegionEntryValid));
     e.callReg(kEax); e.movzxEaxAl(); e.testRR(kEax, kEax); e.jcc(4U, early);
     e.bindLabel(reload);
     e.movR64M(cpu, ctx, off(offsetof(NativeRegionContext, cpu_state)));
-    e.movRR64(kState, cpu);
+    const auto load_msp = e.makeLabel(), stack_ready = e.makeLabel();
+    e.movR32M(kEdx, cpu, offsets.xpsr); e.aluRImm(4U, kEdx, xpsr_ipsr_mask); e.jcc(5U, load_msp);
+    e.movR32M(kEdx, cpu, off(offsetof(CpuState, control))); e.testRImm(kEdx, 2U); e.jcc(4U, load_msp);
+    e.movR32M(sp, cpu, off(offsetof(CpuState, psp))); e.jmp(stack_ready);
+    e.bindLabel(load_msp); e.movR32M(sp, cpu, off(offsetof(CpuState, msp)));
+    e.bindLabel(stack_ready); e.movM8Imm8(4U, 12U, 0U);
     e.movR32M(nzcv, cpu, offsets.xpsr);
     e.movR32Imm(dirty, 0U);
     e.aluRImm(4U, nzcv, kFlagN | kFlagZ | kFlagC | kFlagV);
@@ -2172,26 +2177,10 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
             else exit(NativeRegionExit::external_edge, target);
         } else e.jmp(labels[index].entry);
     };
-    const auto read_sp = [&](std::uint32_t destination) {
-        const auto msp = e.makeLabel(), ready = e.makeLabel();
-        e.movR32M(kEdx, cpu, offsets.xpsr); e.aluRImm(4U, kEdx, xpsr_ipsr_mask);
-        e.jcc(5U, msp);
-        e.movR32M(kEdx, cpu, off(offsetof(CpuState, control)));
-        e.testRImm(kEdx, 2U); e.jcc(4U, msp);
-        e.movR32M(destination, cpu, off(offsetof(CpuState, psp))); e.jmp(ready);
-        e.bindLabel(msp); e.movR32M(destination, cpu, off(offsetof(CpuState, msp)));
-        e.bindLabel(ready);
-    };
+    const auto read_sp = [&](std::uint32_t destination) { e.movRR(destination, sp); };
     const auto write_sp = [&] {
-        const auto msp = e.makeLabel(), ready = e.makeLabel();
-        e.movM32R(cpu, offsets.r + 52U, kEax);
-        e.movR32M(kEcx, cpu, offsets.xpsr); e.aluRImm(4U, kEcx, xpsr_ipsr_mask);
-        e.jcc(5U, msp);
-        e.movR32M(kEcx, cpu, off(offsetof(CpuState, control)));
-        e.testRImm(kEcx, 2U); e.jcc(4U, msp);
-        e.movM32R(cpu, off(offsetof(CpuState, psp)), kEax); e.jmp(ready);
-        e.bindLabel(msp); e.movM32R(cpu, off(offsetof(CpuState, msp)), kEax);
-        e.bindLabel(ready);
+        e.movRR(sp, kEax);
+        e.movM8Imm8(4U, 12U, 1U);
     };
     const auto guard_address = [&](std::uint32_t width, bool write, bool literal, std::size_t miss) {
         const auto window = [&](std::uint32_t binding, std::size_t next) {
@@ -2625,6 +2614,16 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
     for (std::size_t guest = 0U; guest < e.guest_hosts.size(); ++guest)
         if (e.guest_hosts[guest] >= 0)
             e.movM32R(cpu, offsets.r + off(guest * 4U), static_cast<std::uint32_t>(e.guest_hosts[guest]));
+    // The active stack bank cannot change inside native operations. Publish
+    // writes before any checked callback, preserving an untouched r13 mirror.
+    const auto stack_published = e.makeLabel(), publish_msp = e.makeLabel();
+    e.cmpM8Imm8(4U, 12U, 0U); e.jcc(4U, stack_published);
+    e.movM32R(cpu, offsets.r + 52U, sp);
+    e.movR32M(kEax, cpu, offsets.xpsr); e.aluRImm(4U, kEax, xpsr_ipsr_mask); e.jcc(5U, publish_msp);
+    e.movR32M(kEax, cpu, off(offsetof(CpuState, control))); e.testRImm(kEax, 2U); e.jcc(4U, publish_msp);
+    e.movM32R(cpu, off(offsetof(CpuState, psp)), sp); e.jmp(stack_published);
+    e.bindLabel(publish_msp); e.movM32R(cpu, off(offsetof(CpuState, msp)), sp);
+    e.bindLabel(stack_published);
     // Native memory effects are committed, and no observer runs inside the
     // admitted region. Publish aggregate dirty-byte accounting at every exit,
     // before checked execution or any peripheral/event callback can observe it.
