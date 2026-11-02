@@ -84,7 +84,7 @@ is rejected.
 
 | Option | Purpose / default |
 | --- | --- |
-| `--refresh-ms N` | Simulated milliseconds per slice; default 1, must be nonzero. |
+| `--refresh-ms N` / `--refresh-us N` | Simulated time per slice in milliseconds or microseconds; default 100 µs, must be nonzero. |
 | `--live-filter TYPE` / `--trace-type TYPE` | Repeatable event filter; default `can_tx`. The first explicit filter replaces the default. |
 | `--no-wall-pacing` | Run slices back-to-back instead of pacing to real time; live I/O stays active. |
 

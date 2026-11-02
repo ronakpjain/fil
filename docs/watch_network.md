@@ -79,7 +79,7 @@ error and ignored without stopping the simulation.
 | Option | Meaning |
 |---|---|
 | `--duration D` | Stop after at most `D` simulated time; bare values are seconds and suffixes `us`, `ms`, `s`, and `m` are accepted. `0` and the default mean unlimited. The monitor also stops if all boards reach terminal CPU boundaries. Without a duration, it runs until `quit`, `exit`, standard-input EOF, or all boards stop. |
-| `--refresh-ms N` | Run and poll input in slices of `N` simulated milliseconds; defaults to `1` and must be nonzero. |
+| `--refresh-ms N` / `--refresh-us N` | Run and poll input in slices of `N` simulated milliseconds or microseconds; defaults to 100 µs and must be nonzero. |
 | `--no-wall-pacing` | Run slices back-to-back instead of pacing simulation time to wall-clock time. Pacing is on by default. |
 | `--live-filter TYPE` / `--trace-type TYPE` | Print one exact trace event type. Repeat to select more than one type; default `can_tx`. |
 | `--instruction-budget N` | Set the per-board instruction budget used for each run slice; default and `0` are unlimited. |

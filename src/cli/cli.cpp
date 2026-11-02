@@ -1514,7 +1514,7 @@ ExitCode networkMonitorCommand(
     sim::SimTimeNs cross_board_window_ns = sim::WorldRunOptions{}.cross_board_window_ns;
     bool enable_parallel_lanes = sim::WorldRunOptions{}.enable_parallel_lanes;
     std::optional<std::uint64_t> duration_ns;
-    sim::SimTimeNs refresh_ns = 1'000'000U;
+    sim::SimTimeNs refresh_ns = 100'000U;
     std::uint32_t adc_decimation = 1U;
     bool strict_mmio = false;
     bool enable_loop_batching = false;
