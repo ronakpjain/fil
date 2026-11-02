@@ -340,7 +340,7 @@ inline void storeGuest(X86Emitter& e, const Offsets& o, std::uint8_t guest, std:
 
 // Rebuilds guest NZCV from an ADD/SUB result in eax into r8d. C comes from
 // CF (setnc for SUB: ARM C is NOT-borrow), V from OF, N/Z from the result
-// (N via the AH accumulator: eax is dead after the test/store). When
+// (eax is dead after the test/store). When
 // do_store, the result is committed to the guest register first: stores
 // leave flags untouched, so the capture stays exact.
 inline void endAddSub(X86Emitter& e, const Offsets& o, bool is_sub,
@@ -352,12 +352,12 @@ inline void endAddSub(X86Emitter& e, const Offsets& o, bool is_sub,
     e.setcc(0U, kEdx); // V
     e.testRR(kEax, kEax);
     e.setcc(4U, kR10); // Z
-    e.setcc(8U, 4U); // N -> ah (eax dead: stored/tested above)
-    e.movzxEaxAh();
+    // N is already at its architectural position in the dead result.
+    // Preserve it directly instead of SETS AH + MOVZX + SHL.
+    e.aluRImm(4U, kEax, kFlagN);
     e.shImm(4U, kEcx, 29U);
     e.shImm(4U, kEdx, 28U);
     e.shImm(4U, kR10, 30U);
-    e.shImm(4U, kEax, 31U);
     e.aluRR(1U, kEcx, kEdx);
     e.aluRR(1U, kEcx, kR10);
     e.aluRR(1U, kEcx, kEax);
@@ -367,32 +367,23 @@ inline void endAddSub(X86Emitter& e, const Offsets& o, bool is_sub,
 // Rebuilds guest NZCV from a logical/shift result, optionally committing
 // the result first (TST has no destination; stores leave flags untouched). V is
 // always preserved; C is preserved or taken from ecx (0/1) when new_carry.
-// The V/C extraction reuses eax once the result is committed and tested.
+// The result's sign bit is reused once the result is committed and tested.
 inline void endLogic(X86Emitter& e, const Offsets& o, bool new_carry, std::uint8_t rd,
                      bool writeback = true) {
     if (writeback) e.movM32R(kState, guestDisp(o, rd), kEax);
     const auto shared = new_carry ? e.shift_flags : e.logic_flags;
     if (shared != X86Emitter::no_label) { e.call(shared); return; }
     e.testRR(kEax, kEax);
-    e.setcc(8U, kEdx); // N
     e.setcc(4U, kR10); // Z
-    e.shImm(4U, kEdx, 31U);
+    e.aluRImm(4U, kEax, kFlagN); // N is the result's sign bit
     e.shImm(4U, kR10, 30U);
+    e.aluRImm(4U, e.nzcv, new_carry ? kFlagV : kFlagC | kFlagV);
     if (new_carry) {
         e.shImm(4U, kEcx, 29U);
-        e.movRR(kEax, e.nzcv);
-        e.aluRImm(4U, kEax, kFlagV); // preserved V from old NZCV
-        e.aluRR(1U, kEcx, kEax);
-        e.aluRR(1U, kEcx, kEdx);
-        e.aluRR(1U, kEcx, kR10);
-        e.movRR(e.nzcv, kEcx);
-    } else {
-        e.movRR(kEax, e.nzcv);
-        e.aluRImm(4U, kEax, kFlagC | kFlagV); // preserved C/V
-        e.aluRR(1U, kEax, kEdx);
-        e.aluRR(1U, kEax, kR10);
-        e.movRR(e.nzcv, kEax);
+        e.aluRR(1U, e.nzcv, kEcx);
     }
+    e.aluRR(1U, e.nzcv, kEax);
+    e.aluRR(1U, e.nzcv, kR10);
 }
 
 // Computes shiftC(value, type, amount) into dst (carry discarded) for the
