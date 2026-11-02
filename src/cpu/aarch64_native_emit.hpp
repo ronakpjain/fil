@@ -50,6 +50,9 @@ struct Op {
     bool stack{false};
     bool push{false};
     std::uint32_t register_list{0};
+    // Predecoded register list for checked native stack transfers. Only the
+    // trace path carries one; native blocks never contain PUSH/POP.
+    const NativeStackPlan* stack_plan{nullptr};
 };
 
 bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::string& error) {
@@ -164,9 +167,17 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
 
         if (op.stack) {
             e.movX(0U, ctx); e.movImm(1U, m.pc);
-            e.movImm(2U, op.register_list); e.movImm(3U, op.push ? 1U : 0U);
-            e.movImm(4U, op.next_pc);
-            e.call(reinterpret_cast<std::uintptr_t>(&nativeStackTransfer));
+            if (op.stack_plan != nullptr) {
+                // The retained cache entry owns this immutable plan for the
+                // generated function's entire lifetime.
+                e.immX(2U, reinterpret_cast<std::uint64_t>(op.stack_plan));
+                e.movImm(3U, op.next_pc);
+                e.call(reinterpret_cast<std::uintptr_t>(&nativeStackTransferPrepared));
+            } else {
+                e.movImm(2U, op.register_list); e.movImm(3U, op.push ? 1U : 0U);
+                e.movImm(4U, op.next_pc);
+                e.call(reinterpret_cast<std::uintptr_t>(&nativeStackTransfer));
+            }
             if (!op.push && (op.register_list & 0x8000U)) {
                 e.cmpImm(0U, static_cast<std::uint32_t>(NativeStackResult::dynamic_return));
                 e.cond(0U, dynamic_return_exit);
@@ -302,7 +313,8 @@ bool emitTrace(const NativeTracePlan& plan, std::vector<std::uint8_t>& code, std
         // lives on the trace node itself.
         native.pc = inst.pc; native.size = inst.size;
         ops.push_back({native, inst.expected_next_pc, true, inst.expected_taken,
-            stack, inst.decoded.kind == InstrKind::push, inst.decoded.register_list});
+            stack, inst.decoded.kind == InstrKind::push, inst.decoded.register_list,
+            stack ? &inst.stack_plan : nullptr});
     }
     return emitNative(ops, code, error);
 }
