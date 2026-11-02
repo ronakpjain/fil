@@ -117,12 +117,16 @@ changes host scheduling only, not guest events or simulated timing.
 
 ## Execution optimizations
 
-The JIT redesign also provides an internal x86-64 control-flow region API.
-It compiles both branch paths and real loop backedges without branch profiles
+An internal x86-64 control-flow region API compiles both branch paths and real
+loop backedges without branch profiles
 or compilation-result reuse. Full integer-loop iterations share budget admission;
 partial cuts preserve exact instruction state. Actual indirect targets use a
-generated address switch. This API is not yet the CLI execution engine: guarded
-RAM/stack lowering and firmware-program integration remain in progress. Its
+generated address switch. Scalar byte, halfword and word RAM accesses use
+invocation-scoped backing bindings and native range checks. Stores accumulate
+exact changed-byte accounting in a host register and publish it at exits.
+MMIO, aliases and accesses outside the bindings exit before effects. This API
+is separate from the CLI execution engine; stack transfers and system/IT/FP
+instructions return checked exits. Its
 differential tests establish local correctness, not a PER throughput result.
 
 | Mechanism | Behavior |

@@ -839,6 +839,24 @@ bool MemoryBus::directReadWindow(
     return true;
 }
 
+bool MemoryBus::directReadWindow(const std::uint32_t probe, DirectReadWindow& out) const noexcept {
+    DirectReadWindow window;
+    if (!directReadWindow(probe, &window.bytes, &window.begin, &window.size)) return false;
+    out = window;
+    return true;
+}
+
+bool MemoryBus::directWriteWindow(const std::uint32_t probe, DirectWriteWindow& out) noexcept {
+    if constexpr (std::endian::native != std::endian::little) return false;
+    if (read_footprint_tracking_ || store_footprint_tracking_ || write_journal_tracking_) return false;
+    auto* const region = find(probe);
+    if (region == nullptr || region->info.kind != RegionKind::ram
+        || !region->info.writable || region->info.executable) return false;
+    out = {region->bytes.data(), region->info.base, region->info.size,
+        &mutation_sequence_, &side_effect_generation_};
+    return true;
+}
+
 bool MemoryBus::tryFastWriteWords(
     const std::uint32_t address,
     const std::uint32_t count,

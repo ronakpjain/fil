@@ -112,6 +112,13 @@ public:
         u8(rex(true, (dst & 8U) != 0U, (src & 8U) != 0U));
         u8(0x69U); u8(modrm(3U, dst, src)); u32(factor);
     }
+    void imulR32Imm32(std::uint32_t dst, std::uint32_t src, std::uint32_t factor) {
+        prefixRex(false, dst, src); u8(0x69U); u8(modrm(3U, dst, src)); u32(factor);
+    }
+    void addM64R64(std::uint32_t base, std::uint32_t disp, std::uint32_t src) {
+        u8(rex(true, (src & 8U) != 0U, (base & 8U) != 0U));
+        u8(0x01U); mem(src, base & 7U, disp);
+    }
     void addR64Imm8(std::uint32_t reg, std::uint8_t imm) {
         u8(rex(true, false, (reg & 8U) != 0U)); u8(0x83U); u8(modrm(3U, 0U, reg)); u8(imm);
     }
@@ -151,6 +158,14 @@ public:
         prefixRex(false, src, base);
         u8(0x89U);
         mem(src, base & 7U, disp);
+    }
+    void movM16R(std::uint32_t base, std::uint32_t disp, std::uint32_t src) {
+        u8(0x66U); prefixRex(false, src, base); u8(0x89U); mem(src, base & 7U, disp);
+    }
+    void movM8R(std::uint32_t base, std::uint32_t disp, std::uint32_t src) {
+        if ((src & 8U) != 0U || (base & 8U) != 0U || (src & 7U) >= 4U)
+            u8(rex(false, (src & 8U) != 0U, (base & 8U) != 0U));
+        u8(0x88U); mem(src, base & 7U, disp);
     }
     void movR32Imm(std::uint32_t dst, std::uint32_t imm) {
         if ((dst & 8U) != 0U) u8(0x41U);

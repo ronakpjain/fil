@@ -20,3 +20,21 @@ Each access includes its purpose and originating PC. Instruction fetches require
 ## ELF materialization
 
 `MemoryBus::materialize()` validates every segment's runtime allocation, then copies only file-backed bytes to physical load addresses. For split `.data` segments, initializer bytes enter flash while runtime SRAM remains zero until firmware reset code copies them. File-unbacked `.bss` storage remains at its deterministic RAM reset value.
+
+## Native execution bindings
+
+`directReadWindow()` borrows readable RAM/ROM/flash backing when read-footprint
+tracking is off. `directWriteWindow()` borrows writable, non-executable RAM
+when read/store-footprint tracking and write journaling are off. Both decline
+without changing their outputs for ineligible mappings. Native instructions
+check the complete access width against each binding, including unaligned
+accesses and tiny regions. MMIO and alias mappings require checked execution.
+
+Bindings are valid while bus identity, mappings and tracking modes remain
+fixed; callers release them before changing these or resetting the board.
+Native stores preserve exact changed-byte mutation and side-effect counts,
+including unchanged stores. A committed region can accumulate these counts
+and publish them before returning to checked execution or invoking observers.
+Callers must bound a region before event/interrupt boundaries and must not
+invoke observers within it, so accounting is published before callbacks can
+observe native effects.

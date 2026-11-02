@@ -334,6 +334,26 @@ public:
     [[nodiscard]] bool directReadWindow(
         std::uint32_t probe, const std::uint8_t** base, std::uint32_t* begin,
         std::uint32_t* size) const noexcept;
+    struct DirectReadWindow {
+        const std::uint8_t* bytes{nullptr};
+        std::uint32_t begin{0U}, size{0U};
+    };
+    struct DirectWriteWindow {
+        std::uint8_t* bytes{nullptr};
+        std::uint32_t begin{0U}, size{0U};
+        std::uint64_t* mutation_sequence{nullptr};
+        std::uint64_t* side_effect_generation{nullptr};
+    };
+    [[nodiscard]] bool directReadWindow(std::uint32_t probe, DirectReadWindow& out) const noexcept;
+    /** Borrow a committed-write binding for writable, non-executable RAM.
+     * Declines with output untouched unless read/store-footprint tracking and
+     * write journaling are off. Native writes must publish their exact
+     * changed-byte count to both counters before returning or invoking an
+     * observer. Mapping, tracking modes and bus identity
+     * must remain fixed for the binding's lifetime; do not retain it past the
+     * execution scope or move the bus while it is borrowed.
+     */
+    [[nodiscard]] bool directWriteWindow(std::uint32_t probe, DirectWriteWindow& out) noexcept;
     /**
      * @brief Width-generic backed-memory-only access without fault allocation.
      *

@@ -6,12 +6,24 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <limits>
 
 namespace {
 using namespace fil::cpu;
 constexpr std::uint32_t pc = 0x08004000U;
+constexpr std::uint32_t ram = 0x20000000U;
+
+class RegionPort final : public fil::mem::MmioDevice {
+public:
+    unsigned reads{0U}, writes{0U};
+    fil::mem::MemoryResult<std::uint64_t> read(std::uint32_t, fil::mem::AccessSize,
+        const fil::mem::AccessContext&) override { ++reads; return std::uint64_t{0U}; }
+    fil::mem::MemoryResult<std::uint64_t> write(std::uint32_t, fil::mem::AccessSize,
+        std::uint64_t, const fil::mem::AccessContext&) override { ++writes; return std::uint64_t{0U}; }
+    std::string_view name() const noexcept override { return "region-port"; }
+};
 
 template <std::size_t N>
 auto code(const std::array<std::uint16_t, N>& words) {
@@ -75,7 +87,257 @@ TEST(NativeRegionTest, DirectCallsIncludeTheirReturnContinuationWithoutPredictin
     EXPECT_TRUE(return_found);
 }
 
+TEST(NativeRegionTest, WriteBindingsRequireCommittedModesAndNonExecutableRam) {
+    if constexpr (std::endian::native != std::endian::little) GTEST_SKIP();
+    fil::mem::MemoryBus memory;
+    ASSERT_TRUE(memory.mapRam(ram, 32U, "data"));
+    ASSERT_TRUE(memory.mapRam(ram + 64U, 16U, "code", true));
+    ASSERT_TRUE(memory.mapRom(pc, 16U, "rom"));
+    ASSERT_TRUE(memory.mapFlash(pc + 64U, 16U, "flash"));
+    ASSERT_TRUE(memory.mapAlias(ram + 128U, ram, 32U, "alias"));
+    RegionPort port;
+    ASSERT_TRUE(memory.mapMmio(0x40000000U, 32U, port, "port"));
+    fil::mem::MemoryBus::DirectWriteWindow binding;
+    EXPECT_FALSE(memory.directWriteWindow(ram, binding));
+    memory.setReadFootprintTracking(false);
+    EXPECT_FALSE(memory.directWriteWindow(ram, binding));
+    memory.setWriteJournalTracking(false);
+    ASSERT_TRUE(memory.directWriteWindow(ram + 1U, binding));
+    const auto initial = binding;
+    EXPECT_EQ(binding.begin, ram); EXPECT_EQ(binding.size, 32U);
+    ASSERT_NE(binding.bytes, nullptr); ASSERT_NE(binding.mutation_sequence, nullptr);
+    ASSERT_NE(binding.side_effect_generation, nullptr);
+    for (const auto address : {ram + 64U, pc, pc + 64U, ram + 128U, 0x40000000U, 0x60000000U}) {
+        EXPECT_FALSE(memory.directWriteWindow(address, binding));
+        EXPECT_EQ(binding.bytes, initial.bytes);
+        EXPECT_EQ(binding.begin, initial.begin); EXPECT_EQ(binding.size, initial.size);
+        EXPECT_EQ(binding.mutation_sequence, initial.mutation_sequence);
+        EXPECT_EQ(binding.side_effect_generation, initial.side_effect_generation);
+    }
+    {
+        fil::mem::MemoryBus::StoreFootprintScope store_tracking(memory);
+        EXPECT_FALSE(memory.directWriteWindow(ram, binding));
+        EXPECT_EQ(binding.bytes, initial.bytes);
+    }
+    memory.setReadFootprintTracking(true);
+    EXPECT_FALSE(memory.directWriteWindow(ram, binding));
+    EXPECT_EQ(binding.bytes, initial.bytes);
+    EXPECT_EQ(port.reads, 0U); EXPECT_EQ(port.writes, 0U);
+}
+
 #if defined(__x86_64__) && !defined(_WIN32)
+TEST(NativeRegionTest, GuardedRamLoopMatchesCpuMemoryAndCountersAtEveryCut) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    const auto bytes = code(std::array<std::uint16_t, 6>{
+        0x6808U,0x3001U,0x6008U,0x3a01U,0xd1faU,0xbe00U});
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    const auto function = jit->compileRegion(bytes, pc, pc, error); ASSERT_NE(function, nullptr);
+    fil::mem::MemoryBus memory, oracle;
+    for (auto* bus : {&memory, &oracle}) {
+        ASSERT_TRUE(bus->mapRom(pc, bytes.size(), "loop")); ASSERT_TRUE(bus->loadBytes(pc, bytes));
+        ASSERT_TRUE(bus->mapRam(ram, 16U, "data"));
+        bus->setReadFootprintTracking(false); bus->setWriteJournalTracking(false);
+    }
+    CortexM4 reference(oracle);
+    NativeRegionContext binding;
+    ASSERT_TRUE(memory.directReadWindow(ram, binding.ram_read));
+    ASSERT_TRUE(memory.directWriteWindow(ram, binding.ram_write));
+    for (const auto iterations : {0U,1U,3U})
+    for (const auto stalls : {std::array<std::uint32_t,2>{0U,0U}, std::array<std::uint32_t,2>{0U,3U}})
+    for (std::uint32_t limit = 0U; limit <= 17U; ++limit)
+    for (std::uint64_t credit = 0U; credit <= 45U; ++credit) {
+        ASSERT_TRUE(memory.write32(ram, 0x7ffffffeU)); ASSERT_TRUE(oracle.write32(ram, 0x7ffffffeU));
+        CpuState state; state.r[15] = pc; state.r[1] = ram; state.r[2] = iterations;
+        state.instruction_address = pc + 100U; state.xpsr |= xpsr_c | xpsr_q;
+        reference.state() = state;
+        auto context = binding; context.cpu_state = &state;
+        context.instruction_limit = limit; context.cycle_limit = credit;
+        context.sequential_fetch_stall = stalls[0]; context.nonsequential_fetch_stall = stalls[1];
+        std::uint32_t retired = 0U, fetch_end = 0U;
+        std::uint64_t cycles = 0U; bool have = false;
+        NativeRegionExit reason;
+        for (;;) {
+            if (retired == limit) { reason = NativeRegionExit::instruction_budget; break; }
+            const auto next = reference.state().r[15];
+            if (next == pc + 10U) { reason = NativeRegionExit::checked_instruction; break; }
+            std::uint16_t pipeline = 0U; ASSERT_TRUE(reference.peekPredictableCycles(pipeline));
+            const auto charge = pipeline + stalls[have && next == fetch_end ? 0U : 1U];
+            if (charge > credit - cycles) { reason = NativeRegionExit::cycle_budget; break; }
+            const auto step = reference.stepFast(); ASSERT_EQ(step.reason, StopReason::step_complete);
+            ASSERT_EQ(step.cycles, pipeline);
+            ++retired; cycles += charge; have = true; fetch_end = next + step.instruction_size;
+        }
+        function(&context);
+        EXPECT_TRUE(bitwiseEqual(state, reference.state())) << limit << '/' << credit;
+        EXPECT_EQ(context.exit_reason, reason); EXPECT_EQ(context.retired_count, retired);
+        EXPECT_EQ(context.retired_cycles, cycles); EXPECT_EQ(context.have_fetch, have);
+        EXPECT_EQ(context.fetch_end, fetch_end);
+        EXPECT_EQ(memory.read32(ram).value(), oracle.read32(ram).value());
+        EXPECT_EQ(memory.sideEffectCheckpoint().mutation_sequence, oracle.sideEffectCheckpoint().mutation_sequence);
+        EXPECT_EQ(memory.sideEffectGeneration(), oracle.sideEffectGeneration());
+        EXPECT_EQ(memory.executionGeneration(), oracle.executionGeneration());
+        EXPECT_EQ(memory.readFootprint().words, oracle.readFootprint().words);
+    }
+}
+
+TEST(NativeRegionTest, StoresRetainExactChangedByteCountsForEveryWidthAndAlignment) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    for (const auto word : {0x6008U,0x7008U,0x8008U}) {
+        const auto bytes = code(std::array<std::uint16_t, 2>{static_cast<std::uint16_t>(word),0xbe00U});
+        const auto function = jit->compileRegion(bytes, pc, pc, error); ASSERT_NE(function, nullptr);
+        fil::mem::MemoryBus memory, oracle;
+        for (auto* bus : {&memory, &oracle}) {
+            ASSERT_TRUE(bus->mapRom(pc, bytes.size(), "store")); ASSERT_TRUE(bus->loadBytes(pc, bytes));
+            ASSERT_TRUE(bus->mapRam(ram, 16U, "data"));
+            bus->setReadFootprintTracking(false); bus->setWriteJournalTracking(false);
+        }
+        CortexM4 reference(oracle);
+        NativeRegionContext binding;
+        ASSERT_TRUE(memory.directWriteWindow(ram, binding.ram_write));
+        for (auto old : {0U,0xffffffffU,0x80808080U,0x7f7f7f7fU,0x11223344U})
+        for (auto value : {0U,0xffffffffU,0x00800001U,0x01007f80U,0xffaa5500U,0x11223344U})
+        for (std::uint32_t alignment = 0U; alignment < 4U; ++alignment) {
+            ASSERT_TRUE(memory.write64(ram, old | (std::uint64_t{old} << 32U)));
+            ASSERT_TRUE(oracle.write64(ram, old | (std::uint64_t{old} << 32U)));
+            CpuState state; state.r[15] = pc; state.r[0] = value; state.r[1] = ram + alignment;
+            state.xpsr |= xpsr_c | xpsr_v | xpsr_q;
+            reference.state() = state;
+            const auto expected = reference.stepFast(); ASSERT_EQ(expected.reason, StopReason::step_complete);
+            auto context = binding; context.cpu_state = &state;
+            context.instruction_limit = 1U; context.cycle_limit = UINT64_MAX;
+            function(&context);
+            EXPECT_TRUE(bitwiseEqual(state, reference.state()));
+            EXPECT_EQ(context.retired_count, 1U); EXPECT_EQ(context.retired_cycles, expected.cycles);
+            EXPECT_EQ(memory.read64(ram).value(), oracle.read64(ram).value());
+            EXPECT_EQ(memory.sideEffectCheckpoint().mutation_sequence, oracle.sideEffectCheckpoint().mutation_sequence);
+            EXPECT_EQ(memory.sideEffectGeneration(), oracle.sideEffectGeneration());
+        }
+    }
+}
+
+TEST(NativeRegionTest, LoadsCoverSignedWidthsUnalignedDataAndBothReadBindings) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    for (const auto first : {0x680aU,0x780aU,0x880aU,0xf991U,0xf9b1U}) {
+        const bool wide = first >= 0xf000U;
+        const auto bytes = code(std::array<std::uint16_t, 3>{static_cast<std::uint16_t>(first),
+            static_cast<std::uint16_t>(wide ? 0x2000U : 0xbe00U),0xbe00U});
+        const auto function = jit->compileRegion(bytes, pc, pc, error); ASSERT_NE(function, nullptr);
+        fil::mem::MemoryBus memory;
+        ASSERT_TRUE(memory.mapRom(pc, bytes.size(), "load")); ASSERT_TRUE(memory.loadBytes(pc, bytes));
+        ASSERT_TRUE(memory.mapRam(ram, 16U, "data"));
+        ASSERT_TRUE(memory.write64(ram, 0x0180ff007f8001ffULL));
+        memory.setReadFootprintTracking(false);
+        CortexM4 reference(memory);
+        for (const bool secondary : {false, true})
+        for (std::uint32_t alignment = 0U; alignment < 4U; ++alignment) {
+            CpuState state; state.r[15] = pc; state.r[1] = ram + alignment;
+            state.xpsr |= xpsr_c | xpsr_v | xpsr_q;
+            reference.state() = state;
+            const auto expected = reference.stepFast(); ASSERT_EQ(expected.reason, StopReason::step_complete);
+            NativeRegionContext context; context.cpu_state = &state;
+            context.instruction_limit = 1U; context.cycle_limit = UINT64_MAX;
+            ASSERT_TRUE(memory.directReadWindow(ram, secondary ? context.code_read : context.ram_read));
+            function(&context);
+            EXPECT_EQ(context.retired_count, 1U);
+            EXPECT_EQ(context.retired_cycles, expected.cycles);
+            EXPECT_TRUE(bitwiseEqual(state, reference.state()));
+        }
+    }
+}
+
+TEST(NativeRegionTest, MissesAndTinyBindingsExitBeforeMemoryOrPeripheralEffects) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    for (const auto word : {0x6808U,0x6008U,0x8808U,0x8008U}) {
+        const auto bytes = code(std::array<std::uint16_t, 2>{static_cast<std::uint16_t>(word),0xbe00U});
+        const auto function = jit->compileRegion(bytes, pc, pc, error); ASSERT_NE(function, nullptr);
+        fil::mem::MemoryBus memory; RegionPort port;
+        ASSERT_TRUE(memory.mapRam(ram, 3U, "tiny"));
+        ASSERT_TRUE(memory.mapMmio(0x40000000U, 16U, port, "port"));
+        memory.setReadFootprintTracking(false); memory.setWriteJournalTracking(false);
+        NativeRegionContext binding;
+        ASSERT_TRUE(memory.directReadWindow(ram, binding.ram_read));
+        ASSERT_TRUE(memory.directWriteWindow(ram, binding.ram_write));
+        for (const auto address : {ram + 2U, ram - 1U, 0x40000000U, 0xffffffffU}) {
+            CpuState state; state.r[15] = pc; state.r[0] = 0x12345678U; state.r[1] = address;
+            const auto initial = state;
+            const auto checkpoint = memory.sideEffectCheckpoint();
+            auto context = binding; context.cpu_state = &state;
+            context.instruction_limit = 10U; context.cycle_limit = UINT64_MAX;
+            function(&context);
+            EXPECT_EQ(context.exit_reason, NativeRegionExit::checked_instruction);
+            EXPECT_EQ(context.retired_count, 0U); EXPECT_EQ(context.retired_cycles, 0U);
+            EXPECT_TRUE(bitwiseEqual(state, initial));
+            EXPECT_EQ(memory.sideEffectCheckpoint().mutation_sequence, checkpoint.mutation_sequence);
+            EXPECT_EQ(memory.sideEffectCheckpoint().mmio_generation, checkpoint.mmio_generation);
+        }
+        EXPECT_EQ(port.reads, 0U); EXPECT_EQ(port.writes, 0U);
+    }
+}
+
+TEST(NativeRegionTest, StackRelativeScalarAccessUsesTheActiveBankRatherThanTheR13Mirror) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    for (const auto word : {0x9a00U,0x9200U}) {
+        const auto bytes = code(std::array<std::uint16_t, 2>{static_cast<std::uint16_t>(word),0xbe00U});
+        const auto function = jit->compileRegion(bytes, pc, pc, error); ASSERT_NE(function, nullptr);
+        fil::mem::MemoryBus memory, oracle;
+        for (auto* bus : {&memory, &oracle}) {
+            ASSERT_TRUE(bus->mapRom(pc, bytes.size(), "stack-relative")); ASSERT_TRUE(bus->loadBytes(pc, bytes));
+            ASSERT_TRUE(bus->mapRam(ram, 64U, "stack"));
+            bus->setReadFootprintTracking(false); bus->setWriteJournalTracking(false);
+        }
+        CortexM4 reference(oracle);
+        for (const auto mode : {0U,1U,2U}) {
+            for (auto* bus : {&memory, &oracle}) {
+                ASSERT_TRUE(bus->write32(ram + 16U, 0x7fffffffU));
+                ASSERT_TRUE(bus->write32(ram + 40U, 0x80ffffffU));
+            }
+            CpuState state; state.r[15] = pc; state.r[2] = 0x12345680U;
+            state.r[13] = ram + 4U; state.msp = ram + 16U; state.psp = ram + 40U;
+            state.control = mode == 0U ? 0U : 2U;
+            state.xpsr |= xpsr_c | xpsr_q | (mode == 2U ? 3U : 0U);
+            reference.state() = state;
+            const auto expected = reference.stepFast(); ASSERT_EQ(expected.reason, StopReason::step_complete);
+            NativeRegionContext context; context.cpu_state = &state;
+            context.instruction_limit = 1U; context.cycle_limit = UINT64_MAX;
+            ASSERT_TRUE(memory.directReadWindow(ram, context.ram_read));
+            ASSERT_TRUE(memory.directWriteWindow(ram, context.ram_write));
+            function(&context);
+            EXPECT_EQ(context.retired_count, 1U); EXPECT_EQ(context.retired_cycles, expected.cycles);
+            EXPECT_TRUE(bitwiseEqual(state, reference.state()));
+            EXPECT_EQ(memory.read32(ram + 16U).value(), oracle.read32(ram + 16U).value());
+            EXPECT_EQ(memory.read32(ram + 40U).value(), oracle.read32(ram + 40U).value());
+            EXPECT_EQ(memory.sideEffectCheckpoint().mutation_sequence, oracle.sideEffectCheckpoint().mutation_sequence);
+        }
+    }
+}
+
+TEST(NativeRegionTest, LiteralLoadsReadLiveBackingThroughEitherBinding) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    const auto bytes = code(std::array<std::uint16_t, 4>{0x4800U,0xbe00U,0xcdefU,0x89abU});
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    const auto function = jit->compileRegion(bytes, pc, pc, error); ASSERT_NE(function, nullptr);
+    fil::mem::MemoryBus memory;
+    ASSERT_TRUE(memory.mapRom(pc, bytes.size(), "literal")); ASSERT_TRUE(memory.loadBytes(pc, bytes));
+    memory.setReadFootprintTracking(false);
+    CortexM4 reference(memory);
+    for (const bool secondary : {false, true}) {
+        CpuState state; state.r[15] = pc; state.xpsr |= xpsr_c | xpsr_v;
+        reference.state() = state;
+        const auto expected = reference.stepFast(); ASSERT_EQ(expected.reason, StopReason::step_complete);
+        NativeRegionContext context; context.cpu_state = &state;
+        context.instruction_limit = 1U; context.cycle_limit = UINT64_MAX;
+        ASSERT_TRUE(memory.directReadWindow(pc, secondary ? context.ram_read : context.code_read));
+        function(&context);
+        EXPECT_TRUE(bitwiseEqual(state, reference.state()));
+        EXPECT_EQ(state.r[0], 0x89abcdefU);
+        EXPECT_EQ(context.retired_count, 1U); EXPECT_EQ(context.retired_cycles, expected.cycles);
+    }
+}
+
 TEST(NativeRegionTest, EmittedLoopsMatchCheckedCpuAtEveryInstructionAndCycleCut) {
     if (!MicroJit::hostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t, 4>{0x3001U,0x3901U,0xd1fcU,0xbe00U});

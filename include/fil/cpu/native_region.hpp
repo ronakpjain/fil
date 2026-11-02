@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fil/cpu/native_ir.hpp"
+#include "fil/mem/memory_bus.hpp"
 
 #include <array>
 #include <cstddef>
@@ -62,6 +63,11 @@ struct NativeRegionContext {
     std::uint32_t retired_count{0U};
     std::uint64_t retired_cycles{0U};
     NativeRegionExit exit_reason{NativeRegionExit::none};
+    // Invocation-scoped bindings to authoritative backed memory, not retained
+    // lookup results. Publish with MemoryBus's checked binding APIs while its
+    // mapping/tracking modes stay fixed. Empty bindings force checked exits.
+    mem::MemoryBus::DirectReadWindow ram_read{}, code_read{};
+    mem::MemoryBus::DirectWriteWindow ram_write{};
 };
 
 using NativeRegionFunction = void (*)(NativeRegionContext*);

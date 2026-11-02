@@ -93,7 +93,14 @@ bool nativeRegionEntryValid(NativeRegionContext* context) noexcept {
     context->retired_count = 0U;
     context->retired_cycles = 0U;
     const auto* state = context->cpu_state;
-    const bool valid = state != nullptr && (state->r[15] & 1U) == 0U && !state->halted
+    const auto read_valid = [](const mem::MemoryBus::DirectReadWindow& view) {
+        return view.size == 0U || view.bytes != nullptr;
+    };
+    const auto& write = context->ram_write;
+    const bool bindings_valid = read_valid(context->ram_read) && read_valid(context->code_read)
+        && (write.size == 0U || (write.bytes != nullptr && write.mutation_sequence != nullptr
+            && write.side_effect_generation != nullptr));
+    const bool valid = bindings_valid && state != nullptr && (state->r[15] & 1U) == 0U && !state->halted
         && state->thumb && (state->xpsr & xpsr_t) != 0U && state->it_state == 0U
         && !state->pending_exception && !state->pending_exc_return;
     context->exit_reason = valid ? NativeRegionExit::none : NativeRegionExit::invalid_state;

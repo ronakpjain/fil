@@ -2053,7 +2053,7 @@ NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t>
     if (!buildNativeRegion(bytes, base, entry_pc, plan, error)) return nullptr;
     std::lock_guard lock(impl_->mutex);
     using namespace x86detail;
-    constexpr std::uint32_t ctx = 13U, cpu = 12U, nzcv = 3U, retain = 15U;
+    constexpr std::uint32_t ctx = 13U, cpu = 12U, nzcv = 3U, dirty = 15U;
     constexpr std::uint32_t count = 11U, cycles = 5U, fetch = 14U;
     const auto off = [](std::size_t value) { return static_cast<std::uint32_t>(value); };
     const Offsets offsets{off(offsetof(CpuState, r)), off(offsetof(CpuState, xpsr)),
@@ -2072,8 +2072,8 @@ NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t>
     e.callReg(kEax); e.movzxEaxAl(); e.testRR(kEax, kEax); e.jcc(4U, early);
     e.movR64M(cpu, ctx, off(offsetof(NativeRegionContext, cpu_state)));
     e.movRR64(kState, cpu);
-    e.movR32M(retain, cpu, offsets.xpsr); e.movRR(nzcv, retain);
-    e.aluRImm(4U, retain, ~(kFlagN | kFlagZ | kFlagC | kFlagV));
+    e.movR32M(nzcv, cpu, offsets.xpsr);
+    e.movR32Imm(dirty, 0U);
     e.aluRImm(4U, nzcv, kFlagN | kFlagZ | kFlagC | kFlagV);
     e.movR32Imm(count, 0U); e.movR32Imm(cycles, 0U);
     e.movR32M(fetch, ctx, off(offsetof(NativeRegionContext, fetch_end)));
@@ -2086,8 +2086,18 @@ NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t>
     e.movR32M(kEax, cpu, offsets.addr); e.shR64Imm(4U, kEax, 32U); e.orR64R64(fetch, kEax);
     std::array<unsigned, 13U> uses{};
     for (std::size_t i = 0U; i < plan.count; ++i) {
-        const auto& inst = plan.ops[i].instruction.integer;
-        for (auto reg : {inst.rd, inst.rn, inst.rm}) if (reg < uses.size()) ++uses[reg];
+        const auto& op = plan.ops[i];
+        if (op.flow == RegionFlow::checked) continue;
+        const auto& inst = op.instruction;
+        if (nativeOpIsMemory(inst.kind)) {
+            if (!inst.absolute && inst.rn < uses.size()) ++uses[inst.rn];
+            if (inst.rd < uses.size()) ++uses[inst.rd];
+        } else if (inst.kind == NativeOp::blx_reg) {
+            if (inst.rn < uses.size()) ++uses[inst.rn];
+        } else if (inst.kind == NativeOp::integer) {
+            for (auto reg : {inst.integer.rd, inst.integer.rn, inst.integer.rm})
+                if (reg < uses.size()) ++uses[reg];
+        }
     }
     for (const auto host : {6,8,9}) {
         const auto selected = std::max_element(uses.begin(), uses.end());
@@ -2112,6 +2122,79 @@ NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t>
         if (index == NativeRegionOp::external) exit(NativeRegionExit::external_edge, target);
         else e.jmp(labels[index].entry);
     };
+    const auto prepare_memory = [&](const NativeRegionOp& op, std::size_t index) {
+        const auto& inst = op.instruction;
+        const auto width = nativeOpWidth(inst.kind);
+        if (inst.absolute) e.movR32Imm(kR10, inst.absolute_address);
+        else {
+            if (inst.rn == 13U) {
+                const auto msp = e.makeLabel(), ready = e.makeLabel();
+                e.movR32M(kEax, cpu, offsets.xpsr); e.aluRImm(4U, kEax, xpsr_ipsr_mask);
+                e.jcc(5U, msp);
+                e.movR32M(kEax, cpu, off(offsetof(CpuState, control)));
+                e.testRImm(kEax, 2U); e.jcc(4U, msp);
+                e.movR32M(kR10, cpu, off(offsetof(CpuState, psp))); e.jmp(ready);
+                e.bindLabel(msp); e.movR32M(kR10, cpu, off(offsetof(CpuState, msp)));
+                e.bindLabel(ready);
+            } else loadGuest(e, kR10, offsets, inst.rn);
+            if (inst.offset != 0U) e.aluRImm(0U, kR10, inst.offset);
+        }
+        const auto window = [&](std::uint32_t binding, bool write, std::size_t miss) {
+            using Read = mem::MemoryBus::DirectReadWindow;
+            using Write = mem::MemoryBus::DirectWriteWindow;
+            const auto begin = binding + off(write ? offsetof(Write, begin) : offsetof(Read, begin));
+            const auto size = binding + off(write ? offsetof(Write, size) : offsetof(Read, size));
+            const auto bytes = binding + off(write ? offsetof(Write, bytes) : offsetof(Read, bytes));
+            e.movRR(kEdx, kR10); e.aluRM(5U, kEdx, ctx, begin);
+            e.movR32M(kEax, ctx, size); e.aluRImm(5U, kEax, width); e.jcc(2U, miss);
+            e.aluRR(7U, kEdx, kEax); e.jcc(7U, miss);
+            e.movR64M(kEax, ctx, bytes); e.movRR64(kR10, kEax); e.addR64R64(kR10, kEdx);
+        };
+        if (!nativeOpIsLoad(inst.kind)) {
+            window(off(offsetof(NativeRegionContext, ram_write)), true, labels[index].checked);
+        } else {
+            const auto second = e.makeLabel(), ready = e.makeLabel();
+            window(off(inst.absolute ? offsetof(NativeRegionContext, code_read)
+                                    : offsetof(NativeRegionContext, ram_read)), false, second);
+            e.jmp(ready); e.bindLabel(second);
+            window(off(inst.absolute ? offsetof(NativeRegionContext, ram_read)
+                                    : offsetof(NativeRegionContext, code_read)), false, labels[index].checked);
+            e.bindLabel(ready);
+        }
+    };
+    const auto memory_body = [&](const NativeInst& inst) {
+        if (nativeOpIsLoad(inst.kind)) {
+            switch (inst.kind) {
+            case NativeOp::load_byte: e.movzxR32M8(kEax, kR10, 0U); break;
+            case NativeOp::load_half: e.movzxR32M16(kEax, kR10, 0U); break;
+            case NativeOp::load_byte_signed: e.movsxR32M8(kEax, kR10, 0U); break;
+            case NativeOp::load_half_signed: e.movsxR32M16(kEax, kR10, 0U); break;
+            default: e.movR32M(kEax, kR10, 0U); break;
+            }
+            storeGuest(e, offsets, inst.rd, kEax);
+        } else {
+            const auto width = nativeOpWidth(inst.kind);
+            loadGuest(e, kEax, offsets, inst.rd);
+            if (width == 1U) {
+                e.aluRImm(4U, kEax, 0xffU); e.movzxR32M8(kEdx, kR10, 0U);
+            } else if (width == 2U) {
+                e.aluRImm(4U, kEax, 0xffffU); e.movzxR32M16(kEdx, kR10, 0U);
+            } else e.movR32M(kEdx, kR10, 0U);
+            const auto unchanged = e.makeLabel();
+            e.aluRR(6U, kEdx, kEax); e.testRR(kEdx, kEdx); e.jcc(4U, unchanged);
+            if (width == 1U) e.movM8R(kR10, 0U, kEax);
+            else if (width == 2U) e.movM16R(kR10, 0U, kEax);
+            else e.movM32R(kR10, 0U, kEax);
+            // Mark each nonzero difference byte, without cross-byte carries,
+            // then sum the four 0/1 lanes. Counters retain byte-store semantics.
+            e.movRR(kEcx, kEdx); e.aluRImm(4U, kEcx, 0x7f7f7f7fU);
+            e.aluRImm(0U, kEcx, 0x7f7f7f7fU); e.aluRR(1U, kEcx, kEdx);
+            e.aluRImm(4U, kEcx, 0x80808080U); e.shImm(5U, kEcx, 7U);
+            e.imulR32Imm32(kEcx, kEcx, 0x01010101U); e.shImm(5U, kEcx, 24U);
+            e.addR64R64(dirty, kEcx);
+            e.bindLabel(unchanged);
+        }
+    };
     const auto body = [&](const NativeRegionOp& op, std::size_t index, bool taken) {
         const auto nonsequential = e.makeLabel(), charge_ready = e.makeLabel();
         e.cmpR32Imm(fetch, op.pc); e.jcc(5U, nonsequential);
@@ -2127,7 +2210,8 @@ NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t>
         e.jcc(7U, labels[index].credit);
         e.movRR64(cycles, kEax);
         if (op.flow == RegionFlow::next) {
-            if (!emitX86Op(e, offsets, op.instruction.integer, error)) return false;
+            if (nativeOpIsMemory(op.instruction.kind)) memory_body(op.instruction);
+            else if (!emitX86Op(e, offsets, op.instruction.integer, error)) return false;
         } else if (op.flow == RegionFlow::call || op.instruction.kind == NativeOp::blx_reg) {
             e.movM32Imm(cpu, offsets.r + 56U, op.fallthrough | 1U);
         }
@@ -2226,8 +2310,11 @@ NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t>
             if (!body(op, i, true)) return nullptr;
             e.bindLabel(sequential);
             if (!body(op, i, false)) return nullptr;
-        } else if (op.flow == RegionFlow::checked || op.instruction.kind != NativeOp::integer) {
+        } else if (op.flow == RegionFlow::checked) {
             e.jmp(labels[i].checked);
+        } else if (nativeOpIsMemory(op.instruction.kind)) {
+            prepare_memory(op, i);
+            if (!body(op, i, false)) return nullptr;
         } else if (op.flow == RegionFlow::conditional) {
             const auto taken = e.makeLabel();
             const auto& inst = op.instruction.integer;
@@ -2278,7 +2365,21 @@ NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t>
     for (std::size_t guest = 0U; guest < e.guest_hosts.size(); ++guest)
         if (e.guest_hosts[guest] >= 0)
             e.movM32R(cpu, offsets.r + off(guest * 4U), static_cast<std::uint32_t>(e.guest_hosts[guest]));
-    e.movRR(kEax, retain); e.aluRR(1U, kEax, nzcv); e.movM32R(cpu, offsets.xpsr, kEax);
+    // Native memory effects are committed, and no observer runs inside the
+    // admitted region. Publish aggregate dirty-byte accounting at every exit,
+    // before checked execution or any peripheral/event callback can observe it.
+    const auto counters_ready = e.makeLabel();
+    e.cmpR64Imm8(dirty, 0U); e.jcc(4U, counters_ready);
+    using Write = mem::MemoryBus::DirectWriteWindow;
+    const auto write_binding = off(offsetof(NativeRegionContext, ram_write));
+    e.movR64M(kEax, ctx, write_binding + off(offsetof(Write, mutation_sequence)));
+    e.addM64R64(kEax, 0U, dirty);
+    e.movR64M(kEax, ctx, write_binding + off(offsetof(Write, side_effect_generation)));
+    e.addM64R64(kEax, 0U, dirty);
+    e.bindLabel(counters_ready);
+    e.movR32M(kEax, cpu, offsets.xpsr);
+    e.aluRImm(4U, kEax, ~(kFlagN | kFlagZ | kFlagC | kFlagV));
+    e.aluRR(1U, kEax, nzcv); e.movM32R(cpu, offsets.xpsr, kEax);
     e.testRR(count, count); e.jcc(4U, done);
     e.movM32R(ctx, off(offsetof(NativeRegionContext, fetch_end)), fetch);
     e.movM8Imm8(ctx, off(offsetof(NativeRegionContext, have_fetch)), 1U);
