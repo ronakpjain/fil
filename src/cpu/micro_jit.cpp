@@ -1819,7 +1819,8 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
         e.jmp(normal);
     }
     const auto publish = [&](std::size_t i, NativeExitReason why, bool failed,
-                             std::size_t current_override = static_cast<std::size_t>(-1)) {
+                             std::size_t current_override = static_cast<std::size_t>(-1),
+                             bool reason_prepared = false) {
         e.movM32Imm(ctx,retired,static_cast<std::uint32_t>(i));
         const auto publish_checked_cycles = e.makeLabel(), cycles_published = e.makeLabel();
         e.movR32M(kEax, ctx, kAdmittedMode);
@@ -1839,14 +1840,28 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
             if (!dynamic_return) e.movM32Imm(kState,offsets.r+60U,prev.expected_next_pc);
             e.movM32Imm(kState,offsets.addr,prev.pc);
         }
-        e.movM32Imm(ctx,reason,static_cast<std::uint32_t>(why)); e.jmp(done);
+        if (!reason_prepared) e.movM32Imm(ctx,reason,static_cast<std::uint32_t>(why));
+        e.jmp(done);
     };
     for (std::size_t i=0;i<n;++i) {
-        e.bindLabel(exits[i].instruction); publish(i,NativeExitReason::instruction_limit,false);
-        e.bindLabel(exits[i].cycle); publish(i,NativeExitReason::cycle_limit,false);
-        e.bindLabel(exits[i].unsupported); publish(i,NativeExitReason::unsupported_instruction,true);
-        e.bindLabel(exits[i].mismatch); publish(i,NativeExitReason::branch_mismatch,true);
-        e.bindLabel(exits[i].helper); publish(i,NativeExitReason::helper_declined,true);
+        // All pre-instruction exits commit the same prefix. Keep only their
+        // reason/failure metadata in small stubs, rather than duplicating the
+        // cycle, flags and PC publication five times per guest instruction.
+        const auto prefix_exit = e.makeLabel(), failed_exit = e.makeLabel();
+        const auto exit_stub = [&](std::size_t label, NativeExitReason why, bool failed) {
+            e.bindLabel(label);
+            e.movM32Imm(ctx, reason, static_cast<std::uint32_t>(why));
+            e.jmp(failed ? failed_exit : prefix_exit);
+        };
+        exit_stub(exits[i].instruction, NativeExitReason::instruction_limit, false);
+        exit_stub(exits[i].cycle, NativeExitReason::cycle_limit, false);
+        exit_stub(exits[i].unsupported, NativeExitReason::unsupported_instruction, true);
+        exit_stub(exits[i].mismatch, NativeExitReason::branch_mismatch, true);
+        exit_stub(exits[i].helper, NativeExitReason::helper_declined, true);
+        e.bindLabel(failed_exit);
+        e.movM32Imm(ctx, failing, entry.plan.ops[i].pc);
+        e.bindLabel(prefix_exit);
+        publish(i, NativeExitReason::none, false, i, true);
         e.bindLabel(exits[i].dynamic_return);
         if (entry.plan.ops[i].decoded.kind == InstrKind::pop
             && (entry.plan.ops[i].decoded.register_list & 0x8000U)) {
