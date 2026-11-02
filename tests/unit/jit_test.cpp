@@ -1676,7 +1676,7 @@ TEST(JitTest, MixedNativeReversibleMatchesCachedAtEveryBudgetAndDecline) {
             }
         }
     }
-#if defined(__x86_64__) && defined(FIL_ENABLE_MICRO_JIT) && FIL_ENABLE_MICRO_JIT
+#if (defined(__x86_64__) || defined(__aarch64__)) && defined(FIL_ENABLE_MICRO_JIT) && FIL_ENABLE_MICRO_JIT
     EXPECT_GT(native_total, 0U) << "differential test must exercise the mixed native backend";
 #else
     static_cast<void>(native_total); // Unsupported mixed backends retain exact cached execution.
