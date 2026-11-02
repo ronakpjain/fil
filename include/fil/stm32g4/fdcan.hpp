@@ -8,6 +8,7 @@
 #include "fil/stm32g4/peripheral.hpp"
 
 #include <array>
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -241,7 +242,7 @@ private:
     std::array<std::uint64_t, FdcanMessageRam::txFifoElementCount> tx_generation_{};
     InterruptCallback interrupt_callback_;
     std::array<LineInterruptCallback, 2> line_interrupt_callbacks_{};
-    std::array<bool, 2> interrupt_line_asserted_{};
+    std::bitset<2U> interrupt_line_asserted_{};
 };
 
 using FdcanController = FdcanPeripheral;

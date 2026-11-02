@@ -39,6 +39,83 @@ TEST(PeripheralTest, MergesRegisterByteLanesAndRejectsOutOfBlockWrites) {
     EXPECT_EQ(registers.peekRegister(4U), 0U);
 }
 
+TEST(PeripheralTest, EveryReadWidthLoadsEachTouchedSideEffectfulWordOnce) {
+    class ReadClear final : public fil::stm32g4::RegisterPeripheral {
+    public:
+        explicit ReadClear(std::uint32_t size) : RegisterPeripheral("read-clear", size) {
+            for (std::uint32_t offset = 0U; offset < size; offset += 4U)
+                setResetValue(offset, initialWord(offset / 4U));
+            reset();
+        }
+        static std::uint32_t initialWord(std::uint32_t index) { return 0x44332211U ^ (index * 0x01010101U); }
+        std::array<unsigned,66U> touches{};
+    protected:
+        std::uint32_t loadRegister(std::uint32_t offset, const fil::mem::AccessContext&) override {
+            ++touches[offset / 4U];
+            const auto value = registerValue(offset); setRegister(offset, 0U); return value;
+        }
+        void onReset() override { touches.fill(0U); }
+    };
+    for (const auto block_size : {12U,264U}) {
+        ReadClear device(block_size); // inline storage and overflow storage
+        for (const auto size : {fil::mem::AccessSize::byte,fil::mem::AccessSize::halfword,
+                                fil::mem::AccessSize::word,fil::mem::AccessSize::doubleword}) {
+            const auto width = fil::mem::byteCount(size);
+            for (std::uint32_t offset = 0U; offset + width <= block_size; ++offset) {
+                device.reset();
+                std::uint64_t expected = 0U;
+                for (std::uint32_t byte = 0U; byte < width; ++byte) {
+                    const auto address = offset + byte;
+                    const auto value = (ReadClear::initialWord(address / 4U) >> ((address % 4U) * 8U)) & 0xffU;
+                    expected |= static_cast<std::uint64_t>(value) << (byte * 8U);
+                }
+                const auto result = device.read(offset, size, read_context); ASSERT_TRUE(result);
+                EXPECT_EQ(result.value(), expected);
+                for (std::uint32_t word = 0U; word < block_size / 4U; ++word)
+                    EXPECT_EQ(device.touches[word], word >= offset / 4U && word <= (offset + width - 1U) / 4U ? 1U : 0U);
+            }
+        }
+        device.reset();
+        EXPECT_FALSE(device.read(block_size - 1U, fil::mem::AccessSize::halfword, read_context));
+        EXPECT_TRUE(std::all_of(device.touches.begin(), device.touches.end(), [](auto count) { return count == 0U; }));
+    }
+}
+
+TEST(PeripheralTest, UnalignedStoresMergeAgainstEarlierRegisterSideEffectsInWordOrder) {
+    class Probe final : public fil::stm32g4::RegisterPeripheral {
+    public:
+        Probe() : RegisterPeripheral("word-order", 12U) {
+            setResetValue(0U, 0x11223344U); setResetValue(4U, 0x55667788U);
+            setResetValue(8U, 0x99aabbccU); reset();
+        }
+        struct Call { std::uint32_t offset, previous, value, mask; };
+        std::array<Call,3U> calls{};
+        unsigned count{0U};
+    protected:
+        void storeRegister(std::uint32_t offset, std::uint32_t previous, std::uint32_t value,
+            std::uint32_t mask, const fil::mem::AccessContext&) override {
+            calls[count++] = {offset,previous,value,mask};
+            if (offset == 0U) setRegister(4U, 0xdeadbeefU);
+            if (offset == 4U) setRegister(8U, 0x01020304U);
+        }
+        void onReset() override { count = 0U; }
+    } device;
+    ASSERT_TRUE(device.write(1U, fil::mem::AccessSize::doubleword, 0x8877665544332211ULL, write_context));
+    ASSERT_EQ(device.count, 3U);
+    EXPECT_EQ(device.calls[0].offset, 0U); EXPECT_EQ(device.calls[0].previous, 0x11223344U);
+    EXPECT_EQ(device.calls[0].value, 0x33221144U); EXPECT_EQ(device.calls[0].mask, 0xffffff00U);
+    EXPECT_EQ(device.calls[1].offset, 4U); EXPECT_EQ(device.calls[1].previous, 0xdeadbeefU);
+    EXPECT_EQ(device.calls[1].value, 0x77665544U); EXPECT_EQ(device.calls[1].mask, 0xffffffffU);
+    EXPECT_EQ(device.calls[2].offset, 8U); EXPECT_EQ(device.calls[2].previous, 0x01020304U);
+    EXPECT_EQ(device.calls[2].value, 0x01020388U); EXPECT_EQ(device.calls[2].mask, 0xffU);
+    EXPECT_EQ(device.peekRegister(0U), 0x33221144U);
+    EXPECT_EQ(device.peekRegister(4U), 0x77665544U);
+    EXPECT_EQ(device.peekRegister(8U), 0x01020388U);
+    device.reset();
+    EXPECT_FALSE(device.write(6U, fil::mem::AccessSize::doubleword, UINT64_MAX, write_context));
+    EXPECT_EQ(device.count, 0U); EXPECT_EQ(device.peekRegister(4U), 0x55667788U);
+}
+
 TEST(PeripheralTest, StoresRegistersAndUnknownMmio) {
     fil::stm32g4::PwrPeripheral pwr;
     EXPECT_TRUE(pwr.write(0, fil::mem::AccessSize::word, 0x11223344U, write_context).hasValue())

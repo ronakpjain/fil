@@ -4,11 +4,13 @@
  *  @brief Deterministic STM32G4 register-backed peripheral foundations.
  */
 
+#include "fil/common/inline_buffer.hpp"
 #include "fil/mem/memory_bus.hpp"
 #include "fil/sim/event_loop.hpp"
 #include "fil/sim/trace.hpp"
 
 #include <array>
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -131,11 +133,11 @@ private:
     std::string name_;
     std::string trace_source_;
     std::uint32_t block_size_{0};
-    std::vector<std::uint32_t> registers_;
-    std::vector<std::uint32_t> reset_values_;
+    InlineBuffer<std::uint32_t, 64U> registers_;
+    InlineBuffer<std::uint32_t, 64U> reset_values_;
     sim::EventLoop* event_loop_{nullptr};
     sim::TraceRecorder* trace_{nullptr};
-    std::array<bool, 8> interrupt_levels_{};
+    std::bitset<8U> interrupt_levels_{};
     InterruptLevelCallback interrupt_level_callback_;
     std::uint64_t interrupt_level_callback_generation_{0U};
 };
@@ -707,7 +709,7 @@ private:
     [[nodiscard]] std::uint64_t conversionCycleBudget(std::uint32_t rank) const noexcept;
 
     std::array<std::uint16_t, 20> channel_values_{};
-    std::array<bool, 20> channel_overrides_{};
+    std::bitset<20U> channel_overrides_{};
     ChannelProvider channel_provider_;
     SampleCallback sample_callback_;
     InterruptCallback interrupt_callback_;

@@ -9,6 +9,7 @@
 #include "fil/stm32g4/stm32g4.hpp"
 
 #include <algorithm>
+#include <bitset>
 #include <cstdint>
 #include <exception>
 #include <limits>
@@ -94,7 +95,7 @@ struct Board::IdempotentPeriodCertificate {
     std::array<std::uint16_t, max_instructions> instruction_cycles{};
     std::array<std::uint64_t, max_instructions + 1U> cumulative_cycles{};
     std::array<mem::MemoryBus::ReadFootprint, max_instructions + 1U> footprints{};
-    std::array<bool, max_instructions + 1U> have_fetch{};
+    std::bitset<max_instructions + 1U> have_fetch{};
     std::array<std::uint32_t, max_instructions + 1U> fetch_end{};
     // Direct pc -> phase index so the admission hot path avoids scanning every
     // phase with a full CpuState compare. PC collisions still fall back to the
@@ -144,7 +145,7 @@ struct Board::RamNeutralTransitionCertificate {
     std::array<std::uint16_t, max_instructions> instruction_cycles{};
     std::array<std::uint64_t, max_instructions + 1U> cumulative_cycles{};
     std::array<mem::MemoryBus::ReadFootprint, max_instructions + 1U> footprints{};
-    std::array<bool, max_instructions + 1U> have_fetch{};
+    std::bitset<max_instructions + 1U> have_fetch{};
     std::array<std::uint32_t, max_instructions + 1U> fetch_end{};
     mem::MemoryBus::ReadFootprint full_footprint{};
     mem::MemoryBus::SideEffectCheckpoint checkpoint{};

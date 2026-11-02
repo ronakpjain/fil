@@ -10,6 +10,7 @@
 #include "fil/mem/address.hpp"
 
 #include <array>
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -613,12 +614,12 @@ private:
         std::array<std::uint8_t, JitStepOutcome::max_block> sizes{};
         std::array<std::uint32_t, JitStepOutcome::max_block> raws{};
         std::array<std::uint16_t, JitStepOutcome::max_block> base_cycles{};
-        std::array<bool, JitStepOutcome::max_block> divide_form{};
+        std::bitset<JitStepOutcome::max_block> divide_form{};
         std::array<JitFast, JitStepOutcome::max_block> fast{};
         // Compact, portable dispatch for hot unconditional reversible ops.
         std::array<ReversibleFast, JitStepOutcome::max_block> reversible_fast{};
-        std::array<bool, JitStepOutcome::max_block> is_memory{};
-        std::array<bool, JitStepOutcome::max_block> is_terminator{};
+        std::bitset<JitStepOutcome::max_block> is_memory{};
+        std::bitset<JitStepOutcome::max_block> is_terminator{};
         std::array<std::uint16_t, JitStepOutcome::max_block> branch_penalty{};
         // Precomputed fast-block metadata: when every op is a JitFast integer
         // op and nothing touches memory, block execution skips per-op
@@ -633,7 +634,7 @@ private:
         std::array<std::uint16_t, JitStepOutcome::max_block> preview_cycles{};
         std::array<std::uint32_t, JitStepOutcome::max_block + 1U> preview_prefix_cycles{};
         std::array<std::uint32_t, JitStepOutcome::max_block + 1U> base_prefix_cycles{};
-        std::array<bool, JitStepOutcome::max_block> suppress_obs{};
+        std::bitset<JitStepOutcome::max_block> suppress_obs{};
         std::uint8_t preview_count{0}; ///< Memory-free prefix length.
         /// Optimistic prefix incl. handler-covered transfers (horizon gate).
         std::uint8_t preview_extended_count{0};

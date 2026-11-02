@@ -258,7 +258,7 @@ void FdcanPeripheral::detachBus() noexcept {
 
 void FdcanPeripheral::setInterruptCallback(InterruptCallback callback) {
     interrupt_callback_ = std::move(callback);
-    interrupt_line_asserted_.fill(false);
+    interrupt_line_asserted_.reset();
     updateInterruptLines();
 }
 
@@ -692,7 +692,7 @@ void FdcanPeripheral::onReset() {
     rx_message_lost_ = false;
     tx_get_index_ = 0;
     tx_put_index_ = 0;
-    interrupt_line_asserted_.fill(false);
+    interrupt_line_asserted_.reset();
     setRegister(cccr, cccrInit);
     setRegister(ir, 0);
     setRegister(rxf0a, 0);

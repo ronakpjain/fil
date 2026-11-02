@@ -17,6 +17,13 @@ RAM and ROM use target little-endian byte order. Unaligned 16-, 32-, and 64-bit 
 
 Each access includes its purpose and originating PC. Instruction fetches require execute permission. Failures return a structured `BusFault` describing the address, width, access type, region, PC, and machine-readable reason.
 
+Register-backed peripherals merge byte lanes one word at a time. Each touched
+word is loaded or stored once, in ascending address order, preserving
+read-to-clear effects and changes made by earlier write callbacks. Bounds are
+validated before any register effects. Register banks have inline capacity for
+64 words and contiguous overflow storage for larger blocks; reset copies values
+into the existing bank. Interrupt and override flags use bitsets.
+
 ## ELF materialization
 
 `MemoryBus::materialize()` validates every segment's runtime allocation, then copies only file-backed bytes to physical load addresses. For split `.data` segments, initializer bytes enter flash while runtime SRAM remains zero until firmware reset code copies them. File-unbacked `.bss` storage remains at its deterministic RAM reset value.

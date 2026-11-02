@@ -3,6 +3,7 @@
 #include "fil/common/format.hpp"
 #include "fil/common/numeric.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -35,8 +36,8 @@ RegisterPeripheral::RegisterPeripheral(
 ) : name_(std::move(name)),
     trace_source_(name_),
     block_size_(register_block_size),
-    registers_((static_cast<std::size_t>(register_block_size) + 3U) / 4U, 0),
-    reset_values_(registers_.size(), 0),
+    registers_((static_cast<std::size_t>(register_block_size) + 3U) / 4U),
+    reset_values_(registers_.size()),
     event_loop_(event_loop),
     trace_(trace) {
     if (block_size_ == 0) {
@@ -86,28 +87,20 @@ mem::MemoryResult<std::uint64_t> RegisterPeripheral::read(
         return accessFault(offset, size, context, "peripheral register read is outside the register block");
     }
 
-    std::array<std::uint32_t, 3> cached_offsets{};
-    std::array<std::uint32_t, 3> cached_values{};
-    std::size_t cached_count = 0;
-    std::uint64_t value = 0;
-
-    for (std::uint32_t byte_index = 0; byte_index < width; ++byte_index) {
-        const std::uint32_t byte_offset = offset + byte_index;
-        const std::uint32_t word_offset = byte_offset & ~std::uint32_t{3};
-        std::size_t cache_index = 0;
-        while (cache_index < cached_count && cached_offsets[cache_index] != word_offset) {
-            ++cache_index;
-        }
-        if (cache_index == cached_count) {
-            cached_offsets[cached_count] = word_offset;
-            cached_values[cached_count] = loadRegister(word_offset, context);
-            ++cached_count;
-        }
-        const std::uint32_t shift = (byte_offset & 3U) * 8U;
-        const std::uint64_t byte = (cached_values[cache_index] >> shift) & 0xffU;
-        value |= byte << (byte_index * 8U);
+    if (width == 4U && (offset & 3U) == 0U) return loadRegister(offset, context);
+    std::uint64_t value = 0U;
+    for (std::uint32_t consumed = 0U; consumed < width;) {
+        const auto address = offset + consumed;
+        const auto shift = (address & 3U) * 8U;
+        const auto count = std::min(width - consumed, 4U - (address & 3U));
+        const auto mask = (std::uint64_t{1U} << (count * 8U)) - 1U;
+        // Walk contiguous words once, in architectural order. Read-to-clear
+        // registers are never reloaded for subsequent byte lanes.
+        const auto word = loadRegister(address & ~std::uint32_t{3U}, context);
+        value |= ((static_cast<std::uint64_t>(word) >> shift) & mask) << (consumed * 8U);
+        consumed += count;
     }
-    return value & mem::accessWidthMask(size);
+    return value;
 }
 
 mem::MemoryResult<std::uint64_t> RegisterPeripheral::write(
@@ -121,42 +114,32 @@ mem::MemoryResult<std::uint64_t> RegisterPeripheral::write(
         return accessFault(offset, size, context, "peripheral register write is outside the register block");
     }
 
-    std::array<std::uint32_t, 3> touched_offsets{};
-    std::array<std::uint32_t, 3> masks{};
-    std::array<std::uint32_t, 3> bits{};
-    std::size_t touched_count = 0;
-
-    for (std::uint32_t byte_index = 0; byte_index < width; ++byte_index) {
-        const std::uint32_t byte_offset = offset + byte_index;
-        const std::uint32_t word_offset = byte_offset & ~std::uint32_t{3};
-        std::size_t touched_index = 0;
-        while (touched_index < touched_count && touched_offsets[touched_index] != word_offset) {
-            ++touched_index;
-        }
-        if (touched_index == touched_count) {
-            touched_offsets[touched_count] = word_offset;
-            ++touched_count;
-        }
-        const std::uint32_t register_shift = (byte_offset & 3U) * 8U;
-        const std::uint32_t source_shift = byte_index * 8U;
-        masks[touched_index] |= 0xffU << register_shift;
-        bits[touched_index] |= static_cast<std::uint32_t>((value >> source_shift) & 0xffU)
-            << register_shift;
+    const auto store = [&](const std::uint32_t word_offset, const std::uint32_t bits,
+        const std::uint32_t mask) {
+        const auto previous = registers_[word_offset / 4U];
+        const auto merged = (previous & ~mask) | (bits & mask);
+        registers_[word_offset / 4U] = merged;
+        storeRegister(word_offset, previous, merged, mask, context);
+    };
+    if (width == 4U && (offset & 3U) == 0U) {
+        store(offset, static_cast<std::uint32_t>(value), UINT32_MAX);
+        return std::uint64_t{0U};
     }
-
-    for (std::size_t index = 0; index < touched_count; ++index) {
-        const std::uint32_t word_offset = touched_offsets[index];
-        const std::size_t register_index = word_offset / 4U;
-        const std::uint32_t previous = registers_[register_index];
-        const std::uint32_t merged = (previous & ~masks[index]) | bits[index];
-        registers_[register_index] = merged;
-        storeRegister(word_offset, previous, merged, masks[index], context);
+    for (std::uint32_t consumed = 0U; consumed < width;) {
+        const auto address = offset + consumed;
+        const auto shift = (address & 3U) * 8U;
+        const auto count = std::min(width - consumed, 4U - (address & 3U));
+        const auto low_mask = (std::uint64_t{1U} << (count * 8U)) - 1U;
+        const auto bits = static_cast<std::uint32_t>((value >> (consumed * 8U)) & low_mask) << shift;
+        store(address & ~std::uint32_t{3U}, bits, static_cast<std::uint32_t>(low_mask) << shift);
+        consumed += count;
     }
-    return std::uint64_t{0};
+    return std::uint64_t{0U};
 }
 
 void RegisterPeripheral::reset() {
-    registers_ = reset_values_;
+    // The authoritative register bank keeps its address across resets.
+    std::copy(reset_values_.begin(), reset_values_.end(), registers_.begin());
     for (std::uint32_t line = 0; line < interrupt_levels_.size(); ++line) {
         setInterruptLevel(line, false);
     }

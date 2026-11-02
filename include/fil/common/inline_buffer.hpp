@@ -19,14 +19,16 @@ class InlineBuffer {
     static_assert(!std::is_same_v<T, bool>, "use InlineBitset for boolean sets");
 public:
     explicit InlineBuffer(std::size_t size) : size_(size),
-        overflow_(size > Capacity ? std::make_unique<T[]>(size) : nullptr) {}
+        overflow_(size > Capacity ? std::make_unique<T[]>(size) : nullptr) {
+        data_ = overflow_ ? overflow_.get() : inline_.data();
+    }
     InlineBuffer(const InlineBuffer&) = delete;
     InlineBuffer& operator=(const InlineBuffer&) = delete;
     InlineBuffer(InlineBuffer&&) = delete;
     InlineBuffer& operator=(InlineBuffer&&) = delete;
     [[nodiscard]] std::size_t size() const noexcept { return size_; }
-    [[nodiscard]] T* data() noexcept { return overflow_ ? overflow_.get() : inline_.data(); }
-    [[nodiscard]] const T* data() const noexcept { return overflow_ ? overflow_.get() : inline_.data(); }
+    [[nodiscard]] T* data() noexcept { return data_; }
+    [[nodiscard]] const T* data() const noexcept { return data_; }
     T& operator[](std::size_t i) noexcept { return data()[i]; }
     const T& operator[](std::size_t i) const noexcept { return data()[i]; }
     T* begin() noexcept { return data(); }
@@ -35,8 +37,9 @@ public:
     const T* end() const noexcept { return data() + size_; }
 private:
     std::size_t size_;
-    std::array<T, Capacity> inline_{};
+    T* data_{nullptr};
     std::unique_ptr<T[]> overflow_;
+    std::array<T, Capacity> inline_{};
 };
 
 /** Packed scratch flags. Mutations must be synchronized between threads;
