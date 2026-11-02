@@ -324,6 +324,17 @@ public:
      */
     [[nodiscard]] bool isReversibleRamTarget(std::uint32_t address) const noexcept;
     /**
+     * @brief Direct-read window for host-side inlined backed-RAM loads.
+     *
+     * Fills the contiguous bytes backing the RAM/ROM/flash region containing
+     * `probe`, but only when read-footprint tracking is off, so a direct load
+     * is observationally identical to tryFastRead32. False leaves outputs
+     * untouched.
+     */
+    [[nodiscard]] bool directReadWindow(
+        std::uint32_t probe, const std::uint8_t** base, std::uint32_t* begin,
+        std::uint32_t* size) const noexcept;
+    /**
      * @brief Width-generic backed-memory-only access without fault allocation.
      *
      * Same contract as tryFastRead32/Write32 for byte/halfword/word widths.

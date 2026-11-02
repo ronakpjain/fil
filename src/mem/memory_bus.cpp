@@ -822,6 +822,25 @@ bool MemoryBus::isReversibleRamTarget(const std::uint32_t address) const noexcep
         && !region->info.executable;
 }
 
+bool MemoryBus::directReadWindow(
+    const std::uint32_t probe, const std::uint8_t** const base,
+    std::uint32_t* const begin, std::uint32_t* const size
+) const noexcept {
+    if (read_footprint_tracking_ || base == nullptr || begin == nullptr || size == nullptr) {
+        return false;
+    }
+    const Region* const region = find(probe);
+    if (region == nullptr || !region->info.readable) return false;
+    const auto kind = region->info.kind;
+    if (kind != RegionKind::ram && kind != RegionKind::rom && kind != RegionKind::flash) {
+        return false;
+    }
+    *base = region->bytes.data();
+    *begin = region->info.base;
+    *size = region->info.size;
+    return true;
+}
+
 bool MemoryBus::tryFastWriteWords(
     const std::uint32_t address,
     const std::uint32_t count,

@@ -1983,6 +1983,11 @@ std::optional<FastStepResult> CortexM4::executeNativeTrace(
     context.allow_dynamic_returns = true;
     context.mmio_prefix_bias = first_extra;
     context.mmio_bridge = committed_mmio ? mmio_bridge_ : nullptr;
+    // Probe with SP: firmware data/stack traffic dominates and, when backed
+    // RAM is contiguous, this window covers the common load addresses. The
+    // kernel re-checks each address, so a miss simply uses the checked helper.
+    (void)memory_.directReadWindow(state_.r[13], &context.fast_read_base,
+        &context.fast_read_begin, &context.fast_read_size);
     plan.function(&context);
     if (context.retired_count > planned)
         throw std::logic_error("native trace exceeded its admitted prefix");

@@ -67,6 +67,15 @@ struct NativeExecutionContext {
     bool boundary_stop{false};
     /** Entry-fetch bias excluded from the normalized native cycle table. */
     std::uint32_t mmio_prefix_bias{0U};
+    /**
+     * Optional direct read window for inlined backed-RAM loads. Null base (or
+     * zero size) disables the inline path; kernels then use the checked helper.
+     * The host sets this only when read-footprint tracking is off, and the
+     * window is validated against the access address in-kernel.
+     */
+    const std::uint8_t* fast_read_base{nullptr};
+    std::uint32_t fast_read_begin{0U};
+    std::uint32_t fast_read_size{0U};
 };
 
 /** @brief Validate aggregate cycle admission without observing deferred progress. */

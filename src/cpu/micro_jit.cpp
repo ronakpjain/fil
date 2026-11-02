@@ -1622,6 +1622,9 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     const auto charged_count = off(offsetof(NativeExecutionContext, charged_cycles_count));
     const auto kAdmittedMode = off(offsetof(NativeExecutionContext, admitted_cycle_mode));
     const auto boundary_stop_off = off(offsetof(NativeExecutionContext, boundary_stop));
+    const auto fast_read_base_off = off(offsetof(NativeExecutionContext, fast_read_base));
+    const auto fast_read_begin_off = off(offsetof(NativeExecutionContext, fast_read_begin));
+    const auto fast_read_size_off = off(offsetof(NativeExecutionContext, fast_read_size));
     X86Emitter e;
     e.nzcv = kNzcv;
     const auto done = e.makeLabel(), early = e.makeLabel();
@@ -1750,6 +1753,26 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
                 const bool t_load = nativeOpIsLoad(m.kind);
                 const std::uint32_t t_width = nativeOpWidth(m.kind);
                 if (!t_load) loadGuest(e,valuereg,offsets,m.rd);
+                // Inline backed-RAM word loads: the host publishes a direct
+                // window only when footprint tracking is off, so a range check
+                // plus a plain load replaces the checked helper on the common
+                // path. Any address outside the window falls through untouched.
+                const bool fast_word_load = t_load && m.kind == NativeOp::load_word;
+                std::size_t fast_word_done = 0U;
+                if (fast_word_load) {
+                    const auto slow_load = e.makeLabel();
+                    fast_word_done = e.makeLabel();
+                    e.movRR(kEax, addrreg);
+                    e.aluRM(5U, kEax, ctx, fast_read_begin_off);
+                    e.aluRM(7U, kEax, ctx, fast_read_size_off);
+                    e.jcc(3U, slow_load);
+                    e.movR64M(addrreg, ctx, fast_read_base_off);
+                    e.addR64R64(addrreg, kEax);
+                    e.movR32M(kEax, addrreg, 0U);
+                    storeGuest(e, offsets, m.rd, kEax);
+                    e.jmp(fast_word_done);
+                    e.bindLabel(slow_load);
+                }
                 // Publish the exact prefix cycle count for a committed-span MMIO
                 // helper: checked mode already accumulated RBP; admitted mode
                 // reads the certified cumulative table at this op index.
@@ -1778,6 +1801,7 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
                     }
                     storeGuest(e,offsets,m.rd,kEax);
                 }
+                if (fast_word_load) e.bindLabel(fast_word_done);
             }
             // Only the live cycle accumulator advances here. RAM-only helpers
             // consume explicit PCs and no pending NZCV/PC/progress metadata; the
