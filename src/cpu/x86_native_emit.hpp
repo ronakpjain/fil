@@ -25,6 +25,9 @@ public:
     // Trace kernels keep flags in callee-saved registers across RAM helpers;
     // arithmetic-only stencils retain their caller-saved, stack-free ABI.
     std::uint32_t nzcv{8U};
+    using GuestHosts = std::array<int, 16>;
+    static constexpr GuestHosts no_guest_hosts{-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
+    GuestHosts guest_hosts{no_guest_hosts};
     // Optional in-kernel flag subroutines. Trace emitters share these across
     // both cycle kernels; stack-free arithmetic blocks keep inline stencils.
     static constexpr std::size_t no_label = static_cast<std::size_t>(-1);
@@ -335,11 +338,28 @@ inline std::uint32_t guestDisp(const Offsets& o, std::uint8_t guest) {
 }
 
 inline void loadGuest(X86Emitter& e, std::uint32_t tmp, const Offsets& o, std::uint8_t guest) {
-    e.movR32M(tmp, kState, guestDisp(o, guest));
+    if (guest < e.guest_hosts.size() && e.guest_hosts[guest] >= 0)
+        e.movRR(tmp, static_cast<std::uint32_t>(e.guest_hosts[guest]));
+    else e.movR32M(tmp, kState, guestDisp(o, guest));
 }
 
 inline void storeGuest(X86Emitter& e, const Offsets& o, std::uint8_t guest, std::uint32_t tmp) {
-    e.movM32R(kState, guestDisp(o, guest), tmp);
+    if (guest < e.guest_hosts.size() && e.guest_hosts[guest] >= 0)
+        e.movRR(static_cast<std::uint32_t>(e.guest_hosts[guest]), tmp);
+    else e.movM32R(kState, guestDisp(o, guest), tmp);
+}
+
+inline void storeGuestImmediate(X86Emitter& e, const Offsets& o, std::uint8_t guest, std::uint32_t value) {
+    if (guest < e.guest_hosts.size() && e.guest_hosts[guest] >= 0)
+        e.movR32Imm(static_cast<std::uint32_t>(e.guest_hosts[guest]), value);
+    else e.movM32Imm(kState, guestDisp(o, guest), value);
+}
+
+inline void aluGuest(X86Emitter& e, std::uint32_t operation, std::uint32_t dst,
+                     const Offsets& o, std::uint8_t guest) {
+    if (guest < e.guest_hosts.size() && e.guest_hosts[guest] >= 0)
+        e.aluRR(operation, dst, static_cast<std::uint32_t>(e.guest_hosts[guest]));
+    else e.aluRM(operation, dst, kState, guestDisp(o, guest));
 }
 
 // Rebuilds guest NZCV from an ADD/SUB result in eax into r8d. C comes from
@@ -349,7 +369,7 @@ inline void storeGuest(X86Emitter& e, const Offsets& o, std::uint8_t guest, std:
 // leave flags untouched, so the capture stays exact.
 inline void endAddSub(X86Emitter& e, const Offsets& o, bool is_sub,
                       std::uint8_t rd, bool do_store) {
-    if (do_store) e.movM32R(kState, guestDisp(o, rd), kEax);
+    if (do_store) storeGuest(e, o, rd, kEax);
     const auto shared = is_sub ? e.sub_flags : e.add_flags;
     if (shared != X86Emitter::no_label) { e.call(shared); return; }
     e.setcc(is_sub ? 3U : 2U, kEcx); // C
@@ -374,7 +394,7 @@ inline void endAddSub(X86Emitter& e, const Offsets& o, bool is_sub,
 // The result's sign bit is reused once the result is committed and tested.
 inline void endLogic(X86Emitter& e, const Offsets& o, bool new_carry, std::uint8_t rd,
                      bool writeback = true) {
-    if (writeback) e.movM32R(kState, guestDisp(o, rd), kEax);
+    if (writeback) storeGuest(e, o, rd, kEax);
     const auto shared = new_carry ? e.shift_flags : e.logic_flags;
     if (shared != X86Emitter::no_label) { e.call(shared); return; }
     e.testRR(kEax, kEax);
@@ -451,7 +471,7 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
     case MicroOp::nop:
         return true;
     case MicroOp::mov_imm:
-        e.movM32Imm(kState, guestDisp(o, op.rd), op.imm);
+        storeGuestImmediate(e, o, op.rd, op.imm);
         if (op.set_flags) {
             // N/Z from the constant; C is the shifter carry (or retained),
             // V is always retained. Folded at JIT-compile time.
@@ -470,7 +490,7 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
         else storeGuest(e, o, op.rd, kEax);
         return true;
     case MicroOp::movw:
-        e.movM32Imm(kState, guestDisp(o, op.rd), op.imm & 0xffffU);
+        storeGuestImmediate(e, o, op.rd, op.imm & 0xffffU);
         return true;
     case MicroOp::movt:
         loadGuest(e, kEax, o, op.rd);
@@ -499,13 +519,13 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
     case MicroOp::cmn_reg: {
         const bool is_sub = op.op == MicroOp::cmp_reg;
         loadGuest(e, kEax, o, op.rn);
-        e.aluRM(is_sub ? 5U : 0U, kEax, kState, guestDisp(o, op.rm));
+        aluGuest(e, is_sub ? 5U : 0U, kEax, o, op.rm);
         endAddSub(e, o, is_sub, 0U, false);
         return true;
     }
     case MicroOp::tst_reg:
         loadGuest(e, kEax, o, op.rn);
-        e.aluRM(4U, kEax, kState, guestDisp(o, op.rm));
+        aluGuest(e, 4U, kEax, o, op.rm);
         endLogic(e, o, false, 0U, false);
         return true;
     case MicroOp::extend: {
@@ -540,7 +560,7 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
     case MicroOp::sub_reg: {
         const bool is_sub = op.op == MicroOp::sub_reg;
         loadGuest(e, kEax, o, op.rn);
-        e.aluRM(is_sub ? 5U : 0U, kEax, kState, guestDisp(o, op.rm));
+        aluGuest(e, is_sub ? 5U : 0U, kEax, o, op.rm);
         if (op.set_flags) endAddSub(e, o, is_sub, op.rd, true);
         else storeGuest(e, o, op.rd, kEax);
         return true;
@@ -550,7 +570,7 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
     case MicroOp::eor_reg: {
         const std::uint32_t alu = op.op == MicroOp::and_reg ? 4U : op.op == MicroOp::orr_reg ? 1U : 6U;
         loadGuest(e, kEax, o, op.rn);
-        e.aluRM(alu, kEax, kState, guestDisp(o, op.rm));
+        aluGuest(e, alu, kEax, o, op.rm);
         if (op.set_flags) endLogic(e, o, false, op.rd); // C/V retained
         else storeGuest(e, o, op.rd, kEax);
         return true;
@@ -559,7 +579,7 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
         // BIC has no flag-setting host form: plain op, then N/Z with C/V kept.
         loadGuest(e, kEax, o, op.rm);
         e.notR(kEax); // NOT leaves flags untouched
-        e.aluRM(4U, kEax, kState, guestDisp(o, op.rn));
+        aluGuest(e, 4U, kEax, o, op.rn);
         if (op.set_flags) endLogic(e, o, false, op.rd);
         else storeGuest(e, o, op.rd, kEax);
         return true;

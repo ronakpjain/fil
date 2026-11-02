@@ -1690,6 +1690,51 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     const auto helper_exit = e.makeLabel(), dynamic_exit = e.makeLabel();
     const auto checked_admission = e.makeLabel();
     const auto checked_kernel = e.makeLabel();
+    // Allocate caller-saved registers across helper-free integer regions.
+    // Helpers and control-flow guards remain materialization boundaries. Each
+    // cold prefix exit spills the allocation live at that precise cut.
+    std::vector<X86Emitter::GuestHosts> allocations(n, X86Emitter::no_guest_hosts);
+    std::vector<bool> region_start(n, false), region_end(n, false);
+    const auto register_region_op = [](const NativeTraceOp& op) {
+        const auto kind = op.decoded.kind;
+        const auto micro = op.native.integer.op;
+        return op.native.kind == NativeOp::integer
+            && kind != InstrKind::push && kind != InstrKind::pop
+            && micro != MicroOp::b && micro != MicroOp::bl
+            && micro != MicroOp::b_cond && micro != MicroOp::cbz && micro != MicroOp::cbnz;
+    };
+    for (std::size_t begin = 0U; begin < n;) {
+        if (!register_region_op(entry.plan.ops[begin])) { ++begin; continue; }
+        auto end = begin + 1U;
+        while (end < n && register_region_op(entry.plan.ops[end])) ++end;
+        if (end - begin >= 4U) {
+            std::array<unsigned, 13> uses{};
+            for (auto j = begin; j < end; ++j) {
+                const auto& inst = entry.plan.ops[j].native.integer;
+                for (const auto reg : {inst.rd, inst.rn, inst.rm})
+                    if (reg < uses.size()) ++uses[reg];
+            }
+            auto allocation = X86Emitter::no_guest_hosts;
+            // EAX/ECX/EDX/R10 are stencil and flag scratch; guest NZCV is
+            // callee-saved RBX. RSI/R8/R9 are free until a helper/guard.
+            for (const auto host : {6, 8, 9}) {
+                const auto best = std::max_element(uses.begin(), uses.end());
+                if (*best < 3U) break;
+                allocation[static_cast<std::size_t>(best - uses.begin())] = host;
+                *best = 0U;
+            }
+            for (auto j = begin; j < end; ++j) allocations[j] = allocation;
+            region_start[begin] = true;
+            region_end[end - 1U] = true;
+        }
+        begin = end;
+    }
+    const auto spill_registers = [&](const X86Emitter::GuestHosts& allocation) {
+        for (std::size_t guest = 0U; guest < allocation.size(); ++guest)
+            if (allocation[guest] >= 0)
+                e.movM32R(cpu, offsets.r + static_cast<std::uint32_t>(guest * 4U),
+                    static_cast<std::uint32_t>(allocation[guest]));
+    };
     e.movR32M(kEax, ctx, kAdmittedMode);
     e.testRR(kEax, kEax); e.jcc(4U, checked_kernel);
     // Select cycle admission once per invocation, not three times per guest
@@ -1698,6 +1743,13 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     for (const bool admitted_kernel : {true, false}) {
         if (!admitted_kernel) e.bindLabel(checked_kernel);
         for (std::size_t i = 0; i < n; ++i) {
+            e.guest_hosts = allocations[i];
+            if (region_start[i]) {
+                for (std::size_t guest = 0U; guest < e.guest_hosts.size(); ++guest)
+                    if (e.guest_hosts[guest] >= 0)
+                        e.movR32M(static_cast<std::uint32_t>(e.guest_hosts[guest]), cpu,
+                            offsets.r + static_cast<std::uint32_t>(guest * 4U));
+            }
             const auto& op = entry.plan.ops[i];
             const auto& inst = op.native.integer;
             const bool bx_lr = op.native.kind == NativeOp::bx_lr;
@@ -1705,7 +1757,12 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
             const bool conditional = inst.op == MicroOp::b_cond || compare_branch;
             // Guarded branches retain the original unsupported -> mismatch ->
             // cycle ordering. Other ops can share one checked-admission body.
-            const bool shared_admission = !bx_lr && !conditional && op.native.kind != NativeOp::blx_reg;
+            // Allocated regions need their own precise spill stubs on credit
+            // failure; the shared checked-admission trampoline has no live
+            // register-allocation description.
+            const bool shared_admission = !bx_lr && !conditional
+                && op.native.kind != NativeOp::blx_reg
+                && allocations[i] == X86Emitter::no_guest_hosts;
             const bool integer_body = op.native.kind == NativeOp::integer
                 && op.decoded.kind != InstrKind::push && op.decoded.kind != InstrKind::pop;
             e.cmpM32Imm(ctx, limit, static_cast<std::uint32_t>(i));
@@ -1919,7 +1976,9 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
             if (!admitted_kernel && !(shared_admission && integer_body)) {
                 e.movR32M(kEax,costs,static_cast<std::uint32_t>(i*4U)); e.addR64R64(5U,kEax);
             }
+            if (region_end[i]) spill_registers(allocations[i]);
         }
+        e.guest_hosts = X86Emitter::no_guest_hosts;
         e.jmp(normal);
     }
     // Cold stubs carry only a prefix index. Each reason has one trampoline,
@@ -1927,19 +1986,21 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     const auto publish = e.makeLabel(), failed_exit = e.makeLabel();
     std::vector<bool> referenced(e.labels.size(), false);
     for (const auto& fixup : e.fixups) referenced[fixup.label] = true;
-    const auto exit_stub = [&](std::size_t label, std::size_t target, std::size_t prefix) {
+    const auto exit_stub = [&](std::size_t label, std::size_t target, std::size_t prefix,
+                               std::size_t source) {
         if (!referenced[label]) return;
         e.bindLabel(label);
+        spill_registers(allocations[source]);
         e.movR32Imm(kEcx, static_cast<std::uint32_t>(prefix));
         e.jmp(target);
     };
     for (std::size_t i = 0; i < n; ++i) {
-        exit_stub(exits[i].instruction, instruction_exit, i);
-        exit_stub(exits[i].cycle, cycle_exit, i);
-        exit_stub(exits[i].unsupported, unsupported_exit, i);
-        exit_stub(exits[i].mismatch, mismatch_exit, i);
-        exit_stub(exits[i].helper, helper_exit, i);
-        exit_stub(exits[i].dynamic_return, dynamic_exit, i + 1U);
+        exit_stub(exits[i].instruction, instruction_exit, i, i);
+        exit_stub(exits[i].cycle, cycle_exit, i, i);
+        exit_stub(exits[i].unsupported, unsupported_exit, i, i);
+        exit_stub(exits[i].mismatch, mismatch_exit, i, i);
+        exit_stub(exits[i].helper, helper_exit, i, i);
+        exit_stub(exits[i].dynamic_return, dynamic_exit, i + 1U, i);
     }
     e.bindLabel(normal);
     e.movR32Imm(kEcx, static_cast<std::uint32_t>(n));
