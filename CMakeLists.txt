@@ -304,6 +304,7 @@ if(FIL_BUILD_TESTS)
                         NAME fil.per.run_g4_testing_1s
                         COMMAND ${CMAKE_COMMAND}
                             "-DFIL_EXECUTABLE=$<TARGET_FILE:fil>"
+                            "-DFIL_EMULATOR=$<TARGET_PROPERTY:fil,CROSSCOMPILING_EMULATOR>"
                             "-DBOARD_CONFIG=${per_generated_config}"
                             -P "${PROJECT_SOURCE_DIR}/tests/cmake/run_per_g4_smoke.cmake"
                     )
@@ -349,9 +350,11 @@ if(FIL_BUILD_TESTS)
         endif()
 
         if(FIL_PER_NETWORK_COMPLETE)
+            file(READ "${PROJECT_SOURCE_DIR}/configs/networks/per_vehicle.json" per_network_template_json)
+            string(JSON per_network_buses_json GET "${per_network_template_json}" buses)
             set(per_network_json "{\n  \"schema_version\": 1,\n  \"name\": \"per_vehicle_smoke\",\n")
             string(APPEND per_network_json
-                "  \"buses\": {\"vcan\": {\"type\": \"can\", \"bitrate\": 500000}, \"mcan\": {\"type\": \"can\", \"bitrate\": 500000}},\n"
+                "  \"buses\": ${per_network_buses_json},\n"
             )
             string(APPEND per_network_json "  \"boards\": [")
             set(per_network_board_index 0)
@@ -369,6 +372,7 @@ if(FIL_BUILD_TESTS)
                 NAME fil.per.run_network_20ms
                 COMMAND ${CMAKE_COMMAND}
                     "-DFIL_EXECUTABLE=$<TARGET_FILE:fil>"
+                    "-DFIL_EMULATOR=$<TARGET_PROPERTY:fil,CROSSCOMPILING_EMULATOR>"
                     "-DNETWORK_CONFIG=${per_network_config}"
                     "-DTRACE_FILE=${CMAKE_CURRENT_BINARY_DIR}/per-network-smoke.jsonl"
                     -P "${PROJECT_SOURCE_DIR}/tests/cmake/run_per_network_smoke.cmake"

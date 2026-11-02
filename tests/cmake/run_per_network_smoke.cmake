@@ -9,7 +9,7 @@ endforeach()
 # A failed run must not accidentally validate a trace left by an earlier pass.
 file(REMOVE "${TRACE_FILE}")
 execute_process(
-    COMMAND "${FIL_EXECUTABLE}" run-network "${NETWORK_CONFIG}"
+    COMMAND ${FIL_EMULATOR} "${FIL_EXECUTABLE}" run-network "${NETWORK_CONFIG}"
         --duration-ms 20
         --max-instructions 1000000
         --quantum 512
@@ -80,9 +80,9 @@ file(READ "${TRACE_FILE}" trace_jsonl)
 
 # No CAN frame is injected by this test. A shared-bus source therefore proves
 # that real firmware transmitted the frame and at least one peer received it.
-string(REGEX MATCH "\"source\":\"vcan/[^\"]+\",\"type\":\"can_tx\"" firmware_can_tx
+string(REGEX MATCH "\"source\":\"[^\"/]+/[^\"]+\",\"type\":\"can_tx\"" firmware_can_tx
     "${trace_jsonl}")
-string(REGEX MATCH "\"source\":\"vcan/[^\"]+\",\"type\":\"can_rx\"" firmware_can_rx
+string(REGEX MATCH "\"source\":\"[^\"/]+/[^\"]+\",\"type\":\"can_rx\"" firmware_can_rx
     "${trace_jsonl}")
 if(firmware_can_tx STREQUAL "")
     message(FATAL_ERROR "network trace contains no firmware-originated shared-bus can_tx record")
