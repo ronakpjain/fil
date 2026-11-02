@@ -104,6 +104,12 @@ public:
     void movsxR64M32(std::uint32_t dst, std::uint32_t base, std::uint32_t disp) {
         u8(rex(true, (dst & 8U) != 0U, (base & 8U) != 0U)); u8(0x63U); mem(dst, base & 7U, disp);
     }
+    void bitR64Imm(std::uint32_t operation, std::uint32_t reg, std::uint8_t bit) {
+        prefixRex(true, operation, reg); u8(0x0FU); u8(0xBAU); u8(modrm(3U, operation, reg)); u8(bit);
+    }
+    void incrementM64(std::uint32_t base) {
+        prefixRex(true, 0U, base); u8(0x83U); mem(0U, base & 7U, 0U); u8(1U);
+    }
     void movR64M(std::uint32_t dst, std::uint32_t base, std::uint32_t disp) {
         u8(rex(true, (dst & 8U) != 0U, (base & 8U) != 0U)); u8(0x8BU); mem(dst, base & 7U, disp);
     }

@@ -103,6 +103,7 @@ protected:
     void setResetValue(std::uint32_t word_offset, std::uint32_t value) noexcept;
     void setRegister(std::uint32_t word_offset, std::uint32_t value) noexcept;
     [[nodiscard]] std::uint32_t registerValue(std::uint32_t word_offset) const noexcept;
+    [[nodiscard]] const std::uint32_t* registerStorage(std::uint32_t word_offset) const noexcept;
     [[nodiscard]] sim::SimTimeNs currentTime() const noexcept;
     [[nodiscard]] sim::EventLoop* eventLoop() const noexcept { return event_loop_; }
     [[nodiscard]] bool traceEnabled() const noexcept {
@@ -813,6 +814,9 @@ struct DmaTransfer {
 /** @brief STM32G4 DMA controller with request-driven channel progress. */
 class DmaPeripheral final : public RegisterPeripheral {
 public:
+    [[nodiscard]] const std::uint32_t* directReadWord(std::uint32_t offset) const noexcept override {
+        return offset == 0U ? registerStorage(0U) : nullptr;
+    }
     using InterruptCallback = std::function<void(std::uint32_t channel)>;
     using EnableCallback = std::function<void(std::uint32_t channel)>;
 

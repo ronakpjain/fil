@@ -338,6 +338,20 @@ Result<void> MemoryBus::materialize(const elf::ElfImage& image) {
     return {};
 }
 
+bool MemoryBus::directMmioReadWord(const std::uint32_t address, DirectMmioReadWord& out,
+    DirectMmioReadEffects& effects) noexcept {
+    if ((address & 3U) != 0U || !validRange(address, 4U) || mmioTrapping()) return false;
+    const auto* region = find(address);
+    if (region == nullptr || region->info.kind != RegionKind::mmio || !region->info.readable
+        || !region->containsRange(address, 4U)) return false;
+    const auto* value = region->device->directReadWord(address - region->info.base);
+    if (value == nullptr || (reinterpret_cast<std::uintptr_t>(value) >> (sizeof(std::uintptr_t) * 8U - 1U)) != 0U)
+        return false;
+    out = {value, address};
+    effects = {&mmio_generation_, &side_effect_generation_};
+    return true;
+}
+
 MemoryResult<std::uint64_t> MemoryBus::read(
     const std::uint32_t address,
     const AccessSize size,

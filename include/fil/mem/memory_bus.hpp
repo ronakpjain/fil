@@ -136,6 +136,15 @@ public:
     /** @brief Gets the device's diagnostic name. @return Static or device-owned name. */
     [[nodiscard]] virtual std::string_view name() const noexcept = 0;
 
+    /** Borrow live storage for an aligned word read with no device effects.
+     * The device must keep the word's address stable across resets. All other
+     * accesses, including reads with callbacks or clear-on-read state, decline.
+     */
+    [[nodiscard]] virtual const std::uint32_t* directReadWord(std::uint32_t offset) const noexcept {
+        static_cast<void>(offset);
+        return nullptr;
+    }
+
     /** @brief Classifies an access for conservative multi-board synchronization. */
     [[nodiscard]] virtual MmioDomain domain(
         std::uint32_t offset, AccessSize size
@@ -344,6 +353,21 @@ public:
         std::uint64_t* mutation_sequence{nullptr};
         std::uint64_t* side_effect_generation{nullptr};
     };
+    struct DirectMmioReadWord {
+        const std::uint32_t* value{nullptr};
+        std::uint32_t address{0U};
+    };
+    struct DirectMmioReadEffects {
+        std::uint64_t* mmio_generation{nullptr};
+        std::uint64_t* side_effect_generation{nullptr};
+    };
+    /** Borrow an authoritative aligned MMIO word, without performing a read.
+     * Aliases, traps and devices without pure storage decline unchanged.
+     * Each actual read must increment both effects counters exactly once.
+     * Bus mappings, devices and trapping modes must remain fixed while borrowed.
+     */
+    [[nodiscard]] bool directMmioReadWord(std::uint32_t address, DirectMmioReadWord& out,
+        DirectMmioReadEffects& effects) noexcept;
     [[nodiscard]] bool directReadWindow(std::uint32_t probe, DirectReadWindow& out) const noexcept;
     /** Borrow a committed-write binding for writable, non-executable RAM.
      * Declines with output untouched unless read/store-footprint tracking and

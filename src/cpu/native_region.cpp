@@ -182,6 +182,12 @@ bool regionStateValid(const NativeRegionContext* context, const bool allow_it = 
         return view.size == 0U || view.bytes != nullptr;
     };
     const auto& write = context->ram_write;
+    for (const auto& word : context->mmio_read) {
+        if (word.value != nullptr && ((word.address & 3U) != 0U
+            || (reinterpret_cast<std::uintptr_t>(word.value) >> (sizeof(std::uintptr_t) * 8U - 1U)) != 0U
+            || context->mmio_read_effects.mmio_generation == nullptr
+            || context->mmio_read_effects.side_effect_generation == nullptr)) return false;
+    }
     const bool bindings_valid = read_valid(context->ram_read) && read_valid(context->code_read)
         && (write.size == 0U || (write.bytes != nullptr && write.mutation_sequence != nullptr
             && write.side_effect_generation != nullptr));

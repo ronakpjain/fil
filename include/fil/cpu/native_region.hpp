@@ -98,6 +98,8 @@ struct NativeRegionContext {
     // mapping/tracking modes stay fixed. Empty bindings force checked exits.
     mem::MemoryBus::DirectReadWindow ram_read{}, code_read{};
     mem::MemoryBus::DirectWriteWindow ram_write{};
+    std::array<mem::MemoryBus::DirectMmioReadWord, 2U> mmio_read{};
+    mem::MemoryBus::DirectMmioReadEffects mmio_read_effects{};
 };
 
 using NativeRegionFunction = void (*)(NativeRegionContext*);

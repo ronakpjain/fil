@@ -150,6 +150,11 @@ std::uint32_t RegisterPeripheral::peekRegister(const std::uint32_t word_offset) 
     return registerValue(word_offset);
 }
 
+const std::uint32_t* RegisterPeripheral::registerStorage(const std::uint32_t word_offset) const noexcept {
+    if ((word_offset & 3U) != 0U || word_offset >= block_size_) return nullptr;
+    return registers_.data() + word_offset / 4U;
+}
+
 std::uint32_t RegisterPeripheral::loadRegister(
     const std::uint32_t word_offset,
     const mem::AccessContext& context

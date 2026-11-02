@@ -1,4 +1,5 @@
 #include "fil/mem/memory_bus.hpp"
+#include "fil/mem/mmio_router.hpp"
 #include "fil/stm32g4/peripheral.hpp"
 
 #include <gtest/gtest.h>
@@ -563,6 +564,53 @@ TEST(PeripheralTest, DmaOwnerLocalAdcTransferRejectsPublicObserversAndSubstituti
     dma.setMemory(&replacement);
     EXPECT_FALSE(dma.ownerLocalAdcTransferSafe(1U, &memory, source, refreshed_generation));
     EXPECT_TRUE(dma.ownerLocalAdcTransferSafe(1U, &replacement, source, refreshed_generation));
+}
+
+TEST(PeripheralTest, DirectDmaStatusBindingUsesLiveStorageAndPreservesBusReadAccounting) {
+    fil::mem::MemoryBus bus;
+    fil::stm32g4::DmaPeripheral dma("DMA1", 8U);
+    fil::stm32g4::UsartPeripheral usart;
+    fil::mem::MmioRouter router(0x40020000U, 0x1000U, "router");
+    ASSERT_TRUE(router.map(0U, dma.size(), dma, "dma"));
+    ASSERT_TRUE(router.map(0x800U, usart.size(), usart, "usart"));
+    ASSERT_TRUE(bus.mapMmio(0x40020000U, 0x1000U, router, "peripherals"));
+    ASSERT_TRUE(bus.mapAlias(0x50000000U, 0x40020000U, 0x1000U, "alias"));
+    fil::mem::MemoryBus::DirectMmioReadWord word;
+    fil::mem::MemoryBus::DirectMmioReadEffects effects;
+    const auto checkpoint = bus.sideEffectCheckpoint();
+    const auto generation = bus.sideEffectGeneration();
+    ASSERT_TRUE(bus.directMmioReadWord(0x40020000U, word, effects));
+    ASSERT_NE(word.value, nullptr); EXPECT_EQ(*word.value, 0U);
+    EXPECT_EQ(bus.sideEffectCheckpoint().mmio_generation, checkpoint.mmio_generation);
+    EXPECT_EQ(bus.sideEffectGeneration(), generation);
+    for (const auto address : {0x40020001U,0x40020004U,0x400207fcU,0x40020800U,0x50000000U,0xfffffffcU}) {
+        EXPECT_FALSE(bus.directMmioReadWord(address, word, effects));
+        EXPECT_EQ(word.address, 0x40020000U);
+    }
+    EXPECT_TRUE(router.unknownAccesses().empty());
+    bus.setSharedMmioTrapping(true);
+    EXPECT_FALSE(bus.directMmioReadWord(0x40020000U, word, effects));
+    bus.setSharedMmioTrapping(false); bus.setAllMmioTrapping(true);
+    EXPECT_FALSE(bus.directMmioReadWord(0x40020000U, word, effects));
+    bus.setAllMmioTrapping(false);
+    constexpr auto width = fil::mem::AccessSize::word;
+    ASSERT_TRUE(dma.write(0x0cU, width, 1U, {})); ASSERT_TRUE(dma.write(0x08U, width, 1U, {}));
+    ASSERT_TRUE(dma.request(1U)); // Missing bus produces live TEIF/GIF.
+    EXPECT_EQ(*word.value, 9U);
+    const auto before = bus.sideEffectCheckpoint(); const auto side = bus.sideEffectGeneration();
+    EXPECT_EQ(bus.read32(0x40020000U).value(), 9U);
+    EXPECT_EQ(bus.sideEffectCheckpoint().mmio_generation, before.mmio_generation + 1U);
+    EXPECT_EQ(bus.sideEffectGeneration(), side + 1U);
+    const auto direct = *word.value;
+    ++*effects.mmio_generation; ++*effects.side_effect_generation;
+    EXPECT_EQ(direct, 9U);
+    EXPECT_EQ(bus.sideEffectCheckpoint().mmio_generation, before.mmio_generation + 2U);
+    EXPECT_EQ(bus.sideEffectGeneration(), side + 2U);
+    EXPECT_EQ(bus.sideEffectCheckpoint().mutation_sequence, before.mutation_sequence);
+    ASSERT_TRUE(dma.write(4U, width, 1U, {})); EXPECT_EQ(*word.value, 0U);
+    const auto* storage = word.value; dma.reset();
+    ASSERT_TRUE(bus.directMmioReadWord(0x40020000U, word, effects));
+    EXPECT_EQ(word.value, storage); EXPECT_EQ(*storage, 0U);
 }
 
 TEST(PeripheralTest, DmaGlobalFlagClearDeassertsOnlySelectedChannel) {

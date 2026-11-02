@@ -2191,7 +2191,8 @@ bool Board::nativeCheckedStep(cpu::NativeRegionContext* const context) noexcept 
             || board.memory_.executionGeneration() != board.program_execution_generation_
             || board.peripherals_->rcc().systemClockHz() != service.frequency
             || board.peripherals_->flash().acrGeneration() != service.flash_generation
-            || board.memory_.readFootprintTracking() || board.memory_.writeJournalTracking()) return false;
+            || board.memory_.readFootprintTracking() || board.memory_.writeJournalTracking()
+            || board.memory_.mmioTrapping()) return false;
         auto horizon = service.deadline;
         if (const auto event = board.event_loop_->nextScheduledTime(board.event_loop_->activeOwner());
             event && (!horizon || *event < *horizon)) horizon = event;
@@ -2265,6 +2266,10 @@ std::optional<cpu::FastStepResult> Board::stepNativeLocal(
     const auto probe = sp == 0U ? 0U : sp - 1U;
     static_cast<void>(memory_.directReadWindow(probe, context.ram_read));
     static_cast<void>(memory_.directWriteWindow(probe, context.ram_write));
+    for (std::size_t slot = 0U; slot < context.mmio_read.size(); ++slot) {
+        const auto address = 0x40020000U + static_cast<std::uint32_t>(slot) * 0x400U;
+        static_cast<void>(memory_.directMmioReadWord(address, context.mmio_read[slot], context.mmio_read_effects));
+    }
     NativeServiceState service{*this, deadline, frequency, flash.acrGeneration(), {}, {}};
     context.checked_context = &service;
     context.checked_step = &Board::nativeCheckedStep;

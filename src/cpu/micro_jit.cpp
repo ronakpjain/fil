@@ -2182,7 +2182,12 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
         e.movRR(sp, kEax);
         e.movM8Imm8(4U, 12U, 1U);
     };
-    const auto guard_address = [&](std::uint32_t width, bool write, bool literal, std::size_t miss) {
+    const auto mmio_load = [](const NativeRegionOp& op) {
+        return op.instruction.kind == NativeOp::load_word && !op.instruction.absolute
+            && op.instruction.rn != 13U;
+    };
+    const auto guard_address = [&](std::uint32_t width, bool write, bool literal, std::size_t miss,
+                                   bool allow_mmio = false) {
         const auto window = [&](std::uint32_t binding, std::size_t next) {
             using Read = mem::MemoryBus::DirectReadWindow;
             using Write = mem::MemoryBus::DirectWriteWindow;
@@ -2197,11 +2202,28 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
         if (write) window(off(offsetof(NativeRegionContext, ram_write)), miss);
         else {
             const auto second = e.makeLabel(), ready = e.makeLabel();
+            const auto mmio = allow_mmio ? e.makeLabel() : miss;
             window(off(literal ? offsetof(NativeRegionContext, code_read)
                                : offsetof(NativeRegionContext, ram_read)), second);
             e.jmp(ready); e.bindLabel(second);
             window(off(literal ? offsetof(NativeRegionContext, ram_read)
-                               : offsetof(NativeRegionContext, code_read)), miss);
+                               : offsetof(NativeRegionContext, code_read)), mmio);
+            if (allow_mmio) {
+                e.jmp(ready); e.bindLabel(mmio);
+                using Word = mem::MemoryBus::DirectMmioReadWord;
+                for (std::size_t slot = 0U; slot < 2U; ++slot) {
+                    const auto next = slot == 1U ? miss : e.makeLabel();
+                    const auto binding = off(offsetof(NativeRegionContext, mmio_read) + slot * sizeof(Word));
+                    e.aluRM(7U, kR10, ctx, binding + off(offsetof(Word, address))); e.jcc(5U, next);
+                    e.movR64M(kEax, ctx, binding + off(offsetof(Word, value)));
+                    e.cmpR64Imm8(kEax, 0U); e.jcc(4U, next);
+                    e.movRR64(kR10, kEax);
+                    // Bindings certify low-half user pointers. Tag only this
+                    // scalar word path; guards and budget tests have no effects.
+                    e.bitR64Imm(5U, kR10, 63U); e.jmp(ready);
+                    if (slot == 0U) e.bindLabel(next);
+                }
+            }
             e.bindLabel(ready);
         }
     };
@@ -2222,7 +2244,8 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
             if (!op.address.index) e.movRR(kR10, kEcx);
         }
         guard_address(nativeOpWidth(inst.kind), !nativeOpIsLoad(inst.kind), inst.absolute,
-            miss == X86Emitter::no_label ? labels[index].checked : miss);
+            miss == X86Emitter::no_label ? labels[index].checked : miss,
+            mmio_load(op));
     };
     const auto prepare_stack = [&](const NativeRegionOp& op, std::size_t index) {
         const auto bytes = op.stack.count() * 4U;
@@ -2269,6 +2292,17 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
     const auto memory_body = [&](const NativeRegionOp& op) {
         const auto& inst = op.instruction;
         if (nativeOpIsLoad(inst.kind)) {
+            if (mmio_load(op)) {
+                const auto ordinary = e.makeLabel();
+                e.bitR64Imm(6U, kR10, 63U); e.jcc(3U, ordinary); // BTR reports the tag in CF.
+                using Effects = mem::MemoryBus::DirectMmioReadEffects;
+                const auto effects = off(offsetof(NativeRegionContext, mmio_read_effects));
+                e.movR64M(kEdx, ctx, effects + off(offsetof(Effects, mmio_generation)));
+                e.incrementM64(kEdx);
+                e.movR64M(kEdx, ctx, effects + off(offsetof(Effects, side_effect_generation)));
+                e.incrementM64(kEdx);
+                e.bindLabel(ordinary);
+            }
             switch (inst.kind) {
             case NativeOp::load_byte: e.movzxR32M8(kEax, kR10, 0U); break;
             case NativeOp::load_half: e.movzxR32M16(kEax, kR10, 0U); break;

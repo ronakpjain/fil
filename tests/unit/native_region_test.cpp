@@ -3,6 +3,8 @@
 #include "fil/cpu/decoder.hpp"
 #include "fil/cpu/micro_jit.hpp"
 #include "fil/mem/memory_bus.hpp"
+#include "fil/mem/mmio_router.hpp"
+#include "fil/stm32g4/peripheral.hpp"
 
 #include <gtest/gtest.h>
 
@@ -670,6 +672,89 @@ TEST(NativeRegionTest, LinearSpanWideChargesAndInteriorEntriesMatchCheckedExecut
         EXPECT_EQ(context.exit_reason, reason); EXPECT_EQ(context.fetch_end, fetch_end); EXPECT_EQ(context.have_fetch, have);
         EXPECT_EQ(memory.read8(ram).value(), oracle.read8(ram).value());
         EXPECT_EQ(memory.sideEffectCheckpoint().mutation_sequence, oracle.sideEffectCheckpoint().mutation_sequence);
+        EXPECT_EQ(memory.sideEffectGeneration(), oracle.sideEffectGeneration());
+    }
+}
+
+TEST(NativeRegionTest, DirectMmioLoadsPublishExactEffectsAtEveryBudgetAndLaterGuardMiss) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    const auto bytes = code(std::array<std::uint16_t,8U>{
+        0x2001U,0x680aU,0x3001U,0x6823U,0x602aU,0x683eU,0x2802U,0xbe00U});
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    const auto function = jit->compileRegion(bytes, pc, pc, error); ASSERT_NE(function, nullptr) << error;
+    fil::mem::MemoryBus memory, oracle;
+    fil::stm32g4::DmaPeripheral dma1("DMA1", 1U), dma2("DMA2", 1U);
+    fil::stm32g4::DmaPeripheral ref1("DMA1", 1U), ref2("DMA2", 1U);
+    fil::mem::MmioRouter router(0x40020000U, 0x1000U, "devices"), ref_router(0x40020000U, 0x1000U, "devices");
+    ASSERT_TRUE(router.map(0U, dma1.size(), dma1, "dma1")); ASSERT_TRUE(router.map(0x400U, dma2.size(), dma2, "dma2"));
+    ASSERT_TRUE(ref_router.map(0U, ref1.size(), ref1, "dma1")); ASSERT_TRUE(ref_router.map(0x400U, ref2.size(), ref2, "dma2"));
+    for (auto* device : {&dma1,&dma2,&ref1,&ref2}) {
+        ASSERT_TRUE(device->write(12U, fil::mem::AccessSize::word, 1U, {}));
+        ASSERT_TRUE(device->write(8U, fil::mem::AccessSize::word, 1U, {})); ASSERT_TRUE(device->request(1U));
+    }
+    for (auto* bus : {&memory,&oracle}) {
+        ASSERT_TRUE(bus->mapRom(pc, bytes.size(), "mmio-loads")); ASSERT_TRUE(bus->loadBytes(pc, bytes));
+        ASSERT_TRUE(bus->mapRam(ram, 8U, "data"));
+        bus->setReadFootprintTracking(false); bus->setWriteJournalTracking(false);
+    }
+    ASSERT_TRUE(memory.mapMmio(0x40020000U, 0x1000U, router, "devices"));
+    ASSERT_TRUE(oracle.mapMmio(0x40020000U, 0x1000U, ref_router, "devices"));
+    CortexM4 reference(oracle);
+    NativeRegionContext binding;
+    ASSERT_TRUE(memory.directReadWindow(ram, binding.ram_read)); ASSERT_TRUE(memory.directWriteWindow(ram, binding.ram_write));
+    ASSERT_TRUE(memory.directMmioReadWord(0x40020000U, binding.mmio_read[0], binding.mmio_read_effects));
+    ASSERT_TRUE(memory.directMmioReadWord(0x40020400U, binding.mmio_read[1], binding.mmio_read_effects));
+    {
+        CpuState state; state.r[15] = pc; state.r[1] = 0x40020000U;
+        const auto initial = state; const auto checkpoint = memory.sideEffectCheckpoint();
+        auto invalid = binding; invalid.cpu_state = &state;
+        invalid.instruction_limit = 10U; invalid.cycle_limit = 100U; invalid.mmio_read_effects = {};
+        function(&invalid);
+        EXPECT_EQ(invalid.exit_reason, NativeRegionExit::invalid_state);
+        EXPECT_EQ(invalid.retired_count, 0U); EXPECT_TRUE(bitwiseEqual(state, initial));
+        const auto store_bytes = code(std::array<std::uint16_t,2U>{0x600aU,0xbe00U}); // STR r2,[r1]
+        const auto store = jit->compileRegion(store_bytes, pc, pc, error); ASSERT_NE(store, nullptr) << error;
+        auto read_only = binding; read_only.cpu_state = &state;
+        read_only.instruction_limit = 10U; read_only.cycle_limit = 100U;
+        store(&read_only);
+        EXPECT_EQ(read_only.exit_reason, NativeRegionExit::checked_instruction);
+        EXPECT_EQ(read_only.retired_count, 0U); EXPECT_TRUE(bitwiseEqual(state, initial));
+        EXPECT_EQ(memory.sideEffectCheckpoint().mmio_generation, checkpoint.mmio_generation);
+        EXPECT_EQ(*binding.mmio_read[0].value, 9U);
+    }
+    for (const auto mask : {0U,1U,2U,3U})
+    for (const bool late_miss : {false,true})
+    for (const auto stall : {0U,3U})
+    for (std::uint32_t limit = 0U; limit <= 9U; ++limit)
+    for (std::uint64_t credit = 0U; credit <= 48U; ++credit) {
+        ASSERT_TRUE(memory.write32(ram, 0x12345678U)); ASSERT_TRUE(oracle.write32(ram, 0x12345678U));
+        CpuState state; state.r[15] = pc; state.r[1] = 0x40020000U; state.r[4] = 0x40020400U;
+        state.r[5] = ram; state.r[7] = late_miss ? 0x40020800U : ram;
+        state.xpsr |= xpsr_c | xpsr_v | xpsr_q; reference.state() = state;
+        auto context = binding; context.cpu_state = &state;
+        for (std::size_t slot = 0U; slot < 2U; ++slot) if ((mask & (1U << slot)) == 0U) context.mmio_read[slot] = {};
+        context.instruction_limit = limit; context.cycle_limit = credit;
+        context.sequential_fetch_stall = stall; context.nonsequential_fetch_stall = stall;
+        std::uint32_t retired = 0U; std::uint64_t cycles = 0U;
+        NativeRegionExit reason;
+        for (;;) {
+            if (retired == limit) { reason = NativeRegionExit::instruction_budget; break; }
+            const auto next = reference.state().r[15];
+            if (next == pc + 14U || (next == pc + 2U && !(mask & 1U))
+                || (next == pc + 6U && !(mask & 2U)) || (next == pc + 10U && late_miss)) {
+                reason = NativeRegionExit::checked_instruction; break;
+            }
+            std::uint16_t pipeline = 0U; ASSERT_TRUE(reference.peekPredictableCycles(pipeline));
+            const auto charge = pipeline + stall;
+            if (charge > credit - cycles) { reason = NativeRegionExit::cycle_budget; break; }
+            ASSERT_EQ(reference.stepFast().reason, StopReason::step_complete); ++retired; cycles += charge;
+        }
+        function(&context);
+        EXPECT_TRUE(bitwiseEqual(state, reference.state())) << mask << '/' << late_miss << '/' << limit << '/' << credit;
+        EXPECT_EQ(context.retired_count, retired); EXPECT_EQ(context.retired_cycles, cycles); EXPECT_EQ(context.exit_reason, reason);
+        EXPECT_EQ(memory.read32(ram).value(), oracle.read32(ram).value());
+        EXPECT_EQ(memory.sideEffectCheckpoint().mutation_sequence, oracle.sideEffectCheckpoint().mutation_sequence);
+        EXPECT_EQ(memory.sideEffectCheckpoint().mmio_generation, oracle.sideEffectCheckpoint().mmio_generation);
         EXPECT_EQ(memory.sideEffectGeneration(), oracle.sideEffectGeneration());
     }
 }
