@@ -133,39 +133,34 @@ inline bool MemoryBus::storeBackedWord(
         std::uint32_t old_value = 0U;
         std::memcpy(&old_value, region.bytes.data() + offset, sizeof(old_value));
         if (old_value == value) return true;
-        std::uint32_t difference = old_value ^ value;
-        // One low bit per changed byte. Propagation never crosses the low
-        // bit of a byte, so adjacent bytes cannot create false mutations.
-        difference |= difference >> 4U;
-        difference |= difference >> 2U;
-        difference |= difference >> 1U;
-        std::uint32_t changed = difference & 0x01010101U;
-        // Each byte is now exactly 0 or 1. A horizontal byte sum avoids a
-        // general popcount (and its software helper on portable x86 builds).
-        const auto changed_bytes = static_cast<std::uint64_t>((changed * 0x01010101U) >> 24U);
-        if (changed_bytes != 0U) {
-            if (write_journal_tracking_) {
-                // Keep byte-address order and exact old values for checkpoints,
-                // journal wrap and restoration, but inspect only dirty lanes.
-                // No callbacks or observers run inside a backed word store.
-                // Reserve the exact byte sequence locally, avoiding repeated
-                // tracking checks and publication for each dirty lane.
-                auto sequence = mutation_sequence_;
-                const auto address = region.info.base + static_cast<std::uint32_t>(offset);
-                while (changed != 0U) {
-                    const auto shift = static_cast<std::uint32_t>(std::countr_zero(changed));
-                    mutation_journal_[sequence % mutation_journal_capacity] = BackedMutation{
-                        address + shift / 8U, static_cast<std::uint8_t>(old_value >> shift), external};
-                    ++sequence;
-                    changed &= changed - 1U;
-                }
-                mutation_sequence_ = sequence;
-            } else {
-                mutation_sequence_ += changed_bytes;
-            }
-            std::memcpy(region.bytes.data() + offset, &value, sizeof(value));
-            side_effect_generation_ += changed_bytes;
+        const auto difference = old_value ^ value;
+        std::uint64_t changed_bytes;
+        if (write_journal_tracking_) {
+            // Fixed lane positions avoid bit propagation, CTZ and variable
+            // shifts in the journaled path. Byte order and partial rollback
+            // checkpoints remain identical to four checked byte stores.
+            auto sequence = mutation_sequence_;
+            const auto address = region.info.base + static_cast<std::uint32_t>(offset);
+            const auto record_lane = [&](const std::uint32_t shift) {
+                if ((difference & (0xffU << shift)) == 0U) return;
+                mutation_journal_[sequence % mutation_journal_capacity] = BackedMutation{
+                    address + shift / 8U, static_cast<std::uint8_t>(old_value >> shift), external};
+                ++sequence;
+            };
+            record_lane(0U); record_lane(8U); record_lane(16U); record_lane(24U);
+            changed_bytes = sequence - mutation_sequence_;
+            mutation_sequence_ = sequence;
+        } else {
+            auto changed = difference;
+            changed |= changed >> 4U;
+            changed |= changed >> 2U;
+            changed |= changed >> 1U;
+            changed &= 0x01010101U;
+            changed_bytes = (changed * 0x01010101U) >> 24U;
+            mutation_sequence_ += changed_bytes;
         }
+        std::memcpy(region.bytes.data() + offset, &value, sizeof(value));
+        side_effect_generation_ += changed_bytes;
         return true;
     }
     return false;
