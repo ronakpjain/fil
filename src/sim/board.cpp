@@ -20,6 +20,17 @@ namespace {
 
 constexpr std::uint64_t nanoseconds_per_second = 1'000'000'000ULL;
 
+SimTimeNs cycleTimeQuotient(const std::uint64_t numerator, const std::uint64_t frequency) noexcept {
+    // Constant divisors lower to multiply/shift arithmetic. Other RCC clock
+    // configurations retain exact integer division, without retained results.
+    switch (frequency) {
+    case 16'000'000U: return numerator / 16'000'000U;
+    case 170'000'000U: return numerator / 170'000'000U;
+    default: return numerator / frequency;
+    }
+}
+
+
 struct ReversibleMemoryGuard {
     mem::MemoryBus& memory;
     bool all_trapping;
@@ -239,54 +250,25 @@ Result<void> Board::reset() {
     transition_restoration_generations_.fill(memory_.restorationGeneration());
     transition_hotness_.fill(0U);
     transition_probes_ = {};
-    local_prefix_probes_ = {};
     period_validation_checkpoint_ = {};
     period_validation_restoration_generation_ = memory_.restorationGeneration();
     read_footprint_boundary_.reset();
     static_cast<void>(memory_.takeReadFootprint());
-    cached_clock_hz_ = peripherals_->rcc().systemClockHz();
-    cached_flash_acr_generation_ = peripherals_->flash().acrGeneration();
-    cached_flash_ws_ = peripherals_->flash().waitStates();
-    cached_flash_art_hit_capable_ = peripherals_->flash().prefetchEnabled()
-        || peripherals_->flash().instructionCacheEnabled();
-    cached_fetch_timing_valid_ = false;
     have_last_fetch_ = false;
     last_fetch_end_ = 0U;
     return {};
 }
 
 SimTimeNs Board::accountCycles(const std::uint64_t cycles) {
-    const std::uint64_t applied = std::min(system_credit_applied_, cycles);
-    system_credit_applied_ -= applied;
-    system_->advanceCycles(cycles - applied);
-    // Cached-clock fast path: the RCC value changes only on firmware clock
-    // writes, so the common case is one inline load plus one compare.
-    // Small cycle counts convert divide-free via the remainder table
-    // (remainder + carry < 2*F resolves with one compare); only large
-    // loop-skip jumps pay a real division. Exact in both cases.
+    system_->advanceCycles(cycles);
     const std::uint64_t frequency = peripherals_->rcc().systemClockHz();
-    if (frequency != cached_clock_hz_) {
-        cached_clock_hz_ = frequency;
-        invalidateLoopObservations();
-    }
     if (frequency == 0U) {
         time_fraction_ = 0U;
         return 0U;
     }
-    if (cycle_table_hz_ != frequency) rebuildCycleTable(frequency);
-    if (cycles < cycle_table_size) {
-        const auto& entry = cycle_table_[static_cast<std::size_t>(cycles)];
-        const std::uint64_t carried = entry.remainder + time_fraction_;
-        if (carried >= frequency) {
-            time_fraction_ = carried - frequency;
-            return entry.quotient + 1U;
-        }
-        time_fraction_ = carried;
-        return entry.quotient;
-    }
     const std::uint64_t numerator = cycles * nanoseconds_per_second + time_fraction_;
-    const SimTimeNs elapsed = numerator / frequency;
-    time_fraction_ = numerator % frequency;
+    const SimTimeNs elapsed = cycleTimeQuotient(numerator, frequency);
+    time_fraction_ = numerator - elapsed * frequency;
     return elapsed;
 }
 
@@ -304,24 +286,10 @@ cpu::FastStepResult Board::stepSingleWithFetchTiming(const bool allow_jit) {
     auto result = allow_jit ? cpu_->stepJitFast() : cpu_->stepFast();
     if (result.instructions == 0U || result.instruction_size == 0U) return result;
     const auto& flash = peripherals_->flash();
-    const std::uint64_t generation = flash.acrGeneration();
-    if (generation != cached_flash_acr_generation_) {
-        cached_flash_acr_generation_ = generation;
-        cached_flash_ws_ = flash.waitStates();
-        cached_flash_art_hit_capable_ = flash.prefetchEnabled()
-            || flash.instructionCacheEnabled();
-        invalidateLoopObservations();
-    }
-    if (cached_flash_ws_ == 0U) {
-        last_fetch_end_ = result.instruction_address + result.instruction_size;
-        have_last_fetch_ = true;
-        return result;
-    }
     const bool sequential = have_last_fetch_
         && result.instruction_address == last_fetch_end_;
     last_fetch_end_ = result.instruction_address + result.instruction_size;
     have_last_fetch_ = true;
-    if (sequential && cached_flash_art_hit_capable_) return result;
     const std::uint32_t stall = flash.fetchStallCycles(
         result.instruction_address, sequential);
     result.cycles = static_cast<std::uint16_t>(result.cycles + stall);
@@ -373,46 +341,17 @@ cpu::FastStepResult Board::stepBlockWithFetchTiming(
             // Fold ART flash stalls per instruction in the block.
             auto& flash = peripherals_->flash();
             std::uint32_t extra = 0U;
-            // Memory-free blocks cannot change flash config mid-block: check
-            // the ACR generation once and skip the loop when no wait states.
-            const bool hoist_flash = jit->memory_free;
-            if (hoist_flash) {
-                const std::uint64_t generation = flash.acrGeneration();
-                if (generation != cached_flash_acr_generation_) {
-                    cached_flash_acr_generation_ = generation;
-                    cached_flash_ws_ = flash.waitStates();
-                    cached_flash_art_hit_capable_ = flash.prefetchEnabled()
-                        || flash.instructionCacheEnabled();
-                    invalidateLoopObservations();
-                }
-            }
-            if (hoist_flash && cached_flash_ws_ == 0U) {
+            if (flash.waitStates() == 0U) {
                 const auto last = static_cast<std::uint8_t>(jit->count - 1U);
                 last_fetch_end_ = jit->pcs[last] + jit->sizes[last];
                 have_last_fetch_ = true;
             } else {
-            for (std::uint8_t i = 0; i < jit->count; ++i) {
-                const std::uint64_t generation = hoist_flash
-                    ? cached_flash_acr_generation_ : flash.acrGeneration();
-                if (generation != cached_flash_acr_generation_) {
-                    cached_flash_acr_generation_ = generation;
-                    cached_flash_ws_ = flash.waitStates();
-                    cached_flash_art_hit_capable_ = flash.prefetchEnabled()
-                        || flash.instructionCacheEnabled();
-                    invalidateLoopObservations();
-                }
-                if (cached_flash_ws_ == 0U) {
+                for (std::uint8_t i = 0U; i < jit->count; ++i) {
+                    const bool sequential = have_last_fetch_ && jit->pcs[i] == last_fetch_end_;
                     last_fetch_end_ = jit->pcs[i] + jit->sizes[i];
                     have_last_fetch_ = true;
-                    continue;
+                    extra += flash.fetchStallCycles(jit->pcs[i], sequential);
                 }
-                const bool sequential = have_last_fetch_
-                    && jit->pcs[i] == last_fetch_end_;
-                last_fetch_end_ = jit->pcs[i] + jit->sizes[i];
-                have_last_fetch_ = true;
-                if (sequential && cached_flash_art_hit_capable_) continue;
-                extra += flash.fetchStallCycles(jit->pcs[i], sequential);
-            }
             }
             cpu::FastStepResult result = jit->result;
             result.cycles = static_cast<std::uint16_t>(result.cycles + extra);
@@ -921,15 +860,9 @@ bool Board::prepareReversibleRamPrefix(ReversibleRamPrefix& prefix,
 
     // MMIO is trapped and every admitted store is non-executable RAM, so
     // clock/flash timing inputs cannot change during this speculative span.
-    if (cycle_table_hz_ != frequency) rebuildCycleTable(frequency);
     const auto& flash = peripherals_->flash();
     const auto elapsed_for_span = [&](const std::uint64_t total_cycles) {
-        if (total_cycles < cycle_table_size) {
-            const auto& entry = cycle_table_[static_cast<std::size_t>(total_cycles)];
-            return entry.quotient + static_cast<SimTimeNs>(
-                entry.remainder + prefix.time_fraction >= frequency);
-        }
-        return (total_cycles * nanoseconds_per_second + prefix.time_fraction) / frequency;
+        return cycleTimeQuotient(total_cycles * nanoseconds_per_second + prefix.time_fraction, frequency);
     };
     // RAM-neutral periods are reusable only at their exact entry CPU/fetch
     // phase. Intermediate phases may have different RAM bytes, so never map
@@ -2004,27 +1937,11 @@ bool Board::loopHasNoMmioSince(const ProvenLoop& loop) const noexcept {
 SimTimeNs Board::elapsedForCycles(const std::uint64_t cycles) const noexcept {
     const std::uint64_t frequency = peripherals_->rcc().systemClockHz();
     if (frequency == 0U) return 0U;
-    if (cycle_table_hz_ != frequency) rebuildCycleTable(frequency);
-    if (cycles < cycle_table_size) {
-        const auto& entry = cycle_table_[static_cast<std::size_t>(cycles)];
-        const std::uint64_t carried = entry.remainder + time_fraction_;
-        return entry.quotient + (carried >= frequency ? 1U : 0U);
-    }
     if (cycles > (std::numeric_limits<std::uint64_t>::max() - time_fraction_)
                 / nanoseconds_per_second) {
         return std::numeric_limits<SimTimeNs>::max();
     }
-    return (cycles * nanoseconds_per_second + time_fraction_) / frequency;
-}
-
-void Board::rebuildCycleTable(const std::uint64_t frequency) const {
-    for (std::size_t c = 0U; c < cycle_table_size; ++c) {
-        const std::uint64_t product = static_cast<std::uint64_t>(c)
-            * nanoseconds_per_second;
-        cycle_table_[c].quotient = frequency == 0U ? 0U : product / frequency;
-        cycle_table_[c].remainder = frequency == 0U ? 0U : product % frequency;
-    }
-    cycle_table_hz_ = frequency;
+    return cycleTimeQuotient(cycles * nanoseconds_per_second + time_fraction_, frequency);
 }
 
 std::optional<SimTimeNs> Board::nextObservableTime(const SimTimeNs boundary_time) const {
@@ -2194,86 +2111,6 @@ BoardRunResult Board::runOwnerSlice(const BoardRunOptions& options) {
         }
     }
     return run(options);
-}
-
-std::optional<Board::ConcurrentStepResult> Board::stepMemoizedLocal(
-    const std::size_t max_instructions, const std::optional<SimTimeNs> deadline) {
-    if (max_instructions < 2U || !memory_.writeJournalTracking() || blockBoundaryPending())
-        return std::nullopt;
-    const auto pc = cpu_->state().r[15];
-    auto& probe = local_prefix_probes_[((pc >> 1U) ^ (pc >> 9U))
-        & (local_prefix_probes_.size() - 1U)];
-    if (probe.pc != pc) probe = {pc, 0U, 0U};
-    const auto visits = probe.visits++;
-    const bool discovery = visits < transition_hotness_threshold || (visits & 63U) == 0U;
-    if (!discovery && probe.misses >= transition_hotness_threshold) return std::nullopt;
-    if (!local_prefix_) local_prefix_ = std::make_unique<ReversibleRamPrefix>();
-    // FastStepResult carries a 16-bit aggregate charge. Bound even compressed
-    // certificates before admission; a full commit accounts these cycles once.
-    auto horizon = saturatingAdd(event_loop_->now(),
-        elapsedForCycles(std::numeric_limits<std::uint16_t>::max()));
-    if (deadline) horizon = std::min(horizon, *deadline);
-    // Only discovery/materialization needs read dependencies. Owner-local
-    // execution outside this scope is committed, not a speculative prefix.
-    mem::MemoryBus::TrackingScope tracking(memory_, true, true);
-    const bool prepared = prepareReversibleRamPrefix(
-        *local_prefix_, max_instructions, horizon, false, true, !discovery);
-    if (prepared && local_prefix_->memoized_count != 0U) {
-        probe.misses = 0U;
-        return materializeReversibleRamPrefix(*local_prefix_, local_prefix_->count);
-    }
-    if (probe.misses < transition_hotness_threshold) ++probe.misses;
-    if (!prepared) return std::nullopt;
-    return materializeReversibleRamPrefix(*local_prefix_, local_prefix_->count);
-}
-
-bool Board::nativeMmioBegin(
-    void* const context, const std::uint64_t prefix_cycles, const std::uint32_t) noexcept {
-    auto& self = *static_cast<Board*>(context);
-    if (self.blockBoundaryPending()) return false;
-    const std::uint64_t absolute = self.span_prior_cycles_ + prefix_cycles;
-    // A checked fallback may already have advanced the real board clock.
-    // Do not charge that prefix to SysTick/DWT a second time on re-entry.
-    const std::uint64_t already = std::max(self.span_bridge_cycles_, self.span_accounted_cycles_);
-    if (absolute > already) {
-        const std::uint64_t delta = absolute - already;
-        // Advance SystemControl (SysTick/DWT) exactly like the checked path so
-        // time-dependent register reads are correct. advanceCycles is
-        // chunk-independent and the span credit keeps SysTick from firing here.
-        self.system_->advanceCycles(delta);
-        self.system_credit_applied_ += delta;
-        self.span_bridge_cycles_ = absolute;
-    }
-    // Read-only offset: devices read the exact guest time; the dispatch clock
-    // advances only at the span boundary, preserving interrupt/SysTick phase.
-    try {
-        self.event_loop_->setReadOffset(self.elapsedForCycles(absolute - self.span_accounted_cycles_));
-    } catch (...) {
-        return false;
-    }
-    return true;
-}
-
-bool Board::nativeMmioMustStop(void* const context, const bool write) noexcept {
-    auto& self = *static_cast<Board*>(context);
-    if (write || self.blockBoundaryPending()) {
-        self.mmio_boundary_stop_ = true;
-        return true;
-    }
-    if (self.span_horizon_ns_ == 0U) return false;
-    try {
-        const auto next = self.event_loop_->nextScheduledTime(self.event_loop_->activeOwner());
-        // Admission already ends strictly before the original horizon. Only a
-        // newly earlier event invalidates it; an unchanged event is not a cut.
-        if (next.has_value() && *next < self.span_horizon_ns_) {
-            self.mmio_boundary_stop_ = true;
-            return true;
-        }
-    } catch (...) {
-        self.mmio_boundary_stop_ = true;
-        return true;
-    }
-    return false;
 }
 
 void Board::prepareNativePrograms() {
@@ -2454,191 +2291,6 @@ std::optional<cpu::FastStepResult> Board::stepNativeLocal(
     return result;
 }
 
-std::optional<cpu::FastStepResult> Board::stepCommittedLocal(
-    const std::size_t max_instructions, const std::optional<SimTimeNs> deadline) {
-    if (max_instructions < 2U || blockBoundaryPending()) {
-        ++cpu_->mutableJitStats().span_skip_boundary;
-        return std::nullopt;
-    }
-    const auto now = event_loop_->now();
-    const auto frequency = peripherals_->rcc().systemClockHz();
-    if (frequency == 0U || time_fraction_ >= frequency) return std::nullopt;
-    auto horizon = deadline;
-    if (const auto event = event_loop_->nextScheduledTime(event_loop_->activeOwner());
-        event && (!horizon || *event < *horizon)) horizon = event;
-    if (horizon && *horizon <= now) {
-        ++cpu_->mutableJitStats().span_skip_clock;
-        return std::nullopt;
-    }
-    const auto systick = system_->cyclesUntilSysTickInterrupt();
-    if (systick && *systick == 0U) {
-        ++cpu_->mutableJitStats().span_skip_clock;
-        return std::nullopt;
-    }
-    auto credit = systick ? *systick - 1U : std::numeric_limits<std::uint64_t>::max();
-    if (horizon && *horizon - now <= std::numeric_limits<std::uint64_t>::max() / frequency) {
-        const auto numerator = (*horizon - now) * frequency - 1U;
-        credit = std::min(credit, numerator >= time_fraction_
-            ? (numerator - time_fraction_) / nanoseconds_per_second : 0U);
-    }
-    credit = std::min<std::uint64_t>(credit, std::numeric_limits<std::uint16_t>::max());
-    if (credit == 0U) {
-        ++cpu_->mutableJitStats().span_skip_credit;
-        return std::nullopt;
-    }
-    cpu::CortexM4::ReversibleCycleBudget budget;
-    budget.remaining_cycles = credit;
-    budget.have_fetch = have_last_fetch_;
-    budget.fetch_end = last_fetch_end_;
-    // Cache the flash fetch-timing snapshot: it changes only on FLASH_ACR
-    // writes (tracked by acrGeneration), yet this span path is entered
-    // millions of times on event-heavy firmware.
-    const auto& flash = peripherals_->flash();
-    const auto timing_generation = flash.acrGeneration();
-    if (!cached_fetch_timing_valid_ || cached_fetch_timing_generation_ != timing_generation) {
-        const auto wait = static_cast<std::uint16_t>(flash.waitStates());
-        cached_fetch_timing_ = {flash.flashBase(), flash.flashBase() + flash.bankSize(),
-            0U, flash.bankSize(), wait,
-            static_cast<std::uint16_t>(
-                (flash.prefetchEnabled() || flash.instructionCacheEnabled()) ? 0U : wait)};
-        cached_fetch_timing_generation_ = timing_generation;
-        cached_fetch_timing_valid_ = true;
-    }
-    budget.fetch_timing = cached_fetch_timing_;
-    // Committed spans may execute MMIO inline through this bridge. Speculative
-    // certificate paths pass committed_mmio=false and never see it.
-    mmio_bridge_ = cpu::NativeMmioBridge{this, &Board::nativeMmioBegin, &Board::nativeMmioMustStop};
-    cpu_->setMmioBridge(&mmio_bridge_);
-    span_horizon_ns_ = horizon ? *horizon : 0U;
-    span_prior_cycles_ = 0U;
-    span_bridge_cycles_ = 0U;
-    mmio_boundary_stop_ = false;
-    // Re-derives the cycle credit still available to this span. A checked single
-    // step may commit MMIO, which can schedule or cancel device events or
-    // reprogram SysTick, so the bound is recomputed from the current clock with
-    // the same formula as admission.
-    const auto remainingCredit = [&]() -> std::uint64_t {
-        auto horizon = deadline;
-        if (const auto event = event_loop_->nextScheduledTime(event_loop_->activeOwner());
-            event && (!horizon || *event < *horizon)) horizon = event;
-        const auto current = event_loop_->now();
-        if (horizon && *horizon <= current) return 0U;
-        const auto systick_now = system_->cyclesUntilSysTickInterrupt();
-        if (systick_now && *systick_now == 0U) return 0U;
-        auto credit_now = systick_now ? *systick_now - 1U
-            : std::numeric_limits<std::uint64_t>::max();
-        if (horizon
-            && *horizon - current <= std::numeric_limits<std::uint64_t>::max() / frequency) {
-            const auto numerator = (*horizon - current) * frequency - 1U;
-            credit_now = std::min(credit_now, numerator >= time_fraction_
-                ? (numerator - time_fraction_) / nanoseconds_per_second : 0U);
-        }
-        return std::min<std::uint64_t>(credit_now,
-            std::numeric_limits<std::uint16_t>::max());
-    };
-    // A batched step skips the memoized-certificate attempt the scheduler would
-    // otherwise make at this pc. That is sound only when the attempt is provably
-    // a no-op for the probe's own accounting: otherwise the span returns to the
-    // caller so idle-loop discovery, certificate reuse and their clock jumps
-    // keep happening at the same cadence and phase as unbatched execution.
-    const auto batchableMemoizedProbe = [&]() -> bool {
-        if (!memory_.writeJournalTracking()) return true;
-        const auto pc = cpu_->state().r[15];
-        auto& probe = local_prefix_probes_[((pc >> 1U) ^ (pc >> 9U))
-            & (local_prefix_probes_.size() - 1U)];
-        if (probe.pc != pc) probe = {pc, 0U, 0U};
-        const auto visits = probe.visits++;
-        const bool discovery = visits < transition_hotness_threshold
-            || (visits & 63U) == 0U;
-        return !discovery && probe.misses >= transition_hotness_threshold;
-    };
-    cpu::FastStepResult result;
-    std::uint32_t instructions = 0U;
-    bool suppress_loop_observation = false;
-    // Cycles charged inside this span, and how many of them have already been
-    // applied to the board clock. Keeping these separate lets the span retire
-    // one checked instruction after a decline without ever letting an MMIO read
-    // observe stale simulated time, while the caller still reports and advances
-    // the full span charge exactly once.
-    std::uint64_t consumed_cycles = 0U;
-    std::uint64_t accounted_cycles = 0U;
-    std::uint64_t reconciled_mmio_generation = memory_.mmioGeneration();
-    while (instructions < max_instructions) {
-        const auto request = std::min<std::size_t>(max_instructions - instructions,
-            cpu::NativeTracePlan::max_ops);
-        std::optional<cpu::FastStepResult> executed;
-        {
-            // Traps and the reversible-RAM restriction apply only to the
-            // speculative span; the checked step below runs outside them so its
-            // MMIO effects commit once, exactly as the scheduler fallback did.
-            ReversibleMemoryGuard guard(memory_);
-            // The bridge installs a thread-local read offset; always clear it,
-            // even if span execution throws.
-            struct ReadOffsetGuard {
-                EventLoop* loop;
-                ~ReadOffsetGuard() { loop->setReadOffset(0); }
-            } offset_guard{event_loop_};
-            const auto before_credit = budget.remaining_cycles;
-            span_prior_cycles_ = consumed_cycles;
-            executed = cpu_->tryStepCommittedRamSpan(request, budget);
-            consumed_cycles += before_credit - budget.remaining_cycles;
-        }
-        // An inline MMIO may have advanced part of the span's clock already.
-        if (span_accounted_cycles_ > accounted_cycles) accounted_cycles = span_accounted_cycles_;
-        if (executed && executed->instructions != 0U) {
-            instructions += executed->instructions;
-            suppress_loop_observation |= executed->suppress_loop_observation;
-            result = *executed;
-            if (result.reason != cpu::StopReason::step_complete || blockBoundaryPending()
-                || mmio_boundary_stop_) break;
-            continue;
-        }
-        // A declined span retires one checked instruction so a single declined
-        // op no longer costs a full scheduler round trip. Everything retired so
-        // far must already be on the board clock first: the step may read a
-        // time-dependent register.
-        if (!batchableMemoizedProbe()) break;
-        if (consumed_cycles != accounted_cycles) {
-            // The span credit is bounded below the next owner event and below
-            // SysTick, so this advance dispatches nothing; it exists only so the
-            // checked step below observes the exact simulated time.
-            static_cast<void>(advanceTime(consumed_cycles - accounted_cycles));
-            accounted_cycles = consumed_cycles;
-            span_accounted_cycles_ = accounted_cycles;
-            // Advancing the clock can make an interrupt takable; the scheduler
-            // fallback this replaces always observed that boundary before
-            // retiring another instruction.
-            if (blockBoundaryPending()) break;
-        }
-        // A committed MMIO access may have retimed the device or the clock. Only
-        // then is the cached bound re-derived: the common checked step touches
-        // no peripheral, and re-reading the horizon and SysTick every time would
-        // cost more than the round trip this batching removes.
-        if (memory_.mmioGeneration() != reconciled_mmio_generation) {
-            if (peripherals_->rcc().systemClockHz() != frequency
-                || peripherals_->flash().acrGeneration() != timing_generation) break;
-            reconciled_mmio_generation = memory_.mmioGeneration();
-            budget.remaining_cycles = std::min(budget.remaining_cycles, remainingCredit());
-            if (budget.remaining_cycles == 0U) break;
-        }
-        const auto before_credit = budget.remaining_cycles;
-        const auto single = cpu_->tryStepCheckedSingle(budget);
-        if (!single) break;
-        consumed_cycles += before_credit - budget.remaining_cycles;
-        ++instructions;
-        result = *single;
-        if (result.reason != cpu::StopReason::step_complete || blockBoundaryPending()) break;
-    }
-    if (instructions == 0U) return std::nullopt;
-    result.instructions = instructions;
-    result.suppress_loop_observation = suppress_loop_observation;
-    result.cycles = static_cast<std::uint16_t>(consumed_cycles);
-    have_last_fetch_ = budget.have_fetch;
-    last_fetch_end_ = budget.fetch_end;
-    span_accounted_cycles_ = accounted_cycles;
-    return result;
-}
-
 BoardRunResult Board::run(const BoardRunOptions& options) {
     // A standalone run owns the board and its event loop until it returns.
     // Hold one exclusive lease so every per-instruction clock/event query
@@ -2683,20 +2335,8 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
             ? stepNativeLocal(static_cast<std::size_t>(std::min<std::uint64_t>(
                 options.max_instructions - aggregate.instructions, UINT32_MAX)), limit_time)
             : std::nullopt;
-        const auto memoized = !native_owner && owner_slice_active_ && jit_ok
-            ? stepMemoizedLocal(static_cast<std::size_t>(std::min<std::uint64_t>(
-                options.max_instructions - aggregate.instructions,
-                DeferredPurePrefix::max_memoized_instructions)), limit_time) : std::nullopt;
-        const auto committed = !native_owner && !memoized && owner_slice_active_ && jit_ok
-            ? stepCommittedLocal(jit_limit == 1U ? 1U : static_cast<std::size_t>(
-                std::min<std::uint64_t>(options.max_instructions - aggregate.instructions,
-                    DeferredPurePrefix::max_memoized_instructions)), limit_time) : std::nullopt;
-        auto result = native ? *native : memoized ? memoized->cpu_result : committed ? *committed
+        auto result = native ? *native
             : stepWithFetchTiming(jit_ok && !native_owner, limit_time, owner_slice_active_ ? 1U : jit_limit);
-        if (memoized && local_prefix_->memoized_count != 0U) {
-            ++aggregate.memoized_prefixes;
-            aggregate.memoized_instructions += local_prefix_->memoized_count;
-        }
         aggregate.instructions += result.instructions;
         aggregate.cycles += result.cycles;
         aggregate.diagnostic.instruction_address = result.instruction_address;
@@ -2708,20 +2348,11 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
                 {{"pc", hex32(result.instruction_address)}, {"raw", hex32(result.raw)}}
             );
         }
-        if (memoized) {
-            // Full certificate materialization already accounted CPU/SysTick
-            // cycles. Only advance the owner's event clock here.
-            const auto events = event_loop_->runOwnedEvents(event_loop_->activeOwner(),
-                saturatingAdd(event_loop_->now(), memoized->elapsed_ns));
-            if (events.same_time_limit_hit) throw std::runtime_error("owner event livelock");
-        } else {
-            // A committed span may have already applied part of its charge to the
-            // board clock so a checked single step could observe exact time;
-            // advance only the remainder.
-            const auto preaccounted = std::exchange(span_accounted_cycles_, 0U);
-            static_cast<void>(advanceTime(result.cycles > preaccounted
-                ? result.cycles - preaccounted : 0U));
-        }
+        // Checked services may have settled a native prefix before MMIO.
+        // Charge only the remainder after the native frame has returned.
+        const auto preaccounted = std::exchange(span_accounted_cycles_, 0U);
+        static_cast<void>(advanceTime(result.cycles > preaccounted
+            ? result.cycles - preaccounted : 0U));
         if (result.reason != cpu::StopReason::step_complete) {
             BoardRunResult failure = cpuFailure(result);
             failure.instructions = aggregate.instructions;

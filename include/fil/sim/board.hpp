@@ -319,41 +319,10 @@ private:
         std::size_t max_instructions, std::optional<SimTimeNs> deadline);
     struct NativeServiceState;
     static bool nativeCheckedStep(cpu::NativeRegionContext*) noexcept;
-    [[nodiscard]] std::optional<cpu::FastStepResult> stepCommittedLocal(
-        std::size_t max_instructions, std::optional<SimTimeNs> deadline);
-    [[nodiscard]] std::optional<ConcurrentStepResult> stepMemoizedLocal(
-        std::size_t max_instructions, std::optional<SimTimeNs> deadline);
-    std::unique_ptr<ReversibleRamPrefix> local_prefix_;
-    struct LocalPrefixProbe {
-        std::uint32_t pc{0U};
-        std::uint8_t visits{0U};
-        std::uint8_t misses{0U};
-    };
-    // Profitability hints only: a deferred discovery always executes normally.
-    std::array<LocalPrefixProbe, 256U> local_prefix_probes_{};
     bool owner_slice_active_{false};
     // Cycles a committed span already applied to the board clock so a checked
     // single step could observe exact time; the caller advances only the rest.
     std::uint64_t span_accounted_cycles_{0U};
-    // Committed-span MMIO bridge: advances the real clock to each MMIO
-    // instruction's exact time before the access, and reports when the span
-    // must stop. Speculative paths never receive this bridge pointer.
-    cpu::NativeMmioBridge mmio_bridge_{};
-    // Cycles retired in earlier spans of the current stepCommittedLocal call.
-    // Each native span counts cycles from its own entry, so the absolute
-    // progress is span_prior_cycles_ + the kernel's published prefix.
-    std::uint64_t span_prior_cycles_{0};
-    // SystemControl cycles already advanced mid-span by the MMIO bridge, so the
-    // boundary advance applies only the remainder without changing SysTick phase.
-    std::uint64_t system_credit_applied_{0};
-    // Highest bridge prefix already processed (offset + SystemControl) this span set.
-    std::uint64_t span_bridge_cycles_{0};
-    SimTimeNs span_horizon_ns_{0};
-    bool mmio_boundary_stop_{false};
-    static bool nativeMmioBegin(
-        void* context, std::uint64_t prefix_cycles, std::uint32_t pc) noexcept;
-    static bool nativeMmioMustStop(void* context, bool write) noexcept;
-
     [[nodiscard]] static bool appendReversibleChunk(
         ReversibleRamPrefix::ReversibleExecution& aggregate,
         const cpu::CortexM4::TimedJitStepOutcome& chunk);
@@ -562,28 +531,6 @@ private:
     std::uint64_t period_validation_restoration_generation_{0U};
     std::uint64_t loop_observation_generation_{1U};
     std::optional<std::uint32_t> read_footprint_boundary_;
-    // Cached real-timing inputs (clock + flash ACR) with fetch-sequencing
-    // for the simplified ART model. Refreshed on change, not per reset.
-    std::uint64_t cached_clock_hz_{0};
-    /// Divide-free cycles->ns conversion: (c*1e9)/F split into quotient and
-    /// remainder per cycle count. Remainder plus carry is always < 2*F, so
-    /// the per-step carry resolves with one compare (exact, no division).
-    // Cover complete 64-instruction capsule spans as well as single steps;
-    // the conversion remains exact, with division retained for larger jumps.
-    static constexpr std::size_t cycle_table_size = 1024U;
-    struct CycleTableEntry { std::uint64_t quotient{0}; std::uint64_t remainder{0}; };
-    mutable std::array<CycleTableEntry, cycle_table_size> cycle_table_{};
-    mutable std::uint64_t cycle_table_hz_{0};
-    void rebuildCycleTable(std::uint64_t frequency) const;
-    std::uint64_t cached_flash_acr_generation_{0};
-    std::uint32_t cached_flash_ws_{0};
-    bool cached_flash_art_hit_capable_{false};
-    /// Flash fetch-timing snapshot reused across owner-slice spans. Valid only
-    /// while ``flash_acr_generation`` matches; ACR writes change wait states,
-    /// prefetch, or the instruction cache, so any change rebuilds it.
-    cpu::CortexM4::ReversibleCycleBudget::FetchTiming cached_fetch_timing_{};
-    std::uint64_t cached_fetch_timing_generation_{0};
-    bool cached_fetch_timing_valid_{false};
     std::uint32_t last_fetch_end_{0};
     bool have_last_fetch_{false};
 };

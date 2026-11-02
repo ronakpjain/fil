@@ -479,7 +479,7 @@ public:
         std::uint64_t block_decline_empty{0};   ///< no instruction retired
         std::uint64_t block_prepare_failed{0};  ///< prepareJitBlock produced no entry
         std::uint64_t block_native_span_ok{0};  ///< committed span retired instructions
-        /// Committed-span outcome counters (Board::stepCommittedLocal).
+        /// Committed-span outcome counters.
         std::uint64_t span_skip_boundary{0};
         std::uint64_t span_skip_credit{0};
         std::uint64_t span_skip_clock{0};
