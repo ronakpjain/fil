@@ -212,7 +212,7 @@ public:
      */
     [[nodiscard]] FastStepResult stepFast();
 
-    /** @brief Executes one cached, specialized instruction or interprets exactly one step. */
+    /** @brief Decodes and executes one specialized instruction, with checked fallback. */
     [[nodiscard]] FastStepResult stepJitFast();
 
     [[nodiscard]] const std::string& microJitError() const noexcept { return micro_jit_error_; }
@@ -228,12 +228,9 @@ public:
     /**
      * @brief Peeks the exact pipeline cycles of the current instruction.
      *
-     * Succeeds only on a decode-cache hit for a non-control-flow form
-     * (no possible PC discontinuity): callers get the same base cost the
-     * stepper will charge, including data-dependent DIV and failed-
-     * condition short-circuiting. Control flow, cache misses, and fault
-     * paths return false so burst prediction fails closed to the exact
-     * general scheduler.
+     * Decodes directly from executable backed memory without MMIO access.
+     * Predictable forms use exact pre-state pipeline and data-dependent costs;
+     * unknown targets and fetch/decode failures return false without effects.
      */
     [[nodiscard]] bool peekPredictableCycles(std::uint16_t& cycles_out) const noexcept;
 
@@ -509,14 +506,11 @@ public:
     void setSystemControl(const cortexm::SystemControl* system) noexcept { system_ = system; }
 
 private:
-    struct InstructionCacheEntry {
-        std::uint64_t generation{0};
-        std::uint32_t pc{0};
+    struct StepInstruction {
         std::uint32_t raw{0};
         DecodedInstruction decoded{};
         std::uint8_t size{0};
-        // Hot-path cycle cost, memoized at decode time so stepping and
-        // burst prediction pay one load instead of a ~90-case switch.
+        // Metadata for this single fallback instruction; never retained.
         // Divide forms are data-dependent: divide_form marks entries whose
         // cost is resolved live via divideCycles().
         std::uint16_t base_cycles{1};
@@ -530,15 +524,6 @@ private:
         bool may_trap{false};
     };
 
-    static constexpr std::size_t instruction_cache_entries = 65536U;
-
-    /// Direct-mapped decode-cache index with high-bit folding so firmware
-    /// spread across flash does not alias every 32 KiB of code.
-    [[nodiscard]] static constexpr std::size_t instructionCacheIndex(
-        const std::uint32_t pc) noexcept {
-        return ((pc >> 1U) ^ (pc >> 17U)) & (instruction_cache_entries - 1U);
-    }
-
     [[nodiscard]] StopReason execute(
         const DecodedInstruction& instruction,
         DiagnosticSnapshot& diagnostic
@@ -548,9 +533,6 @@ private:
     mem::MemoryBus& memory_;
     const cortexm::SystemControl* system_{nullptr};
     CpuState state_{};
-    // Heap-boxed: ~8 MiB combined at current capacities; inline members
-    // would overflow caller stacks (unit tests construct CPUs as locals).
-    std::unique_ptr<std::array<InstructionCacheEntry, instruction_cache_entries>> instruction_cache_;
     DiagnosticSnapshot last_diagnostic_{};
 
     // Hot-path JIT: direct-mapped block cache keyed by entry PC.
@@ -787,7 +769,7 @@ private:
     [[nodiscard]] bool executeJitFast(const DecodedInstruction& op, JitFast fast,
                                       std::uint32_t pc) noexcept;
     [[nodiscard]] std::optional<DecodedInstruction> fetchDecode(
-        std::uint32_t pc, std::uint32_t& raw_out, std::uint8_t& size_out);
+        std::uint32_t pc, std::uint32_t& raw_out, std::uint8_t& size_out) const noexcept;
     [[nodiscard]] static JitFast classifyJitFast(const DecodedInstruction& op) noexcept;
     [[nodiscard]] static ReversibleFast classifyReversibleFast(
         const DecodedInstruction& op, JitFast fast) noexcept;

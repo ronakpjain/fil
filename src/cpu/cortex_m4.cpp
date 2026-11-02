@@ -381,7 +381,6 @@ bool RunResult::succeeded() const noexcept {
 
 CortexM4::CortexM4(mem::MemoryBus& memory) : memory_(memory) {
     assert(decoderTablesHaveNoOverlaps());
-    instruction_cache_ = std::make_unique<std::array<InstructionCacheEntry, instruction_cache_entries>>();
     jit_blocks_ = std::make_unique<std::array<JitBlockEntry, jit_block_entries>>();
 }
 
@@ -593,45 +592,6 @@ FastStepResult CortexM4::stepFast() {
 }
 
 FastStepResult CortexM4::stepJitFast() {
-    // A warm, unconditional cached handler needs neither the cold fetch/fault
-    // frame nor the generic IT/restart state. Keep those off its call stack.
-    const auto pc = state_.r[15];
-    auto& cache = (*instruction_cache_)[instructionCacheIndex(pc)];
-    if (!state_.halted && state_.thumb
-        && (state_.xpsr & xpsr_t) != 0U && (pc & 1U) == 0U && state_.it_state == 0U
-        && cache.pc == pc && cache.generation == memory_.executionGeneration()
-        && static_cast<JitFast>(cache.jit_fast) != JitFast::generic) [[likely]] {
-        const auto& decoded = cache.decoded;
-        const bool condition_passed = decoded.condition == Condition::al
-            || conditionPasses(decoded.condition, state_.xpsr);
-        const auto cycles = !condition_passed ? std::uint16_t{1U} : cache.divide_form
-            ? divideCycles(state_.readRegister(decoded.rm)) : cache.base_cycles;
-        const auto old_instruction_address = state_.instruction_address;
-        state_.instruction_address = pc;
-        state_.r[15] = pc + cache.size;
-        bool handled = !condition_passed;
-
-        if (condition_passed && !handled) {
-            handled = executeJitFast(decoded, static_cast<JitFast>(cache.jit_fast), pc);
-        }
-        if (handled) {
-            if (condition_passed) ++jit_stats_.single_fast;
-            FastStepResult result;
-            result.instruction_address = pc;
-            result.raw = cache.raw;
-            result.instruction_size = cache.size;
-            result.instructions = 1U;
-            result.cycles = static_cast<std::uint16_t>(cycles
-                + (state_.r[15] != pc + cache.size ? cache.branch_penalty : 0U));
-            result.suppress_loop_observation = cache.suppress_loop_observation;
-            return result;
-        }
-        // Declining handlers are side-effect-free. Restore the speculative
-        // PC fields and interpret once, without retrying the same handler.
-        state_.instruction_address = old_instruction_address;
-        state_.r[15] = pc;
-        return stepFastImpl(true, true);
-    }
     return stepFastImpl(true);
 }
 
@@ -662,15 +622,10 @@ FastStepResult CortexM4::stepFastImpl(const bool use_jit, bool fast_handler_decl
         return result;
     }
 
-    auto& cache = (*instruction_cache_)[instructionCacheIndex(pc)];
-    const std::uint64_t execution_generation = memory_.executionGeneration();
+    StepInstruction instruction;
     std::uint8_t instruction_size = 0;
     const DecodedInstruction* decoded = nullptr;
-    if (cache.generation == execution_generation && cache.pc == pc) [[likely]] {
-        instruction_size = cache.size;
-        result.raw = cache.raw;
-        decoded = &cache.decoded;
-    } else {
+    {
         const mem::AccessContext fetch_context{mem::AccessType::instruction_fetch, pc};
         const auto first = memory_.read16(pc, fetch_context);
         if (!first) {
@@ -740,20 +695,18 @@ FastStepResult CortexM4::stepFastImpl(const bool use_jit, bool fast_handler_decl
             capture(last_diagnostic_);
             return result;
         }
-        cache.generation = execution_generation;
-        cache.pc = pc;
-        cache.raw = result.raw;
-        cache.decoded = *newly_decoded;
-        cache.size = instruction_size;
-        cache.divide_form = newly_decoded->kind == InstrKind::udiv
+        instruction.raw = result.raw;
+        instruction.decoded = *newly_decoded;
+        instruction.size = instruction_size;
+        instruction.divide_form = newly_decoded->kind == InstrKind::udiv
             || newly_decoded->kind == InstrKind::sdiv;
-        cache.base_cycles = cache.divide_form
+        instruction.base_cycles = instruction.divide_form
             ? 7U : basePipelineCycles(*newly_decoded);
-        cache.jit_fast = static_cast<std::uint8_t>(classifyJitFast(*newly_decoded));
-        cache.branch_penalty = takenBranchPenalty(newly_decoded->kind);
-        cache.fast_unconditional = newly_decoded->condition == Condition::al
-            && static_cast<JitFast>(cache.jit_fast) != JitFast::generic;
-        cache.suppress_loop_observation = newly_decoded->kind == InstrKind::bl
+        instruction.jit_fast = static_cast<std::uint8_t>(classifyJitFast(*newly_decoded));
+        instruction.branch_penalty = takenBranchPenalty(newly_decoded->kind);
+        instruction.fast_unconditional = newly_decoded->condition == Condition::al
+            && static_cast<JitFast>(instruction.jit_fast) != JitFast::generic;
+        instruction.suppress_loop_observation = newly_decoded->kind == InstrKind::bl
             || newly_decoded->kind == InstrKind::blx
             || (newly_decoded->kind == InstrKind::bx && newly_decoded->rm == 14U)
             || (newly_decoded->kind == InstrKind::mov
@@ -763,30 +716,30 @@ FastStepResult CortexM4::stepFastImpl(const bool use_jit, bool fast_handler_decl
         // Only non-ALU/non-branch forms can report synchronization_required;
         // the stepper skips its restart copy for the rest.
         const auto may_trap_boundary = classifyJitBoundary(*newly_decoded);
-        cache.may_trap = may_trap_boundary != JitBoundary::none
+        instruction.may_trap = may_trap_boundary != JitBoundary::none
             && may_trap_boundary != JitBoundary::control_flow;
-        decoded = &cache.decoded;
+        decoded = &instruction.decoded;
     }
     result.instruction_size = instruction_size;
-    result.suppress_loop_observation = cache.suppress_loop_observation;
+    result.suppress_loop_observation = instruction.suppress_loop_observation;
 
-    // On a decode-cache hit, unconditional non-IT JIT handlers retire
+    // Unconditional non-IT handlers retire after this instruction is decoded;
     // directly; a decline rewinds speculative PC fields before interpreter fallback.
-    if (!fast_handler_declined && use_jit && state_.it_state == 0U && cache.fast_unconditional) {
+    if (!fast_handler_declined && use_jit && state_.it_state == 0U && instruction.fast_unconditional) {
         // Capture data-dependent divide cost from the pre-state: rd can
         // alias rm, so it must be sampled before the fast handler writes back.
-        const std::uint16_t fast_cycles = cache.divide_form
-            ? divideCycles(state_.readRegister(decoded->rm)) : cache.base_cycles;
+        const std::uint16_t fast_cycles = instruction.divide_form
+            ? divideCycles(state_.readRegister(decoded->rm)) : instruction.base_cycles;
         const std::uint32_t old_instruction_address = state_.instruction_address;
         state_.instruction_address = pc;
         state_.r[15] = pc + instruction_size;
-        if (executeJitFast(*decoded, static_cast<JitFast>(cache.jit_fast), pc)) {
+        if (executeJitFast(*decoded, static_cast<JitFast>(instruction.jit_fast), pc)) {
             result.reason = StopReason::step_complete;
             result.instructions = 1U;
             result.cycles = fast_cycles;
             if (state_.r[15] != pc + instruction_size) {
                 result.cycles = static_cast<std::uint16_t>(
-                    result.cycles + cache.branch_penalty);
+                    result.cycles + instruction.branch_penalty);
             }
             ++jit_stats_.single_fast;
             return result;
@@ -796,7 +749,7 @@ FastStepResult CortexM4::stepFastImpl(const bool use_jit, bool fast_handler_decl
         fast_handler_declined = true;
     }
 
-    // Memoized base cost (one load) sampled before execute() mutates
+    // Decode-derived cost sampled before execute() mutates
     // architectural state. Only DIV reads a live operand; every other form
     // uses the decode-time table value.
     const bool was_in_it = inItBlock(state_.it_state);
@@ -809,9 +762,9 @@ FastStepResult CortexM4::stepFastImpl(const bool use_jit, bool fast_handler_decl
         || conditionPasses(effective_condition, state_.xpsr);
     std::uint16_t base_cycles = 1U;
     if (condition_passed) [[likely]] {
-        base_cycles = cache.divide_form
+        base_cycles = instruction.divide_form
             ? divideCycles(state_.readRegister(decoded->rm))
-            : cache.base_cycles;
+            : instruction.base_cycles;
     }
 
     // Stack checkpoint, skipped for trap-free ops (pure ALU/branches can
@@ -820,7 +773,7 @@ FastStepResult CortexM4::stepFastImpl(const bool use_jit, bool fast_handler_decl
     // Avoid zero-initializing the large architectural state on every step;
     // materialize its checkpoint only for a trapping memory instruction.
     std::optional<CpuState> restart_state;
-    const bool need_restart = cache.may_trap && memory_.mmioTrapping();
+    const bool need_restart = instruction.may_trap && memory_.mmioTrapping();
     if (need_restart) restart_state.emplace(state_);
     state_.instruction_address = pc;
     state_.r[15] = pc + instruction_size;
@@ -837,7 +790,7 @@ FastStepResult CortexM4::stepFastImpl(const bool use_jit, bool fast_handler_decl
         if (use_jit && !was_in_it && !fast_handler_declined) {
 
             if (!jit_handled) {
-                const auto fast = static_cast<JitFast>(cache.jit_fast);
+                const auto fast = static_cast<JitFast>(instruction.jit_fast);
                 const bool attempted = fast != JitFast::generic
                     && use_jit && !was_in_it;
                 jit_handled = attempted && executeJitFast(*decoded, fast, pc);
@@ -870,7 +823,7 @@ FastStepResult CortexM4::stepFastImpl(const bool use_jit, bool fast_handler_decl
     if (condition_passed && stop == StopReason::step_complete
         && state_.r[15] != pc + instruction_size) {
         result.cycles = static_cast<std::uint16_t>(
-            result.cycles + cache.branch_penalty
+            result.cycles + instruction.branch_penalty
         );
     }
     if (stop != StopReason::step_complete) [[unlikely]] {
@@ -1393,56 +1346,24 @@ bool CortexM4::executeJitFast(
 }
 
 std::optional<DecodedInstruction> CortexM4::fetchDecode(
-    const std::uint32_t pc, std::uint32_t& raw_out, std::uint8_t& size_out) {
-    const std::uint64_t generation = memory_.executionGeneration();
-    auto& cache = (*instruction_cache_)[instructionCacheIndex(pc)];
-    if (cache.generation == generation && cache.pc == pc) {
-        raw_out = cache.raw;
-        size_out = cache.size;
-        return cache.decoded;
-    }
-    const mem::AccessContext fetch_context{mem::AccessType::instruction_fetch, pc};
-    const auto first = memory_.read16(pc, fetch_context);
-    if (!first) return std::nullopt;
-    const bool wide = is32BitThumbPrefix(first.value());
-    const std::uint8_t size = wide ? 4U : 2U;
-    std::uint16_t second_halfword = 0;
-    if (wide) {
-        if (pc > std::numeric_limits<std::uint32_t>::max() - 2U) return std::nullopt;
-        const auto second = memory_.read16(pc + 2U, fetch_context);
-        if (!second) return std::nullopt;
-        second_halfword = second.value();
-    }
-    const std::uint32_t raw = wide
-        ? (static_cast<std::uint32_t>(first.value()) << 16U) | second_halfword
-        : first.value();
-    const auto decoded = wide ? decode32(first.value(), second_halfword)
-                               : decode16(first.value());
+    const std::uint32_t pc, std::uint32_t& raw_out, std::uint8_t& size_out) const noexcept {
+    // Translation and timing admission must never cause a peripheral access.
+    const mem::AccessContext context{mem::AccessType::instruction_fetch, pc};
+    std::uint64_t first = 0U;
+    if (!memory_.tryFastRead(pc, mem::AccessSize::halfword, first, context)) return std::nullopt;
+    const bool wide = is32BitThumbPrefix(static_cast<std::uint16_t>(first));
+    std::uint64_t second = 0U;
+    if (wide && (pc > std::numeric_limits<std::uint32_t>::max() - 2U
+        || !memory_.tryFastRead(pc + 2U, mem::AccessSize::halfword, second, context)))
+        return std::nullopt;
+    const auto decoded = wide
+        ? decode32(static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(second))
+        : decode16(static_cast<std::uint16_t>(first));
     if (!decoded) return std::nullopt;
-    cache.generation = generation;
-    cache.pc = pc;
-    cache.raw = raw;
-    cache.decoded = *decoded;
-    cache.size = size;
-    cache.divide_form = decoded->kind == InstrKind::udiv
-        || decoded->kind == InstrKind::sdiv;
-    cache.base_cycles = cache.divide_form ? 7U : basePipelineCycles(*decoded);
-    cache.jit_fast = static_cast<std::uint8_t>(classifyJitFast(*decoded));
-    cache.branch_penalty = takenBranchPenalty(decoded->kind);
-    cache.fast_unconditional = decoded->condition == Condition::al
-        && static_cast<JitFast>(cache.jit_fast) != JitFast::generic;
-    cache.suppress_loop_observation = decoded->kind == InstrKind::bl
-        || decoded->kind == InstrKind::blx
-        || (decoded->kind == InstrKind::bx && decoded->rm == 14U)
-        || (decoded->kind == InstrKind::mov && decoded->rd == 15U && decoded->rm == 14U)
-        || ((decoded->kind == InstrKind::pop || decoded->kind == InstrKind::ldm)
-            && (decoded->register_list & (std::uint16_t{1U} << 15U)) != 0U);
-    const auto fetch_may_trap = classifyJitBoundary(*decoded);
-    cache.may_trap = fetch_may_trap != JitBoundary::none
-        && fetch_may_trap != JitBoundary::control_flow;
-    raw_out = raw;
-    size_out = size;
-    return *decoded;
+    raw_out = wide ? (static_cast<std::uint32_t>(first) << 16U) | static_cast<std::uint32_t>(second)
+                   : static_cast<std::uint32_t>(first);
+    size_out = wide ? 4U : 2U;
+    return decoded;
 }
 
 bool CortexM4::jitBlockReady() const noexcept {
@@ -1499,15 +1420,10 @@ bool CortexM4::prepareJitBlock(const bool allow_single) {
         fresh.pcs[fresh.count] = pc;
         fresh.sizes[fresh.count] = size;
         fresh.raws[fresh.count] = raw;
-        // fetchDecode() has just populated (or hit) the decode entry for this
-        // exact PC/generation. Reuse its expensive decode-time classifications
-        // instead of repeating the cycle and fast-handler switches here.
-        const auto& decoded_cache =
-            (*instruction_cache_)[instructionCacheIndex(pc)];
-        const bool div = decoded_cache.divide_form;
+        const bool div = decoded->kind == InstrKind::udiv || decoded->kind == InstrKind::sdiv;
         fresh.divide_form[fresh.count] = div;
-        fresh.base_cycles[fresh.count] = decoded_cache.base_cycles;
-        fresh.fast[fresh.count] = static_cast<JitFast>(decoded_cache.jit_fast);
+        fresh.base_cycles[fresh.count] = div ? 7U : basePipelineCycles(*decoded);
+        fresh.fast[fresh.count] = classifyJitFast(*decoded);
         fresh.reversible_fast[fresh.count] = classifyReversibleFast(
             *decoded, fresh.fast[fresh.count]);
         const bool touches_memory = boundary == JitBoundary::memory_may_trap
@@ -3143,10 +3059,11 @@ bool CortexM4::peekPredictableCycles(std::uint16_t& cycles_out) const noexcept {
     if (state_.halted) return false;
     const std::uint32_t pc = state_.r[15];
     if (!state_.thumb || (state_.xpsr & xpsr_t) == 0U || (pc & 1U) != 0U) return false;
-    const auto& cache = (*instruction_cache_)[instructionCacheIndex(pc)];
-    if (cache.generation != memory_.executionGeneration() || cache.pc != pc) return false;
-    const DecodedInstruction& decoded = cache.decoded;
-    const std::uint8_t size = cache.size;
+    std::uint32_t raw = 0U;
+    std::uint8_t size = 0U;
+    const auto instruction = fetchDecode(pc, raw, size);
+    if (!instruction) return false;
+    const auto& decoded = *instruction;
     const std::uint32_t fallthrough = pc + size;
     // Memory-loaded targets (LDR/MOV-to-PC, LDM/POP-to-PC) need execute-
     // time knowledge (loaded value, fault behavior), so refuse. Direct
@@ -3189,7 +3106,7 @@ bool CortexM4::peekPredictableCycles(std::uint16_t& cycles_out) const noexcept {
     case InstrKind::bl: {
         const auto wide = static_cast<std::int64_t>(pc) + 4 + decoded.branch_offset;
         const std::uint32_t target = static_cast<std::uint32_t>(wide) & ~std::uint32_t{1};
-        base = cache.base_cycles;
+        base = basePipelineCycles(decoded);
         branch_taken = target != fallthrough;
         break;
     }
@@ -3198,11 +3115,11 @@ bool CortexM4::peekPredictableCycles(std::uint16_t& cycles_out) const noexcept {
         const std::uint32_t target = state_.readRegister(decoded.rm);
         if (decoded.kind == InstrKind::bx && isExceptionReturn(target)) {
             exc_return = true;
-            base = cache.base_cycles;
+            base = basePipelineCycles(decoded);
             break;
         }
         if ((target & 1U) == 0U) return false; // fault path needs the stepper
-        base = cache.base_cycles;
+        base = basePipelineCycles(decoded);
         branch_taken = (target & ~std::uint32_t{1}) != fallthrough;
         break;
     }
@@ -3210,7 +3127,7 @@ bool CortexM4::peekPredictableCycles(std::uint16_t& cycles_out) const noexcept {
     case InstrKind::cbnz: {
         const bool zero = state_.readRegister(decoded.rn) == 0U;
         const bool take = decoded.kind == InstrKind::cbz ? zero : !zero;
-        base = cache.base_cycles;
+        base = basePipelineCycles(decoded);
         branch_taken = take
             && ((state_.architecturalPcForRead() + decoded.imm) & ~std::uint32_t{1})
                 != fallthrough;
@@ -3218,10 +3135,10 @@ bool CortexM4::peekPredictableCycles(std::uint16_t& cycles_out) const noexcept {
     }
     case InstrKind::udiv:
     case InstrKind::sdiv:
-        cycles_out = divideCycles(state_.readRegister(cache.decoded.rm));
+        cycles_out = divideCycles(state_.readRegister(decoded.rm));
         return true;
     default:
-        base = cache.base_cycles;
+        base = basePipelineCycles(decoded);
         break;
     }
     if (exc_return) {

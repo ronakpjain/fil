@@ -441,7 +441,7 @@ private:
      * `nextInstructionElapsedNs()` (a 1-cycle minimum for deadline fits),
      * this forecasts the real cost (pipeline class + exact ART flash stall
      * from live ACR and fetch sequencing). Returns nullopt for
-     * memory-loaded targets, decode-cache misses, or fault states, in
+     * memory-loaded targets, backed-memory decode failures, or fault states, in
      * which case the burst fails closed to the exact general scheduler.
      * Predictions are exact, so no post-step rollback is ever required.
      * The gate compares frequencies and time numerators across lanes and

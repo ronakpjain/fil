@@ -2656,7 +2656,7 @@ TEST(JitTest, SingleInstructionJitMatchesInterpreterAndFallbackCases) {
     }, true);
 }
 
-TEST(JitTest, WarmSingleCacheRespectsCodeAndArchitecturalStateChanges) {
+TEST(JitTest, DirectSingleDecodeRespectsCodeAndArchitecturalStateChanges) {
     auto jit_bus = basicBus();
     auto ref_bus = basicBus();
     for (auto* bus : {&jit_bus, &ref_bus}) {
@@ -2690,6 +2690,42 @@ TEST(JitTest, WarmSingleCacheRespectsCodeAndArchitecturalStateChanges) {
             EXPECT_EQ(jit.lastDiagnostic().message, reference.lastDiagnostic().message);
         }
     }
+}
+
+TEST(JitTest, ColdTimingDecodeHasNoMemoryEffectsAndNeverFetchesMmio) {
+    auto bus = basicBus();
+    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0x2001U})));
+    fil::cpu::CortexM4 cpu(bus);
+    prepare(cpu);
+    const auto initial = cpu.state();
+    const auto checkpoint = bus.sideEffectCheckpoint();
+    const auto footprint = bus.readFootprint();
+    std::uint16_t cost = 99U;
+    ASSERT_TRUE(cpu.peekPredictableCycles(cost));
+    EXPECT_EQ(cost, 1U);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), initial));
+    EXPECT_EQ(bus.sideEffectCheckpoint().mutation_sequence, checkpoint.mutation_sequence);
+    EXPECT_EQ(bus.sideEffectCheckpoint().mmio_generation, checkpoint.mmio_generation);
+    EXPECT_EQ(bus.readFootprint().words, footprint.words);
+    // No warmup or invalidation lookup is needed to see changed firmware bytes.
+    ASSERT_TRUE(bus.loadBytes(flash_base, halfwords({0x6808U}))); // LDR r0,[r1]
+    ASSERT_TRUE(cpu.peekPredictableCycles(cost));
+    EXPECT_EQ(cost, 2U);
+
+    SharedMmio device;
+    fil::mem::MemoryBus split;
+    ASSERT_TRUE(split.mapRom(flash_base, 2U, "prefix"));
+    ASSERT_TRUE(split.loadBytes(flash_base, halfwords({0xf000U})));
+    ASSERT_TRUE(split.mapMmio(flash_base + 2U, 2U, device, "second-halfword"));
+    fil::cpu::CortexM4 split_cpu(split);
+    prepare(split_cpu);
+    cost = 99U;
+    EXPECT_FALSE(split_cpu.peekPredictableCycles(cost));
+    EXPECT_EQ(cost, 99U);
+    EXPECT_EQ(device.reads, 0);
+    split_cpu.state().r[15] = flash_base + 2U;
+    EXPECT_FALSE(split_cpu.peekPredictableCycles(cost));
+    EXPECT_EQ(device.reads, 0);
 }
 
 TEST(JitTest, CachedUnconditionalFastPathMatchesInterpreter) {

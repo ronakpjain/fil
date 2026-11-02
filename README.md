@@ -63,7 +63,7 @@ The default run is intended to preserve modeled instruction, event, and peripher
 behavior, but RAM-capsule replay on network commands is not yet verified cycle-exact
 against the non-capsule path on real firmware; see the known issue in
 [Performance](docs/performance.md).
-Decoded-instruction and memory caches, bounded scheduler bursts, eligible
+Prepared instruction blocks, bounded scheduler bursts, eligible
 guarded RAM capsules on network commands, and proven-loop batching on
 single-board `run` reduce host overhead. Network loop batching is off by default.
 Release builds use IPO when supported. Makefile builds also enable host CPU
