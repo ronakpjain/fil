@@ -122,6 +122,19 @@ public:
         u8(0x8BU);
         mem(dst, base & 7U, disp);
     }
+    // movzx/movsx r32, byte/word [base+disp].
+    void movzxR32M8(std::uint32_t dst, std::uint32_t base, std::uint32_t disp) {
+        prefixRex(false, dst, base); u8(0x0FU); u8(0xB6U); mem(dst, base & 7U, disp);
+    }
+    void movzxR32M16(std::uint32_t dst, std::uint32_t base, std::uint32_t disp) {
+        prefixRex(false, dst, base); u8(0x0FU); u8(0xB7U); mem(dst, base & 7U, disp);
+    }
+    void movsxR32M8(std::uint32_t dst, std::uint32_t base, std::uint32_t disp) {
+        prefixRex(false, dst, base); u8(0x0FU); u8(0xBEU); mem(dst, base & 7U, disp);
+    }
+    void movsxR32M16(std::uint32_t dst, std::uint32_t base, std::uint32_t disp) {
+        prefixRex(false, dst, base); u8(0x0FU); u8(0xBFU); mem(dst, base & 7U, disp);
+    }
     void movM32R(std::uint32_t base, std::uint32_t disp, std::uint32_t src) {
         prefixRex(false, src, base);
         u8(0x89U);

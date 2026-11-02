@@ -1757,9 +1757,9 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
                 // window only when footprint tracking is off, so a range check
                 // plus a plain load replaces the checked helper on the common
                 // path. Any address outside the window falls through untouched.
-                const bool fast_word_load = t_load && m.kind == NativeOp::load_word;
+                const bool fast_load = t_load;
                 std::size_t fast_word_done = 0U;
-                if (fast_word_load) {
+                if (fast_load) {
                     const auto slow_load = e.makeLabel();
                     fast_word_done = e.makeLabel();
                     e.movRR(kEax, addrreg);
@@ -1768,7 +1768,13 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
                     e.jcc(3U, slow_load);
                     e.movR64M(addrreg, ctx, fast_read_base_off);
                     e.addR64R64(addrreg, kEax);
-                    e.movR32M(kEax, addrreg, 0U);
+                    switch (m.kind) {
+                    case NativeOp::load_byte: e.movzxR32M8(kEax, addrreg, 0U); break;
+                    case NativeOp::load_half: e.movzxR32M16(kEax, addrreg, 0U); break;
+                    case NativeOp::load_byte_signed: e.movsxR32M8(kEax, addrreg, 0U); break;
+                    case NativeOp::load_half_signed: e.movsxR32M16(kEax, addrreg, 0U); break;
+                    default: e.movR32M(kEax, addrreg, 0U); break;
+                    }
                     storeGuest(e, offsets, m.rd, kEax);
                     e.jmp(fast_word_done);
                     e.bindLabel(slow_load);
@@ -1801,7 +1807,7 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
                     }
                     storeGuest(e,offsets,m.rd,kEax);
                 }
-                if (fast_word_load) e.bindLabel(fast_word_done);
+                if (fast_load) e.bindLabel(fast_word_done);
             }
             // Only the live cycle accumulator advances here. RAM-only helpers
             // consume explicit PCs and no pending NZCV/PC/progress metadata; the
