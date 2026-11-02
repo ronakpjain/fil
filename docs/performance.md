@@ -124,10 +124,13 @@ partial cuts preserve exact instruction state. Actual indirect targets use a
 generated address switch. Scalar byte, halfword and word RAM accesses use
 invocation-scoped backing bindings and native range checks. Stores accumulate
 exact changed-byte accounting in a host register and publish it at exits.
+Canonical narrow and wide PUSH/POP transfers validate the complete stack frame
+before effects and use the active stack bank. POP PC dispatches to the actual
+return target after checking Thumb state and excluding exception returns.
 MMIO, aliases and accesses outside the bindings exit before effects. This API
-is separate from the CLI execution engine; stack transfers and system/IT/FP
-instructions return checked exits. Its
-differential tests establish local correctness, not a PER throughput result.
+is separate from the CLI execution engine; system/IT/FP instructions return
+checked exits. Differential tests cover architectural state, memory, timing,
+and partial instruction and cycle budgets.
 
 | Mechanism | Behavior |
 | --- | --- |

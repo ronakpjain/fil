@@ -6,7 +6,7 @@
 
 namespace fil::cpu {
 
-/** Immutable ISA-only register-list decoding for checked native stack helpers. */
+/** Immutable ISA-only register-list decoding for native stack transfers. */
 class NativeStackPlan {
 public:
     constexpr NativeStackPlan() noexcept = default;

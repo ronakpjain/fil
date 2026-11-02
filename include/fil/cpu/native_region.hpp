@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fil/cpu/native_ir.hpp"
+#include "fil/cpu/native_stack_plan.hpp"
 #include "fil/mem/memory_bus.hpp"
 
 #include <array>
@@ -18,6 +19,7 @@ enum class RegionFlow : std::uint8_t { next, jump, conditional, call, indirect, 
 
 struct NativeRegionOp {
     NativeInst instruction{};
+    NativeStackPlan stack{};
     std::uint32_t pc{0U}, raw{0U};
     std::uint32_t fallthrough{0U}, target{0U};
     std::uint16_t fallthrough_cycles{0U}, taken_cycles{0U};

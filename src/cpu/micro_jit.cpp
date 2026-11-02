@@ -2067,6 +2067,7 @@ NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t>
     for (std::size_t i = 0U; i < plan.count; ++i)
         labels[i] = {e.makeLabel(), e.makeLabel(), e.makeLabel(), e.makeLabel()};
     for (const auto reg : {3U,12U,13U,14U,15U,5U,10U}) e.pushReg(reg);
+    e.subRsp16(); // local operand spill for a validated POP return target
     e.movRR64(ctx, 7U);
     e.movR64Imm(kEax, reinterpret_cast<std::uintptr_t>(&nativeRegionEntryValid));
     e.callReg(kEax); e.movzxEaxAl(); e.testRR(kEax, kEax); e.jcc(4U, early);
@@ -2089,7 +2090,10 @@ NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t>
         const auto& op = plan.ops[i];
         if (op.flow == RegionFlow::checked) continue;
         const auto& inst = op.instruction;
-        if (nativeOpIsMemory(inst.kind)) {
+        if (op.stack.count() != 0U) {
+            for (std::uint32_t n = 0U; n < op.stack.count(); ++n)
+                if (op.stack.reg(n) < uses.size()) ++uses[op.stack.reg(n)];
+        } else if (nativeOpIsMemory(inst.kind)) {
             if (!inst.absolute && inst.rn < uses.size()) ++uses[inst.rn];
             if (inst.rd < uses.size()) ++uses[inst.rd];
         } else if (inst.kind == NativeOp::blx_reg) {
@@ -2122,45 +2126,96 @@ NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t>
         if (index == NativeRegionOp::external) exit(NativeRegionExit::external_edge, target);
         else e.jmp(labels[index].entry);
     };
-    const auto prepare_memory = [&](const NativeRegionOp& op, std::size_t index) {
-        const auto& inst = op.instruction;
-        const auto width = nativeOpWidth(inst.kind);
-        if (inst.absolute) e.movR32Imm(kR10, inst.absolute_address);
-        else {
-            if (inst.rn == 13U) {
-                const auto msp = e.makeLabel(), ready = e.makeLabel();
-                e.movR32M(kEax, cpu, offsets.xpsr); e.aluRImm(4U, kEax, xpsr_ipsr_mask);
-                e.jcc(5U, msp);
-                e.movR32M(kEax, cpu, off(offsetof(CpuState, control)));
-                e.testRImm(kEax, 2U); e.jcc(4U, msp);
-                e.movR32M(kR10, cpu, off(offsetof(CpuState, psp))); e.jmp(ready);
-                e.bindLabel(msp); e.movR32M(kR10, cpu, off(offsetof(CpuState, msp)));
-                e.bindLabel(ready);
-            } else loadGuest(e, kR10, offsets, inst.rn);
-            if (inst.offset != 0U) e.aluRImm(0U, kR10, inst.offset);
-        }
-        const auto window = [&](std::uint32_t binding, bool write, std::size_t miss) {
+    const auto read_sp = [&](std::uint32_t destination) {
+        const auto msp = e.makeLabel(), ready = e.makeLabel();
+        e.movR32M(kEdx, cpu, offsets.xpsr); e.aluRImm(4U, kEdx, xpsr_ipsr_mask);
+        e.jcc(5U, msp);
+        e.movR32M(kEdx, cpu, off(offsetof(CpuState, control)));
+        e.testRImm(kEdx, 2U); e.jcc(4U, msp);
+        e.movR32M(destination, cpu, off(offsetof(CpuState, psp))); e.jmp(ready);
+        e.bindLabel(msp); e.movR32M(destination, cpu, off(offsetof(CpuState, msp)));
+        e.bindLabel(ready);
+    };
+    const auto write_sp = [&] {
+        const auto msp = e.makeLabel(), ready = e.makeLabel();
+        e.movM32R(cpu, offsets.r + 52U, kEax);
+        e.movR32M(kEcx, cpu, offsets.xpsr); e.aluRImm(4U, kEcx, xpsr_ipsr_mask);
+        e.jcc(5U, msp);
+        e.movR32M(kEcx, cpu, off(offsetof(CpuState, control)));
+        e.testRImm(kEcx, 2U); e.jcc(4U, msp);
+        e.movM32R(cpu, off(offsetof(CpuState, psp)), kEax); e.jmp(ready);
+        e.bindLabel(msp); e.movM32R(cpu, off(offsetof(CpuState, msp)), kEax);
+        e.bindLabel(ready);
+    };
+    const auto guard_address = [&](std::uint32_t width, bool write, bool literal, std::size_t miss) {
+        const auto window = [&](std::uint32_t binding, std::size_t next) {
             using Read = mem::MemoryBus::DirectReadWindow;
             using Write = mem::MemoryBus::DirectWriteWindow;
             const auto begin = binding + off(write ? offsetof(Write, begin) : offsetof(Read, begin));
             const auto size = binding + off(write ? offsetof(Write, size) : offsetof(Read, size));
             const auto bytes = binding + off(write ? offsetof(Write, bytes) : offsetof(Read, bytes));
             e.movRR(kEdx, kR10); e.aluRM(5U, kEdx, ctx, begin);
-            e.movR32M(kEax, ctx, size); e.aluRImm(5U, kEax, width); e.jcc(2U, miss);
-            e.aluRR(7U, kEdx, kEax); e.jcc(7U, miss);
+            e.movR32M(kEax, ctx, size); e.aluRImm(5U, kEax, width); e.jcc(2U, next);
+            e.aluRR(7U, kEdx, kEax); e.jcc(7U, next);
             e.movR64M(kEax, ctx, bytes); e.movRR64(kR10, kEax); e.addR64R64(kR10, kEdx);
         };
-        if (!nativeOpIsLoad(inst.kind)) {
-            window(off(offsetof(NativeRegionContext, ram_write)), true, labels[index].checked);
-        } else {
+        if (write) window(off(offsetof(NativeRegionContext, ram_write)), miss);
+        else {
             const auto second = e.makeLabel(), ready = e.makeLabel();
-            window(off(inst.absolute ? offsetof(NativeRegionContext, code_read)
-                                    : offsetof(NativeRegionContext, ram_read)), false, second);
+            window(off(literal ? offsetof(NativeRegionContext, code_read)
+                               : offsetof(NativeRegionContext, ram_read)), second);
             e.jmp(ready); e.bindLabel(second);
-            window(off(inst.absolute ? offsetof(NativeRegionContext, ram_read)
-                                    : offsetof(NativeRegionContext, code_read)), false, labels[index].checked);
+            window(off(literal ? offsetof(NativeRegionContext, ram_read)
+                               : offsetof(NativeRegionContext, code_read)), miss);
             e.bindLabel(ready);
         }
+    };
+    const auto prepare_memory = [&](const NativeRegionOp& op, std::size_t index) {
+        const auto& inst = op.instruction;
+        if (inst.absolute) e.movR32Imm(kR10, inst.absolute_address);
+        else {
+            if (inst.rn == 13U) read_sp(kR10);
+            else loadGuest(e, kR10, offsets, inst.rn);
+            if (inst.offset != 0U) e.aluRImm(0U, kR10, inst.offset);
+        }
+        guard_address(nativeOpWidth(inst.kind), !nativeOpIsLoad(inst.kind), inst.absolute, labels[index].checked);
+    };
+    const auto prepare_stack = [&](const NativeRegionOp& op, std::size_t index) {
+        const auto bytes = op.stack.count() * 4U;
+        read_sp(kR10);
+        if (op.stack.push()) {
+            e.cmpR32Imm(kR10, bytes); e.jcc(2U, labels[index].checked);
+            e.aluRImm(5U, kR10, bytes);
+        }
+        guard_address(bytes, op.stack.push(), false, labels[index].checked);
+        if (op.stack.loadsPc()) {
+            e.movR32M(kEax, kR10, bytes - 4U);
+            e.testRImm(kEax, 1U); e.jcc(4U, labels[index].checked);
+            e.movRR(kEcx, kEax); e.aluRImm(4U, kEcx, 0xffffffe0U);
+            e.cmpR32Imm(kEcx, 0xffffffe0U); e.jcc(4U, labels[index].checked);
+            e.aluRImm(4U, kEax, ~std::uint32_t{1U}); e.movM32R(4U, 0U, kEax);
+        }
+    };
+    const auto store_memory = [&](std::uint32_t width, std::uint8_t guest, std::uint32_t displacement) {
+        loadGuest(e, kEax, offsets, guest);
+        if (width == 1U) {
+            e.aluRImm(4U, kEax, 0xffU); e.movzxR32M8(kEdx, kR10, displacement);
+        } else if (width == 2U) {
+            e.aluRImm(4U, kEax, 0xffffU); e.movzxR32M16(kEdx, kR10, displacement);
+        } else e.movR32M(kEdx, kR10, displacement);
+        const auto unchanged = e.makeLabel();
+        e.aluRR(6U, kEdx, kEax); e.testRR(kEdx, kEdx); e.jcc(4U, unchanged);
+        if (width == 1U) e.movM8R(kR10, displacement, kEax);
+        else if (width == 2U) e.movM16R(kR10, displacement, kEax);
+        else e.movM32R(kR10, displacement, kEax);
+        // Mark each nonzero difference byte, without cross-byte carries,
+        // then sum the four 0/1 lanes. Counters retain byte-store semantics.
+        e.movRR(kEcx, kEdx); e.aluRImm(4U, kEcx, 0x7f7f7f7fU);
+        e.aluRImm(0U, kEcx, 0x7f7f7f7fU); e.aluRR(1U, kEcx, kEdx);
+        e.aluRImm(4U, kEcx, 0x80808080U); e.shImm(5U, kEcx, 7U);
+        e.imulR32Imm32(kEcx, kEcx, 0x01010101U); e.shImm(5U, kEcx, 24U);
+        e.addR64R64(dirty, kEcx);
+        e.bindLabel(unchanged);
     };
     const auto memory_body = [&](const NativeInst& inst) {
         if (nativeOpIsLoad(inst.kind)) {
@@ -2172,28 +2227,23 @@ NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t>
             default: e.movR32M(kEax, kR10, 0U); break;
             }
             storeGuest(e, offsets, inst.rd, kEax);
-        } else {
-            const auto width = nativeOpWidth(inst.kind);
-            loadGuest(e, kEax, offsets, inst.rd);
-            if (width == 1U) {
-                e.aluRImm(4U, kEax, 0xffU); e.movzxR32M8(kEdx, kR10, 0U);
-            } else if (width == 2U) {
-                e.aluRImm(4U, kEax, 0xffffU); e.movzxR32M16(kEdx, kR10, 0U);
-            } else e.movR32M(kEdx, kR10, 0U);
-            const auto unchanged = e.makeLabel();
-            e.aluRR(6U, kEdx, kEax); e.testRR(kEdx, kEdx); e.jcc(4U, unchanged);
-            if (width == 1U) e.movM8R(kR10, 0U, kEax);
-            else if (width == 2U) e.movM16R(kR10, 0U, kEax);
-            else e.movM32R(kR10, 0U, kEax);
-            // Mark each nonzero difference byte, without cross-byte carries,
-            // then sum the four 0/1 lanes. Counters retain byte-store semantics.
-            e.movRR(kEcx, kEdx); e.aluRImm(4U, kEcx, 0x7f7f7f7fU);
-            e.aluRImm(0U, kEcx, 0x7f7f7f7fU); e.aluRR(1U, kEcx, kEdx);
-            e.aluRImm(4U, kEcx, 0x80808080U); e.shImm(5U, kEcx, 7U);
-            e.imulR32Imm32(kEcx, kEcx, 0x01010101U); e.shImm(5U, kEcx, 24U);
-            e.addR64R64(dirty, kEcx);
-            e.bindLabel(unchanged);
+        } else store_memory(nativeOpWidth(inst.kind), inst.rd, 0U);
+    };
+    const auto stack_body = [&](const NativeRegionOp& op) {
+        // All frame and return-target checks and cycle admission precede these
+        // effects. Neither transfers nor SP commit can decline from here.
+        read_sp(kEax);
+        e.aluRImm(op.stack.push() ? 5U : 0U, kEax, op.stack.count() * 4U);
+        write_sp();
+        for (std::uint32_t n = 0U; n < op.stack.count(); ++n) {
+            const auto reg = static_cast<std::uint8_t>(op.stack.reg(n));
+            if (op.stack.push()) store_memory(4U, reg, n * 4U);
+            else if (reg != 15U) {
+                e.movR32M(kEax, kR10, n * 4U);
+                storeGuest(e, offsets, reg, kEax);
+            }
         }
+        if (op.stack.loadsPc()) e.movR32M(kR10, 4U, 0U);
     };
     const auto body = [&](const NativeRegionOp& op, std::size_t index, bool taken) {
         const auto nonsequential = e.makeLabel(), charge_ready = e.makeLabel();
@@ -2209,7 +2259,8 @@ NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t>
         e.cmpR64M(kEax, ctx, off(offsetof(NativeRegionContext, cycle_limit)));
         e.jcc(7U, labels[index].credit);
         e.movRR64(cycles, kEax);
-        if (op.flow == RegionFlow::next) {
+        if (op.stack.count() != 0U) stack_body(op);
+        else if (op.flow == RegionFlow::next) {
             if (nativeOpIsMemory(op.instruction.kind)) memory_body(op.instruction);
             else if (!emitX86Op(e, offsets, op.instruction.integer, error)) return false;
         } else if (op.flow == RegionFlow::call || op.instruction.kind == NativeOp::blx_reg) {
@@ -2234,7 +2285,7 @@ NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t>
         while (cursor != NativeRegionOp::external && !seen[cursor]) {
             seen.set(cursor);
             const auto& op = plan.ops[cursor];
-            if (op.instruction.kind != NativeOp::integer) break;
+            if (op.stack.count() != 0U || op.instruction.kind != NativeOp::integer) break;
             ++length;
             if (op.flow == RegionFlow::next) {
                 pipeline += op.fallthrough_cycles;
@@ -2296,7 +2347,16 @@ NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t>
         e.aluRM(7U, count, ctx, off(offsetof(NativeRegionContext, instruction_limit)));
         e.jcc(3U, labels[i].instructions);
         if (loops[i].length != 0U && !fast_loop(static_cast<std::uint16_t>(i), loops[i])) return nullptr;
-        if (op.flow == RegionFlow::indirect) {
+        if (op.stack.count() != 0U) {
+            prepare_stack(op, i);
+            if (op.stack.loadsPc()) {
+                const auto sequential = e.makeLabel();
+                e.cmpR32Imm(kEax, op.fallthrough); e.jcc(4U, sequential);
+                if (!body(op, i, true)) return nullptr;
+                e.bindLabel(sequential);
+                if (!body(op, i, false)) return nullptr;
+            } else if (!body(op, i, false)) return nullptr;
+        } else if (op.flow == RegionFlow::indirect) {
             const auto reg = op.instruction.kind == NativeOp::bx_lr ? 14U : op.instruction.rn;
             loadGuest(e, kR10, offsets, static_cast<std::uint8_t>(reg));
             e.testRImm(kR10, 1U); e.jcc(4U, labels[i].checked);
@@ -2386,6 +2446,7 @@ NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t>
     e.movRR64(kEax, fetch); e.shR64Imm(5U, kEax, 32U); e.movM32R(cpu, offsets.addr, kEax);
     e.bindLabel(done);
     e.bindLabel(early);
+    e.addRsp16();
     for (const auto reg : {10U,5U,15U,14U,13U,12U,3U}) e.popReg(reg);
     e.ret();
     if (!e.patchBranches(error) || !impl_->makeWritable(error)) return nullptr;

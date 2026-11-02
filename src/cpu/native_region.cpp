@@ -53,8 +53,12 @@ bool buildNativeRegion(const std::span<const std::uint8_t> bytes,
         const auto second = wide ? halfword(op.pc + 2U) : std::uint16_t{0U};
         if (wide) op.raw |= second;
         const auto decoded = wide ? decode32(first, second) : decode16(first);
-        if (!decoded || !tryLowerNativeInst({*decoded, op.pc, op.size}, op.instruction).ok)
-            continue;
+        if (!decoded) continue;
+        const bool stack = decoded->kind == InstrKind::push || decoded->kind == InstrKind::pop;
+        if (stack) {
+            op.stack = NativeStackPlan(decoded->register_list, decoded->kind == InstrKind::push);
+            if (op.stack.count() == 0U) continue;
+        } else if (!tryLowerNativeInst({*decoded, op.pc, op.size}, op.instruction).ok) continue;
         op.fallthrough = op.pc + op.size;
         op.fallthrough_cycles = basePipelineCycles(*decoded);
         op.flow = RegionFlow::next;
@@ -74,7 +78,8 @@ bool buildNativeRegion(const std::span<const std::uint8_t> bytes,
                 op.edges[0] = link(op.target);
                 if (op.flow == RegionFlow::call) op.edges[1] = link(op.fallthrough);
             }
-        } else if (op.instruction.kind == NativeOp::bx_lr || op.instruction.kind == NativeOp::blx_reg) {
+        } else if (op.stack.loadsPc() || op.instruction.kind == NativeOp::bx_lr
+                   || op.instruction.kind == NativeOp::blx_reg) {
             op.flow = RegionFlow::indirect;
             op.taken_cycles = static_cast<std::uint16_t>(op.fallthrough_cycles
                 + takenBranchPenalty(decoded->kind));
