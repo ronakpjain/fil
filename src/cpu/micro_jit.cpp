@@ -812,7 +812,18 @@ struct MicroJit::Impl {
     std::vector<CacheEntry> cache;
     struct NativeCacheEntry { NativeBlock block; NativeFunction function{nullptr}; };
     std::deque<NativeCacheEntry> native_cache;
-    struct TraceCacheEntry { NativeTracePlan plan; NativeFunction function{nullptr}; };
+    // One immutable record per committed prefix, plus the complete trace.
+    // A shared native exit epilogue indexes these records; they are data, not
+    // executable stencils repeated for each possible exit reason.
+    struct TracePrefixPc {
+        std::uint32_t current, previous, next, reserved;
+    };
+    static_assert(sizeof(TracePrefixPc) == 16U);
+    struct TraceCacheEntry {
+        NativeTracePlan plan;
+        NativeFunction function{nullptr};
+        std::vector<TracePrefixPc> prefix_pcs;
+    };
     std::deque<TraceCacheEntry> trace_cache;
     std::uint8_t* base{nullptr};
     std::size_t capacity{0};
@@ -1656,6 +1667,12 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     e.aluRImm(4U, kRetain, ~(kFlagN | kFlagZ | kFlagC | kFlagV));
     e.aluRImm(4U, kNzcv, kFlagN | kFlagZ | kFlagC | kFlagV);
     const std::size_t n = entry.plan.ops.size();
+    entry.prefix_pcs.reserve(n + 1U);
+    for (std::size_t i = 0; i <= n; ++i) {
+        const auto& current_op = entry.plan.ops[i == n ? n - 1U : i];
+        const auto& previous_op = entry.plan.ops[i == 0U ? 0U : i - 1U];
+        entry.prefix_pcs.push_back({current_op.pc, previous_op.pc, previous_op.expected_next_pc, 0U});
+    }
     struct ExitLabels { std::size_t instruction, cycle, unsupported, mismatch, helper, dynamic_return; };
     std::vector<ExitLabels> exits; exits.reserve(n);
     for (std::size_t i=0; i<n; ++i)
@@ -1672,15 +1689,18 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
         for (std::size_t i = 0; i < n; ++i) {
             const auto& op = entry.plan.ops[i];
             const auto& inst = op.native.integer;
-            e.movR32M(kEax, ctx, limit); e.cmpR32Imm(kEax, static_cast<std::uint32_t>(i));
+            e.cmpM32Imm(ctx, limit, static_cast<std::uint32_t>(i));
             e.jcc(6U, exits[i].instruction); // i >= instruction_limit before all other admissions
-            // Stop before the next op after a committed-span MMIO, so the
-            // retired prefix already includes the MMIO instruction.
-            e.cmpM8Imm8(ctx, boundary_stop_off, 0U);
-            e.jcc(5U, exits[i].instruction);
+            // Only helpers can request an MMIO boundary stop. An integer op
+            // cannot change the flag, so testing it again after one is redundant.
+            const auto* previous = i == 0U ? nullptr : &entry.plan.ops[i - 1U];
+            if (previous == nullptr || previous->native.kind != NativeOp::integer
+                || previous->decoded.kind == InstrKind::push || previous->decoded.kind == InstrKind::pop) {
+                e.cmpM8Imm8(ctx, boundary_stop_off, 0U);
+                e.jcc(5U, exits[i].instruction);
+            }
             if (!admitted_kernel) {
-                e.movR32M(kEax, ctx, charged_count);
-                e.cmpR32Imm(kEax, static_cast<std::uint32_t>(i + 1U));
+                e.cmpM32Imm(ctx, charged_count, static_cast<std::uint32_t>(i + 1U));
                 e.jcc(2U, exits[i].unsupported);
                 e.cmpR64Imm8(costs, 0U); e.jcc(4U, exits[i].unsupported);
             }
@@ -1818,76 +1838,84 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
         }
         e.jmp(normal);
     }
-    const auto publish = [&](std::size_t i, NativeExitReason why, bool failed,
-                             std::size_t current_override = static_cast<std::size_t>(-1),
-                             bool reason_prepared = false) {
-        e.movM32Imm(ctx,retired,static_cast<std::uint32_t>(i));
-        const auto publish_checked_cycles = e.makeLabel(), cycles_published = e.makeLabel();
-        e.movR32M(kEax, ctx, kAdmittedMode);
-        e.testRR(kEax, kEax); e.jcc(4U, publish_checked_cycles);
-        e.movR32M(kEax, costs, static_cast<std::uint32_t>(i * sizeof(std::uint32_t)));
-        e.movM64R(ctx, cycle_count, kEax); e.jmp(cycles_published);
-        e.bindLabel(publish_checked_cycles); e.movM64R(ctx,cycle_count,5U);
-        e.bindLabel(cycles_published);
-        const bool dynamic_return = why == NativeExitReason::dynamic_return;
-        const std::size_t current_op = current_override != static_cast<std::size_t>(-1)
-            ? current_override : (dynamic_return ? i - 1U : i);
-        e.movM32Imm(ctx,current,entry.plan.ops[current_op].pc);
-        if (failed) e.movM32Imm(ctx,failing,entry.plan.ops[i].pc);
-        if (i != 0U) {
-            const auto& prev=entry.plan.ops[i-1U];
-            e.movRR(kEax,kRetain); e.aluRR(1U,kEax,kNzcv); e.movM32R(kState,offsets.xpsr,kEax);
-            if (!dynamic_return) e.movM32Imm(kState,offsets.r+60U,prev.expected_next_pc);
-            e.movM32Imm(kState,offsets.addr,prev.pc);
-        }
-        if (!reason_prepared) e.movM32Imm(ctx,reason,static_cast<std::uint32_t>(why));
-        e.jmp(done);
+    // Cold stubs carry only a prefix index. Each reason has one trampoline,
+    // and every prefix/reason shares the same native publication code.
+    const auto instruction_exit = e.makeLabel(), cycle_exit = e.makeLabel();
+    const auto unsupported_exit = e.makeLabel(), mismatch_exit = e.makeLabel();
+    const auto helper_exit = e.makeLabel(), dynamic_exit = e.makeLabel();
+    const auto publish = e.makeLabel(), failed_exit = e.makeLabel();
+    std::vector<bool> referenced(e.labels.size(), false);
+    for (const auto& fixup : e.fixups) referenced[fixup.label] = true;
+    const auto exit_stub = [&](std::size_t label, std::size_t target, std::size_t prefix) {
+        if (!referenced[label]) return;
+        e.bindLabel(label);
+        e.movR32Imm(kEcx, static_cast<std::uint32_t>(prefix));
+        e.jmp(target);
     };
-    for (std::size_t i=0;i<n;++i) {
-        // All pre-instruction exits commit the same prefix. Keep only their
-        // reason/failure metadata in small stubs, rather than duplicating the
-        // cycle, flags and PC publication five times per guest instruction.
-        const auto prefix_exit = e.makeLabel(), failed_exit = e.makeLabel();
-        const auto exit_stub = [&](std::size_t label, NativeExitReason why, bool failed) {
-            e.bindLabel(label);
-            e.movM32Imm(ctx, reason, static_cast<std::uint32_t>(why));
-            e.jmp(failed ? failed_exit : prefix_exit);
-        };
-        exit_stub(exits[i].instruction, NativeExitReason::instruction_limit, false);
-        exit_stub(exits[i].cycle, NativeExitReason::cycle_limit, false);
-        exit_stub(exits[i].unsupported, NativeExitReason::unsupported_instruction, true);
-        exit_stub(exits[i].mismatch, NativeExitReason::branch_mismatch, true);
-        exit_stub(exits[i].helper, NativeExitReason::helper_declined, true);
-        e.bindLabel(failed_exit);
-        e.movM32Imm(ctx, failing, entry.plan.ops[i].pc);
-        e.bindLabel(prefix_exit);
-        publish(i, NativeExitReason::none, false, i, true);
-        e.bindLabel(exits[i].dynamic_return);
-        if (entry.plan.ops[i].decoded.kind == InstrKind::pop
-            && (entry.plan.ops[i].decoded.register_list & 0x8000U)) {
-            const auto dynamic_admitted = e.makeLabel();
-            e.movR32M(kEax, ctx, kAdmittedMode);
-            e.testRR(kEax, kEax); e.jcc(5U, dynamic_admitted);
-            e.movR32M(kEax, costs, static_cast<std::uint32_t>(i * sizeof(std::uint32_t)));
-            e.addR64R64(5U, kEax);
-            e.bindLabel(dynamic_admitted);
-            publish(i + 1U, NativeExitReason::dynamic_return, false);
-        }
+    for (std::size_t i = 0; i < n; ++i) {
+        exit_stub(exits[i].instruction, instruction_exit, i);
+        exit_stub(exits[i].cycle, cycle_exit, i);
+        exit_stub(exits[i].unsupported, unsupported_exit, i);
+        exit_stub(exits[i].mismatch, mismatch_exit, i);
+        exit_stub(exits[i].helper, helper_exit, i);
+        exit_stub(exits[i].dynamic_return, dynamic_exit, i + 1U);
     }
     e.bindLabel(normal);
-    e.movM32Imm(ctx,retired,static_cast<std::uint32_t>(n));
-    const auto normal_checked_cycles = e.makeLabel(), normal_cycles_published = e.makeLabel();
-    e.movR32M(kEax, ctx, kAdmittedMode);
-    e.testRR(kEax, kEax); e.jcc(4U, normal_checked_cycles);
-    e.movR32M(kEax, costs, static_cast<std::uint32_t>(n * sizeof(std::uint32_t)));
-    e.movM64R(ctx, cycle_count, kEax); e.jmp(normal_cycles_published);
-    e.bindLabel(normal_checked_cycles); e.movM64R(ctx,cycle_count,5U);
-    e.bindLabel(normal_cycles_published);
-    e.movM32Imm(ctx,current,entry.plan.ops.back().pc);
-    e.movRR(kEax,kRetain); e.aluRR(1U,kEax,kNzcv); e.movM32R(kState,offsets.xpsr,kEax);
-    e.movM32Imm(kState,offsets.r+60U,entry.plan.ops.back().expected_next_pc);
-    e.movM32Imm(kState,offsets.addr,entry.plan.ops.back().pc);
-    e.movM32Imm(ctx,reason,static_cast<std::uint32_t>(NativeExitReason::none)); e.jmp(done);
+    e.movR32Imm(kEcx, static_cast<std::uint32_t>(n));
+    e.movR32Imm(kEax, static_cast<std::uint32_t>(NativeExitReason::none));
+    e.jmp(publish);
+    const auto reason_stub = [&](std::size_t label, NativeExitReason why, bool failed) {
+        e.bindLabel(label);
+        e.movR32Imm(kEax, static_cast<std::uint32_t>(why));
+        e.jmp(failed ? failed_exit : publish);
+    };
+    reason_stub(instruction_exit, NativeExitReason::instruction_limit, false);
+    reason_stub(cycle_exit, NativeExitReason::cycle_limit, false);
+    reason_stub(unsupported_exit, NativeExitReason::unsupported_instruction, true);
+    reason_stub(mismatch_exit, NativeExitReason::branch_mismatch, true);
+    reason_stub(helper_exit, NativeExitReason::helper_declined, true);
+    reason_stub(dynamic_exit, NativeExitReason::dynamic_return, false);
+    e.bindLabel(failed_exit);
+    // Failure PC is the current instruction, not the last retired instruction.
+    e.movRR(kEdx, kEcx); e.shImm(4U, kEdx, 4U);
+    e.movR64Imm(kR10, reinterpret_cast<std::uintptr_t>(entry.prefix_pcs.data()));
+    e.addR64R64(kR10, kEdx);
+    e.movR32M(kEdx, kR10, 0U); e.movM32R(ctx, failing, kEdx);
+    e.bindLabel(publish);
+    e.movM32R(ctx, reason, kEax);
+    e.movM32R(ctx, retired, kEcx);
+    e.movRR(kEdx, kEcx); e.shImm(4U, kEdx, 4U);
+    e.movR64Imm(kR10, reinterpret_cast<std::uintptr_t>(entry.prefix_pcs.data()));
+    e.addR64R64(kR10, kEdx);
+    const auto ordinary_current = e.makeLabel(), current_ready = e.makeLabel();
+    e.cmpR32Imm(kEax, static_cast<std::uint32_t>(NativeExitReason::dynamic_return));
+    e.jcc(5U, ordinary_current);
+    e.movR32M(kEdx, kR10, 4U); e.jmp(current_ready);
+    e.bindLabel(ordinary_current); e.movR32M(kEdx, kR10, 0U);
+    e.bindLabel(current_ready); e.movM32R(ctx, current, kEdx);
+    const auto checked_cycles = e.makeLabel(), cycles_ready = e.makeLabel();
+    e.cmpMImm8(ctx, kAdmittedMode, 0U); e.jcc(4U, checked_cycles);
+    e.movRR(kEdx, kEcx); e.shImm(4U, kEdx, 2U); e.addR64R64(kEdx, costs);
+    e.movR32M(kEdx, kEdx, 0U); e.movM64R(ctx, cycle_count, kEdx);
+    e.jmp(cycles_ready);
+    e.bindLabel(checked_cycles);
+    const auto checked_cycles_ready = e.makeLabel();
+    e.cmpR32Imm(kEax, static_cast<std::uint32_t>(NativeExitReason::dynamic_return));
+    e.jcc(5U, checked_cycles_ready);
+    // A dynamic POP return commits this op without reaching the normal
+    // per-op accumulator update. Include its cost exactly once.
+    e.movRR(kEdx, kEcx); e.shImm(4U, kEdx, 2U); e.addR64R64(kEdx, costs);
+    e.movR32M(kEdx, kEdx, static_cast<std::uint32_t>(-4)); e.addR64R64(5U, kEdx);
+    e.bindLabel(checked_cycles_ready); e.movM64R(ctx, cycle_count, 5U);
+    e.bindLabel(cycles_ready);
+    e.testRR(kEcx, kEcx); e.jcc(4U, done); // Empty prefix leaves CPU state untouched.
+    const auto keep_dynamic_pc = e.makeLabel();
+    e.cmpR32Imm(kEax, static_cast<std::uint32_t>(NativeExitReason::dynamic_return));
+    e.jcc(4U, keep_dynamic_pc);
+    e.movR32M(kEdx, kR10, 8U); e.movM32R(kState, offsets.r + 60U, kEdx);
+    e.bindLabel(keep_dynamic_pc);
+    e.movR32M(kEdx, kR10, 4U); e.movM32R(kState, offsets.addr, kEdx);
+    e.movRR(kEax, kRetain); e.aluRR(1U, kEax, kNzcv); e.movM32R(kState, offsets.xpsr, kEax);
     e.bindLabel(done);
     e.movM32Imm(ctx, kAdmittedMode, 0U);
     e.addRsp16(); e.popReg(10U); e.popReg(5U); e.popReg(15U); e.popReg(14U); e.popReg(13U); e.popReg(12U); e.popReg(3U); e.ret();

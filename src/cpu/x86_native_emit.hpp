@@ -187,6 +187,16 @@ public:
         u8(modrm(3U, 0U, r));
         u32(imm);
     }
+    // cmp dword [base + disp], imm32 (or sign-extended imm8).
+    void cmpM32Imm(std::uint32_t base, std::uint32_t disp, std::uint32_t imm) {
+        const auto simm = static_cast<std::int32_t>(imm);
+        const bool narrow = simm >= -128 && simm <= 127;
+        if ((base & 8U) != 0U) u8(0x41U);
+        u8(narrow ? 0x83U : 0x81U);
+        mem(7U, base & 7U, disp);
+        if (narrow) u8(static_cast<std::uint8_t>(simm));
+        else u32(imm);
+    }
     // cmp dword [base + disp], imm8.
     void cmpMImm8(std::uint32_t base, std::uint32_t disp, std::uint8_t imm) {
         if ((base & 8U) != 0U) u8(0x41U);
