@@ -29,6 +29,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 
 namespace fil::cpu {
@@ -38,6 +39,8 @@ struct MicroBlock;
 struct NativeBlock;
 struct NativeTracePlan;
 struct NativeExecutionContext;
+struct NativeRegionContext;
+using NativeRegionFunction = void (*)(NativeRegionContext*);
 
 /** Block kernel with scheduler prefix limits: executes while data and
  *  the limit allow. Returns retired count in the low 32 bits and a
@@ -72,6 +75,14 @@ public:
 
     /** Compile a guarded executed trace (up to NativeTracePlan::max_ops). */
     [[nodiscard]] NativeFunction compileNativeTrace(const NativeTracePlan& plan, std::string& error);
+
+    /** Compile actual firmware control flow, including native loop backedges.
+     * Unsupported operations exit before their effects. No profile or reuse
+     * lookup is involved; each invocation emits a separately owned section.
+     * entry_pc seeds graph formation; the function accepts any compiled PC.
+     */
+    [[nodiscard]] NativeRegionFunction compileRegion(std::span<const std::uint8_t> bytes,
+        std::uint32_t base, std::uint32_t entry_pc, std::string& error);
 
     [[nodiscard]] std::uint64_t compilations() const noexcept { return compilations_; }
     [[nodiscard]] std::uint64_t bytesEmitted() const noexcept { return bytes_emitted_; }

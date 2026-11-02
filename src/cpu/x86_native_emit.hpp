@@ -108,6 +108,10 @@ public:
     void addR64R64(std::uint32_t dst, std::uint32_t src) {
         u8(rex(true, (src & 8U) != 0U, (dst & 8U) != 0U)); u8(0x01U); u8(modrm(3U, src, dst));
     }
+    void imulR64Imm32(std::uint32_t dst, std::uint32_t src, std::uint32_t factor) {
+        u8(rex(true, (dst & 8U) != 0U, (src & 8U) != 0U));
+        u8(0x69U); u8(modrm(3U, dst, src)); u32(factor);
+    }
     void addR64Imm8(std::uint32_t reg, std::uint8_t imm) {
         u8(rex(true, false, (reg & 8U) != 0U)); u8(0x83U); u8(modrm(3U, 0U, reg)); u8(imm);
     }
@@ -158,6 +162,10 @@ public:
         u8(0xC7U);
         mem(0U, base & 7U, disp);
         u32(imm);
+    }
+    void movM8Imm8(std::uint32_t base, std::uint32_t disp, std::uint8_t imm) {
+        if ((base & 8U) != 0U) u8(0x41U);
+        u8(0xC6U); mem(0U, base & 7U, disp); u8(imm);
     }
     // ALU ext: 0=add, 1=or, 4=and, 5=sub, 6=xor, 7=cmp.
     void aluRR(std::uint32_t op, std::uint32_t dst, std::uint32_t src) {
@@ -786,9 +794,9 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
 // path records op_index in the r11d mask. Returns false for NV (rejected at
 // lowering; defensive).
 inline bool emitX86CondTaken(X86Emitter& e, Condition cond, std::uint32_t op_index,
-                             std::size_t taken, std::string& error) {
+                             std::size_t taken, std::string& error, bool record_failed = true) {
     const auto markFailed = [&]() {
-        e.aluRImm(1U, kFailed, 1U << op_index);
+        if (record_failed) e.aluRImm(1U, kFailed, 1U << op_index);
     };
     const auto testFlag = [&](std::uint32_t mask) { e.testRImm(e.nzcv, mask); };
     // Extracts N (bit 31) and V (bit 28) into eax/ecx bit 0 and compares.

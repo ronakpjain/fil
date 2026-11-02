@@ -27,6 +27,7 @@
 #include "fil/cpu/native_execution.hpp"
 #include "fil/cpu/native_stack.hpp"
 #include "fil/cpu/native_trace.hpp"
+#include "fil/cpu/native_region.hpp"
 
 #include <algorithm>
 #include <array>
@@ -2042,6 +2043,262 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     return entry.function;
 #else
     (void)input; error = "native-trace unsupported on this host"; return nullptr;
+#endif
+}
+
+NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t> bytes,
+    const std::uint32_t base, const std::uint32_t entry_pc, std::string& error) {
+#if defined(FIL_ENABLE_MICRO_JIT) && FIL_ENABLE_MICRO_JIT && defined(FIL_MICRO_JIT_X86_64) && !defined(_WIN32)
+    NativeRegionPlan plan;
+    if (!buildNativeRegion(bytes, base, entry_pc, plan, error)) return nullptr;
+    std::lock_guard lock(impl_->mutex);
+    using namespace x86detail;
+    constexpr std::uint32_t ctx = 13U, cpu = 12U, nzcv = 3U, retain = 15U;
+    constexpr std::uint32_t count = 11U, cycles = 5U, fetch = 14U;
+    const auto off = [](std::size_t value) { return static_cast<std::uint32_t>(value); };
+    const Offsets offsets{off(offsetof(CpuState, r)), off(offsetof(CpuState, xpsr)),
+        off(offsetof(CpuState, instruction_address))};
+    X86Emitter e;
+    e.nzcv = nzcv;
+    const auto early = e.makeLabel(), publish = e.makeLabel(), done = e.makeLabel();
+    const auto indirect = e.makeLabel(), indirect_external = e.makeLabel();
+    struct Labels { std::size_t entry, instructions, credit, checked; };
+    std::array<Labels, NativeRegionPlan::max_ops> labels;
+    for (std::size_t i = 0U; i < plan.count; ++i)
+        labels[i] = {e.makeLabel(), e.makeLabel(), e.makeLabel(), e.makeLabel()};
+    for (const auto reg : {3U,12U,13U,14U,15U,5U,10U}) e.pushReg(reg);
+    e.movRR64(ctx, 7U);
+    e.movR64Imm(kEax, reinterpret_cast<std::uintptr_t>(&nativeRegionEntryValid));
+    e.callReg(kEax); e.movzxEaxAl(); e.testRR(kEax, kEax); e.jcc(4U, early);
+    e.movR64M(cpu, ctx, off(offsetof(NativeRegionContext, cpu_state)));
+    e.movRR64(kState, cpu);
+    e.movR32M(retain, cpu, offsets.xpsr); e.movRR(nzcv, retain);
+    e.aluRImm(4U, retain, ~(kFlagN | kFlagZ | kFlagC | kFlagV));
+    e.aluRImm(4U, nzcv, kFlagN | kFlagZ | kFlagC | kFlagV);
+    e.movR32Imm(count, 0U); e.movR32Imm(cycles, 0U);
+    e.movR32M(fetch, ctx, off(offsetof(NativeRegionContext, fetch_end)));
+    const auto fetch_ready = e.makeLabel();
+    e.cmpM8Imm8(ctx, off(offsetof(NativeRegionContext, have_fetch)), 0U); e.jcc(5U, fetch_ready);
+    e.movR32Imm(fetch, entry_pc | 1U); // odd sentinel cannot match an instruction PC
+    e.bindLabel(fetch_ready);
+    // R14 packs the last retired PC above its fetch end. This keeps precise
+    // exit diagnostics without a per-instruction store to architectural state.
+    e.movR32M(kEax, cpu, offsets.addr); e.shR64Imm(4U, kEax, 32U); e.orR64R64(fetch, kEax);
+    std::array<unsigned, 13U> uses{};
+    for (std::size_t i = 0U; i < plan.count; ++i) {
+        const auto& inst = plan.ops[i].instruction.integer;
+        for (auto reg : {inst.rd, inst.rn, inst.rm}) if (reg < uses.size()) ++uses[reg];
+    }
+    for (const auto host : {6,8,9}) {
+        const auto selected = std::max_element(uses.begin(), uses.end());
+        if (*selected == 0U) break;
+        const auto guest = static_cast<std::size_t>(selected - uses.begin());
+        e.guest_hosts[guest] = host;
+        e.movR32M(static_cast<std::uint32_t>(host), cpu, offsets.r + off(guest * 4U));
+        *selected = 0U;
+    }
+    e.movR32M(kR10, cpu, offsets.r + 60U);
+    e.jmp(indirect);
+    const auto exit = [&](NativeRegionExit reason, std::uint32_t next_pc) {
+        e.movR32Imm(kEax, next_pc);
+        e.movR32Imm(kEcx, static_cast<std::uint32_t>(reason));
+        e.jmp(publish);
+    };
+    const auto edge = [&](const NativeRegionOp& op, bool taken) {
+        const bool conditional = op.flow == RegionFlow::conditional;
+        const auto index = op.edges[conditional && taken ? 1U : 0U];
+        const auto target = (taken || op.flow == RegionFlow::jump || op.flow == RegionFlow::call)
+            ? op.target : op.fallthrough;
+        if (index == NativeRegionOp::external) exit(NativeRegionExit::external_edge, target);
+        else e.jmp(labels[index].entry);
+    };
+    const auto body = [&](const NativeRegionOp& op, std::size_t index, bool taken) {
+        const auto nonsequential = e.makeLabel(), charge_ready = e.makeLabel();
+        e.cmpR32Imm(fetch, op.pc); e.jcc(5U, nonsequential);
+        e.movR32M(kEax, ctx, off(offsetof(NativeRegionContext, sequential_fetch_stall)));
+        e.jmp(charge_ready);
+        e.bindLabel(nonsequential);
+        e.movR32M(kEax, ctx, off(offsetof(NativeRegionContext, nonsequential_fetch_stall)));
+        e.bindLabel(charge_ready);
+        const auto charge = taken ? op.taken_cycles : op.fallthrough_cycles;
+        e.movR32Imm(kEdx, charge); e.addR64R64(kEdx, kEax);
+        e.movRR64(kEax, cycles); e.addR64R64(kEax, kEdx); e.jcc(2U, labels[index].credit);
+        e.cmpR64M(kEax, ctx, off(offsetof(NativeRegionContext, cycle_limit)));
+        e.jcc(7U, labels[index].credit);
+        e.movRR64(cycles, kEax);
+        if (op.flow == RegionFlow::next) {
+            if (!emitX86Op(e, offsets, op.instruction.integer, error)) return false;
+        } else if (op.flow == RegionFlow::call || op.instruction.kind == NativeOp::blx_reg) {
+            e.movM32Imm(cpu, offsets.r + 56U, op.fallthrough | 1U);
+        }
+        e.aluRImm(0U, count, 1U);
+        e.movR64Imm(fetch, (static_cast<std::uint64_t>(op.pc) << 32U) | op.fallthrough);
+        if (op.flow == RegionFlow::indirect) e.jmp(indirect);
+        else edge(op, taken);
+        return true;
+    };
+    struct IntegerLoop {
+        std::uint16_t length{0U}, terminal{0U};
+        std::uint32_t maximum_pipeline_cycles{0U};
+    };
+    std::array<IntegerLoop, NativeRegionPlan::max_ops> loops{};
+    for (std::uint16_t start = 0U; start < plan.count; ++start) {
+        std::bitset<NativeRegionPlan::max_ops> seen;
+        auto cursor = start;
+        std::uint32_t pipeline = 0U;
+        std::uint16_t length = 0U;
+        while (cursor != NativeRegionOp::external && !seen[cursor]) {
+            seen.set(cursor);
+            const auto& op = plan.ops[cursor];
+            if (op.instruction.kind != NativeOp::integer) break;
+            ++length;
+            if (op.flow == RegionFlow::next) {
+                pipeline += op.fallthrough_cycles;
+                cursor = op.edges[0];
+            } else {
+                if (length > 1U && (op.flow == RegionFlow::jump || op.flow == RegionFlow::conditional)
+                    && op.target == plan.ops[start].pc)
+                    loops[start] = {length, cursor, pipeline + op.taken_cycles};
+                break;
+            }
+        }
+    }
+    const auto fast_loop = [&](std::uint16_t start, const IntegerLoop& loop) {
+        const auto slow = e.makeLabel();
+        e.movR32M(kEax, ctx, off(offsetof(NativeRegionContext, instruction_limit)));
+        e.aluRR(5U, kEax, count); e.cmpR32Imm(kEax, loop.length); e.jcc(2U, slow);
+        // All internal fetches are sequential. Only the first fetch varies
+        // with entry phase; compute an exact conservative full-loop charge.
+        e.movR32M(kEax, ctx, off(offsetof(NativeRegionContext, sequential_fetch_stall)));
+        e.imulR64Imm32(kEdx, kEax, loop.length - 1U);
+        const auto first_nonsequential = e.makeLabel(), first_ready = e.makeLabel();
+        e.cmpR32Imm(fetch, plan.ops[start].pc); e.jcc(5U, first_nonsequential);
+        e.jmp(first_ready);
+        e.bindLabel(first_nonsequential);
+        e.movR32M(kEax, ctx, off(offsetof(NativeRegionContext, nonsequential_fetch_stall)));
+        e.bindLabel(first_ready); e.addR64R64(kEdx, kEax);
+        e.movR32Imm(kEax, loop.maximum_pipeline_cycles); e.addR64R64(kEdx, kEax);
+        e.movRR64(kEax, cycles); e.addR64R64(kEax, kEdx); e.jcc(2U, slow);
+        e.cmpR64M(kEax, ctx, off(offsetof(NativeRegionContext, cycle_limit))); e.jcc(7U, slow);
+        e.movRR64(cycles, kEax);
+        auto cursor = start;
+        while (cursor != loop.terminal) {
+            const auto& op = plan.ops[cursor];
+            if (!emitX86Op(e, offsets, op.instruction.integer, error)) return false;
+            cursor = op.edges[0];
+        }
+        const auto& terminal = plan.ops[loop.terminal];
+        e.aluRImm(0U, count, loop.length);
+        e.movR64Imm(fetch, (static_cast<std::uint64_t>(terminal.pc) << 32U) | terminal.fallthrough);
+        if (terminal.flow == RegionFlow::conditional) {
+            const auto taken = e.makeLabel();
+            const auto& inst = terminal.instruction.integer;
+            if (inst.op == MicroOp::cbz || inst.op == MicroOp::cbnz) {
+                loadGuest(e, kEax, offsets, inst.rn); e.testRR(kEax, kEax);
+                e.jcc(inst.op == MicroOp::cbz ? 4U : 5U, taken);
+            } else if (!emitX86CondTaken(e, inst.condition, 0U, taken, error, false)) return false;
+            const auto extra = terminal.taken_cycles - terminal.fallthrough_cycles;
+            if (extra != 0U) e.addR64Imm8(cycles, static_cast<std::uint8_t>(-extra));
+            edge(terminal, false);
+            e.bindLabel(taken);
+        }
+        edge(terminal, true);
+        e.bindLabel(slow);
+        return true;
+    };
+    for (std::size_t i = 0U; i < plan.count; ++i) {
+        const auto& op = plan.ops[i];
+        e.bindLabel(labels[i].entry);
+        e.aluRM(7U, count, ctx, off(offsetof(NativeRegionContext, instruction_limit)));
+        e.jcc(3U, labels[i].instructions);
+        if (loops[i].length != 0U && !fast_loop(static_cast<std::uint16_t>(i), loops[i])) return nullptr;
+        if (op.flow == RegionFlow::indirect) {
+            const auto reg = op.instruction.kind == NativeOp::bx_lr ? 14U : op.instruction.rn;
+            loadGuest(e, kR10, offsets, static_cast<std::uint8_t>(reg));
+            e.testRImm(kR10, 1U); e.jcc(4U, labels[i].checked);
+            // Both basic and extended FP EXC_RETURN tokens stay on the
+            // architectural exception path, before LR or PC can be modified.
+            e.movRR(kEax, kR10); e.aluRImm(4U, kEax, 0xffffffe0U);
+            e.cmpR32Imm(kEax, 0xffffffe0U); e.jcc(4U, labels[i].checked);
+            e.aluRImm(4U, kR10, ~std::uint32_t{1U});
+            const auto sequential = e.makeLabel();
+            e.cmpR32Imm(kR10, op.fallthrough); e.jcc(4U, sequential);
+            if (!body(op, i, true)) return nullptr;
+            e.bindLabel(sequential);
+            if (!body(op, i, false)) return nullptr;
+        } else if (op.flow == RegionFlow::checked || op.instruction.kind != NativeOp::integer) {
+            e.jmp(labels[i].checked);
+        } else if (op.flow == RegionFlow::conditional) {
+            const auto taken = e.makeLabel();
+            const auto& inst = op.instruction.integer;
+            if (inst.op == MicroOp::cbz || inst.op == MicroOp::cbnz) {
+                loadGuest(e, kEax, offsets, inst.rn); e.testRR(kEax, kEax);
+                e.jcc(inst.op == MicroOp::cbz ? 4U : 5U, taken);
+            } else if (!emitX86CondTaken(e, inst.condition, 0U, taken, error, false)) return nullptr;
+            if (!body(op, i, false)) return nullptr;
+            e.bindLabel(taken);
+            if (!body(op, i, true)) return nullptr;
+        } else if (!body(op, i, op.flow != RegionFlow::next)) return nullptr;
+    }
+    // An immutable switch over compiled instruction addresses resolves actual
+    // return/call targets. This is generated control flow, without a target
+    // history, prediction guard, lookup cache, or eviction/relearning path.
+    e.bindLabel(indirect);
+    std::array<std::uint16_t, NativeRegionPlan::max_ops> target_order;
+    for (std::uint16_t i = 0U; i < plan.count; ++i) target_order[i] = i;
+    std::sort(target_order.begin(), target_order.begin() + plan.count,
+        [&](auto a, auto b) { return plan.ops[a].pc < plan.ops[b].pc; });
+    const auto dispatch = [&](auto&& self, std::size_t begin, std::size_t end) -> void {
+        if (begin == end) { e.jmp(indirect_external); return; }
+        const auto middle = begin + (end - begin) / 2U;
+        const auto index = target_order[middle];
+        e.cmpR32Imm(kR10, plan.ops[index].pc); e.jcc(4U, labels[index].entry);
+        if (end - begin == 1U) { e.jmp(indirect_external); return; }
+        const auto upper = e.makeLabel();
+        e.jcc(7U, upper);
+        self(self, begin, middle);
+        e.bindLabel(upper);
+        self(self, middle + 1U, end);
+    };
+    dispatch(dispatch, 0U, plan.count);
+    e.bindLabel(indirect_external);
+    e.movRR(kEax, kR10);
+    e.movR32Imm(kEcx, static_cast<std::uint32_t>(NativeRegionExit::external_edge));
+    e.jmp(publish);
+    for (std::size_t i = 0U; i < plan.count; ++i) {
+        e.bindLabel(labels[i].instructions); exit(NativeRegionExit::instruction_budget, plan.ops[i].pc);
+        e.bindLabel(labels[i].credit); exit(NativeRegionExit::cycle_budget, plan.ops[i].pc);
+        e.bindLabel(labels[i].checked); exit(NativeRegionExit::checked_instruction, plan.ops[i].pc);
+    }
+    e.bindLabel(publish);
+    e.movM32R(cpu, offsets.r + 60U, kEax);
+    e.movM32R(ctx, off(offsetof(NativeRegionContext, exit_reason)), kEcx);
+    e.movM32R(ctx, off(offsetof(NativeRegionContext, retired_count)), count);
+    e.movM64R(ctx, off(offsetof(NativeRegionContext, retired_cycles)), cycles);
+    for (std::size_t guest = 0U; guest < e.guest_hosts.size(); ++guest)
+        if (e.guest_hosts[guest] >= 0)
+            e.movM32R(cpu, offsets.r + off(guest * 4U), static_cast<std::uint32_t>(e.guest_hosts[guest]));
+    e.movRR(kEax, retain); e.aluRR(1U, kEax, nzcv); e.movM32R(cpu, offsets.xpsr, kEax);
+    e.testRR(count, count); e.jcc(4U, done);
+    e.movM32R(ctx, off(offsetof(NativeRegionContext, fetch_end)), fetch);
+    e.movM8Imm8(ctx, off(offsetof(NativeRegionContext, have_fetch)), 1U);
+    e.movRR64(kEax, fetch); e.shR64Imm(5U, kEax, 32U); e.movM32R(cpu, offsets.addr, kEax);
+    e.bindLabel(done);
+    e.bindLabel(early);
+    for (const auto reg : {10U,5U,15U,14U,13U,12U,3U}) e.popReg(reg);
+    e.ret();
+    if (!e.patchBranches(error) || !impl_->makeWritable(error)) return nullptr;
+    std::size_t emitted = 0U;
+    void* slot = impl_->append(e.code.data(), e.code.size(), error, emitted);
+    if (slot == nullptr || !impl_->seal(slot, emitted, error)) return nullptr;
+    NativeRegionFunction function = nullptr;
+    std::memcpy(&function, &slot, sizeof(function));
+    ++compilations_; bytes_emitted_ += emitted;
+    return function;
+#else
+    (void)bytes; (void)base; (void)entry_pc;
+    error = "native-region: host emitter unavailable";
+    return nullptr;
 #endif
 }
 
