@@ -795,6 +795,12 @@ bool MemoryBus::tryFastReadWords(
     const bool footprint = read_footprint_tracking_
         && context.type == AccessType::data_read && context.pc != 0U;
     const std::size_t base = address - region->info.base;
+    if constexpr (std::endian::native == std::endian::little) {
+        if (!footprint) {
+            std::memcpy(values_out, region->bytes.data() + base, static_cast<std::size_t>(span));
+            return true;
+        }
+    }
     for (std::uint32_t w = 0U; w < count; ++w) {
         if (footprint) addAccessFootprint(address + w * 4U, 4U);
         std::uint32_t value = 0U;

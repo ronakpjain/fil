@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <string_view>
@@ -85,6 +86,45 @@ fil::mem::MemoryBus basicBus() {
     EXPECT_TRUE(bus.mapAlias(0x00000000U, 0x08000000U, 32, "boot-alias").hasValue())
         << "maps boot alias";
     return bus;
+}
+
+/** @brief Bulk outputs and read dependencies match sequential checked words. */
+TEST(MemoryBusTest, BulkReadMatchesWordReadsAcrossTrackingWidthsAndAlignment) {
+    constexpr std::uint32_t base = 0x20000000U;
+    for (unsigned kind = 0U; kind < 3U; ++kind) {
+        fil::mem::MemoryBus bulk, scalar;
+        std::array<std::uint8_t, 256> bytes{};
+        for (std::size_t i = 0U; i < bytes.size(); ++i)
+            bytes[i] = static_cast<std::uint8_t>(i * 73U + 19U);
+        for (auto* bus : {&bulk, &scalar}) {
+            if (kind == 0U) ASSERT_TRUE(bus->mapRam(base, bytes.size(), "ram", true));
+            else if (kind == 1U) ASSERT_TRUE(bus->mapRom(base, bytes.size(), "rom"));
+            else ASSERT_TRUE(bus->mapFlash(base, bytes.size(), "flash"));
+            ASSERT_TRUE(bus->loadBytes(base, bytes));
+        }
+        for (unsigned mode = 0U; mode < 4U; ++mode) {
+            const fil::mem::AccessContext context{
+                mode == 3U ? fil::mem::AccessType::instruction_fetch : fil::mem::AccessType::data_read,
+                mode == 2U ? 0U : 0x08000000U};
+            for (std::uint32_t align = 0U; align < 4U; ++align) {
+                for (std::uint32_t count = 1U; count <= 16U; ++count) {
+                    for (auto* bus : {&bulk, &scalar}) {
+                        bus->setReadFootprintTracking(mode != 1U);
+                        bus->restoreReadFootprint({});
+                    }
+                    std::array<std::uint32_t, 18> actual, expected;
+                    actual.fill(0xdeadbeefU); expected = actual;
+                    const auto address = base + 64U + align;
+                    ASSERT_TRUE(bulk.tryFastReadWords(address, count, actual.data() + 1U, context));
+                    for (std::uint32_t i = 0U; i < count; ++i)
+                        ASSERT_TRUE(scalar.tryFastRead32(address + i * 4U, expected[i + 1U], context));
+                    ASSERT_EQ(actual, expected) << kind << "/" << mode << "/" << align << "/" << count;
+                    EXPECT_EQ(bulk.readFootprint().words, scalar.readFootprint().words);
+                    EXPECT_EQ(bulk.readFootprint().complete, scalar.readFootprint().complete);
+                }
+            }
+        }
+    }
 }
 
 /** @brief Verifies little-endian aligned, unaligned, and alias accesses. */
