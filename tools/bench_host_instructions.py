@@ -63,6 +63,11 @@ def parse_callgrind(data):
             summary = [int(value) for value in line.split()[1:]]
         elif line.startswith("ob="):
             current_object = expand(line[3:], objects)
+        elif line.startswith("cob="):
+            # Object IDs can be introduced on a call edge before a later
+            # function's ob=(id) reuses them (notably in Clang profiles).
+            # Defining a callee object must not change the caller's object.
+            expand(line[4:], objects)
         elif line.startswith("fn="):
             current = expand(line[3:], names)
             function_objects[current] = current_object
