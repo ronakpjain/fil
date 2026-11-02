@@ -1994,6 +1994,13 @@ ExitCode serveNetworkCommand(
         return ExitCode::usage_error;
     }
 
+    if (&out == &std::cout && ::isatty(STDOUT_FILENO)) {
+        err << "fil: serve-network cannot write binary protocol frames to a terminal; "
+               "pipe stdout to a protocol client or redirect it to a file. "
+               "Use watch-network for terminal output.\n";
+        return ExitCode::usage_error;
+    }
+
     ScopedSigpipeIgnore ignore_sigpipe;
     return networkMonitorCommand(monitor_args, out, err, true);
 }

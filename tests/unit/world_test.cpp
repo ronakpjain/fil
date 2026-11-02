@@ -5,7 +5,10 @@
 #include "fil/stm32g4/stm32g4.hpp"
 #include "../fixture_support.hpp"
 
+#include <cerrno>
 #include <cstdint>
+#include <cstdlib>
+#include <fcntl.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -426,6 +429,52 @@ TEST(WorldTest, ServeNetworkRequiresAnExplicitSupportedTransport) {
               fil::cli::ExitCode::usage_error);
     EXPECT_TRUE(unsupported_out.str().empty());
     EXPECT_NE(unsupported_err.str().find("supported: stdio"), std::string::npos);
+}
+
+TEST(WorldTest, ServeNetworkRejectsBinaryOutputToATerminalBeforeLoadingNetwork) {
+    const int master = ::posix_openpt(O_RDWR | O_NOCTTY);
+    ASSERT_GE(master, 0);
+    struct TerminalOutput {
+        int master;
+        int original{-1};
+        int slave{-1};
+        ~TerminalOutput() {
+            if (original >= 0) {
+                std::cout.flush();
+                static_cast<void>(::dup2(original, STDOUT_FILENO));
+                static_cast<void>(::close(original));
+            }
+            if (slave >= 0) static_cast<void>(::close(slave));
+            static_cast<void>(::close(master));
+        }
+    } terminal{master};
+    ASSERT_EQ(::grantpt(master), 0);
+    ASSERT_EQ(::unlockpt(master), 0);
+    const char* const slave_name = ::ptsname(master);
+    ASSERT_NE(slave_name, nullptr);
+    terminal.slave = ::open(slave_name, O_RDWR | O_NOCTTY);
+    ASSERT_GE(terminal.slave, 0);
+    std::ostringstream errors;
+    fil::cli::ExitCode result;
+    {
+        std::cout.flush();
+        terminal.original = ::dup(STDOUT_FILENO);
+        ASSERT_GE(terminal.original, 0);
+        ASSERT_GE(::dup2(terminal.slave, STDOUT_FILENO), 0);
+        const std::string_view args[]{"serve-network", "missing-network.json",
+                                      "--transport", "stdio"};
+        result = fil::cli::run(args, std::cout, errors);
+    }
+    // Restore stdout before GoogleTest prints assertion results.
+    ASSERT_GE(::dup2(terminal.original, STDOUT_FILENO), 0);
+    EXPECT_EQ(result, fil::cli::ExitCode::usage_error);
+    EXPECT_NE(errors.str().find("cannot write binary protocol frames to a terminal"),
+              std::string::npos);
+    EXPECT_NE(errors.str().find("watch-network"), std::string::npos);
+    EXPECT_EQ(::fcntl(master, F_SETFL, O_NONBLOCK), 0);
+    char byte{};
+    EXPECT_EQ(::read(master, &byte, 1), -1); // No protocol bytes were emitted.
+    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK);
 }
 
 TEST(WorldTest, ServeNetworkUsesBinaryStdioFramesForControlsAndTraces) {

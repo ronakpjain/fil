@@ -12,8 +12,14 @@ human-readable summary and optional JSONL trace file.
 
 ```bash
 ./build/fil serve-network configs/networks/per_vehicle.json \
-  --transport stdio --refresh-ms 1 --live-filter can_tx
+  --transport stdio --refresh-ms 1 --live-filter can_tx > network.filn
 ```
+
+Stdout must be a pipe to a protocol client or a redirected file. Terminal output
+is rejected because these frames contain binary control bytes. For human-readable
+terminal traces, use `fil watch-network NETWORK` instead. A finite capture can use
+`--duration-ms 10000 > network.filn`; elapsed wall time may exceed the requested
+simulated duration when simulation or output is slower than real time.
 
 The service sends a `HELLO` frame after loading the network, then streams selected
 trace records and replies to client requests. Trace filtering follows

@@ -60,7 +60,7 @@ See [Tracing](tracing.md) and [Performance](performance.md) for details.
 
 ```bash
 fil watch-network network.json
-fil serve-network network.json --transport stdio
+fil serve-network network.json --transport stdio --duration-ms 10000 > network.filn
 ```
 
 Both accept `--duration-ms`, `--max-instructions`, `--quantum`, MMIO controls,
