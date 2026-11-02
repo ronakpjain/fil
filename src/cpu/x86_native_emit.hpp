@@ -97,6 +97,13 @@ public:
     void leaR64(std::uint32_t dst, std::uint32_t base, std::uint32_t disp) {
         u8(rex(true, (dst & 8U) != 0U, (base & 8U) != 0U)); u8(0x8DU); mem(dst, base & 7U, disp);
     }
+    void leaR64Rip(std::uint32_t dst, std::size_t label) {
+        u8(rex(true, (dst & 8U) != 0U, false)); u8(0x8DU); u8(modrm(0U, dst, 5U));
+        fixups.push_back({code.size(), label}); u32(0U);
+    }
+    void movsxR64M32(std::uint32_t dst, std::uint32_t base, std::uint32_t disp) {
+        u8(rex(true, (dst & 8U) != 0U, (base & 8U) != 0U)); u8(0x63U); mem(dst, base & 7U, disp);
+    }
     void movR64M(std::uint32_t dst, std::uint32_t base, std::uint32_t disp) {
         u8(rex(true, (dst & 8U) != 0U, (base & 8U) != 0U)); u8(0x8BU); mem(dst, base & 7U, disp);
     }

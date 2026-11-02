@@ -674,6 +674,47 @@ TEST(NativeRegionTest, LinearSpanWideChargesAndInteriorEntriesMatchCheckedExecut
     }
 }
 
+TEST(NativeRegionTest, DenseReturnDispatchPreservesWideInstructionGapsAndExternalEdges) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    const auto bytes = code(std::array<std::uint16_t,8U>{
+        0xf000U,0xf804U,0xf240U,0x0200U,0x3301U,0xbe00U,0x4700U,0xbe00U});
+    std::string error; NativeRegionPlan plan;
+    ASSERT_TRUE(buildNativeRegion(bytes, pc, pc, plan, error));
+    ASSERT_EQ(plan.count, 5U);
+    auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    const auto function = jit->compileRegion(bytes, pc, pc, error); ASSERT_NE(function, nullptr) << error;
+    fil::mem::MemoryBus memory;
+    ASSERT_TRUE(memory.mapRom(pc, bytes.size(), "return-dispatch")); ASSERT_TRUE(memory.loadBytes(pc, bytes));
+    CortexM4 reference(memory);
+    for (std::uint32_t target = pc - 2U; target <= pc + 16U; target += 2U)
+    for (std::uint32_t limit = 0U; limit <= 12U; ++limit)
+    for (std::uint64_t credit = 0U; credit <= 40U; ++credit) {
+        CpuState state; state.r[15] = pc; state.r[0] = target | 1U;
+        state.r[2] = 0xdeadbeefU; state.r[3] = 0xffffffffU;
+        state.xpsr |= xpsr_c | xpsr_v; reference.state() = state;
+        NativeRegionContext context; context.cpu_state = &state;
+        context.instruction_limit = limit; context.cycle_limit = credit;
+        std::uint32_t retired = 0U, fetch_end = 0U; std::uint64_t cycles = 0U;
+        NativeRegionExit reason;
+        for (;;) {
+            const auto next = reference.state().r[15];
+            const auto found = std::find_if(plan.ops.begin(), plan.ops.begin() + plan.count,
+                [&](const auto& op) { return op.pc == next; });
+            if (found == plan.ops.begin() + plan.count) { reason = NativeRegionExit::external_edge; break; }
+            if (retired == limit) { reason = NativeRegionExit::instruction_budget; break; }
+            if (found->flow == RegionFlow::checked) { reason = NativeRegionExit::checked_instruction; break; }
+            std::uint16_t charge = 0U; ASSERT_TRUE(reference.peekPredictableCycles(charge));
+            if (charge > credit - cycles) { reason = NativeRegionExit::cycle_budget; break; }
+            const auto step = reference.stepFast(); ASSERT_EQ(step.reason, StopReason::step_complete);
+            ++retired; cycles += charge; fetch_end = next + step.instruction_size;
+        }
+        function(&context);
+        EXPECT_TRUE(bitwiseEqual(state, reference.state())) << target << '/' << limit << '/' << credit;
+        EXPECT_EQ(context.retired_count, retired); EXPECT_EQ(context.retired_cycles, cycles);
+        EXPECT_EQ(context.exit_reason, reason); EXPECT_EQ(context.fetch_end, fetch_end);
+    }
+}
+
 TEST(NativeRegionTest, SpanFlagElisionPreservesCarryAndGuardExitFlags) {
     if (!MicroJit::hostSupported()) GTEST_SKIP();
     // ADDS; MOVS; CMP; ADD with RRX; ADDS; LDR; SUBS; MOVS; CMP; BKPT.

@@ -2591,14 +2591,20 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
             if (!body(op, i, true)) return nullptr;
         } else if (!body(op, i, op.flow != RegionFlow::next)) return nullptr;
     }
-    // An immutable switch over compiled instruction addresses resolves actual
-    // return/call targets. This is generated control flow, without a target
-    // history, prediction guard, lookup cache, or eviction/relearning path.
+    // Dense code windows use a complete relative jump table in the executable
+    // image. Sparse plans retain a comparison tree. Both resolve actual PCs
+    // without recording or predicting any previously observed target.
     e.bindLabel(indirect);
     std::array<std::uint16_t, NativeRegionPlan::max_ops> target_order;
     for (std::uint16_t i = 0U; i < plan.count; ++i) target_order[i] = i;
     std::sort(target_order.begin(), target_order.begin() + plan.count,
         [&](auto a, auto b) { return plan.ops[a].pc < plan.ops[b].pc; });
+    const auto dispatch_base = plan.ops[target_order[0]].pc;
+    const auto dispatch_extent = static_cast<std::uint64_t>(plan.ops[target_order[plan.count - 1U]].pc)
+        - dispatch_base + 2U;
+    const bool dense = plan.count >= 4U && dispatch_extent <= NativeRegionPlan::max_ops * 2U
+        && dispatch_extent <= plan.count * 4U;
+    const auto dispatch_table = dense ? e.makeLabel() : X86Emitter::no_label;
     const auto dispatch = [&](auto&& self, std::size_t begin, std::size_t end) -> void {
         if (begin == end) { e.jmp(indirect_external); return; }
         const auto middle = begin + (end - begin) / 2U;
@@ -2611,7 +2617,14 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
         e.bindLabel(upper);
         self(self, middle + 1U, end);
     };
-    dispatch(dispatch, 0U, plan.count);
+    if (dense) {
+        e.movRR(kEax, kR10); e.aluRImm(5U, kEax, dispatch_base);
+        e.cmpR32Imm(kEax, static_cast<std::uint32_t>(dispatch_extent)); e.jcc(3U, indirect_external);
+        e.testRImm(kEax, 1U); e.jcc(5U, indirect_external);
+        e.leaR64Rip(kEcx, dispatch_table);
+        e.shImm(4U, kEax, 1U); e.addR64R64(kEax, kEcx);
+        e.movsxR64M32(kEax, kEax, 0U); e.addR64R64(kEax, kEcx); e.jmpReg(kEax);
+    } else dispatch(dispatch, 0U, plan.count);
     e.bindLabel(indirect_external);
     if (program != nullptr) {
         const auto outside = e.makeLabel();
@@ -2690,6 +2703,23 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
     e.addRsp16();
     for (const auto reg : {10U,5U,15U,14U,13U,12U,3U}) e.popReg(reg);
     e.ret();
+    if (dense) {
+        e.bindLabel(dispatch_table);
+        const auto table_offset = e.code.size();
+        std::size_t next = 0U;
+        for (std::uint64_t offset = 0U; offset < dispatch_extent; offset += 2U) {
+            auto destination = indirect_external;
+            if (next < plan.count && plan.ops[target_order[next]].pc == dispatch_base + offset)
+                destination = labels[target_order[next++]].entry;
+            const auto delta = static_cast<std::int64_t>(e.labels[destination])
+                - static_cast<std::int64_t>(table_offset);
+            if (delta < INT32_MIN || delta > INT32_MAX) {
+                error = "native-region: dispatch target out of range";
+                return nullptr;
+            }
+            e.u32(static_cast<std::uint32_t>(delta));
+        }
+    }
     if (!e.patchBranches(error) || !impl_->makeWritable(error)) return nullptr;
     std::size_t emitted = 0U;
     void* slot = impl_->append(e.code.data(), e.code.size(), error, emitted);
