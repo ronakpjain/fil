@@ -1682,6 +1682,10 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     for (std::size_t i=0; i<n; ++i)
         exits.push_back({e.makeLabel(),e.makeLabel(),e.makeLabel(),e.makeLabel(),e.makeLabel(),e.makeLabel()});
     const auto normal = e.makeLabel();
+    const auto instruction_exit = e.makeLabel(), cycle_exit = e.makeLabel();
+    const auto unsupported_exit = e.makeLabel(), mismatch_exit = e.makeLabel();
+    const auto helper_exit = e.makeLabel(), dynamic_exit = e.makeLabel();
+    const auto checked_admission = e.makeLabel();
     const auto checked_kernel = e.makeLabel();
     e.movR32M(kEax, ctx, kAdmittedMode);
     e.testRR(kEax, kEax); e.jcc(4U, checked_kernel);
@@ -1693,6 +1697,14 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
         for (std::size_t i = 0; i < n; ++i) {
             const auto& op = entry.plan.ops[i];
             const auto& inst = op.native.integer;
+            const bool bx_lr = op.native.kind == NativeOp::bx_lr;
+            const bool compare_branch = inst.op == MicroOp::cbz || inst.op == MicroOp::cbnz;
+            const bool conditional = inst.op == MicroOp::b_cond || compare_branch;
+            // Guarded branches retain the original unsupported -> mismatch ->
+            // cycle ordering. Other ops can share one checked-admission body.
+            const bool shared_admission = !bx_lr && !conditional && op.native.kind != NativeOp::blx_reg;
+            const bool integer_body = op.native.kind == NativeOp::integer
+                && op.decoded.kind != InstrKind::push && op.decoded.kind != InstrKind::pop;
             e.cmpM32Imm(ctx, limit, static_cast<std::uint32_t>(i));
             e.jcc(6U, exits[i].instruction); // i >= instruction_limit before all other admissions
             // Only helpers can request an MMIO boundary stop. An integer op
@@ -1703,14 +1715,11 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
                 e.cmpM8Imm8(ctx, boundary_stop_off, 0U);
                 e.jcc(5U, exits[i].instruction);
             }
-            if (!admitted_kernel) {
+            if (!admitted_kernel && !shared_admission) {
                 e.cmpM32Imm(ctx, charged_count, static_cast<std::uint32_t>(i + 1U));
                 e.jcc(2U, exits[i].unsupported);
                 e.cmpR64Imm8(costs, 0U); e.jcc(4U, exits[i].unsupported);
             }
-            const bool bx_lr = op.native.kind == NativeOp::bx_lr;
-            const bool compare_branch = inst.op == MicroOp::cbz || inst.op == MicroOp::cbnz;
-            const auto conditional = inst.op == MicroOp::b_cond || compare_branch;
             if (bx_lr) {
                 e.movR32M(kEax, cpu, offsets.r + 56U);
                 e.cmpR32Imm(kEax, op.expected_next_pc | 1U);
@@ -1736,9 +1745,17 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
                 e.bindLabel(guard_done);
             }
             if (!admitted_kernel) {
-                e.movR32M(kEax, costs, static_cast<std::uint32_t>(i * sizeof(std::uint32_t)));
-                e.movRR64(kEdx, 5U); e.addR64R64(kEdx, kEax);
-                e.jcc(2U, exits[i].cycle); e.cmpR64M(kEdx, ctx, cycle_limit); e.jcc(7U, exits[i].cycle);
+                if (shared_admission) {
+                    e.movR32Imm(kEcx, static_cast<std::uint32_t>(i));
+                    e.call(checked_admission);
+                    // Pure integer ops cannot decline after this admission.
+                    // Commit the computed cycle total instead of reloading cost.
+                    if (integer_body) e.movRR64(5U, kEdx);
+                } else {
+                    e.movR32M(kEax, costs, static_cast<std::uint32_t>(i * sizeof(std::uint32_t)));
+                    e.movRR64(kEdx, 5U); e.addR64R64(kEdx, kEax);
+                    e.jcc(2U, exits[i].cycle); e.cmpR64M(kEdx, ctx, cycle_limit); e.jcc(7U, exits[i].cycle);
+                }
             }
             if (inst.op == MicroOp::bl || op.native.kind == NativeOp::blx_reg)
                 e.movM32Imm(kState, offsets.r + 56U, (op.pc + op.size) | 1U);
@@ -1836,7 +1853,7 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
             // Only the live cycle accumulator advances here. RAM-only helpers
             // consume explicit PCs and no pending NZCV/PC/progress metadata; the
             // selected exit stub publishes the exact committed prefix once.
-            if (!admitted_kernel) {
+            if (!admitted_kernel && !(shared_admission && integer_body)) {
                 e.movR32M(kEax,costs,static_cast<std::uint32_t>(i*4U)); e.addR64R64(5U,kEax);
             }
         }
@@ -1844,9 +1861,6 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     }
     // Cold stubs carry only a prefix index. Each reason has one trampoline,
     // and every prefix/reason shares the same native publication code.
-    const auto instruction_exit = e.makeLabel(), cycle_exit = e.makeLabel();
-    const auto unsupported_exit = e.makeLabel(), mismatch_exit = e.makeLabel();
-    const auto helper_exit = e.makeLabel(), dynamic_exit = e.makeLabel();
     const auto publish = e.makeLabel(), failed_exit = e.makeLabel();
     std::vector<bool> referenced(e.labels.size(), false);
     for (const auto& fixup : e.fixups) referenced[fixup.label] = true;
@@ -1932,6 +1946,21 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
         return std::any_of(e.fixups.begin(), e.fixups.end(),
             [label](const auto& fixup) { return fixup.label == label; });
     };
+    if (used(checked_admission)) {
+        e.bindLabel(checked_admission);
+        const auto unsupported = e.makeLabel(), cycle = e.makeLabel();
+        e.aluRM(7U, kEcx, ctx, charged_count); e.jcc(3U, unsupported);
+        e.cmpR64Imm8(costs, 0U); e.jcc(4U, unsupported);
+        e.movRR(kEax, kEcx); e.shImm(4U, kEax, 2U); e.addR64R64(kEax, costs);
+        e.movR32M(kEax, kEax, 0U);
+        e.movRR64(kEdx, 5U); e.addR64R64(kEdx, kEax);
+        e.jcc(2U, cycle); e.cmpR64M(kEdx, ctx, cycle_limit); e.jcc(7U, cycle);
+        e.ret();
+        // The shared epilogue expects the main kernel's stack frame. Drop this
+        // native subroutine's return address before transferring an early exit.
+        e.bindLabel(unsupported); e.addR64Imm8(4U, 8U); e.jmp(unsupported_exit);
+        e.bindLabel(cycle); e.addR64Imm8(4U, 8U); e.jmp(cycle_exit);
+    }
     if (used(add_flags)) {
         e.bindLabel(add_flags); endAddSub(e, offsets, false, 0U, false); e.ret();
     }
