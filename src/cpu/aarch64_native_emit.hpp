@@ -98,6 +98,12 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
         e.storeImm(ctx, offsetof(NativeExecutionContext, current_instruction_pc), m.pc);
         e.load(9U, ctx, offsetof(NativeExecutionContext, instruction_limit));
         e.cmpImm(9U, static_cast<std::uint32_t>(i + 1U)); e.cond(3U, instruction_exit); // lo
+        // Stop before the next op after a committed-span MMIO, so the retired
+        // prefix already includes the MMIO instruction. Mask the bool byte:
+        // a word load also sees the field's uninitialized alignment padding.
+        e.load(9U, ctx, offsetof(NativeExecutionContext, boundary_stop));
+        e.andImm(9U, 9U, 0U, 7U);
+        e.cbnzW(9U, instruction_exit);
         // Both admission modes need the per-instruction charge table. Reload
         // it here: integer stencils and scalar helpers may clobber x11.
         e.load(11U, ctx, offsetof(NativeExecutionContext, charged_cycles), true);
@@ -169,6 +175,14 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
             e.cond(0U, mismatch_exit);
             e.cbnzW(0U, helper_exit);
         } else if (nativeOpIsMemory(m.kind)) {
+            // A committed-span MMIO helper needs the exact prefix cycle count.
+            // Checked mode already accumulated it in `cycles`; admitted kernels
+            // otherwise defer cumulative cycle publication to their exit.
+            const auto have_prefix = e.makeLabel();
+            e.cbzW(22U, have_prefix);
+            e.load(9U, 23U, i * sizeof(std::uint32_t));
+            e.store(9U, ctx, cycles, true);
+            e.bindLabel(have_prefix);
             if (m.absolute) e.movImm(2U, m.absolute_address);
             else {
                 if (m.rn == 13U) {
