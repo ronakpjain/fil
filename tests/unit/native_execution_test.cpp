@@ -7,6 +7,45 @@
 
 namespace {
 
+TEST(NativeExecutionTest, PreparedStackPlansDecodeEveryRegisterMaskInAscendingOrder) {
+    for (const bool push : {false, true}) {
+        for (std::uint32_t mask = 0U; mask <= 0xffffU; ++mask) {
+            const fil::cpu::NativeStackPlan plan(mask, push);
+            const bool valid = mask != 0U && (mask & 0x2000U) == 0U
+                && (push ? (mask & 0x8000U) == 0U : (mask & 0xc000U) != 0xc000U);
+            std::uint32_t count = 0U;
+            if (valid) {
+                for (std::uint32_t r = 0U; r < 16U; ++r) {
+                    if ((mask & (1U << r)) != 0U) {
+                        ASSERT_EQ(plan.reg(count), r) << mask << "/" << push;
+                        ++count;
+                    }
+                }
+            }
+            ASSERT_EQ(plan.count(), count) << mask << "/" << push;
+            ASSERT_EQ(plan.loadsPc(), valid && !push && (mask & 0x8000U) != 0U);
+            ASSERT_EQ(plan.push(), push);
+        }
+        for (std::uint32_t high = 16U; high < 32U; ++high)
+            EXPECT_EQ(fil::cpu::NativeStackPlan((1U << high) | 1U, push).count(), 0U);
+    }
+    EXPECT_EQ(fil::cpu::NativeStackPlan{}.count(), 0U);
+}
+
+TEST(NativeExecutionTest, PreparedStackHelpersRejectEmptyPlansWithoutEffects) {
+    fil::mem::MemoryBus bus;
+    ASSERT_TRUE(bus.mapRam(0x20000000U, 64U, "ram"));
+    fil::cpu::CpuState state;
+    state.msp = 0x20000020U;
+    const auto before = state;
+    fil::cpu::NativeExecutionContext context{&state, &bus, 1U, 100U};
+    EXPECT_EQ(fil::cpu::nativeStackTransferPrepared(&context, 0x08000000U, {}, 0U),
+        fil::cpu::NativeStackResult::memory_declined);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(state, before));
+    EXPECT_EQ(fil::cpu::nativeStackTransferPrepared(nullptr, 0U,
+        fil::cpu::NativeStackPlan(1U, true), 0U), fil::cpu::NativeStackResult::memory_declined);
+}
+
 TEST(NativeExecutionTest, ScalarHelpersUseFastRamPathsAndExplicitInstructionPc) {
     fil::mem::MemoryBus helper_bus;
     fil::mem::MemoryBus direct_bus;

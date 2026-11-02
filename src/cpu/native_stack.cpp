@@ -1,20 +1,22 @@
 #include "fil/cpu/native_stack.hpp"
 #include <array>
-#include <bit>
 #include <optional>
 
 namespace fil::cpu {
 NativeStackResult nativeStackTransfer(NativeExecutionContext* c, std::uint32_t pc,
     std::uint32_t mask, std::uint32_t push, std::uint32_t expected_pc) noexcept {
-    if (!c || !c->cpu_state || !c->memory_bus || mask == 0
-        || (mask & 0xffff0000U) != 0U || (mask & (1U << 13U)))
+    const NativeStackPlan plan(mask, push != 0U);
+    return nativeStackTransferPrepared(c, pc, plan, expected_pc);
+}
+
+NativeStackResult nativeStackTransferPrepared(NativeExecutionContext* c, std::uint32_t pc,
+    const NativeStackPlan& plan, std::uint32_t expected_pc) noexcept {
+    if (!c || !c->cpu_state || !c->memory_bus || plan.count() == 0U)
         return NativeStackResult::memory_declined;
     CpuState& s = *c->cpu_state;
-    const bool is_push = push != 0;
-    const bool loads_pc = !is_push && (mask & 0x8000U);
-    if (is_push && (mask & 0x8000U)) return NativeStackResult::memory_declined;
-    if (loads_pc && (mask & 0x4000U)) return NativeStackResult::memory_declined;
-    const std::uint32_t count = static_cast<std::uint32_t>(std::popcount(mask));
+    const bool is_push = plan.push();
+    const bool loads_pc = plan.loadsPc();
+    const std::uint32_t count = plan.count();
     const std::uint64_t bytes = static_cast<std::uint64_t>(count) * 4U;
     const std::uint32_t old_sp = s.readRegister(13U);
     const std::uint32_t start = is_push ? old_sp - static_cast<std::uint32_t>(bytes) : old_sp;
@@ -23,11 +25,7 @@ NativeStackResult nativeStackTransfer(NativeExecutionContext* c, std::uint32_t p
         // Only the first `count` entries are written and read; clearing all
         // sixteen would cost a 64-byte store per transferred stack frame.
         std::array<std::uint32_t, 16> values;
-        std::uint32_t n = 0;
-        for (std::uint32_t bits = mask; bits != 0U; bits &= bits - 1U) {
-            const auto r = static_cast<std::uint32_t>(std::countr_zero(bits));
-            values[n++] = s.r[r];
-        }
+        for (std::uint32_t n = 0U; n < count; ++n) values[n] = s.r[plan.reg(n)];
         if (!c->memory_bus->tryFastWriteWords(start, count, values.data(), {mem::AccessType::data_write, pc}, true))
             return NativeStackResult::memory_declined;
         s.writeRegister(13U, start);
@@ -64,12 +62,8 @@ NativeStackResult nativeStackTransfer(NativeExecutionContext* c, std::uint32_t p
             return NativeStackResult::branch_mismatch;
         }
     }
-    std::uint32_t n = 0;
-    for (std::uint32_t bits = mask; bits != 0U; bits &= bits - 1U) {
-        const auto r = static_cast<std::uint32_t>(std::countr_zero(bits));
-        if (r != 15U) s.r[r] = values[n];
-        ++n;
-    }
+    const auto ordinary_count = count - (loads_pc ? 1U : 0U);
+    for (std::uint32_t n = 0U; n < ordinary_count; ++n) s.r[plan.reg(n)] = values[n];
     s.writeRegister(13U, old_sp + static_cast<std::uint32_t>(bytes));
     if (loads_pc) s.r[15] = target & ~1U;
     return alternate_return ? NativeStackResult::dynamic_return : NativeStackResult::success;

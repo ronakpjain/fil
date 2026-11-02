@@ -68,6 +68,25 @@ return/exception; the outer run restores the caller's tracking modes. Certificat
 input validation still rejects changed RAM. POP PC also avoids a read-footprint
 snapshot when tracking is disabled, retaining atomic declines in both modes.
 
+### Predecoded native stack register lists
+
+The trace builder derives immutable PUSH/POP register-index lists from canonical
+instruction encodings. The x86-64 emitter passes this plan to the checked stack
+helper rather than decoding the same register mask at every execution. Incoming
+derived stack metadata is discarded and rebuilt, just like the native IR. Only
+ISA decoding moves to compilation: backing-range and permission checks, active
+MSP/PSP selection, journaling, read footprints, return-target validation and
+atomic declines remain runtime operations. The original scalar helper API still
+validates arbitrary masks before using the same transfer implementation.
+
+On the full-fidelity 170 MHz PER workload, five alternating isolated 3 s
+front-driveline runs with fresh PGO measured median 3.450 s before and 3.356 s
+after (about 2.8% faster). Five alternating full-network runs measured 4.673 s
+versus 4.557 s (0.658× real time), with identical guest counters and final PCs.
+Full-network timings are noisy: an identical-binary control previously showed
+an apparent 8% difference, so the isolated result is the attribution evidence,
+not a claim that the real-time target has been reached.
+
 ### Word-store journal bookkeeping
 
 Little-endian backed word stores compute a changed-byte mask from one word load.

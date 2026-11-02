@@ -140,6 +140,9 @@ bool buildNativeTrace(std::span<const NativeTraceOp> sources, NativeTracePlan& o
         }
         candidate.ops.push_back(src);
         candidate.ops.back().native = lowered;
+        candidate.ops.back().stack_plan = stack
+            ? NativeStackPlan(src.decoded.register_list, src.decoded.kind == InstrKind::push)
+            : NativeStackPlan{};
     }
     out = std::move(candidate);
     return true;

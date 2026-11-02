@@ -14,6 +14,29 @@
 namespace {
 using namespace fil::cpu;
 
+TEST(NativeJitTest, TraceBuilderRebuildsStackPlansFromCanonicalInstructions) {
+    for (const auto raw : std::array<std::uint16_t, 3>{0xb510U, 0xbd10U, 0xbf00U}) {
+        const auto decoded = decode16(raw); ASSERT_TRUE(decoded);
+        NativeTraceOp source;
+        source.decoded = *decoded; source.raw = raw;
+        source.pc = 0x08000000U; source.size = 2U; source.execution_cycles = 3U;
+        source.expected_taken = decoded->kind == InstrKind::pop;
+        source.expected_next_pc = source.expected_taken ? 0x08000080U : source.pc + 2U;
+        source.stack_plan = NativeStackPlan(1U, false); // Deliberately forged derived metadata.
+        NativeTracePlan plan; std::string error;
+        ASSERT_TRUE(buildNativeTrace(std::span(&source, 1U), plan, error)) << error;
+        const auto& stack = plan.ops.front().stack_plan;
+        if (decoded->kind == InstrKind::nop) {
+            EXPECT_EQ(stack.count(), 0U);
+        } else {
+            ASSERT_EQ(stack.count(), 2U);
+            EXPECT_EQ(stack.reg(0U), 4U);
+            EXPECT_EQ(stack.reg(1U), decoded->kind == InstrKind::push ? 14U : 15U);
+            EXPECT_EQ(stack.push(), decoded->kind == InstrKind::push);
+        }
+    }
+}
+
 TEST(NativeJitTest, DecodedLiteralAndStackAccessesMatchExactEveryPrefix) {
     if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
     constexpr std::uint32_t flash = 0x08000000U, ram = 0x20000000U;

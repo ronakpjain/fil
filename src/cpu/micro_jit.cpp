@@ -1717,10 +1717,11 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
                 e.movM32Imm(kState, offsets.r + 56U, (op.pc + op.size) | 1U);
             if (op.decoded.kind == InstrKind::push || op.decoded.kind == InstrKind::pop) {
                 e.movRR64(7U, ctx); e.movR32Imm(6U, op.pc);
-                e.movR32Imm(kEdx, op.decoded.register_list);
-                e.movR32Imm(1U, op.decoded.kind == InstrKind::push ? 1U : 0U);
-                e.movR32Imm(8U, op.expected_next_pc);
-                e.movR64Imm(kEax, reinterpret_cast<std::uintptr_t>(&nativeStackTransfer)); e.callReg(kEax);
+                // The retained cache entry owns this immutable plan for the
+                // generated function's entire lifetime (vector moves retain storage).
+                e.movR64Imm(kEdx, reinterpret_cast<std::uintptr_t>(&op.stack_plan));
+                e.movR32Imm(1U, op.expected_next_pc);
+                e.movR64Imm(kEax, reinterpret_cast<std::uintptr_t>(&nativeStackTransferPrepared)); e.callReg(kEax);
                 e.movRR64(7U, cpu);
                 if (op.decoded.kind == InstrKind::pop && (op.decoded.register_list & 0x8000U)) {
                     e.cmpR32Imm(kEax, static_cast<std::uint32_t>(NativeStackResult::dynamic_return));
