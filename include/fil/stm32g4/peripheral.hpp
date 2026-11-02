@@ -74,6 +74,11 @@ public:
 
     /** @brief Observes level-sensitive interrupt requests, one callback per changed line. */
     void setInterruptLevelCallback(InterruptLevelCallback callback);
+    /** Install internal IRQ wiring that only updates interrupt-controller state.
+     * It must not throw, schedule events, access CPU state or invoke observers.
+     * Installing an ordinary callback revokes this permission.
+     */
+    void setDeviceLocalInterruptLevelCallback(InterruptLevelCallback callback);
     [[nodiscard]] std::uint64_t interruptLevelCallbackGeneration() const noexcept {
         return interrupt_level_callback_generation_;
     }
@@ -85,6 +90,12 @@ public:
     [[nodiscard]] std::string_view traceSource() const noexcept { return trace_source_; }
 
 protected:
+    [[nodiscard]] std::uint32_t interruptLevelMask() const noexcept {
+        return static_cast<std::uint32_t>(interrupt_levels_.to_ulong());
+    }
+    [[nodiscard]] bool deviceLocalInterruptRouting() const noexcept {
+        return !interrupt_level_callback_ || interrupt_level_callback_device_local_;
+    }
     [[nodiscard]] virtual std::uint32_t loadRegister(
         std::uint32_t word_offset,
         const mem::AccessContext& context
@@ -140,6 +151,7 @@ private:
     sim::TraceRecorder* trace_{nullptr};
     std::bitset<8U> interrupt_levels_{};
     InterruptLevelCallback interrupt_level_callback_;
+    bool interrupt_level_callback_device_local_{false};
     std::uint64_t interrupt_level_callback_generation_{0U};
 };
 
@@ -814,6 +826,9 @@ struct DmaTransfer {
 /** @brief STM32G4 DMA controller with request-driven channel progress. */
 class DmaPeripheral final : public RegisterPeripheral {
 public:
+    [[nodiscard]] DirectWriteWord directWriteWord(std::uint32_t offset) noexcept override {
+        return offset == 4U ? DirectWriteWord{&DmaPeripheral::directClearFlags, this} : DirectWriteWord{};
+    }
     [[nodiscard]] const std::uint32_t* directReadWord(std::uint32_t offset) const noexcept override {
         return offset == 0U ? registerStorage(0U) : nullptr;
     }
@@ -852,6 +867,7 @@ protected:
     ) override;
 
 private:
+    static bool directClearFlags(void* context, std::uint32_t value) noexcept;
     [[nodiscard]] bool channelForOffset(std::uint32_t offset, std::uint32_t& channel) const noexcept;
     void initializeChannel(std::uint32_t channel);
     void runChannelRequest(std::uint32_t channel);

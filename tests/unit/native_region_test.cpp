@@ -29,6 +29,31 @@ public:
     std::string_view name() const noexcept override { return "region-port"; }
 };
 
+class GuardedWordPort final : public fil::mem::MmioDevice {
+public:
+    std::uint32_t value{0U}, writes{0U};
+    bool blocked{false};
+    static bool execute(void* context, std::uint32_t input) noexcept {
+        auto& port = *static_cast<GuardedWordPort*>(context);
+        if (port.blocked) return false;
+        port.value = input; ++port.writes;
+#if defined(__x86_64__)
+        asm volatile("" ::: "rdi", "rsi", "rdx", "rcx", "r8", "r9", "r10", "r11", "cc", "memory");
+#endif
+        return true;
+    }
+    DirectWriteWord directWriteWord(std::uint32_t offset) noexcept override {
+        return offset == 0U ? DirectWriteWord{&execute, this} : DirectWriteWord{};
+    }
+    fil::mem::MemoryResult<std::uint64_t> read(std::uint32_t, fil::mem::AccessSize,
+        const fil::mem::AccessContext&) override { return value; }
+    fil::mem::MemoryResult<std::uint64_t> write(std::uint32_t, fil::mem::AccessSize,
+        std::uint64_t input, const fil::mem::AccessContext&) override {
+        value = static_cast<std::uint32_t>(input); ++writes; return std::uint64_t{0U};
+    }
+    std::string_view name() const noexcept override { return "guarded-word"; }
+};
+
 template <std::size_t N>
 auto code(const std::array<std::uint16_t, N>& words) {
     std::array<std::uint8_t, N * 2U> bytes{};
@@ -727,6 +752,80 @@ TEST(NativeRegionTest, LinearSpanWideChargesAndInteriorEntriesMatchCheckedExecut
     }
 }
 
+TEST(NativeRegionTest, GuardedMmioWritesPreserveCallerRegistersWritebackAndEveryPartialExit) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    const auto bytes = code(std::array<std::uint16_t,10U>{
+        0x2001U,0x6008U,0x3001U,0x6010U,0xf843U,0x0b04U,0x3001U,0x6020U,0x6835U,0xbe00U});
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    const auto function = jit->compileRegion(bytes, pc, pc, error); ASSERT_NE(function, nullptr) << error;
+    fil::mem::MemoryBus memory, oracle; GuardedWordPort first, second, ref_first, ref_second;
+    for (auto* bus : {&memory,&oracle}) {
+        ASSERT_TRUE(bus->mapRom(pc, bytes.size(), "guarded-writes")); ASSERT_TRUE(bus->loadBytes(pc, bytes));
+        ASSERT_TRUE(bus->mapRam(ram, 8U, "ram"));
+        bus->setReadFootprintTracking(false); bus->setWriteJournalTracking(false);
+    }
+    ASSERT_TRUE(memory.mapMmio(0x40001000U, 4U, first, "first"));
+    ASSERT_TRUE(memory.mapMmio(0x40002000U, 4U, second, "second"));
+    ASSERT_TRUE(oracle.mapMmio(0x40001000U, 4U, ref_first, "first"));
+    ASSERT_TRUE(oracle.mapMmio(0x40002000U, 4U, ref_second, "second"));
+    NativeRegionContext binding;
+    ASSERT_TRUE(memory.directReadWindow(ram, binding.ram_read)); ASSERT_TRUE(memory.directWriteWindow(ram, binding.ram_write));
+    ASSERT_TRUE(memory.directMmioWriteWord(0x40001000U, binding.mmio_write[0], binding.mmio_effects));
+    ASSERT_TRUE(memory.directMmioWriteWord(0x40002000U, binding.mmio_write[1], binding.mmio_effects));
+    CortexM4 reference(oracle);
+    {
+        CpuState state; state.r[15] = pc; const auto initial = state;
+        auto invalid = binding; invalid.cpu_state = &state; invalid.mmio_effects = {};
+        invalid.instruction_limit = 20U; invalid.cycle_limit = 100U; function(&invalid);
+        EXPECT_EQ(invalid.exit_reason, NativeRegionExit::invalid_state);
+        EXPECT_EQ(invalid.retired_count, 0U); EXPECT_TRUE(bitwiseEqual(state, initial));
+        EXPECT_EQ(first.writes, 0U); EXPECT_EQ(second.writes, 0U);
+    }
+    for (const auto blocked : {0U,1U,2U,3U})
+    for (const bool late_miss : {false,true})
+    for (const auto stall : {0U,3U})
+    for (std::uint32_t limit = 0U; limit <= 11U; ++limit)
+    for (std::uint64_t credit = 0U; credit <= 64U; ++credit) {
+        for (auto* port : {&first,&second,&ref_first,&ref_second}) { port->value = 0x87654321U; port->writes = 0U; }
+        first.blocked = (blocked & 1U) != 0U; second.blocked = (blocked & 2U) != 0U;
+        ASSERT_TRUE(memory.write32(ram, 0x12345678U)); ASSERT_TRUE(oracle.write32(ram, 0x12345678U));
+        CpuState state; state.r[15] = pc; state.r[1] = state.r[3] = 0x40001000U; state.r[2] = ram;
+        state.r[4] = 0x40002000U; state.r[6] = late_miss ? 0x40003000U : ram;
+        state.r[7] = 0xabcdef01U; state.r[8] = 0x87654321U; state.r[9] = 0x11223344U;
+        state.xpsr |= xpsr_c | xpsr_v | xpsr_q; reference.state() = state;
+        auto context = binding; context.cpu_state = &state; context.instruction_limit = limit; context.cycle_limit = credit;
+        context.sequential_fetch_stall = stall; context.nonsequential_fetch_stall = stall;
+        std::uint32_t retired = 0U; std::uint64_t cycles = 0U; NativeRegionExit reason;
+        for (;;) {
+            if (retired == limit) { reason = NativeRegionExit::instruction_budget; break; }
+            const auto next = reference.state().r[15];
+            if (next == pc + 18U || ((next == pc + 2U || next == pc + 8U) && (blocked & 1U))
+                || (next == pc + 14U && (blocked & 2U)) || (next == pc + 16U && late_miss)) {
+                // A device guard runs only after cycle admission. Insufficient
+                // credit therefore reports the ordinary budget exit first.
+                std::uint16_t pipeline = 0U; ASSERT_TRUE(reference.peekPredictableCycles(pipeline));
+                reason = next != pc + 18U && next != pc + 16U && pipeline + stall > credit - cycles
+                    ? NativeRegionExit::cycle_budget : NativeRegionExit::checked_instruction;
+                break;
+            }
+            std::uint16_t pipeline = 0U; ASSERT_TRUE(reference.peekPredictableCycles(pipeline));
+            const auto charge = pipeline + stall;
+            if (charge > credit - cycles) { reason = NativeRegionExit::cycle_budget; break; }
+            ASSERT_EQ(reference.stepFast().reason, StopReason::step_complete); ++retired; cycles += charge;
+        }
+        function(&context);
+        EXPECT_TRUE(bitwiseEqual(state, reference.state())) << blocked << '/' << late_miss << '/' << limit << '/' << credit;
+        EXPECT_EQ(context.retired_count, retired); EXPECT_EQ(context.retired_cycles, cycles);
+        EXPECT_EQ(context.exit_reason, reason) << blocked << '/' << late_miss << '/' << limit << '/' << credit;
+        EXPECT_EQ(first.value, ref_first.value); EXPECT_EQ(first.writes, ref_first.writes);
+        EXPECT_EQ(second.value, ref_second.value); EXPECT_EQ(second.writes, ref_second.writes);
+        EXPECT_EQ(memory.read32(ram).value(), oracle.read32(ram).value());
+        EXPECT_EQ(memory.sideEffectCheckpoint().mmio_generation, oracle.sideEffectCheckpoint().mmio_generation);
+        EXPECT_EQ(memory.sideEffectCheckpoint().mutation_sequence, oracle.sideEffectCheckpoint().mutation_sequence);
+        EXPECT_EQ(memory.sideEffectGeneration(), oracle.sideEffectGeneration());
+    }
+}
+
 TEST(NativeRegionTest, DirectMmioLoadsPublishExactEffectsAtEveryBudgetAndLaterGuardMiss) {
     if (!MicroJit::hostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t,8U>{
@@ -753,13 +852,13 @@ TEST(NativeRegionTest, DirectMmioLoadsPublishExactEffectsAtEveryBudgetAndLaterGu
     CortexM4 reference(oracle);
     NativeRegionContext binding;
     ASSERT_TRUE(memory.directReadWindow(ram, binding.ram_read)); ASSERT_TRUE(memory.directWriteWindow(ram, binding.ram_write));
-    ASSERT_TRUE(memory.directMmioReadWord(0x40020000U, binding.mmio_read[0], binding.mmio_read_effects));
-    ASSERT_TRUE(memory.directMmioReadWord(0x40020400U, binding.mmio_read[1], binding.mmio_read_effects));
+    ASSERT_TRUE(memory.directMmioReadWord(0x40020000U, binding.mmio_read[0], binding.mmio_effects));
+    ASSERT_TRUE(memory.directMmioReadWord(0x40020400U, binding.mmio_read[1], binding.mmio_effects));
     {
         CpuState state; state.r[15] = pc; state.r[1] = 0x40020000U;
         const auto initial = state; const auto checkpoint = memory.sideEffectCheckpoint();
         auto invalid = binding; invalid.cpu_state = &state;
-        invalid.instruction_limit = 10U; invalid.cycle_limit = 100U; invalid.mmio_read_effects = {};
+        invalid.instruction_limit = 10U; invalid.cycle_limit = 100U; invalid.mmio_effects = {};
         function(&invalid);
         EXPECT_EQ(invalid.exit_reason, NativeRegionExit::invalid_state);
         EXPECT_EQ(invalid.retired_count, 0U); EXPECT_TRUE(bitwiseEqual(state, initial));

@@ -1,6 +1,7 @@
 #include "fil/stm32g4/peripheral.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <limits>
 #include <utility>
@@ -91,6 +92,35 @@ bool DmaPeripheral::request(const std::uint32_t channel) {
         return false;
     }
     runChannelRequest(channel);
+    return true;
+}
+
+bool DmaPeripheral::directClearFlags(void* const context, const std::uint32_t value) noexcept {
+    auto& dma = *static_cast<DmaPeripheral*>(context);
+    // Each nibble contains GIF plus TCIF/HTIF/TEIF. Expand CGIF to all
+    // four bits, then clear GIF only for nibbles whose other flags are empty.
+    const auto active = UINT32_MAX >> (32U - dma.channel_count_ * 4U);
+    const auto clear = ((value & 0xeeeeeeeeU) | (value & 0x11111111U) * 15U) & active;
+    auto status = dma.registerValue(dma_isr) & ~clear;
+    const auto occupied = ((status >> 1U) | (status >> 2U) | (status >> 3U)) & 0x11111111U;
+    status &= ~(~occupied & 0x11111111U & active);
+    std::uint32_t levels = 0U;
+    for (std::uint32_t channel = 0U; channel < dma.channel_count_; ++channel) {
+        const auto flags = (status >> (channel * 4U)) & 0xeU;
+        const auto control = dma.registerValue(first_channel + channel * channel_stride);
+        if ((flags & control) != 0U) levels |= 1U << channel;
+    }
+    const auto previous_levels = dma.interruptLevelMask();
+    // Never introduce a pending interrupt into an unpublished native span.
+    if ((levels & ~previous_levels) != 0U) return false;
+    auto changed = previous_levels ^ levels;
+    if (changed != 0U && !dma.deviceLocalInterruptRouting()) return false;
+    dma.setRegister(dma_isr, status); dma.setRegister(dma_ifcr, 0U);
+    while (changed != 0U) {
+        const auto channel = static_cast<std::uint32_t>(std::countr_zero(changed));
+        dma.setInterruptLevel(channel, false);
+        changed &= changed - 1U;
+    }
     return true;
 }
 

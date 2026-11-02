@@ -576,7 +576,7 @@ TEST(PeripheralTest, DirectDmaStatusBindingUsesLiveStorageAndPreservesBusReadAcc
     ASSERT_TRUE(bus.mapMmio(0x40020000U, 0x1000U, router, "peripherals"));
     ASSERT_TRUE(bus.mapAlias(0x50000000U, 0x40020000U, 0x1000U, "alias"));
     fil::mem::MemoryBus::DirectMmioReadWord word;
-    fil::mem::MemoryBus::DirectMmioReadEffects effects;
+    fil::mem::MemoryBus::DirectMmioEffects effects;
     const auto checkpoint = bus.sideEffectCheckpoint();
     const auto generation = bus.sideEffectGeneration();
     ASSERT_TRUE(bus.directMmioReadWord(0x40020000U, word, effects));
@@ -588,9 +588,21 @@ TEST(PeripheralTest, DirectDmaStatusBindingUsesLiveStorageAndPreservesBusReadAcc
         EXPECT_EQ(word.address, 0x40020000U);
     }
     EXPECT_TRUE(router.unknownAccesses().empty());
+    fil::mem::MemoryBus::DirectMmioWriteWord write;
+    ASSERT_TRUE(bus.directMmioWriteWord(0x40020004U, write, effects));
+    ASSERT_NE(write.operation.execute, nullptr);
+    for (const auto address : {0x40020000U,0x40020005U,0x40020800U,0x50000004U}) {
+        EXPECT_FALSE(bus.directMmioWriteWord(address, write, effects));
+        EXPECT_EQ(write.address, 0x40020004U);
+    }
+    bus.setReversibleRamOnly(true);
+    EXPECT_FALSE(bus.directMmioWriteWord(0x40020004U, write, effects));
+    bus.setReversibleRamOnly(false);
     bus.setSharedMmioTrapping(true);
+    EXPECT_FALSE(bus.directMmioWriteWord(0x40020004U, write, effects));
     EXPECT_FALSE(bus.directMmioReadWord(0x40020000U, word, effects));
     bus.setSharedMmioTrapping(false); bus.setAllMmioTrapping(true);
+    EXPECT_FALSE(bus.directMmioWriteWord(0x40020004U, write, effects));
     EXPECT_FALSE(bus.directMmioReadWord(0x40020000U, word, effects));
     bus.setAllMmioTrapping(false);
     constexpr auto width = fil::mem::AccessSize::word;
@@ -611,6 +623,78 @@ TEST(PeripheralTest, DirectDmaStatusBindingUsesLiveStorageAndPreservesBusReadAcc
     const auto* storage = word.value; dma.reset();
     ASSERT_TRUE(bus.directMmioReadWord(0x40020000U, word, effects));
     EXPECT_EQ(word.value, storage); EXPECT_EQ(*storage, 0U);
+}
+
+TEST(PeripheralTest, GuardedDmaClearMatchesCheckedWritesAndRechecksLiveInterruptEnables) {
+    for (const auto channels : {1U,7U,8U}) {
+        fil::stm32g4::DmaPeripheral direct("DMA", channels), checked("DMA", channels);
+        auto operation = direct.directWriteWord(4U); ASSERT_NE(operation.execute, nullptr);
+        EXPECT_EQ(direct.directWriteWord(0U).execute, nullptr);
+        auto* status = const_cast<std::uint32_t*>(direct.directReadWord(0U));
+        auto* reference = const_cast<std::uint32_t*>(checked.directReadWord(0U));
+        std::uint32_t seed = 0xabcdef12U;
+        for (unsigned i = 0U; i < 2048U; ++i) {
+            seed = seed * 1664525U + 1013904223U; *status = *reference = seed;
+            seed = seed * 1664525U + 1013904223U;
+            ASSERT_TRUE(operation.execute(operation.context, seed));
+            ASSERT_TRUE(checked.write(4U, fil::mem::AccessSize::word, seed, {}));
+            EXPECT_EQ(*status, *reference) << channels << '/' << i;
+            EXPECT_EQ(direct.peekRegister(4U), checked.peekRegister(4U));
+        }
+        unsigned events = 0U;
+        direct.setInterruptLevelCallback([&](std::uint32_t, bool) { ++events; });
+        *status = 9U;
+        ASSERT_TRUE(direct.write(8U, fil::mem::AccessSize::word, 8U, {})); // Live TEIE after binding.
+        const auto before = events;
+        EXPECT_FALSE(operation.execute(operation.context, 15U));
+        EXPECT_EQ(*status, 9U); EXPECT_EQ(events, before);
+        ASSERT_TRUE(direct.write(4U, fil::mem::AccessSize::word, 15U, {}));
+        EXPECT_EQ(*status, 0U); EXPECT_EQ(events, before + 1U);
+        EXPECT_TRUE(operation.execute(operation.context, 0U)); // No level changes, so no callback is needed.
+        ASSERT_TRUE(direct.write(8U, fil::mem::AccessSize::word, 0U, {}));
+        EXPECT_TRUE(operation.execute(operation.context, 15U));
+    }
+}
+
+TEST(PeripheralTest, DeviceLocalDmaClearsDeassertInOrderAndObserverReplacementRevokesPermission) {
+    for (const auto channels : {1U,7U,8U}) {
+        fil::stm32g4::DmaPeripheral dma("DMA", channels);
+        std::array<std::uint32_t,64U> events{}; std::size_t count = 0U;
+        dma.setDeviceLocalInterruptLevelCallback([&](std::uint32_t line, bool asserted) {
+            events[count++] = line * 2U + (asserted ? 1U : 0U);
+        });
+        auto operation = dma.directWriteWord(4U); ASSERT_NE(operation.execute, nullptr);
+        auto* status = const_cast<std::uint32_t*>(dma.directReadWord(0U));
+        *status = 0x99999999U;
+        for (std::uint32_t channel = 0U; channel < channels; ++channel)
+            ASSERT_TRUE(dma.write(8U + channel * 20U, fil::mem::AccessSize::word, 8U, {}));
+        const auto start = count;
+        ASSERT_TRUE(operation.execute(operation.context, 0x11111111U));
+        EXPECT_EQ(count - start, channels);
+        for (std::uint32_t channel = 0U; channel < channels; ++channel) EXPECT_EQ(events[start + channel], channel * 2U);
+        const auto active = UINT32_MAX >> (32U - channels * 4U);
+        EXPECT_EQ(*status & active, 0U);
+        // An unexpected assertion is refused even with trusted routing.
+        *status |= 9U; const auto before = count;
+        EXPECT_FALSE(operation.execute(operation.context, 0U)); EXPECT_EQ(count, before);
+        EXPECT_EQ(*status & 15U, 9U);
+        ASSERT_TRUE(operation.execute(operation.context, 15U));
+        bool replace = true;
+        unsigned observed = 0U;
+        dma.setDeviceLocalInterruptLevelCallback([&](std::uint32_t, bool) {
+            if (replace) {
+                replace = false;
+                dma.setInterruptLevelCallback([&](std::uint32_t, bool) { ++observed; });
+            }
+        });
+        *status |= 9U;
+        ASSERT_TRUE(dma.write(8U, fil::mem::AccessSize::word, 8U, {}));
+        const auto observations = observed;
+        EXPECT_FALSE(operation.execute(operation.context, 15U));
+        EXPECT_EQ(observed, observations); EXPECT_EQ(*status & 15U, 9U);
+        ASSERT_TRUE(dma.write(4U, fil::mem::AccessSize::word, 15U, {}));
+        EXPECT_EQ(observed, observations + 1U);
+    }
 }
 
 TEST(PeripheralTest, DmaGlobalFlagClearDeassertsOnlySelectedChannel) {

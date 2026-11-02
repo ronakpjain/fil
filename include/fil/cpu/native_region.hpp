@@ -99,7 +99,8 @@ struct NativeRegionContext {
     mem::MemoryBus::DirectReadWindow ram_read{}, code_read{};
     mem::MemoryBus::DirectWriteWindow ram_write{};
     std::array<mem::MemoryBus::DirectMmioReadWord, 2U> mmio_read{};
-    mem::MemoryBus::DirectMmioReadEffects mmio_read_effects{};
+    std::array<mem::MemoryBus::DirectMmioWriteWord, 2U> mmio_write{};
+    mem::MemoryBus::DirectMmioEffects mmio_effects{};
 };
 
 using NativeRegionFunction = void (*)(NativeRegionContext*);

@@ -52,6 +52,7 @@ void RegisterPeripheral::setTraceSourcePrefix(const std::string_view prefix) {
 }
 
 void RegisterPeripheral::setInterruptLevelCallback(InterruptLevelCallback callback) {
+    interrupt_level_callback_device_local_ = false;
     interrupt_level_callback_ = std::move(callback);
     ++interrupt_level_callback_generation_;
     if (interrupt_level_callback_) {
@@ -59,6 +60,14 @@ void RegisterPeripheral::setInterruptLevelCallback(InterruptLevelCallback callba
             interrupt_level_callback_(line, interrupt_levels_[line]);
         }
     }
+}
+
+void RegisterPeripheral::setDeviceLocalInterruptLevelCallback(InterruptLevelCallback callback) {
+    const auto generation = interrupt_level_callback_generation_ + 1U;
+    setInterruptLevelCallback(std::move(callback));
+    // Initial level publication may reenter and replace the callback.
+    if (interrupt_level_callback_generation_ == generation)
+        interrupt_level_callback_device_local_ = true;
 }
 
 mem::BusFault RegisterPeripheral::accessFault(

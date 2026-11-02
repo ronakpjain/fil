@@ -2190,8 +2190,11 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
         return op.instruction.kind == NativeOp::load_word && !op.instruction.absolute
             && op.instruction.rn != 13U;
     };
+    const auto mmio_store = [](const NativeRegionOp& op) {
+        return op.instruction.kind == NativeOp::store_word && op.instruction.rn != 13U;
+    };
     const auto guard_address = [&](std::uint32_t width, bool write, bool literal, std::size_t miss,
-                                   bool allow_mmio = false) {
+                                   bool allow_mmio = false, bool save_cycles = false) {
         const auto window = [&](std::uint32_t binding, std::size_t next) {
             using Read = mem::MemoryBus::DirectReadWindow;
             using Write = mem::MemoryBus::DirectWriteWindow;
@@ -2203,7 +2206,27 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
             e.aluRR(7U, kEdx, kEax); e.jcc(7U, next);
             e.movR64M(kEax, ctx, bytes); e.movRR64(kR10, kEax); e.addR64R64(kR10, kEdx);
         };
-        if (write) window(off(offsetof(NativeRegionContext, ram_write)), miss);
+        if (write) {
+            const auto mmio = allow_mmio ? e.makeLabel() : miss;
+            const auto ready = allow_mmio ? e.makeLabel() : X86Emitter::no_label;
+            window(off(offsetof(NativeRegionContext, ram_write)), mmio);
+            if (allow_mmio) {
+                e.jmp(ready); e.bindLabel(mmio);
+                using Word = mem::MemoryBus::DirectMmioWriteWord;
+                using Operation = mem::MmioDevice::DirectWriteWord;
+                for (std::size_t slot = 0U; slot < 2U; ++slot) {
+                    const auto next = slot == 1U ? miss : e.makeLabel();
+                    const auto binding = off(offsetof(NativeRegionContext, mmio_write) + slot * sizeof(Word));
+                    e.aluRM(7U, kR10, ctx, binding + off(offsetof(Word, address))); e.jcc(5U, next);
+                    e.movR64M(kEax, ctx, binding + off(offsetof(Word, operation)) + off(offsetof(Operation, execute)));
+                    e.cmpR64Imm8(kEax, 0U); e.jcc(4U, next);
+                    if (save_cycles) e.movM64R(4U, 0U, cycles);
+                    e.leaR64(kR10, ctx, binding); e.bitR64Imm(5U, kR10, 63U); e.jmp(ready);
+                    if (slot == 0U) e.bindLabel(next);
+                }
+                e.bindLabel(ready);
+            }
+        }
         else {
             const auto second = e.makeLabel(), ready = e.makeLabel();
             const auto mmio = allow_mmio ? e.makeLabel() : miss;
@@ -2249,7 +2272,7 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
         }
         guard_address(nativeOpWidth(inst.kind), !nativeOpIsLoad(inst.kind), inst.absolute,
             miss == X86Emitter::no_label ? labels[index].checked : miss,
-            mmio_load(op));
+            mmio_load(op) || mmio_store(op), miss == X86Emitter::no_label && mmio_store(op));
     };
     const auto prepare_stack = [&](const NativeRegionOp& op, std::size_t index) {
         const auto bytes = op.stack.count() * 4U;
@@ -2293,18 +2316,19 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
         e.addR64R64(dirty, kEcx);
         e.bindLabel(unchanged);
     };
-    const auto memory_body = [&](const NativeRegionOp& op) {
+    const auto mmio_effect = [&] {
+        using Effects = mem::MemoryBus::DirectMmioEffects;
+        const auto effects = off(offsetof(NativeRegionContext, mmio_effects));
+        e.movR64M(kEdx, ctx, effects + off(offsetof(Effects, mmio_generation))); e.incrementM64(kEdx);
+        e.movR64M(kEdx, ctx, effects + off(offsetof(Effects, side_effect_generation))); e.incrementM64(kEdx);
+    };
+    const auto memory_body = [&](const NativeRegionOp& op, std::size_t miss, bool restore_cycles) {
         const auto& inst = op.instruction;
         if (nativeOpIsLoad(inst.kind)) {
             if (mmio_load(op)) {
                 const auto ordinary = e.makeLabel();
                 e.bitR64Imm(6U, kR10, 63U); e.jcc(3U, ordinary); // BTR reports the tag in CF.
-                using Effects = mem::MemoryBus::DirectMmioReadEffects;
-                const auto effects = off(offsetof(NativeRegionContext, mmio_read_effects));
-                e.movR64M(kEdx, ctx, effects + off(offsetof(Effects, mmio_generation)));
-                e.incrementM64(kEdx);
-                e.movR64M(kEdx, ctx, effects + off(offsetof(Effects, side_effect_generation)));
-                e.incrementM64(kEdx);
+                mmio_effect();
                 e.bindLabel(ordinary);
             }
             switch (inst.kind) {
@@ -2315,6 +2339,28 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
             default: e.movR32M(kEax, kR10, 0U); break;
             }
             storeGuest(e, offsets, inst.rd, kEax);
+        } else if (mmio_store(op)) {
+            const auto ordinary = e.makeLabel(), committed = e.makeLabel(), declined = e.makeLabel();
+            e.bitR64Imm(6U, kR10, 63U); e.jcc(3U, ordinary);
+            loadGuest(e, kEax, offsets, inst.rd);
+            // Preserve every caller-saved register retained by the native ABI.
+            // Six pushes keep SysV call alignment; the private frame slots stay
+            // untouched, including full-span charge and pending writeback.
+            for (const auto reg : {7U,6U,8U,9U,11U,10U}) e.pushReg(reg);
+            using Word = mem::MemoryBus::DirectMmioWriteWord;
+            using Operation = mem::MmioDevice::DirectWriteWord;
+            e.movRR(6U, kEax);
+            e.movR64M(7U, kR10, off(offsetof(Word, operation) + offsetof(Operation, context)));
+            e.movR64M(kEax, kR10, off(offsetof(Word, operation) + offsetof(Operation, execute)));
+            e.callReg(kEax); e.movzxEaxAl();
+            for (const auto reg : {10U,11U,9U,8U,6U,7U}) e.popReg(reg);
+            e.testRR(kEax, kEax); e.jcc(4U, declined);
+            mmio_effect(); e.jmp(committed);
+            e.bindLabel(declined);
+            if (restore_cycles) e.movR64M(cycles, 4U, 0U);
+            e.jmp(miss);
+            e.bindLabel(ordinary); store_memory(4U, inst.rd, 0U);
+            e.bindLabel(committed);
         } else store_memory(nativeOpWidth(inst.kind), inst.rd, 0U);
         if (op.address.writeback) {
             e.movR32M(kEax, 4U, 8U);
@@ -2354,7 +2400,7 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
         e.movRR64(cycles, kEax);
         if (op.stack.count() != 0U) stack_body(op);
         else if (op.flow == RegionFlow::next) {
-            if (nativeOpIsMemory(op.instruction.kind)) memory_body(op);
+            if (nativeOpIsMemory(op.instruction.kind)) memory_body(op, labels[index].checked, true);
             else if (!emitX86Op(e, offsets, op.instruction.integer, error)) return false;
         } else if (op.flow == RegionFlow::call || op.instruction.kind == NativeOp::blx_reg) {
             e.movM32Imm(cpu, offsets.r + 56U, op.fallthrough | 1U);
@@ -2516,7 +2562,7 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
             if (nativeOpIsMemory(op.instruction.kind)) {
                 misses[n] = e.makeLabel();
                 prepare_memory(op, index, misses[n]);
-                memory_body(op);
+                memory_body(op, misses[n], false);
             } else {
                 auto inst = op.instruction.integer;
                 if (dead_flags[n]) {

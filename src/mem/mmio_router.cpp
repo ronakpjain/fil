@@ -114,6 +114,12 @@ const std::uint32_t* MmioRouter::directReadWord(const std::uint32_t offset) cons
     return route ? route->device->directReadWord(offset - route->offset) : nullptr;
 }
 
+MmioDevice::DirectWriteWord MmioRouter::directWriteWord(const std::uint32_t offset) noexcept {
+    if ((offset & 3U) != 0U || !rangeFits(offset, 4U, window_size_)) return {};
+    const auto* route = find(offset, 4U);
+    return route ? route->device->directWriteWord(offset - route->offset) : DirectWriteWord{};
+}
+
 MemoryResult<std::uint64_t> MmioRouter::read(
     const std::uint32_t offset,
     const AccessSize size,

@@ -102,6 +102,22 @@ enum class MmioDomain {
 /** @brief Interface implemented by target peripheral register blocks. */
 class MmioDevice {
 public:
+    struct DirectWriteWord {
+        using Execute = bool (*)(void*, std::uint32_t) noexcept;
+        Execute execute{nullptr};
+        void* context{nullptr};
+    };
+    /** Guarded aligned word operation. False must leave every
+     * device field unchanged; true must exactly match the normal device write.
+     * The operation must inspect live state and must never throw.
+     * It may access device-owned state and deassert certified internal IRQ
+     * routes, with no CPU, bus, scheduler or observer access. It must never
+     * introduce pending interrupts: native bookkeeping is not yet published.
+     */
+    [[nodiscard]] virtual DirectWriteWord directWriteWord(std::uint32_t offset) noexcept {
+        static_cast<void>(offset);
+        return {};
+    }
     /** @brief Allows polymorphic destruction through the interface. */
     virtual ~MmioDevice() = default;
 
@@ -357,17 +373,26 @@ public:
         const std::uint32_t* value{nullptr};
         std::uint32_t address{0U};
     };
-    struct DirectMmioReadEffects {
+    struct DirectMmioEffects {
         std::uint64_t* mmio_generation{nullptr};
         std::uint64_t* side_effect_generation{nullptr};
     };
+    struct DirectMmioWriteWord {
+        MmioDevice::DirectWriteWord operation{};
+        std::uint32_t address{0U};
+    };
+    /** Borrow a guarded device write; identical lifetime and accounting rules
+     * to directMmioReadWord. Declines aliases, trapping and reversible RAM mode.
+     */
+    [[nodiscard]] bool directMmioWriteWord(std::uint32_t address, DirectMmioWriteWord& out,
+        DirectMmioEffects& effects) noexcept;
     /** Borrow an authoritative aligned MMIO word, without performing a read.
      * Aliases, traps and devices without pure storage decline unchanged.
      * Each actual read must increment both effects counters exactly once.
      * Bus mappings, devices and trapping modes must remain fixed while borrowed.
      */
     [[nodiscard]] bool directMmioReadWord(std::uint32_t address, DirectMmioReadWord& out,
-        DirectMmioReadEffects& effects) noexcept;
+        DirectMmioEffects& effects) noexcept;
     [[nodiscard]] bool directReadWindow(std::uint32_t probe, DirectReadWindow& out) const noexcept;
     /** Borrow a committed-write binding for writable, non-executable RAM.
      * Declines with output untouched unless read/store-footprint tracking and

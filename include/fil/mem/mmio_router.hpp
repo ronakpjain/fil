@@ -77,6 +77,7 @@ public:
     [[nodiscard]] std::string_view name() const noexcept override { return name_; }
 
     [[nodiscard]] const std::uint32_t* directReadWord(std::uint32_t offset) const noexcept override;
+    [[nodiscard]] DirectWriteWord directWriteWord(std::uint32_t offset) noexcept override;
 
     [[nodiscard]] MmioDomain domain(
         std::uint32_t offset, AccessSize size

@@ -176,18 +176,19 @@ Result<void> Stm32G4::mapDevices() {
 
 void Stm32G4::wireInterrupts() {
     std::uint32_t source = 0U;
-    const auto connect = [this, &source](RegisterPeripheral& peripheral, const auto irqs) {
+    const auto connect = [this, &source](RegisterPeripheral& peripheral, const auto irqs,
+                                       const bool device_local = false) {
         const std::uint32_t source_bit = std::uint32_t{1} << source++;
-        peripheral.setInterruptLevelCallback(
-            [this, irqs, source_bit](const std::uint32_t line, const bool asserted) {
-                if (line >= irqs.size()) return;
-                const std::uint16_t irq = irqs[line];
-                auto& sources = irq_sources_[irq];
-                if (asserted) sources |= source_bit;
-                else sources &= ~source_bit;
-                system_.setInterruptLine(irq, sources != 0U);
-            }
-        );
+        auto callback = [this, irqs, source_bit](const std::uint32_t line, const bool asserted) {
+            if (line >= irqs.size()) return;
+            const std::uint16_t irq = irqs[line];
+            auto& sources = irq_sources_[irq];
+            if (asserted) sources |= source_bit;
+            else sources &= ~source_bit;
+            system_.setInterruptLine(irq, sources != 0U);
+        };
+        if (device_local) peripheral.setDeviceLocalInterruptLevelCallback(std::move(callback));
+        else peripheral.setInterruptLevelCallback(std::move(callback));
     };
     constexpr std::array<std::uint16_t, 3> usart_irqs{37, 38, 39};
     for (std::size_t index = 0; index < usart_.size(); ++index) {
@@ -219,9 +220,11 @@ void Stm32G4::wireInterrupts() {
     for (std::size_t index = 0; index < fdcan_.size(); ++index) {
         connect(*fdcan_[index], fdcan_irqs[index]);
     }
-    connect(dma1_, std::array<std::uint16_t, 8>{11U, 12U, 13U, 14U, 15U, 16U, 17U, 96U});
+    // DMA channels use unshared IRQ lines. Their deassertions cannot introduce
+    // new pending edges through another peripheral sharing the same IRQ.
+    connect(dma1_, std::array<std::uint16_t, 8>{11U, 12U, 13U, 14U, 15U, 16U, 17U, 96U}, true);
     dma_interrupt_generations_[0] = dma1_.interruptLevelCallbackGeneration();
-    connect(dma2_, std::array<std::uint16_t, 8>{56U, 57U, 58U, 59U, 60U, 97U, 98U, 99U});
+    connect(dma2_, std::array<std::uint16_t, 8>{56U, 57U, 58U, 59U, 60U, 97U, 98U, 99U}, true);
     dma_interrupt_generations_[1] = dma2_.interruptLevelCallbackGeneration();
     connect(exti_, std::array<std::uint16_t, 7>{6U, 7U, 8U, 9U, 10U, 23U, 40U});
     for (std::size_t port = 0; port < gpio_.size(); ++port) {

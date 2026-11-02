@@ -339,7 +339,7 @@ Result<void> MemoryBus::materialize(const elf::ElfImage& image) {
 }
 
 bool MemoryBus::directMmioReadWord(const std::uint32_t address, DirectMmioReadWord& out,
-    DirectMmioReadEffects& effects) noexcept {
+    DirectMmioEffects& effects) noexcept {
     if ((address & 3U) != 0U || !validRange(address, 4U) || mmioTrapping()) return false;
     const auto* region = find(address);
     if (region == nullptr || region->info.kind != RegionKind::mmio || !region->info.readable
@@ -349,6 +349,18 @@ bool MemoryBus::directMmioReadWord(const std::uint32_t address, DirectMmioReadWo
         return false;
     out = {value, address};
     effects = {&mmio_generation_, &side_effect_generation_};
+    return true;
+}
+
+bool MemoryBus::directMmioWriteWord(const std::uint32_t address, DirectMmioWriteWord& out,
+    DirectMmioEffects& effects) noexcept {
+    if ((address & 3U) != 0U || !validRange(address, 4U) || mmioTrapping() || reversible_ram_only_) return false;
+    const auto* region = find(address);
+    if (region == nullptr || region->info.kind != RegionKind::mmio || !region->info.writable
+        || !region->containsRange(address, 4U)) return false;
+    const auto operation = region->device->directWriteWord(address - region->info.base);
+    if (operation.execute == nullptr) return false;
+    out = {operation, address}; effects = {&mmio_generation_, &side_effect_generation_};
     return true;
 }
 
