@@ -18,6 +18,7 @@ Options:
   --reps N                  repetitions per executable (default: 3)
   --cross-board-window-ns N  cross-board skew window (default: 100000; 0 = exact)
   --min-throughput X        required realtime ratio (default: above 1.0)
+  --min-speedup X           required speedup over --reference-binary
   -h, --help                show this help
 EOF
 }
@@ -48,11 +49,13 @@ duration_ms=5000
 reps=3
 cross_board_window_ns=100000
 min_throughput=
+min_speedup=
+speedup_requested=0
 threshold_requested=0
 
 while (($#)); do
     case $1 in
-        --binary|--reference-binary|--duration-ms|--reps|--min-throughput|--cross-board-window-ns)
+        --binary|--reference-binary|--duration-ms|--reps|--min-throughput|--min-speedup|--cross-board-window-ns)
             (($# >= 2)) || fail "$1 requires a value"
             option=$1
             value=$2
@@ -65,6 +68,7 @@ while (($#)); do
                     duration_ms=$((10#$value))
                     ;;
                 --min-throughput) min_throughput=$value; threshold_requested=1 ;;
+                --min-speedup) min_speedup=$value; speedup_requested=1 ;;
                 --cross-board-window-ns)
                     [[ $value =~ ^[0-9]+$ ]] || fail '--cross-board-window-ns must be a nonnegative integer'
                     cross_board_window_ns=$value ;;
@@ -89,6 +93,7 @@ while (($#)); do
             shift
             ;;
         --min-throughput=*) min_throughput=${1#*=}; threshold_requested=1; shift ;;
+        --min-speedup=*) min_speedup=${1#*=}; speedup_requested=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) fail "unrecognized argument: $1" ;;
     esac
@@ -98,6 +103,12 @@ if ((threshold_requested)); then
     [[ $min_throughput =~ ^[0-9]+([.][0-9]+)?$ ]] || fail '--min-throughput must be a positive number'
     awk -v value="$min_throughput" 'BEGIN { exit value > 0 ? 0 : 1 }' \
         || fail '--min-throughput must be a positive number'
+fi
+if ((speedup_requested)); then
+    [[ -n $reference_binary ]] || fail '--min-speedup requires --reference-binary'
+    [[ $min_speedup =~ ^[0-9]+([.][0-9]+)?$ ]] || fail '--min-speedup must be a positive number'
+    awk -v value="$min_speedup" 'BEGIN { exit value > 0 ? 0 : 1 }' \
+        || fail '--min-speedup must be a positive number'
 fi
 
 absolute_path() {
@@ -338,6 +349,12 @@ if [[ -n $reference_binary ]]; then
     speedup=$(awk -v r="$reference_median" -v c="$candidate_median" \
         'BEGIN { printf "%.3f", r / c }')
     printf 'Reference median: %.3fs; candidate speedup: %sx\n' "$reference_median" "$speedup"
+    # Compare unrounded measurements; display rounding must not pass the gate.
+    if [[ -n $min_speedup ]]; then
+        awk -v r="$reference_median" -v c="$candidate_median" -v minimum="$min_speedup" \
+            'BEGIN { exit r / c >= minimum ? 0 : 1 }' \
+            || fail "Candidate did not reach the required ${min_speedup}x speedup"
+    fi
 fi
 printf 'ADC decimation: 1; all six boards reached the time budget\n'
 printf 'Median: %.3fs; throughput: %sx realtime\n' "$candidate_median" "$throughput"
