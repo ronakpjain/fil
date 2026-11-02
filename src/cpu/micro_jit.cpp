@@ -2216,7 +2216,8 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
             e.bindLabel(ready);
         }
     };
-    const auto prepare_memory = [&](const NativeRegionOp& op, std::size_t index) {
+    const auto prepare_memory = [&](const NativeRegionOp& op, std::size_t index,
+                                    std::size_t miss = X86Emitter::no_label) {
         const auto& inst = op.instruction;
         if (inst.absolute) e.movR32Imm(kR10, inst.absolute_address);
         else {
@@ -2231,7 +2232,8 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
             if (op.address.writeback) e.movM32R(4U, 8U, kR10);
             if (!op.address.index) e.movRR(kR10, kEcx);
         }
-        guard_address(nativeOpWidth(inst.kind), !nativeOpIsLoad(inst.kind), inst.absolute, labels[index].checked);
+        guard_address(nativeOpWidth(inst.kind), !nativeOpIsLoad(inst.kind), inst.absolute,
+            miss == X86Emitter::no_label ? labels[index].checked : miss);
     };
     const auto prepare_stack = [&](const NativeRegionOp& op, std::size_t index) {
         const auto bytes = op.stack.count() * 4U;
@@ -2261,6 +2263,11 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
         if (width == 1U) e.movM8R(kR10, displacement, kEax);
         else if (width == 2U) e.movM16R(kR10, displacement, kEax);
         else e.movM32R(kR10, displacement, kEax);
+        if (width == 1U) {
+            e.addR64Imm8(dirty, 1U);
+            e.bindLabel(unchanged);
+            return;
+        }
         // Mark each nonzero difference byte, without cross-byte carries,
         // then sum the four 0/1 lanes. Counters retain byte-store semantics.
         e.movRR(kEcx, kEdx); e.aluRImm(4U, kEcx, 0x7f7f7f7fU);
@@ -2400,6 +2407,90 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
         e.bindLabel(slow);
         return true;
     };
+    constexpr std::size_t max_span_ops = 16U;
+    struct LinearSpan {
+        std::array<std::uint16_t, max_span_ops> ops{};
+        std::uint16_t length{0U};
+        std::uint32_t pipeline_cycles{0U};
+    };
+    std::array<LinearSpan, NativeRegionPlan::max_ops> spans{};
+    std::bitset<NativeRegionPlan::max_ops> covered;
+    for (std::uint16_t start = 0U; start < plan.count; ++start) {
+        if (covered[start] || loops[start].length != 0U) continue;
+        LinearSpan span;
+        std::bitset<NativeRegionPlan::max_ops> seen;
+        auto cursor = start;
+        while (cursor != NativeRegionOp::external && span.length < span.ops.size()
+            && !covered[cursor] && !seen[cursor]) {
+            const auto& op = plan.ops[cursor];
+            if (op.flow != RegionFlow::next || op.stack.count() != 0U) break;
+            seen.set(cursor);
+            span.ops[span.length++] = cursor;
+            span.pipeline_cycles += op.fallthrough_cycles;
+            const auto next = op.edges[0];
+            if (next != NativeRegionOp::external && plan.ops[next].pc != op.fallthrough) break;
+            cursor = next;
+        }
+        if (span.length < 3U) continue;
+        spans[start] = span;
+        for (std::size_t n = 0U; n < span.length; ++n) covered.set(span.ops[n]);
+    }
+    // Every internal fetch in a straight-line prefix is sequential. Fetch is
+    // deliberately unchanged until commitment, so a memory miss can derive the
+    // exact first-fetch mode and publish only its actually executed prefix.
+    const auto prefix_charge = [&](const NativeRegionOp& first, std::uint32_t length,
+                                   std::uint32_t pipeline) {
+        e.movR32M(kEax, ctx, off(offsetof(NativeRegionContext, sequential_fetch_stall)));
+        e.imulR64Imm32(kEdx, kEax, length - 1U);
+        const auto ready = e.makeLabel();
+        e.cmpR32Imm(fetch, first.pc); e.jcc(4U, ready);
+        e.movR32M(kEax, ctx, off(offsetof(NativeRegionContext, nonsequential_fetch_stall)));
+        e.bindLabel(ready); e.addR64R64(kEdx, kEax);
+        e.movR32Imm(kEax, pipeline); e.addR64R64(kEdx, kEax);
+    };
+    const auto linear_span = [&](const LinearSpan& span) {
+        const auto slow = e.makeLabel();
+        const auto& first = plan.ops[span.ops[0]];
+        e.movR32M(kEax, ctx, off(offsetof(NativeRegionContext, instruction_limit)));
+        e.aluRR(5U, kEax, count); e.cmpR32Imm(kEax, span.length); e.jcc(2U, slow);
+        prefix_charge(first, span.length, span.pipeline_cycles);
+        e.movRR64(kEax, cycles); e.addR64R64(kEax, kEdx); e.jcc(2U, slow);
+        e.cmpR64M(kEax, ctx, off(offsetof(NativeRegionContext, cycle_limit))); e.jcc(7U, slow);
+        // Stack slot zero is free in scalar spans; writeback uses slot eight.
+        // Retire counters remain unchanged until the full span or a miss stub.
+        e.movM64R(4U, 0U, kEax);
+        std::array<std::size_t, max_span_ops> misses;
+        misses.fill(X86Emitter::no_label);
+        for (std::size_t n = 0U; n < span.length; ++n) {
+            const auto index = span.ops[n];
+            const auto& op = plan.ops[index];
+            if (nativeOpIsMemory(op.instruction.kind)) {
+                misses[n] = e.makeLabel();
+                prepare_memory(op, index, misses[n]);
+                memory_body(op);
+            } else if (!emitX86Op(e, offsets, op.instruction.integer, error)) return false;
+        }
+        const auto& last = plan.ops[span.ops[span.length - 1U]];
+        e.movR64M(cycles, 4U, 0U); e.aluRImm(0U, count, span.length);
+        e.movR64Imm(fetch, (static_cast<std::uint64_t>(last.pc) << 32U) | last.fallthrough);
+        edge(last, false);
+        std::uint32_t pipeline = 0U;
+        for (std::size_t n = 0U; n < span.length; ++n) {
+            if (misses[n] != X86Emitter::no_label) {
+                e.bindLabel(misses[n]);
+                if (n != 0U) {
+                    prefix_charge(first, static_cast<std::uint32_t>(n), pipeline);
+                    e.addR64R64(cycles, kEdx); e.aluRImm(0U, count, static_cast<std::uint32_t>(n));
+                    const auto& previous = plan.ops[span.ops[n - 1U]];
+                    e.movR64Imm(fetch, (static_cast<std::uint64_t>(previous.pc) << 32U) | previous.fallthrough);
+                }
+                e.jmp(labels[span.ops[n]].checked);
+            }
+            pipeline += plan.ops[span.ops[n]].fallthrough_cycles;
+        }
+        e.bindLabel(slow);
+        return true;
+    };
     const auto predicated_pair = [&](const NativeRegionOp& op) {
         const auto slow = e.makeLabel();
         e.movR32M(kEax, ctx, off(offsetof(NativeRegionContext, instruction_limit)));
@@ -2439,6 +2530,7 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
         e.jcc(3U, labels[i].instructions);
         if (op.predicated_pair.valid && !predicated_pair(op)) return nullptr;
         if (loops[i].length != 0U && !fast_loop(static_cast<std::uint16_t>(i), loops[i])) return nullptr;
+        if (spans[i].length != 0U && !linear_span(spans[i])) return nullptr;
         if (op.stack.count() != 0U) {
             prepare_stack(op, i);
             if (op.stack.loadsPc()) {

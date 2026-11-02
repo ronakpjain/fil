@@ -124,6 +124,11 @@ partial cuts preserve exact instruction state. Actual indirect targets use a
 generated address switch. Scalar byte, halfword and word RAM accesses use
 invocation-scoped backing bindings and native range checks. Stores accumulate
 exact changed-byte accounting in a host register and publish it at exits.
+Straight-line integer/RAM spans share full-span budget admission and retirement
+bookkeeping. Every memory address is still checked before its access. A failed
+guard publishes the completed prefix's exact cycles, fetch state and diagnostic
+PC before checked execution; insufficient full-span credit uses per-instruction
+admission. Span selection is bounded and uses no execution history.
 Region memory operations also support shifted register offsets, subtraction,
 and pre/post-index writeback. Range and budget checks precede all effects;
 writeback follows the access, including source/destination aliases and active
