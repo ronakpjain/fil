@@ -129,6 +129,7 @@ bool MemoryBus::storeBackedWord(
     if constexpr (std::endian::native == std::endian::little) {
         std::uint32_t old_value = 0U;
         std::memcpy(&old_value, region.bytes.data() + offset, sizeof(old_value));
+        if (old_value == value) return true;
         std::uint32_t difference = old_value ^ value;
         // One low bit per changed byte. Propagation never crosses the low
         // bit of a byte, so adjacent bytes cannot create false mutations.
@@ -143,12 +144,19 @@ bool MemoryBus::storeBackedWord(
             if (write_journal_tracking_) {
                 // Keep byte-address order and exact old values for checkpoints,
                 // journal wrap and restoration, but inspect only dirty lanes.
+                // No callbacks or observers run inside a backed word store.
+                // Reserve the exact byte sequence locally, avoiding repeated
+                // tracking checks and publication for each dirty lane.
+                auto sequence = mutation_sequence_;
+                const auto address = region.info.base + static_cast<std::uint32_t>(offset);
                 while (changed != 0U) {
                     const auto shift = static_cast<std::uint32_t>(std::countr_zero(changed));
-                    recordMutation(region.info.base + static_cast<std::uint32_t>(offset)
-                        + shift / 8U, static_cast<std::uint8_t>(old_value >> shift), external);
+                    mutation_journal_[sequence % mutation_journal_capacity] = BackedMutation{
+                        address + shift / 8U, static_cast<std::uint8_t>(old_value >> shift), external};
+                    ++sequence;
                     changed &= changed - 1U;
                 }
+                mutation_sequence_ = sequence;
             } else {
                 mutation_sequence_ += changed_bytes;
             }
