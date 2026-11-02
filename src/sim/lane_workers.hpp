@@ -128,6 +128,17 @@ public:
     LaneWorkers(const LaneWorkers&) = delete;
     LaneWorkers& operator=(const LaneWorkers&) = delete;
 
+    // Called only by the coordinator while every worker is parked. The
+    // callback may borrow invocation-local state; release it on every exit.
+    void run(std::function<void(std::size_t)> work) {
+        work_ = std::move(work);
+        struct ClearWork {
+            std::function<void(std::size_t)>& work;
+            ~ClearWork() { work = {}; }
+        } clear{work_};
+        run();
+    }
+
     void run() {
         // Start expensive owners first. Costs are host-only scheduling hints;
         // every owner still executes exactly once and keeps its original ID.

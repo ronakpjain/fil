@@ -299,6 +299,7 @@ Result<WorldRunResult> World::runIndependent(const WorldRunOptions& options) {
     const auto deadline = options.duration_ns == 0U ? 0U
         : saturatingAdd(output.start_time_ns, options.duration_ns);
     bool failed = false;
+    bool control_yield = false;
     auto now = output.start_time_ns;
     auto end = now;
     auto domains = parallel ? std::unique_ptr<EventLoop::LaneDomainsScope>(
@@ -337,11 +338,12 @@ Result<WorldRunResult> World::runIndependent(const WorldRunOptions& options) {
                 output.boards[i].terminal = result.reason != BoardStopReason::instruction_budget;
             }
     };
-    auto workers = parallel ? std::make_unique<detail::LaneWorkers>(boards_.size(),
-        [&](const std::size_t i) {
-            auto lane = event_loop_.useLaneDomain(static_cast<EventOwner>(i));
-            execute_lane(i);
-        }, std::min(boards_.size(), detail::laneExecutionSlots()) - 1U) : nullptr;
+    if (parallel && !lane_workers_) {
+        lane_workers_ = std::make_unique<detail::LaneWorkers>(boards_.size(),
+            std::function<void(std::size_t)>{},
+            std::min(boards_.size(), detail::laneExecutionSlots()) - 1U);
+    }
+    auto* workers = parallel ? lane_workers_.get() : nullptr;
     output.parallel_lanes = parallel ? boards_.size() : 0U;
     const auto drain_shared = [&](const SimTimeNs at) {
         const auto events = event_loop_.runSharedEvents(at);
@@ -360,7 +362,10 @@ Result<WorldRunResult> World::runIndependent(const WorldRunOptions& options) {
             // so observers never run on a worker thread.
             const bool capture = trace_.enabled();
             if (capture) trace_.beginLaneCapture(boards_.size());
-            workers->run();
+            workers->run([&](const std::size_t i) {
+                auto lane = event_loop_.useLaneDomain(static_cast<EventOwner>(i));
+                execute_lane(i);
+            });
             if (capture) trace_.flushLaneCapture();
         } else {
             for (std::size_t i = 0; i < boards_.size(); ++i) {
@@ -400,9 +405,12 @@ Result<WorldRunResult> World::runIndependent(const WorldRunOptions& options) {
         now = end;
         output.end_time_ns = now;
         if (failed && options.stop_on_board_failure) break;
+        if (options.window_control && !options.window_control(now)) {
+            control_yield = true;
+            break;
+        }
     }
-    workers.reset();
-    if (domains) domains->close(); // Fallible merge while all workers are joined.
+    if (domains) domains->close(); // Fallible merge while all workers are parked.
     domains.reset();
     for (auto& command : pending) {
         auto owner = event_loop_.useOwner(shared_event_owner);
@@ -413,7 +421,7 @@ Result<WorldRunResult> World::runIndependent(const WorldRunOptions& options) {
     }
     output.event_callbacks = event_loop_.executedCallbacks() - initial_callbacks;
     if (failed) output.reason = WorldStopReason::board_failure;
-    else if (deadline != 0U && now >= deadline) output.reason = WorldStopReason::time_budget;
+    else if (control_yield || (deadline != 0U && now >= deadline)) output.reason = WorldStopReason::time_budget;
     else {
         const bool budget = std::any_of(output.boards.begin(), output.boards.end(), [](const auto& entry) {
             return entry.result.reason == BoardStopReason::instruction_budget;
@@ -467,6 +475,9 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
     if (options.cross_board_window_ns != 0U && !options.trace_instructions
         && !options.detect_spin && !options.enable_loop_batching) {
         return runIndependent(options);
+    }
+    if (options.window_control) {
+        return argumentError("window controls require independent scheduling without diagnostics");
     }
     const bool deferred_enabled = options.enable_ram_capsules;
 

@@ -1410,7 +1410,7 @@ ExitCode networkMonitorCommand(
     sim::SimTimeNs cross_board_window_ns = sim::WorldRunOptions{}.cross_board_window_ns;
     bool enable_parallel_lanes = sim::WorldRunOptions{}.enable_parallel_lanes;
     std::optional<std::uint64_t> duration_ns;
-    std::uint64_t refresh_ms = 1U;
+    sim::SimTimeNs refresh_ns = 1'000'000U;
     std::uint32_t adc_decimation = 1U;
     bool strict_mmio = false;
     bool enable_loop_batching = false;
@@ -1425,7 +1425,7 @@ ExitCode networkMonitorCommand(
     for (std::size_t index = 2U; index < args.size(); ++index) {
         const std::string_view option = args[index];
         if (option == "--max-instructions" || option == "--quantum"
-            || option == "--duration-ms" || option == "--refresh-ms"
+            || option == "--duration-ms" || option == "--refresh-ms" || option == "--refresh-us"
             || option == "--adc-decimation" || option == "--cross-board-window-ns") {
             const auto value = nextOptionValue(args, index);
             if (!value) {
@@ -1459,11 +1459,11 @@ ExitCode networkMonitorCommand(
             } else {
                 if (parsed.value() == 0U
                     || parsed.value() > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
-                    err << "fil: --refresh-ms must be between 1 and "
+                    err << "fil: " << option << " must be between 1 and "
                         << std::numeric_limits<std::int32_t>::max() << '\n';
                     return ExitCode::usage_error;
                 }
-                refresh_ms = parsed.value();
+                refresh_ns = parsed.value() * (option == "--refresh-us" ? 1'000ULL : 1'000'000ULL);
             }
         } else if (option == "--live-filter" || option == "--trace-type") {
             const auto value = nextOptionValue(args, index);
@@ -1556,7 +1556,7 @@ ExitCode networkMonitorCommand(
 
     const sim::SimTimeNs started_at = world.value()->eventLoop().now();
     const auto wall_start = std::chrono::steady_clock::now();
-    const std::uint64_t slice_ns = refresh_ms * 1'000'000ULL;
+    const std::uint64_t slice_ns = refresh_ns;
     bool stdin_eof = false;
     bool stop_requested = false;
     auto wall_elapsed_ns = [&]() -> std::uint64_t {
@@ -1752,6 +1752,33 @@ ExitCode networkMonitorCommand(
             if (!readProtocolInput()) return ExitCode::runtime_error;
         }
     }
+    const bool window_controls = binary_protocol && !wall_pacing
+        && cross_board_window_ns != 0U && !trace_instructions && !detect_spin
+        && !enable_loop_batching && max_instructions >= 50'000'000U
+        && (slice_ns % cross_board_window_ns == 0U || cross_board_window_ns % slice_ns == 0U);
+    bool window_controls_ok = true;
+    auto next_control_at = started_at + slice_ns;
+    const auto pollWindowControls = [&](const sim::SimTimeNs now) {
+        if (protocol_output_failed) return false;
+        if (now < next_control_at) return true;
+        next_control_at = now + slice_ns;
+        if (stdin_eof) return !stop_requested;
+        pollfd input{STDIN_FILENO, POLLIN, 0};
+        const auto ready = ::poll(&input, 1, 0);
+        if (ready < 0) {
+            if (errno == EINTR) return true;
+            err << "fil: failed to poll serve-network stdio input\n";
+            window_controls_ok = false;
+        } else if (ready > 0) {
+            if ((input.revents & (POLLERR | POLLNVAL)) != 0
+                && (input.revents & (POLLIN | POLLHUP)) == 0) {
+                window_controls_ok = closeProtocolInput();
+            } else if ((input.revents & (POLLIN | POLLHUP)) != 0) {
+                window_controls_ok = readProtocolInput();
+            }
+        }
+        return window_controls_ok && !stop_requested;
+    };
     while (!stop_requested) {
         const sim::SimTimeNs elapsed = world.value()->eventLoop().now() - started_at;
         if (duration_ns && elapsed >= *duration_ns) {
@@ -1760,7 +1787,10 @@ ExitCode networkMonitorCommand(
         }
 
         sim::WorldRunOptions options;
-        options.duration_ns = duration_ns ? std::min(slice_ns, *duration_ns - elapsed) : slice_ns;
+        // Control checks stay at refresh boundaries inside the independent
+        // scheduler, amortizing domain setup over a longer host invocation.
+        const auto invocation_ns = window_controls ? std::max<sim::SimTimeNs>(slice_ns, 10'000'000U) : slice_ns;
+        options.duration_ns = duration_ns ? std::min(invocation_ns, *duration_ns - elapsed) : invocation_ns;
         options.max_instructions_per_board = max_instructions;
         options.instruction_quantum = quantum;
         options.cross_board_window_ns = cross_board_window_ns;
@@ -1771,7 +1801,15 @@ ExitCode networkMonitorCommand(
         options.adc_decimation = adc_decimation;
         options.trace_instructions = trace_instructions;
         options.detect_spin = detect_spin;
+        if (window_controls) {
+            options.cross_board_window_ns = std::min(cross_board_window_ns, slice_ns);
+            options.window_control = pollWindowControls;
+        }
         auto result = world.value()->run(options);
+        if (!window_controls_ok) {
+            if (!expectations.empty()) expectation_evaluator.finish(world.value()->eventLoop().now());
+            return ExitCode::runtime_error;
+        }
         if (protocol_output_failed) {
             if (!expectations.empty()) expectation_evaluator.finish(world.value()->eventLoop().now());
             err << "fil: serve-network failed to write protocol trace\n";
@@ -2041,7 +2079,7 @@ void printHelp(std::ostream& out) {
         << "  --adc-decimation N (keep 1 of N continuous ADC scans)\n"
         << "  --inject-can BUS[@TIME_MS]:ID:HEXDATA\n\n"
         << "Watch-network options:\n"
-        << "  --duration-ms N --refresh-ms N --max-instructions N --quantum N\n"
+        << "  --duration-ms N --refresh-ms N --refresh-us N --max-instructions N --quantum N\n"
         << "  --adc-decimation N (keep 1 of N continuous ADC scans)\n"
         << "  --trace-type TYPE (alias: --live-filter; repeatable) --strict-mmio --trace-instr --detect-spin\n"
         << "  --control-stdin\n"
@@ -2051,7 +2089,7 @@ void printHelp(std::ostream& out) {
         << "  gpio BOARD PORT PIN 0|1|release, quit, or exit\n"
         << "\nServe-network options:\n"
         << "  --transport stdio (required; binary protocol on stdin/stdout)\n"
-        << "  --duration-ms N --refresh-ms N --max-instructions N --quantum N\n"
+        << "  --duration-ms N --refresh-ms N --refresh-us N --max-instructions N --quantum N\n"
         << "  --live-filter TYPE (repeatable), --trace-instr, --no-wall-pacing\n"
         << "  --adc-decimation N --strict-mmio --lenient-mmio --detect-spin\n"
         << "  See docs/serve_network.md for the versioned binary protocol.\n";

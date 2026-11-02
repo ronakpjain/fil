@@ -65,7 +65,8 @@ bool TraceRecorder::passesFilter(const std::string_view type) const noexcept {
 
 void TraceRecorder::beginLaneCapture(const std::size_t lane_count) {
     capturing_ = true;
-    lane_records_.assign(lane_count, {});
+    lane_records_.resize(lane_count);
+    for (auto& lane : lane_records_) lane.clear();
 }
 
 void TraceRecorder::flushLaneCapture() {
@@ -80,7 +81,6 @@ void TraceRecorder::flushLaneCapture() {
         for (auto& record : lane) pending.push_back(std::move(record));
         lane.clear();
     }
-    lane_records_.clear();
     std::stable_sort(pending.begin(), pending.end(), [](const TraceRecord& a, const TraceRecord& b) {
         return a.time_ns < b.time_ns;
     });

@@ -64,6 +64,19 @@ TEST(TraceRecorderTest, LaneCaptureMergesWorkerRecordsInTimeOrder) {
     EXPECT_EQ(trace.records().front().source, "lane0");
     EXPECT_EQ(observed.front().source, "lane0");
     EXPECT_EQ(trace.jsonLines().find("\"source\":\"hidden\""), std::string::npos);
+
+    // Reused buffers must not replay old records, including after lane shrink.
+    trace.beginLaneCapture(1U);
+    trace.flushLaneCapture();
+    EXPECT_EQ(observed.size(), 200U);
+    trace.beginLaneCapture(3U);
+    fil::sim::TraceRecorder::setCurrentLane(2U);
+    static_cast<void>(trace.record(2'000U, "new-window", "lane"));
+    fil::sim::TraceRecorder::clearCurrentLane();
+    trace.flushLaneCapture();
+    ASSERT_EQ(observed.size(), 201U);
+    EXPECT_EQ(observed.back().sequence, 200U);
+    EXPECT_EQ(observed.back().source, "new-window");
 }
 
 TEST(TraceRecorderTest, ObserverRecordSurvivesRecursiveAppend) {

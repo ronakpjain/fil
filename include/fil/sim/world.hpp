@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -22,6 +23,7 @@ class VirtualCanBus;
 }
 
 namespace fil::sim {
+namespace detail { class LaneWorkers; }
 
 /** @brief Stable reason a multi-board run reached its boundary. */
 enum class WorldStopReason : std::uint8_t {
@@ -46,6 +48,10 @@ struct WorldRunOptions {
     std::uint32_t adc_decimation{1}; ///< Keep 1 of N continuous ADC scans on every board.
     SimTimeNs cross_board_window_ns{100'000}; ///< Bounded-skew owner slices; zero selects exact reference scheduling.
     bool enable_parallel_lanes{true}; ///< Eligible unobserved owner lanes run concurrently; false is a validation reference.
+    /// Coordinator-only control at independent window boundaries, after trace
+    /// merge and shared delivery. Return false to yield with a time-budget stop.
+    /// Workers are parked; reentrant run/event dispatch is unsupported.
+    std::function<bool(SimTimeNs)> window_control;
 };
 
 /** @brief Accumulated outcome for one board in a world run. */
@@ -147,6 +153,7 @@ private:
     // Buses must outlive boards because FDCAN destructors detach their nodes.
     std::vector<std::unique_ptr<BusEntry>> buses_;
     std::vector<std::unique_ptr<BoardEntry>> boards_;
+    std::unique_ptr<detail::LaneWorkers> lane_workers_;
 };
 
 /** @brief Stable lowercase stop-reason name for CLI and trace output. */

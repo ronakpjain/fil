@@ -1045,6 +1045,22 @@ TEST(WorldTimeTest, PersistentLaneWorkersJoinEveryWindowAndPropagateExceptions) 
     EXPECT_EQ(counts, (std::vector<std::size_t>{12U, 12U, 12U}));
 }
 
+TEST(WorldTimeTest, ReusedLaneWorkersReleaseInvocationCallbacksAfterSuccessAndFailure) {
+    fil::sim::detail::LaneWorkers workers(4U, {});
+    std::array<unsigned, 4U> counts{};
+    for (unsigned invocation = 0; invocation < 4U; ++invocation) {
+        auto token = std::make_shared<unsigned>(invocation);
+        const auto work = [&, token](const auto index) {
+            ++counts[index];
+            if (*token == 1U && index == 2U) throw std::runtime_error("slice failure");
+        };
+        if (invocation == 1U) EXPECT_THROW(workers.run(work), std::runtime_error);
+        else EXPECT_NO_THROW(workers.run(work));
+        EXPECT_EQ(token.use_count(), 2U); // Only this scope and work retain it.
+        for (auto count : counts) EXPECT_EQ(count, invocation + 1U);
+    }
+}
+
 TEST(WorldTimeTest, PersistentLaneWorkersWakeAfterUnbalancedWindows) {
     std::vector<std::size_t> counts(3U, 0U);
     {
@@ -1206,6 +1222,56 @@ TEST(WorldTimeTest, ParallelOwnerWindowsMatchSerialOwnerExecution) {
                       serial.value()->board(name)->eventLoop().now(name == std::string_view{"alpha"} ? 0U : 1U));
         }
     }
+}
+
+TEST(WorldTimeTest, WindowControlsMatchExternalSlicesAndYieldAtTheRequestedBoundary) {
+    TempWorldTimeConfigs files;
+    const auto alpha = files.writeBoard("alpha.json", "alpha");
+    const auto beta = files.writeBoard("beta.json", "beta");
+    auto monitored = fil::sim::World::load(files.network({alpha, beta}));
+    auto sliced = fil::sim::World::load(files.network({alpha, beta}));
+    ASSERT_TRUE(monitored && sliced);
+    for (auto* world : {monitored.value().get(), sliced.value().get()}) {
+        ASSERT_TRUE(configureZeroWaitFixture(*world));
+        ASSERT_TRUE(configureSysTickIdleLoop(*world, "alpha", 3U));
+        ASSERT_TRUE(configureSysTickIdleLoop(*world, "beta", 7U));
+    }
+    const auto apply_control = [](fil::sim::World& world, const auto now) {
+        EXPECT_EQ(world.eventLoop().now(), now);
+        EXPECT_TRUE(world.board("alpha")->memory().write32(0xe000ed04U, 1U << 26U));
+        EXPECT_TRUE(world.board("beta")->memory().write32(0x20000100U, static_cast<std::uint32_t>(now)));
+    };
+    auto options = runOptions(100'000U);
+    options.cross_board_window_ns = 100'000U;
+    options.max_instructions_per_board = 1'000'000U;
+    std::uint64_t instructions = 0U;
+    std::uint64_t cycles = 0U;
+    for (unsigned slice = 1U; slice <= 3U; ++slice) {
+        const auto result = sliced.value()->run(options);
+        ASSERT_TRUE(result);
+        instructions += result.value().instructions;
+        cycles += result.value().cycles;
+        apply_control(*sliced.value(), slice * 100'000U);
+    }
+    unsigned calls = 0U;
+    options.duration_ns = 1'000'000U;
+    options.window_control = [&](const auto now) {
+        EXPECT_EQ(now, ++calls * 100'000U);
+        apply_control(*monitored.value(), now);
+        return calls < 3U;
+    };
+    const auto result = monitored.value()->run(options);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result.value().reason, fil::sim::WorldStopReason::time_budget);
+    EXPECT_EQ(result.value().end_time_ns, 300'000U);
+    EXPECT_EQ(result.value().instructions, instructions);
+    EXPECT_EQ(result.value().cycles, cycles);
+    EXPECT_EQ(calls, 3U);
+    for (const auto name : {"alpha", "beta"}) {
+        EXPECT_TRUE(fil::cpu::bitwiseEqual(monitored.value()->board(name)->cpu().state(),
+                                          sliced.value()->board(name)->cpu().state()));
+    }
+    EXPECT_EQ(monitored.value()->board("beta")->memory().read32(0x20000100U).value(), 300'000U);
 }
 
 TEST(WorldTimeTest, OwnerRamRunnerMatchesCheckedMmioAndInterruptsAfterWarmup) {

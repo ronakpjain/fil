@@ -23,14 +23,14 @@ def main():
     parser.add_argument('--binary', default=str(root / 'build-pgo/fil'))
     parser.add_argument('--network', default=str(root / 'configs/networks/per_vehicle.json'))
     parser.add_argument('--duration-ms', type=int, default=10000)
-    parser.add_argument('--refresh-ms', type=int, default=100)
+    parser.add_argument('--refresh-us', type=int, default=100)
     parser.add_argument('--reps', type=int, default=3)
     args = parser.parse_args()
-    if min(args.duration_ms, args.refresh_ms, args.reps) <= 0:
+    if min(args.duration_ms, args.refresh_us, args.reps) <= 0:
         parser.error('duration, refresh, and reps must be positive')
     for repetition in range(args.reps):
         command = [args.binary, 'serve-network', args.network, '--transport', 'stdio',
-                   '--duration-ms', str(args.duration_ms), '--refresh-ms', str(args.refresh_ms),
+                   '--duration-ms', str(args.duration_ms), '--refresh-us', str(args.refresh_us),
                    '--no-wall-pacing', '--strict-mmio', '--adc-decimation', '1']
         started = time.monotonic()
         # Popen's stdin stays open; communicate() would close the control channel.

@@ -411,6 +411,16 @@ TEST(WorldTest, StopsWatchNetworkFromStdin) {
     EXPECT_TRUE(err.str().empty());
 }
 
+TEST(WorldTest, NetworkMonitorRejectsZeroMicrosecondSlices) {
+    const std::string_view args[]{"serve-network", "missing.json", "--transport", "stdio",
+                                  "--refresh-us", "0"};
+    std::ostringstream out;
+    std::ostringstream err;
+    EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::usage_error);
+    EXPECT_NE(err.str().find("--refresh-us must be between 1 and"), std::string::npos);
+    EXPECT_TRUE(out.str().empty());
+}
+
 TEST(WorldTest, ServeNetworkRequiresAnExplicitSupportedTransport) {
     const std::string_view missing_transport[]{"serve-network", "network.json"};
     std::ostringstream missing_out;
@@ -536,7 +546,7 @@ TEST(WorldTest, ServeNetworkUsesBinaryStdioFramesForControlsAndTraces) {
     ScopedStdinPipe stdin_pipe;
     ASSERT_TRUE(stdin_pipe.redirect(request_bytes)) << "redirects test protocol requests to stdin";
     const std::string_view args[]{"serve-network", path, "--transport", "stdio",
-                                  "--no-wall-pacing", "--live-filter", "can_rx"};
+                                  "--no-wall-pacing", "--refresh-us", "100", "--live-filter", "can_rx"};
     std::ostringstream out(std::ios::out | std::ios::binary);
     std::ostringstream err;
     const auto result = fil::cli::run(args, out, err);

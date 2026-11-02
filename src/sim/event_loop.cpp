@@ -88,6 +88,7 @@ struct EventLoop::Impl {
     EventOwner lane_owner{shared_event_owner};
     std::uint64_t lane_next_id{1U};
     std::vector<std::unique_ptr<Impl>> lane_domains;
+    std::vector<std::unique_ptr<Impl>> spare_lane_domains;
     std::size_t lane_owner_count{0U};
     bool lane_domains_active{false};
     std::atomic<bool> lane_domains_orphaned{false};
@@ -541,7 +542,9 @@ struct EventLoop::Impl {
         std::vector<Transfer> transfers;
         transfers.reserve(live_events.size());
         for (std::size_t owner = 0; owner < owner_count; ++owner) {
-            auto domain = std::make_unique<Impl>();
+            auto domain = owner < spare_lane_domains.size()
+                ? std::move(spare_lane_domains[owner]) : nullptr;
+            if (!domain) domain = std::make_unique<Impl>();
             domain->lane_domain = true;
             domain->lane_owner = static_cast<EventOwner>(owner);
             domain->lane_next_id = next_lane_ids[owner];
@@ -689,7 +692,19 @@ struct EventLoop::Impl {
         maximum_same_time_events = merged_maximum;
         observation_barrier.swap(merged_observer_ptr);
         scheduler_observation_barrier.swap(merged_scheduler);
-        lane_domains.clear();
+        // Keep empty domain storage between short service invocations. No
+        // callbacks, observation hooks, or owner clocks survive the merge.
+        for (auto& domain : lane_domains) {
+            domain->slots.clear();
+            domain->free_slots.clear();
+            domain->live_events.clear();
+            domain->rebuildQueues();
+            domain->observation_barrier.reset();
+            domain->scheduler_observation_barrier = {};
+            domain->dense_owner_now.fill(std::nullopt);
+            domain->owner_now.clear();
+        }
+        spare_lane_domains = std::move(lane_domains);
         lane_owner_count = 0U;
         lane_domains_active = false;
         lane_domains_orphaned.store(false, std::memory_order_release);
