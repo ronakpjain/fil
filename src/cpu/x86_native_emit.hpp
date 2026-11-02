@@ -305,14 +305,6 @@ inline void storeGuest(X86Emitter& e, const Offsets& o, std::uint8_t guest, std:
     e.movM32R(kState, guestDisp(o, guest), tmp);
 }
 
-// Zero the accumulators used by the flag finishers. Emitted before the
-// flag-setting ALU op (xor overwrites flags; the op restores them).
-inline void beginFlags(X86Emitter& e) {
-    e.aluRR(6U, kEcx, kEcx); // xor ecx, ecx
-    e.aluRR(6U, kEdx, kEdx);
-    e.aluRR(6U, kR10, kR10);
-}
-
 // Rebuilds guest NZCV from an ADD/SUB result in eax into r8d. C comes from
 // CF (setnc for SUB: ARM C is NOT-borrow), V from OF, N/Z from the result
 // (N via the AH accumulator: eax is dead after the test/store). When
@@ -344,8 +336,6 @@ inline void endAddSub(X86Emitter& e, const Offsets& o, bool is_sub,
 inline void endLogic(X86Emitter& e, const Offsets& o, bool new_carry, std::uint8_t rd,
                      bool writeback = true) {
     if (writeback) e.movM32R(kState, guestDisp(o, rd), kEax);
-    e.aluRR(6U, kEdx, kEdx);
-    e.aluRR(6U, kR10, kR10);
     e.testRR(kEax, kEax);
     e.setcc(8U, kEdx); // N
     e.setcc(4U, kR10); // Z
@@ -460,7 +450,6 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
     case MicroOp::sub_imm: {
         const bool is_sub = op.op == MicroOp::sub_imm;
         loadGuest(e, kEax, o, op.rn);
-        if (op.set_flags) beginFlags(e);
         e.aluRImm(is_sub ? 5U : 0U, kEax, op.imm);
         if (op.set_flags) endAddSub(e, o, is_sub, op.rd, true);
         else storeGuest(e, o, op.rd, kEax);
@@ -470,7 +459,6 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
     case MicroOp::cmn_imm: {
         const bool is_sub = op.op == MicroOp::cmp_imm;
         loadGuest(e, kEax, o, op.rn);
-        beginFlags(e);
         e.aluRImm(is_sub ? 5U : 0U, kEax, op.imm);
         endAddSub(e, o, is_sub, 0U, false);
         return true;
@@ -479,7 +467,6 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
     case MicroOp::cmn_reg: {
         const bool is_sub = op.op == MicroOp::cmp_reg;
         loadGuest(e, kEax, o, op.rn);
-        beginFlags(e);
         e.aluRM(is_sub ? 5U : 0U, kEax, kState, guestDisp(o, op.rm));
         endAddSub(e, o, is_sub, 0U, false);
         return true;
@@ -521,7 +508,6 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
     case MicroOp::sub_reg: {
         const bool is_sub = op.op == MicroOp::sub_reg;
         loadGuest(e, kEax, o, op.rn);
-        if (op.set_flags) beginFlags(e); // xor flags die in the add/sub below
         e.aluRM(is_sub ? 5U : 0U, kEax, kState, guestDisp(o, op.rm));
         if (op.set_flags) endAddSub(e, o, is_sub, op.rd, true);
         else storeGuest(e, o, op.rd, kEax);
@@ -549,7 +535,6 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
     case MicroOp::sub_shift: {
         const bool is_sub = op.op == MicroOp::sub_shift;
         loadGuest(e, kEax, o, op.rn);
-        if (op.set_flags) beginFlags(e); // zeros die in shift/alu below; add sets fresh flags
         if (!shiftValue(e, kEdx, o, op.rm, op.shift, op.shift_amount, error)) return false;
         e.aluRR(is_sub ? 5U : 0U, kEax, kEdx);
         if (op.set_flags) endAddSub(e, o, is_sub, op.rd, true);
