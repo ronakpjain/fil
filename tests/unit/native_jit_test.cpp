@@ -269,6 +269,43 @@ TEST(NativeJitTest, AdmittedCyclePrefixMatchesCheckedInterpreterAtEveryCut) {
     EXPECT_EQ(biased.admitted_cycle_mode, 0U);
 }
 
+TEST(NativeJitTest, AdmissionBoolIsNormalizedForMixedAndTraceKernels) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
+    constexpr std::uint32_t pc = 0x08000000U;
+    const auto decoded = decode16(0x3001U); ASSERT_TRUE(decoded); // ADDS r0,#1
+    const MicroSource source{*decoded, pc, 2U};
+    NativeBlock block; ASSERT_TRUE(buildNativeBlock(std::span(&source, 1U), block).ok);
+    NativeTraceOp op; op.decoded = *decoded; op.raw = decoded->raw;
+    op.pc = pc; op.size = 2U; op.execution_cycles = 1U; op.expected_next_pc = pc + 2U;
+    NativeTracePlan plan; std::string error;
+    ASSERT_TRUE(buildNativeTrace(std::span(&op, 1U), plan, error)) << error;
+    auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    const auto mixed = jit->compileNative(block, error); ASSERT_NE(mixed, nullptr) << error;
+    const auto trace = jit->compileNativeTrace(plan, error); ASSERT_NE(trace, nullptr) << error;
+    const std::uint32_t cost = 1U;
+    const std::array<std::uint32_t, 2> prefix{0U, cost};
+    for (const auto function : {mixed, trace}) {
+        for (const auto credit : {0U, 1U}) {
+            CpuState state; state.r[15] = pc; state.r[0] = 42U; state.xpsr = xpsr_t;
+            fil::mem::MemoryBus bus;
+            NativeExecutionContext context{&state, &bus, 1U, credit};
+            context.charged_cycles = &cost; context.charged_cycles_count = 1U;
+            context.admitted_cycle_prefix = prefix.data();
+            context.admitted_cycle_prefix_count = prefix.size();
+            // GCC's sanitized validator can return false in AL while retaining
+            // a context pointer in EAX's upper bytes. Full-register tests must
+            // not turn that false result into aggregate admission.
+            ASSERT_EQ(nativeAdmittedCyclePrefixValid(&context), credit != 0U);
+            function(&context);
+            EXPECT_EQ(context.retired_count, credit);
+            EXPECT_EQ(context.retired_cycles, credit);
+            EXPECT_EQ(state.r[0], 42U + credit);
+            EXPECT_EQ(state.r[15], pc + credit * 2U);
+            EXPECT_EQ(context.admitted_cycle_mode, 0U);
+        }
+    }
+}
+
 TEST(NativeJitTest, CycleKernelSelectionPreservesGuardAndHelperExitPrefixes) {
     if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
     constexpr std::uint32_t pc = 0x08003000U, ram = 0x20000000U;

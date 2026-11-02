@@ -1386,6 +1386,7 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
     e.movRR64(7U, kCtx);
     e.movR64Imm(kEax, reinterpret_cast<std::uintptr_t>(&nativeAdmittedCyclePrefixValid));
     e.callReg(kEax);
+    e.movzxEaxAl(); // The scalar bool ABI leaves EAX's upper bytes undefined.
     e.movM32R(kCtx, kAdmittedMode, kEax);
     e.testRR(kEax, kEax); e.jcc(4U, checked_cost_table);
     e.movR64M(kCosts, kCtx, ctx_off(offsetof(NativeExecutionContext, admitted_cycle_prefix)));
@@ -1548,6 +1549,7 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
     e.movM32R(kCtx, kCycles, kScratch);
     e.movM32Imm(kCtx, kCycles + 4U, 0U);
     e.bindLabel(skip_prefix_publish);
+    e.movM32Imm(kCtx, kAdmittedMode, 0U);
     e.addRsp16(); e.popReg(15U); e.popReg(14U); e.popReg(13U); e.popReg(12U); e.popReg(3U); e.ret();
     if (!e.patchBranches(error)) { impl_->native_cache.pop_back(); return nullptr; }
     code = std::move(e.code);
@@ -1660,6 +1662,7 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     e.movRR64(7U, ctx);
     e.movR64Imm(kEax, reinterpret_cast<std::uintptr_t>(&nativeAdmittedCyclePrefixValid));
     e.callReg(kEax);
+    e.movzxEaxAl(); // Do not mistake stale pointer bits for a true admission.
     e.movM32R(ctx, kAdmittedMode, kEax);
     e.testRR(kEax, kEax); e.jcc(4U, checked_cost_table);
     e.movR64M(costs, ctx, off(offsetof(NativeExecutionContext, admitted_cycle_prefix)));

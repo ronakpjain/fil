@@ -259,6 +259,10 @@ public:
         u8(static_cast<std::uint8_t>(0x90U | (cc & 15U)));
         u8(modrm(3U, 0U, r));
     }
+    // SysV bool results define AL only, not the rest of EAX.
+    void movzxEaxAl() {
+        u8(0x0FU); u8(0xB6U); u8(0xC0U);
+    }
     // movzx eax, ah: zero-extends the AH flag accumulator. Never takes a
     // REX prefix (AH is only encodable without one); callers use eax/ah
     // solely as a dead scratch pair here.
