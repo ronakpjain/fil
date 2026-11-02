@@ -50,21 +50,23 @@ NativeStackResult nativeStackTransferPrepared(NativeExecutionContext* c, std::ui
         footprint = c->memory_bus->readFootprint();
     std::array<std::uint32_t, 16> values;
     // Reuse the trace's direct-read window when it covers the whole frame: the
-    // window is only published with read-footprint tracking off, so a plain
-    // copy is identical to the checked bulk helper but skips its lookup.
-    bool fast_loaded = false;
+    // window is only published with read-footprint tracking off. Validate the
+    // return target before committing any registers, then load directly from
+    // the window instead of copying the frame into a temporary and back.
+    const std::uint8_t* frame = nullptr;
     if (c->fast_read_base != nullptr) {
         const std::uint64_t off = static_cast<std::uint64_t>(start) - c->fast_read_begin;
         if (off + bytes <= c->fast_read_size) {
-            std::memcpy(values.data(), c->fast_read_base + off, static_cast<std::size_t>(bytes));
-            fast_loaded = true;
+            frame = c->fast_read_base + off;
         }
     }
-    if (!fast_loaded
-        && !c->memory_bus->tryFastReadWords(start, count, values.data(), {mem::AccessType::data_read, pc}))
-        return NativeStackResult::memory_declined;
+    if (frame == nullptr) {
+        if (!c->memory_bus->tryFastReadWords(start, count, values.data(), {mem::AccessType::data_read, pc}))
+            return NativeStackResult::memory_declined;
+        frame = reinterpret_cast<const std::uint8_t*>(values.data());
+    }
     if (loads_pc) {
-        target = values[pc_slot];
+        std::memcpy(&target, frame + pc_slot * 4U, sizeof(target));
         if ((target & 0xfffffff0U) == 0xfffffff0U || (target & 1U) == 0U) {
             if (footprint) c->memory_bus->restoreReadFootprint(*footprint);
             return NativeStackResult::memory_declined;
@@ -76,7 +78,11 @@ NativeStackResult nativeStackTransferPrepared(NativeExecutionContext* c, std::ui
         }
     }
     const auto ordinary_count = count - (loads_pc ? 1U : 0U);
-    for (std::uint32_t n = 0U; n < ordinary_count; ++n) s.r[plan.reg(n)] = values[n];
+    for (std::uint32_t n = 0U; n < ordinary_count; ++n) {
+        std::uint32_t value;
+        std::memcpy(&value, frame + n * 4U, sizeof(value));
+        s.r[plan.reg(n)] = value;
+    }
     s.writeRegister(13U, old_sp + static_cast<std::uint32_t>(bytes));
     if (loads_pc) s.r[15] = target & ~1U;
     return alternate_return ? NativeStackResult::dynamic_return : NativeStackResult::success;
