@@ -122,7 +122,10 @@ void MemoryBus::recordMutation(
     }
 }
 
-bool MemoryBus::storeBackedWord(
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((always_inline))
+#endif
+inline bool MemoryBus::storeBackedWord(
     Region& region, const std::size_t offset, const std::uint32_t value,
     const bool external
 ) noexcept {
