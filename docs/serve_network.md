@@ -12,32 +12,8 @@ human-readable summary and optional JSONL trace file.
 
 ```bash
 ./build/fil serve-network configs/networks/per_vehicle.json \
-  --transport stdio --refresh-ms 1 --live-filter can_tx > network.filn
+  --transport stdio --refresh-ms 1 --live-filter can_tx
 ```
-
-Stdout must be a pipe to a protocol client or a redirected file. Terminal output
-is rejected because these frames contain binary control bytes. For human-readable
-terminal traces, use `fil watch-network NETWORK` instead. A finite capture can use
-`--duration-ms 10000 > network.filn`; elapsed wall time may exceed the requested
-simulated duration when simulation or output is slower than real time.
-
-For faster-than-real-time PER execution, build the trained Release binary with
-`make pgo`, then disable pacing and use longer service slices:
-
-```bash
-./build-pgo/fil serve-network configs/networks/per_vehicle.json \
-  --transport stdio --duration-ms 10000 --no-wall-pacing --refresh-ms 100 \
-  --strict-mmio --adc-decimation 1 > network.filn
-```
-
-The board configs load the six ELF files from `../PER/monorepo/firmware/output`.
-The 100 ms refresh interval amortizes scheduler setup, but also means controls
-are applied only at those slice boundaries. The cross-board synchronization
-window remains at its default 100 microseconds. Throughput depends on the host
-and output consumer. Run `python3 tools/bench_serve_network.py` to measure three
-10-second captures with the control pipe kept open; it validates the six-board
-HELLO, trace output, and successful duration END, and requires every run to
-exceed real time. Timings include startup and compilation.
 
 The service sends a `HELLO` frame after loading the network, then streams selected
 trace records and replies to client requests. Trace filtering follows
