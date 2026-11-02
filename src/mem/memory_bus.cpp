@@ -136,7 +136,9 @@ bool MemoryBus::storeBackedWord(
         difference |= difference >> 2U;
         difference |= difference >> 1U;
         std::uint32_t changed = difference & 0x01010101U;
-        const auto changed_bytes = static_cast<std::uint64_t>(std::popcount(changed));
+        // Each byte is now exactly 0 or 1. A horizontal byte sum avoids a
+        // general popcount (and its software helper on portable x86 builds).
+        const auto changed_bytes = static_cast<std::uint64_t>((changed * 0x01010101U) >> 24U);
         if (changed_bytes != 0U) {
             if (write_journal_tracking_) {
                 // Keep byte-address order and exact old values for checkpoints,
