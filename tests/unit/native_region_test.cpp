@@ -126,6 +126,130 @@ TEST(NativeRegionTest, LinkedProgramKeepsRegistersFlagsMemoryAndBudgetsAcrossWin
     EXPECT_EQ(jit->compilations(), 3U); // all entries were emitted before any execution
 }
 
+TEST(NativeRegionTest, CheckedServicesResumeWithPublishedStateAndExactCumulativeBudgets) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    std::array<std::uint16_t, 266U> words; words.fill(0xbe00U);
+    words[0] = 0x2003U; words[1] = 0x6008U; // MOVS r0,3; STR r0,[r1]
+    words[2] = 0x6822U; words[3] = 0x3201U; // checked MMIO LDR r2,[r4]; ADD r2,1
+    words[4] = 0xe0faU; // B window 1
+    words[256] = 0x4350U; // checked MULS r0,r2
+    words[257] = 0x3001U; words[258] = 0x6008U; words[259] = 0xbf00U;
+    const auto bytes = code(words);
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    const auto program = jit->compileProgram(bytes, pc, error); ASSERT_TRUE(program) << error;
+    fil::mem::MemoryBus memory, oracle;
+    RegionPort port, reference_port;
+    for (auto* bus : {&memory, &oracle}) {
+        ASSERT_TRUE(bus->mapRom(pc, bytes.size(), "services")); ASSERT_TRUE(bus->loadBytes(pc, bytes));
+        ASSERT_TRUE(bus->mapRam(ram, 32U, "data"));
+        ASSERT_TRUE(bus->mapMmio(0x40000000U, 16U, bus == &memory ? port : reference_port, "port"));
+        bus->setReadFootprintTracking(false); bus->setWriteJournalTracking(false);
+    }
+    CortexM4 checked(memory), reference(oracle);
+    NativeRegionContext binding;
+    ASSERT_TRUE(memory.directReadWindow(ram, binding.ram_read));
+    ASSERT_TRUE(memory.directWriteWindow(ram, binding.ram_write));
+    struct Service { CortexM4& cpu; fil::mem::MemoryBus& memory; std::uint64_t mutation; };
+    for (const auto stalls : {std::array<std::uint32_t,2>{0U,0U},
+                             std::array<std::uint32_t,2>{2U,4U}})
+    for (std::uint32_t limit = 0U; limit <= 12U; ++limit)
+    for (std::uint64_t credit = 0U; credit <= 65U; ++credit) {
+        ASSERT_TRUE(memory.write32(ram, 0xdeadbeefU)); ASSERT_TRUE(oracle.write32(ram, 0xdeadbeefU));
+        CpuState state; state.r[15] = pc; state.r[1] = ram; state.r[4] = 0x40000000U;
+        state.r[2] = 0xdeadbeefU; state.r[13] = state.msp = ram + 32U;
+        state.xpsr |= xpsr_c | xpsr_v | xpsr_q;
+        checked.state() = state; reference.state() = state;
+        Service service{checked, memory, memory.sideEffectCheckpoint().mutation_sequence};
+        auto context = binding; context.cpu_state = &checked.state();
+        context.instruction_limit = limit; context.cycle_limit = credit;
+        context.sequential_fetch_stall = stalls[0]; context.nonsequential_fetch_stall = stalls[1];
+        context.checked_context = &service;
+        context.checked_step = +[](NativeRegionContext* ctx) noexcept -> bool {
+            auto& svc = *static_cast<Service*>(ctx->checked_context);
+            EXPECT_EQ(ctx->cpu_state, &svc.cpu.state());
+            const auto next = ctx->cpu_state->r[15];
+            if (next == pc + 4U || next == pc + 512U) {
+                EXPECT_EQ(ctx->cpu_state->r[0], 3U);
+                EXPECT_EQ(svc.memory.read32(ram).value(), 3U);
+                EXPECT_EQ(svc.memory.sideEffectCheckpoint().mutation_sequence, svc.mutation + 4U);
+            } else {
+                EXPECT_EQ(next, pc + 520U);
+                EXPECT_EQ(ctx->cpu_state->r[0], 4U);
+                EXPECT_EQ(svc.memory.read32(ram).value(), 4U);
+                EXPECT_EQ(svc.memory.sideEffectCheckpoint().mutation_sequence, svc.mutation + 5U);
+                return false;
+            }
+            std::uint16_t pipeline = 0U;
+            if (!svc.cpu.peekPredictableCycles(pipeline)) return false;
+            const auto charge = pipeline + (ctx->have_fetch && next == ctx->fetch_end
+                ? ctx->sequential_fetch_stall : ctx->nonsequential_fetch_stall);
+            if (charge > ctx->cycle_limit - ctx->retired_cycles) return false;
+            const auto step = svc.cpu.stepFast();
+            EXPECT_EQ(step.reason, StopReason::step_complete);
+            ++ctx->retired_count; ctx->retired_cycles += charge;
+            ctx->have_fetch = true; ctx->fetch_end = next + step.instruction_size;
+            return true;
+        };
+        std::uint32_t retired = 0U, checked_count = 0U, fetch_end = 0U;
+        std::uint64_t cycles = 0U; bool have = false;
+        NativeRegionExit reason;
+        for (;;) {
+            if (retired == limit) { reason = NativeRegionExit::instruction_budget; break; }
+            const auto next = reference.state().r[15];
+            if (next == pc + 520U) { reason = NativeRegionExit::checked_instruction; break; }
+            std::uint16_t pipeline = 0U; ASSERT_TRUE(reference.peekPredictableCycles(pipeline));
+            const auto charge = pipeline + stalls[have && next == fetch_end ? 0U : 1U];
+            const bool service_op = next == pc + 4U || next == pc + 512U;
+            if (charge > credit - cycles) {
+                reason = service_op ? NativeRegionExit::checked_instruction : NativeRegionExit::cycle_budget;
+                break;
+            }
+            const auto step = reference.stepFast(); ASSERT_EQ(step.reason, StopReason::step_complete);
+            ++retired; checked_count += service_op; cycles += charge;
+            have = true; fetch_end = next + step.instruction_size;
+        }
+        program->entryFor(pc)(&context);
+        EXPECT_TRUE(bitwiseEqual(checked.state(), reference.state())) << limit << '/' << credit;
+        EXPECT_EQ(context.retired_count, retired); EXPECT_EQ(context.retired_cycles, cycles);
+        EXPECT_EQ(context.checked_count, checked_count); EXPECT_EQ(context.exit_reason, reason);
+        EXPECT_EQ(context.have_fetch, have); EXPECT_EQ(context.fetch_end, fetch_end);
+        EXPECT_EQ(memory.read32(ram).value(), oracle.read32(ram).value());
+        EXPECT_EQ(memory.sideEffectCheckpoint().mutation_sequence, oracle.sideEffectCheckpoint().mutation_sequence);
+        EXPECT_EQ(memory.sideEffectGeneration(), oracle.sideEffectGeneration());
+        EXPECT_EQ(port.reads, reference_port.reads);
+    }
+}
+
+TEST(NativeRegionTest, CheckedServicesCanRetireAndStopOrLeaveAnItBoundary) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    for (const auto first : {0x4350U,0xbf08U}) for (const bool resume : {false,true}) {
+        const auto bytes = code(std::array<std::uint16_t,2U>{static_cast<std::uint16_t>(first),0xbe00U});
+        const auto function = jit->compileRegion(bytes, pc, pc, error); ASSERT_NE(function, nullptr);
+        fil::mem::MemoryBus memory;
+        ASSERT_TRUE(memory.mapRom(pc, bytes.size(), "checked-stop")); ASSERT_TRUE(memory.loadBytes(pc, bytes));
+        CortexM4 cpu(memory); cpu.state().r[15] = pc; cpu.state().r[0] = 7U; cpu.state().r[2] = 3U;
+        struct Service { CortexM4& cpu; bool resume; } service{cpu, resume};
+        NativeRegionContext context; context.cpu_state = &cpu.state();
+        context.instruction_limit = 1U; context.cycle_limit = 100U;
+        context.checked_context = &service;
+        context.checked_step = +[](NativeRegionContext* ctx) noexcept {
+            auto& svc = *static_cast<Service*>(ctx->checked_context);
+            const auto step = svc.cpu.stepFast();
+            ctx->retired_count += step.instructions; ctx->retired_cycles += step.cycles;
+            ctx->have_fetch = true; ctx->fetch_end = step.instruction_address + step.instruction_size;
+            return svc.resume;
+        };
+        function(&context);
+        EXPECT_EQ(context.retired_count, 1U); EXPECT_EQ(context.checked_count, 1U);
+        EXPECT_EQ(context.retired_cycles, 1U); EXPECT_EQ(cpu.state().r[15], pc + 2U);
+        EXPECT_EQ(context.exit_reason, resume && first != 0xbf08U
+            ? NativeRegionExit::external_edge : NativeRegionExit::checked_instruction);
+        EXPECT_EQ(cpu.state().it_state != 0U, first == 0xbf08U);
+        EXPECT_EQ(cpu.state().r[0], first == 0x4350U ? 21U : 7U);
+    }
+}
+
 TEST(NativeRegionTest, FormsBothConditionalEdgesAndARealBackedgeWithoutUnrolling) {
     const auto bytes = code(std::array<std::uint16_t, 4>{0x3001U,0x3901U,0xd1fcU,0xbe00U});
     NativeRegionPlan plan;

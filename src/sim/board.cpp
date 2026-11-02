@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -2307,6 +2308,81 @@ void Board::prepareNativePrograms() {
 #endif
 }
 
+struct Board::NativeServiceState {
+    Board& board;
+    std::optional<SimTimeNs> deadline;
+    std::uint64_t frequency, flash_generation;
+    std::optional<cpu::FastStepResult> stop;
+    std::exception_ptr exception;
+};
+
+bool Board::nativeCheckedStep(cpu::NativeRegionContext* const context) noexcept {
+    auto& service = *static_cast<NativeServiceState*>(context->checked_context);
+    auto& board = service.board;
+    try {
+        if (context->retired_count >= context->instruction_limit
+            || context->retired_cycles > context->cycle_limit) return false;
+        std::uint16_t pipeline = 0U;
+        if (!board.cpu_->peekPredictableCycles(pipeline)) return false;
+        // FLASH_ACR can change during a checked store. The modeled LATENCY
+        // field is three bits; reserve its worst post-write fetch charge before
+        // any effects, and charge only the actual checked step afterwards.
+        constexpr std::uint64_t maximum_flash_stall = 7U;
+        if (pipeline + maximum_flash_stall > context->cycle_limit - context->retired_cycles)
+            return false;
+        // Admission keeps this prefix strictly before every owner event. Only
+        // advance the already retired prefix here: events scheduled by this
+        // checked instruction are drained after the native frame returns.
+        const auto pending = context->retired_cycles - board.span_accounted_cycles_;
+        if (pending != 0U) {
+            static_cast<void>(board.advanceTime(pending));
+            board.span_accounted_cycles_ = context->retired_cycles;
+        }
+        board.have_last_fetch_ = context->have_fetch;
+        board.last_fetch_end_ = context->fetch_end;
+        const auto step = board.stepSingleWithFetchTiming(false);
+        context->retired_count += step.instructions;
+        context->retired_cycles += step.cycles;
+        context->have_fetch = board.have_last_fetch_;
+        context->fetch_end = board.last_fetch_end_;
+        if (step.reason != cpu::StopReason::step_complete) {
+            service.stop = step;
+            return false;
+        }
+        if (board.blockBoundaryPending()
+            || board.memory_.executionGeneration() != board.program_execution_generation_
+            || board.peripherals_->rcc().systemClockHz() != service.frequency
+            || board.peripherals_->flash().acrGeneration() != service.flash_generation
+            || board.memory_.readFootprintTracking() || board.memory_.writeJournalTracking()) return false;
+        auto horizon = service.deadline;
+        if (const auto event = board.event_loop_->nextScheduledTime(board.event_loop_->activeOwner());
+            event && (!horizon || *event < *horizon)) horizon = event;
+        const auto now = board.event_loop_->now();
+        if (horizon && *horizon <= now) return false;
+        const auto systick = board.system_->cyclesUntilSysTickInterrupt();
+        if (systick && *systick == 0U) return false;
+        auto credit = systick ? *systick - 1U : std::numeric_limits<std::uint64_t>::max();
+        if (horizon && *horizon - now <= std::numeric_limits<std::uint64_t>::max() / service.frequency) {
+            const auto numerator = (*horizon - now) * service.frequency - 1U;
+            credit = std::min(credit, numerator >= board.time_fraction_
+                ? (numerator - board.time_fraction_) / nanoseconds_per_second : 0U);
+        }
+        credit = std::min<std::uint64_t>(credit,
+            std::numeric_limits<std::uint16_t>::max() - board.span_accounted_cycles_);
+        // The checked step may have scheduled an event inside its own charge.
+        // It is already retired, just as in checked execution. Leave its charge
+        // pending for the scheduler, without running that event in native code.
+        if (credit < step.cycles) return false;
+        context->cycle_limit = board.span_accounted_cycles_ + credit;
+        return true;
+    } catch (...) {
+        // Generated sections have no C++ unwind metadata. Carry exceptions back
+        // through the ordinary native epilogue before rethrowing on the host.
+        service.exception = std::current_exception();
+        return false;
+    }
+}
+
 std::optional<cpu::FastStepResult> Board::stepNativeLocal(
     const std::size_t max_instructions, const std::optional<SimTimeNs> deadline) {
     if (max_instructions < 2U || blockBoundaryPending()) return std::nullopt;
@@ -2351,11 +2427,15 @@ std::optional<cpu::FastStepResult> Board::stepNativeLocal(
     const auto probe = sp == 0U ? 0U : sp - 1U;
     static_cast<void>(memory_.directReadWindow(probe, context.ram_read));
     static_cast<void>(memory_.directWriteWindow(probe, context.ram_write));
+    NativeServiceState service{*this, deadline, frequency, flash.acrGeneration(), {}, {}};
+    context.checked_context = &service;
+    context.checked_step = &Board::nativeCheckedStep;
     function(&context);
-    if (context.retired_count == 0U) return std::nullopt;
+    if (service.exception) std::rethrow_exception(service.exception);
+    if (context.retired_count == 0U && !service.stop) return std::nullopt;
     have_last_fetch_ = context.have_fetch;
     last_fetch_end_ = context.fetch_end;
-    cpu::FastStepResult result;
+    cpu::FastStepResult result = service.stop.value_or(cpu::FastStepResult{});
     result.instructions = context.retired_count;
     result.cycles = static_cast<std::uint16_t>(context.retired_cycles);
     result.instruction_address = cpu_->state().instruction_address;
@@ -2369,7 +2449,8 @@ std::optional<cpu::FastStepResult> Board::stepNativeLocal(
             result.raw = (static_cast<std::uint32_t>(first) << 16U) | bytes[2] | (bytes[3] << 8U);
     }
     auto& stats = cpu_->mutableJitStats();
-    ++stats.native_executions; stats.native_instructions += context.retired_count;
+    ++stats.native_executions;
+    stats.native_instructions += context.retired_count - context.checked_count;
     return result;
 }
 

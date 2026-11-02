@@ -317,6 +317,8 @@ private:
     void prepareNativePrograms();
     [[nodiscard]] std::optional<cpu::FastStepResult> stepNativeLocal(
         std::size_t max_instructions, std::optional<SimTimeNs> deadline);
+    struct NativeServiceState;
+    static bool nativeCheckedStep(cpu::NativeRegionContext*) noexcept;
     [[nodiscard]] std::optional<cpu::FastStepResult> stepCommittedLocal(
         std::size_t max_instructions, std::optional<SimTimeNs> deadline);
     [[nodiscard]] std::optional<ConcurrentStepResult> stepMemoizedLocal(

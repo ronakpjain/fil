@@ -64,6 +64,7 @@ enum class NativeRegionExit : std::uint32_t {
  * The caller supplies stable flash fetch costs for the executable backing.
  */
 struct NativeRegionContext {
+    using CheckedStep = bool (*)(NativeRegionContext*) noexcept;
     CpuState* cpu_state{nullptr};
     std::uint32_t instruction_limit{0U};
     std::uint64_t cycle_limit{0U};
@@ -73,6 +74,13 @@ struct NativeRegionContext {
     std::uint32_t retired_count{0U};
     std::uint64_t retired_cycles{0U};
     NativeRegionExit exit_reason{NativeRegionExit::none};
+    // Called only after complete architectural and memory publication at a
+    // checked exit. May retire checked work, update credit/fetch state, and
+    // request native resumption. Must catch exceptions and retain all code,
+    // CPU and backing storage until this invocation returns.
+    CheckedStep checked_step{nullptr};
+    void* checked_context{nullptr};
+    std::uint32_t checked_count{0U};
     // Invocation-scoped bindings to authoritative backed memory, not retained
     // lookup results. Publish with MemoryBus's checked binding APIs while its
     // mapping/tracking modes stay fixed. Empty bindings force checked exits.
@@ -111,5 +119,10 @@ private:
  * instruction can be a resumption point; an uncompiled PC exits unchanged.
  */
 [[nodiscard]] bool nativeRegionEntryValid(NativeRegionContext*) noexcept;
+
+/** Invoke a checked service and validate progress before native resumption.
+ * Unlike entry validation this retains cumulative retirement accounting.
+ */
+[[nodiscard]] bool nativeRegionContinue(NativeRegionContext*) noexcept;
 
 } // namespace fil::cpu

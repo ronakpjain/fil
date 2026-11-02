@@ -134,8 +134,14 @@ MMIO, aliases and accesses outside the bindings exit before effects. The x86-64
 owner-window scheduler uses these programs with journaling and read-footprint
 tracking disabled for committed execution. An executable backing change
 discards the image's native sections and recompiles from current bytes.
-System/IT/FP instructions return checked exits. The scheduler advances retired
-cycles before the next checked operation, preserving MMIO observation time.
+Unsupported operations enter an optional checked service after registers,
+flags, retirement state and RAM accounting have been published. Safe
+continuations reload the native ABI in the same invocation. The owner service
+advances the retired prefix before a checked operation, preserving MMIO
+observation time, and rederives credit after it. Interrupts, executable writes,
+clock changes and unsafe CPU states return control to the scheduler. Events
+newly due during a checked operation are drained after the native frame returns;
+captured C++ exceptions are likewise rethrown on the host.
 Differential tests cover architectural state, memory, timing, executable
 writes, and partial instruction and cycle budgets.
 

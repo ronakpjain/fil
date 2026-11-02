@@ -2091,6 +2091,7 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
     X86Emitter e;
     e.nzcv = nzcv;
     const auto early = e.makeLabel(), publish = e.makeLabel(), done = e.makeLabel();
+    const auto reload = e.makeLabel();
     const auto indirect = e.makeLabel(), indirect_external = e.makeLabel();
     struct Labels { std::size_t entry, instructions, credit, checked; };
     std::array<Labels, NativeRegionPlan::max_ops> labels;
@@ -2101,12 +2102,14 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
     e.movRR64(ctx, 7U);
     e.movR64Imm(kEax, reinterpret_cast<std::uintptr_t>(&nativeRegionEntryValid));
     e.callReg(kEax); e.movzxEaxAl(); e.testRR(kEax, kEax); e.jcc(4U, early);
+    e.bindLabel(reload);
     e.movR64M(cpu, ctx, off(offsetof(NativeRegionContext, cpu_state)));
     e.movRR64(kState, cpu);
     e.movR32M(nzcv, cpu, offsets.xpsr);
     e.movR32Imm(dirty, 0U);
     e.aluRImm(4U, nzcv, kFlagN | kFlagZ | kFlagC | kFlagV);
-    e.movR32Imm(count, 0U); e.movR32Imm(cycles, 0U);
+    e.movR32M(count, ctx, off(offsetof(NativeRegionContext, retired_count)));
+    e.movR64M(cycles, ctx, off(offsetof(NativeRegionContext, retired_cycles)));
     e.movR32M(fetch, ctx, off(offsetof(NativeRegionContext, fetch_end)));
     const auto fetch_ready = e.makeLabel();
     e.cmpM8Imm8(ctx, off(offsetof(NativeRegionContext, have_fetch)), 0U); e.jcc(5U, fetch_ready);
@@ -2503,6 +2506,17 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
     e.movM8Imm8(ctx, off(offsetof(NativeRegionContext, have_fetch)), 1U);
     e.movRR64(kEax, fetch); e.shR64Imm(5U, kEax, 32U); e.movM32R(cpu, offsets.addr, kEax);
     e.bindLabel(done);
+    // Every live guest value and dirty-byte counter is authoritative before a
+    // service can observe it. The service returns into this same host frame;
+    // reloading the common ABI also works after a tail transfer from another
+    // program window. No compiler entry validation resets cumulative counts.
+    e.movR32M(kEax, ctx, off(offsetof(NativeRegionContext, exit_reason)));
+    e.cmpR32Imm(kEax, static_cast<std::uint32_t>(NativeRegionExit::checked_instruction));
+    e.jcc(5U, early);
+    e.movRR64(7U, ctx);
+    e.movR64Imm(kEax, reinterpret_cast<std::uintptr_t>(&nativeRegionContinue));
+    e.callReg(kEax); e.movzxEaxAl(); e.testRR(kEax, kEax);
+    e.jcc(5U, reload);
     e.bindLabel(early);
     e.addRsp16();
     for (const auto reg : {10U,5U,15U,14U,13U,12U,3U}) e.popReg(reg);

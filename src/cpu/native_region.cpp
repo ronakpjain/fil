@@ -126,10 +126,9 @@ bool buildNativeRegionWindow(const std::span<const std::uint8_t> bytes,
     return buildRegion(bytes, base, window_pc, out, error, window_bytes);
 }
 
-bool nativeRegionEntryValid(NativeRegionContext* context) noexcept {
+namespace {
+bool regionStateValid(const NativeRegionContext* context) noexcept {
     if (context == nullptr) return false;
-    context->retired_count = 0U;
-    context->retired_cycles = 0U;
     const auto* state = context->cpu_state;
     const auto read_valid = [](const mem::MemoryBus::DirectReadWindow& view) {
         return view.size == 0U || view.bytes != nullptr;
@@ -138,11 +137,35 @@ bool nativeRegionEntryValid(NativeRegionContext* context) noexcept {
     const bool bindings_valid = read_valid(context->ram_read) && read_valid(context->code_read)
         && (write.size == 0U || (write.bytes != nullptr && write.mutation_sequence != nullptr
             && write.side_effect_generation != nullptr));
-    const bool valid = bindings_valid && state != nullptr && (state->r[15] & 1U) == 0U && !state->halted
+    return bindings_valid && state != nullptr && (state->r[15] & 1U) == 0U && !state->halted
         && state->thumb && (state->xpsr & xpsr_t) != 0U && state->it_state == 0U
         && !state->pending_exception && !state->pending_exc_return;
+}
+} // namespace
+
+bool nativeRegionEntryValid(NativeRegionContext* context) noexcept {
+    if (context == nullptr) return false;
+    context->retired_count = 0U;
+    context->retired_cycles = 0U;
+    context->checked_count = 0U;
+    const auto valid = regionStateValid(context);
     context->exit_reason = valid ? NativeRegionExit::none : NativeRegionExit::invalid_state;
     return valid;
+}
+
+bool nativeRegionContinue(NativeRegionContext* context) noexcept {
+    if (context == nullptr || context->exit_reason != NativeRegionExit::checked_instruction
+        || context->checked_step == nullptr) return false;
+    const auto count = context->retired_count;
+    const auto cycles = context->retired_cycles;
+    const auto* cpu = context->cpu_state;
+    const auto resume = context->checked_step(context);
+    if (context->retired_count > count) context->checked_count += context->retired_count - count;
+    if (!resume) return false;
+    return context->cpu_state == cpu && context->retired_count > count
+        && context->retired_count <= context->instruction_limit
+        && context->retired_cycles >= cycles && context->retired_cycles <= context->cycle_limit
+        && regionStateValid(context);
 }
 
 } // namespace fil::cpu
