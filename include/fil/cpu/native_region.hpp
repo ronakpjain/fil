@@ -47,6 +47,14 @@ struct NativeRegionPlan {
 [[nodiscard]] bool buildNativeRegion(std::span<const std::uint8_t> bytes,
     std::uint32_t base, std::uint32_t entry_pc, NativeRegionPlan& out, std::string& error);
 
+/** Decode every aligned entry in a bounded code window, including entries
+ * after checked instructions and the second halfword of wide instructions.
+ * The backing span may extend beyond the window for a final wide fetch.
+ */
+[[nodiscard]] bool buildNativeRegionWindow(std::span<const std::uint8_t> bytes,
+    std::uint32_t base, std::uint32_t window_pc, std::uint32_t window_bytes,
+    NativeRegionPlan& out, std::string& error);
+
 enum class NativeRegionExit : std::uint32_t {
     none, instruction_budget, cycle_budget, checked_instruction, external_edge, invalid_state
 };
@@ -73,6 +81,31 @@ struct NativeRegionContext {
 };
 
 using NativeRegionFunction = void (*)(NativeRegionContext*);
+
+/** Eagerly linked executable image. Tables describe every code window;
+ * execution never inserts entries, records target history, or evicts code.
+ * The compiling MicroJit must outlive this object and every invocation.
+ */
+class NativeProgram {
+public:
+    static constexpr std::uint32_t window_bytes = NativeRegionPlan::max_ops * 2U;
+    static constexpr std::size_t max_windows = 1024U;
+    NativeProgram(const NativeProgram&) = delete;
+    NativeProgram& operator=(const NativeProgram&) = delete;
+    [[nodiscard]] NativeRegionFunction entryFor(std::uint32_t pc) const noexcept {
+        if ((pc & 1U) != 0U || pc < base_ || pc - base_ >= size_) return nullptr;
+        return entries_[(pc - base_) / window_bytes];
+    }
+    [[nodiscard]] std::uint32_t base() const noexcept { return base_; }
+    [[nodiscard]] std::uint32_t size() const noexcept { return size_; }
+
+private:
+    friend class MicroJit;
+    NativeProgram() = default;
+    std::uint32_t base_{0U}, size_{0U};
+    std::array<NativeRegionFunction, max_windows> entries_{};
+    std::array<void*, max_windows> resumes_{};
+};
 
 /** Checked once before entering the compiled address switch. Any compiled
  * instruction can be a resumption point; an uncompiled PC exits unchanged.

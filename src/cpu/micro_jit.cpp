@@ -810,7 +810,7 @@ struct MicroJit::Impl {
     std::size_t used{0};
     bool sealed{false};
 
-    static constexpr std::size_t kArenaBytes = 4U * 1024U * 1024U;
+    static constexpr std::size_t kArenaBytes = 32U * 1024U * 1024U;
 
     ~Impl() {
         if (base) munmap(base, capacity);
@@ -2048,10 +2048,40 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
 
 NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t> bytes,
     const std::uint32_t base, const std::uint32_t entry_pc, std::string& error) {
-#if defined(FIL_ENABLE_MICRO_JIT) && FIL_ENABLE_MICRO_JIT && defined(FIL_MICRO_JIT_X86_64) && !defined(_WIN32)
     NativeRegionPlan plan;
     if (!buildNativeRegion(bytes, base, entry_pc, plan, error)) return nullptr;
+    void* resume = nullptr;
+    return compileRegionPlan(plan, nullptr, resume, error);
+}
+
+std::unique_ptr<NativeProgram> MicroJit::compileProgram(
+    const std::span<const std::uint8_t> bytes, const std::uint32_t base, std::string& error) {
+    if (bytes.empty() || (base & 1U) != 0U || (bytes.size() & 1U) != 0U
+        || bytes.size() > NativeProgram::max_windows * NativeProgram::window_bytes
+        || bytes.size() > (std::uint64_t{1U} << 32U) - base) {
+        error = "native-program: invalid executable image";
+        return nullptr;
+    }
+    std::unique_ptr<NativeProgram> program(new NativeProgram);
+    program->base_ = base;
+    program->size_ = static_cast<std::uint32_t>(bytes.size());
+    for (std::uint32_t offset = 0U; offset < bytes.size(); offset += NativeProgram::window_bytes) {
+        NativeRegionPlan plan;
+        const auto size = std::min(NativeProgram::window_bytes, program->size_ - offset);
+        if (!buildNativeRegionWindow(bytes, base, base + offset, size, plan, error)) return nullptr;
+        const auto index = offset / NativeProgram::window_bytes;
+        program->entries_[index] = compileRegionPlan(plan, program.get(), program->resumes_[index], error);
+        if (program->entries_[index] == nullptr) return nullptr;
+    }
+    error.clear();
+    return program;
+}
+
+NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
+    const NativeProgram* program, void*& resume, std::string& error) {
+#if defined(FIL_ENABLE_MICRO_JIT) && FIL_ENABLE_MICRO_JIT && defined(FIL_MICRO_JIT_X86_64) && !defined(_WIN32)
     std::lock_guard lock(impl_->mutex);
+    const auto entry_pc = plan.entry_pc;
     using namespace x86detail;
     constexpr std::uint32_t ctx = 13U, cpu = 12U, nzcv = 3U, dirty = 15U;
     constexpr std::uint32_t count = 11U, cycles = 5U, fetch = 14U;
@@ -2103,7 +2133,17 @@ NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t>
                 if (reg < uses.size()) ++uses[reg];
         }
     }
+    // Every linked window uses one register ABI so tail transfers preserve
+    // live guest state, flags and budgets without a host exit or spill.
+    if (program != nullptr) {
+        for (std::size_t guest = 0U; guest < 3U; ++guest) {
+            constexpr std::array<int, 3U> hosts{6,8,9};
+            e.guest_hosts[guest] = hosts[guest];
+            e.movR32M(static_cast<std::uint32_t>(hosts[guest]), cpu, offsets.r + off(guest * 4U));
+        }
+    }
     for (const auto host : {6,8,9}) {
+        if (program != nullptr) break;
         const auto selected = std::max_element(uses.begin(), uses.end());
         if (*selected == 0U) break;
         const auto guest = static_cast<std::size_t>(selected - uses.begin());
@@ -2123,8 +2163,10 @@ NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t>
         const auto index = op.edges[conditional && taken ? 1U : 0U];
         const auto target = (taken || op.flow == RegionFlow::jump || op.flow == RegionFlow::call)
             ? op.target : op.fallthrough;
-        if (index == NativeRegionOp::external) exit(NativeRegionExit::external_edge, target);
-        else e.jmp(labels[index].entry);
+        if (index == NativeRegionOp::external) {
+            if (program != nullptr) { e.movR32Imm(kR10, target); e.jmp(indirect_external); }
+            else exit(NativeRegionExit::external_edge, target);
+        } else e.jmp(labels[index].entry);
     };
     const auto read_sp = [&](std::uint32_t destination) {
         const auto msp = e.makeLabel(), ready = e.makeLabel();
@@ -2409,6 +2451,22 @@ NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t>
     };
     dispatch(dispatch, 0U, plan.count);
     e.bindLabel(indirect_external);
+    if (program != nullptr) {
+        const auto outside = e.makeLabel();
+        e.movRR(kEax, kR10);
+        e.aluRImm(5U, kEax, program->base_);
+        e.cmpR32Imm(kEax, program->size_); e.jcc(3U, outside);
+        e.testRImm(kEax, 1U); e.jcc(5U, outside);
+        // A complete, immutable linker table, indexed by code-window number.
+        // R10 retains the actual guest PC for the destination's address switch.
+        e.shImm(5U, kEax, 9U);
+        e.shR64Imm(4U, kEax, 3U);
+        e.movR64Imm(kEcx, reinterpret_cast<std::uintptr_t>(program->resumes_.data()));
+        e.addR64R64(kEax, kEcx);
+        e.movR64M(kEax, kEax, 0U);
+        e.jmpReg(kEax);
+        e.bindLabel(outside);
+    }
     e.movRR(kEax, kR10);
     e.movR32Imm(kEcx, static_cast<std::uint32_t>(NativeRegionExit::external_edge));
     e.jmp(publish);
@@ -2453,12 +2511,13 @@ NativeRegionFunction MicroJit::compileRegion(const std::span<const std::uint8_t>
     std::size_t emitted = 0U;
     void* slot = impl_->append(e.code.data(), e.code.size(), error, emitted);
     if (slot == nullptr || !impl_->seal(slot, emitted, error)) return nullptr;
+    resume = static_cast<std::uint8_t*>(slot) + e.labels[indirect];
     NativeRegionFunction function = nullptr;
     std::memcpy(&function, &slot, sizeof(function));
     ++compilations_; bytes_emitted_ += emitted;
     return function;
 #else
-    (void)bytes; (void)base; (void)entry_pc;
+    (void)plan; (void)program; (void)resume;
     error = "native-region: host emitter unavailable";
     return nullptr;
 #endif

@@ -33,6 +33,8 @@
 #include <string>
 
 namespace fil::cpu {
+struct NativeRegionPlan;
+class NativeProgram;
 
 struct CpuState;
 struct MicroBlock;
@@ -84,11 +86,20 @@ public:
     [[nodiscard]] NativeRegionFunction compileRegion(std::span<const std::uint8_t> bytes,
         std::uint32_t base, std::uint32_t entry_pc, std::string& error);
 
+    /** Compile every aligned image entry and link native windows before use.
+     * The returned object's address and this compiler must remain stable and
+     * alive while its entry functions execute.
+     */
+    [[nodiscard]] std::unique_ptr<NativeProgram> compileProgram(
+        std::span<const std::uint8_t> bytes, std::uint32_t base, std::string& error);
+
     [[nodiscard]] std::uint64_t compilations() const noexcept { return compilations_; }
     [[nodiscard]] std::uint64_t bytesEmitted() const noexcept { return bytes_emitted_; }
 
 private:
     MicroJit() noexcept = default;
+    [[nodiscard]] NativeRegionFunction compileRegionPlan(const NativeRegionPlan&,
+        const NativeProgram*, void*& resume, std::string& error);
     MicroFunction compileX86(const MicroBlock& block, std::string& error);
     struct Impl;
     std::unique_ptr<Impl> impl_;

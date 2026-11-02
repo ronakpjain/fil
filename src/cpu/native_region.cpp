@@ -7,9 +7,10 @@
 
 namespace fil::cpu {
 
-bool buildNativeRegion(const std::span<const std::uint8_t> bytes,
+namespace {
+bool buildRegion(const std::span<const std::uint8_t> bytes,
     const std::uint32_t base, const std::uint32_t entry_pc,
-    NativeRegionPlan& out, std::string& error) {
+    NativeRegionPlan& out, std::string& error, const std::uint32_t window_bytes) {
     constexpr auto address_space = std::uint64_t{1U} << 32U;
     if (bytes.size() > address_space - base) {
         error = "native-region: executable span wraps target address space";
@@ -23,12 +24,26 @@ bool buildNativeRegion(const std::span<const std::uint8_t> bytes,
         error = "native-region: invalid executable span or entry";
         return false;
     }
+    if (window_bytes != 0U && ((window_bytes & 1U) != 0U
+        || window_bytes > NativeRegionPlan::max_ops * 2U || !contains(entry_pc, window_bytes))) {
+        error = "native-region: invalid code window";
+        return false;
+    }
     NativeRegionPlan plan;
     plan.entry_pc = entry_pc;
     plan.ops[0].pc = entry_pc;
     plan.count = 1U;
+    if (window_bytes != 0U) {
+        plan.count = static_cast<std::uint16_t>(window_bytes / 2U);
+        for (std::uint16_t i = 0U; i < plan.count; ++i)
+            plan.ops[i].pc = entry_pc + i * 2U;
+    }
     const auto link = [&](std::uint32_t pc) -> std::uint16_t {
         if ((pc & 1U) != 0U || !contains(pc, 2U)) return NativeRegionOp::external;
+        if (window_bytes != 0U) {
+            if (pc < entry_pc || pc - entry_pc >= window_bytes) return NativeRegionOp::external;
+            return static_cast<std::uint16_t>((pc - entry_pc) / 2U);
+        }
         for (std::uint16_t i = 0U; i < plan.count; ++i)
             if (plan.ops[i].pc == pc) return i;
         if (plan.count == plan.ops.size()) {
@@ -91,6 +106,24 @@ bool buildNativeRegion(const std::span<const std::uint8_t> bytes,
     out = std::move(plan);
     error.clear();
     return true;
+}
+
+} // namespace
+
+bool buildNativeRegion(const std::span<const std::uint8_t> bytes,
+    const std::uint32_t base, const std::uint32_t entry_pc,
+    NativeRegionPlan& out, std::string& error) {
+    return buildRegion(bytes, base, entry_pc, out, error, 0U);
+}
+
+bool buildNativeRegionWindow(const std::span<const std::uint8_t> bytes,
+    const std::uint32_t base, const std::uint32_t window_pc,
+    const std::uint32_t window_bytes, NativeRegionPlan& out, std::string& error) {
+    if (window_bytes == 0U) {
+        error = "native-region: empty code window";
+        return false;
+    }
+    return buildRegion(bytes, base, window_pc, out, error, window_bytes);
 }
 
 bool nativeRegionEntryValid(NativeRegionContext* context) noexcept {

@@ -127,6 +127,9 @@ exact changed-byte accounting in a host register and publish it at exits.
 Canonical narrow and wide PUSH/POP transfers validate the complete stack frame
 before effects and use the active stack bank. POP PC dispatches to the actual
 return target after checking Thumb state and excluding exception returns.
+An eager program compiler decodes every aligned entry in bounded code windows
+and links those windows before execution. Native transfers share a register ABI,
+preserving live registers, flags, memory accounting and budgets across windows.
 MMIO, aliases and accesses outside the bindings exit before effects. This API
 is separate from the CLI execution engine; system/IT/FP instructions return
 checked exits. Differential tests cover architectural state, memory, timing,

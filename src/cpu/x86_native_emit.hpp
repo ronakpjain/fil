@@ -88,6 +88,7 @@ public:
     }
     void ret() { u8(0xC3U); }
     void callReg(std::uint32_t r) { prefixRex(false, 2U, r); u8(0xFFU); u8(modrm(3U, 2U, r)); }
+    void jmpReg(std::uint32_t r) { prefixRex(false, 4U, r); u8(0xFFU); u8(modrm(3U, 4U, r)); }
     void movR64Imm(std::uint32_t dst, std::uint64_t imm) {
         u8(rex(true, false, (dst & 8U) != 0U));
         u8(static_cast<std::uint8_t>(0xB8U | (dst & 7U)));

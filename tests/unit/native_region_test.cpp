@@ -35,6 +35,97 @@ auto code(const std::array<std::uint16_t, N>& words) {
     return bytes;
 }
 
+TEST(NativeRegionTest, CodeWindowsIncludeCheckedSuccessorsAndBoundaryWideFetches) {
+    auto bytes = code(std::array<std::uint16_t, 5>{0xbe00U,0x3001U,0xf000U,0xf800U,0xbe00U});
+    NativeRegionPlan plan; std::string error;
+    ASSERT_TRUE(buildNativeRegionWindow(bytes, pc, pc, 6U, plan, error)) << error;
+    ASSERT_EQ(plan.count, 3U);
+    EXPECT_EQ(plan.ops[0].flow, RegionFlow::checked);
+    EXPECT_EQ(plan.ops[1].flow, RegionFlow::next);
+    EXPECT_EQ(plan.ops[1].edges[0], 2U);
+    EXPECT_EQ(plan.ops[2].size, 4U);
+    EXPECT_EQ(plan.ops[2].flow, RegionFlow::call);
+    EXPECT_EQ(plan.ops[2].edges[0], NativeRegionOp::external);
+    ASSERT_TRUE(buildNativeRegionWindow(bytes, pc, pc + 6U, 4U, plan, error));
+    EXPECT_EQ(plan.ops[0].pc, pc + 6U); // legal entry into a wide instruction's second halfword
+    const auto initial = plan;
+    for (const auto size : {0U,1U,12U,514U}) {
+        EXPECT_FALSE(buildNativeRegionWindow(bytes, pc, pc, size, plan, error));
+        EXPECT_EQ(plan.count, initial.count); EXPECT_EQ(plan.entry_pc, initial.entry_pc);
+    }
+}
+
+TEST(NativeRegionTest, LinkedProgramKeepsRegistersFlagsMemoryAndBudgetsAcrossWindows) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    std::array<std::uint16_t, 520U> words; words.fill(0xbe00U);
+    words[0] = 0x3001U; words[1] = 0xe0fdU; // ADD r0; B window 1
+    words[255] = 0xbf00U; // sequential window crossing is also an entry
+    words[256] = 0x3102U; // ADD r1, #2
+    words[257] = 0xf000U; words[258] = 0xf8fdU; // BL window 2
+    words[259] = 0x6020U; // STR r0, [r4]
+    words[260] = 0x3a01U; words[261] = 0xd000U; // SUB r2; BEQ checked
+    words[262] = 0xe6f8U; // B window 0
+    words[512] = 0x3003U; words[513] = 0x3105U; words[514] = 0x4770U;
+    const auto bytes = code(words);
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    const auto program = jit->compileProgram(bytes, pc, error); ASSERT_TRUE(program) << error;
+    EXPECT_EQ(jit->compilations(), 3U);
+    EXPECT_EQ(program->base(), pc); EXPECT_EQ(program->size(), bytes.size());
+    EXPECT_EQ(program->entryFor(pc - 2U), nullptr);
+    EXPECT_EQ(program->entryFor(pc + 1U), nullptr);
+    EXPECT_EQ(program->entryFor(pc + bytes.size()), nullptr);
+    fil::mem::MemoryBus memory, oracle;
+    for (auto* bus : {&memory, &oracle}) {
+        ASSERT_TRUE(bus->mapRom(pc, bytes.size(), "linked")); ASSERT_TRUE(bus->loadBytes(pc, bytes));
+        ASSERT_TRUE(bus->mapRam(ram, 16U, "data"));
+        bus->setReadFootprintTracking(false); bus->setWriteJournalTracking(false);
+    }
+    CortexM4 reference(oracle);
+    NativeRegionContext binding;
+    ASSERT_TRUE(memory.directReadWindow(ram, binding.ram_read));
+    ASSERT_TRUE(memory.directWriteWindow(ram, binding.ram_write));
+    for (const auto stalls : {std::array<std::uint32_t,2>{0U,0U},
+                             std::array<std::uint32_t,2>{1U,3U}})
+    for (const auto entry : {pc,pc + 510U})
+    for (std::uint32_t limit = 0U; limit <= 31U; ++limit)
+    for (std::uint64_t credit = 0U; credit <= 100U; ++credit) {
+        ASSERT_TRUE(memory.write32(ram, 0xffffffffU)); ASSERT_TRUE(oracle.write32(ram, 0xffffffffU));
+        CpuState state; state.r[15] = entry; state.r[0] = 0x7ffffffeU;
+        state.r[1] = 0xfffffffeU; state.r[2] = 3U; state.r[4] = ram;
+        state.r[14] = 0x12345679U; state.xpsr |= xpsr_c | xpsr_v | xpsr_q;
+        state.instruction_address = pc + 16U;
+        reference.state() = state;
+        auto context = binding; context.cpu_state = &state;
+        context.instruction_limit = limit; context.cycle_limit = credit;
+        context.sequential_fetch_stall = stalls[0]; context.nonsequential_fetch_stall = stalls[1];
+        std::uint32_t retired = 0U, fetch_end = 0U;
+        std::uint64_t cycles = 0U; bool have = false;
+        NativeRegionExit reason;
+        for (;;) {
+            if (retired == limit) { reason = NativeRegionExit::instruction_budget; break; }
+            const auto next = reference.state().r[15];
+            if (next == pc + 526U) { reason = NativeRegionExit::checked_instruction; break; }
+            std::uint16_t pipeline = 0U;
+            ASSERT_TRUE(reference.peekPredictableCycles(pipeline)) << std::hex << next;
+            const auto charge = pipeline + stalls[have && next == fetch_end ? 0U : 1U];
+            if (charge > credit - cycles) { reason = NativeRegionExit::cycle_budget; break; }
+            const auto step = reference.stepFast();
+            ASSERT_EQ(step.reason, StopReason::step_complete); ASSERT_EQ(step.cycles, pipeline);
+            ++retired; cycles += charge; have = true; fetch_end = next + step.instruction_size;
+        }
+        const auto function = program->entryFor(entry); ASSERT_NE(function, nullptr);
+        function(&context);
+        EXPECT_TRUE(bitwiseEqual(state, reference.state())) << limit << '/' << credit << '/' << entry;
+        EXPECT_EQ(context.exit_reason, reason); EXPECT_EQ(context.retired_count, retired);
+        EXPECT_EQ(context.retired_cycles, cycles); EXPECT_EQ(context.have_fetch, have);
+        EXPECT_EQ(context.fetch_end, fetch_end);
+        EXPECT_EQ(memory.read32(ram).value(), oracle.read32(ram).value());
+        EXPECT_EQ(memory.sideEffectCheckpoint().mutation_sequence, oracle.sideEffectCheckpoint().mutation_sequence);
+        EXPECT_EQ(memory.sideEffectGeneration(), oracle.sideEffectGeneration());
+    }
+    EXPECT_EQ(jit->compilations(), 3U); // all entries were emitted before any execution
+}
+
 TEST(NativeRegionTest, FormsBothConditionalEdgesAndARealBackedgeWithoutUnrolling) {
     const auto bytes = code(std::array<std::uint16_t, 4>{0x3001U,0x3901U,0xd1fcU,0xbe00U});
     NativeRegionPlan plan;
