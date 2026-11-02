@@ -520,6 +520,8 @@ struct ExpandedImmediate {
     result.rm = rm;
     result.shift_amount = amount;
     result.shift_type = decodeImmediateShiftType(shift_encoding, amount);
+    if (amount == 0U && (result.shift_type == ShiftType::lsr || result.shift_type == ShiftType::asr))
+        result.shift_amount = 32U;
     result.set_flags = set_flags;
     return result;
 }

@@ -542,8 +542,9 @@ inline bool emitX86Op(X86Emitter& e, const Offsets& o, const MicroInst& op, std:
     case MicroOp::cmp_reg:
     case MicroOp::cmn_reg: {
         const bool is_sub = op.op == MicroOp::cmp_reg;
+        if (!shiftValue(e, kEdx, o, op.rm, op.shift, op.shift_amount, error)) return false;
         loadGuest(e, kEax, o, op.rn);
-        aluGuest(e, is_sub ? 5U : 0U, kEax, o, op.rm);
+        e.aluRR(is_sub ? 5U : 0U, kEax, kEdx);
         endAddSub(e, o, is_sub, 0U, false);
         return true;
     }

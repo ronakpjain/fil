@@ -171,6 +171,8 @@ MicroLowerResult tryLowerMicroInst(const MicroSource& source, MicroInst& out) no
             inst.op = is_cmp ? MicroOp::cmp_reg : MicroOp::cmn_reg;
             inst.rn = d.rn;
             inst.rm = d.rm;
+            inst.shift = d.shift_type;
+            inst.shift_amount = d.shift_amount;
             out = inst;
             return {true, MicroLowerReason::ok, {}};
         }
@@ -420,12 +422,14 @@ std::size_t interpretMicroOps(std::span<const MicroInst> ops, MicroCpu& cpu, std
             break;
         }
         case MicroOp::cmp_reg: {
-            AddResult r = addWithCarry(readOp(cpu, op.rn), ~readOp(cpu, op.rm), true);
+            const auto rhs = shiftC(readOp(cpu, op.rm), op.shift, op.shift_amount, old_c).value;
+            AddResult r = addWithCarry(readOp(cpu, op.rn), ~rhs, true);
             applyNzcv(cpu, r);
             break;
         }
         case MicroOp::cmn_reg: {
-            AddResult r = addWithCarry(readOp(cpu, op.rn), readOp(cpu, op.rm), false);
+            const auto rhs = shiftC(readOp(cpu, op.rm), op.shift, op.shift_amount, old_c).value;
+            AddResult r = addWithCarry(readOp(cpu, op.rn), rhs, false);
             applyNzcv(cpu, r);
             break;
         }

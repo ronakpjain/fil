@@ -13,6 +13,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -120,6 +121,48 @@ bool runMicro(const std::vector<std::uint16_t>& code, const CpuState& initial,
     const std::size_t retired = static_cast<std::size_t>(fn(&final_out, block.ops.size()) & 0xffffffffU);
     EXPECT_EQ(retired, block.ops.size());
     return true;
+}
+
+TEST(MicroJitEmitterTest, ShiftedRegisterComparisonsMatchCheckedCpuAndIrForEveryEncoding) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    Fixture fixture;
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    constexpr std::array<std::uint32_t, 6U> values{
+        0U,1U,0x80000000U,0x7fffffffU,0xffffffffU,0x12345678U};
+    for (const bool subtract : {false,true})
+    for (std::uint32_t type = 0U; type < 4U; ++type)
+    for (std::uint32_t amount = 0U; amount < 32U; ++amount) {
+        const auto first = static_cast<std::uint16_t>(subtract ? 0xebb6U : 0xeb16U);
+        const auto second = static_cast<std::uint16_t>(0x0f05U | ((amount >> 2U) << 12U)
+            | ((amount & 3U) << 6U) | (type << 4U));
+        const auto decoded = fil::cpu::decode32(first, second); ASSERT_TRUE(decoded);
+        ASSERT_EQ(decoded->kind, subtract ? fil::cpu::InstrKind::cmp : fil::cpu::InstrKind::cmn);
+        EXPECT_EQ(decoded->shift_amount, amount == 0U && (type == 1U || type == 2U) ? 32U : amount);
+        const std::array<MicroSource,1U> sources{MicroSource{*decoded,kFlash,4U}};
+        MicroBlock block; ASSERT_TRUE(fil::cpu::buildMicroBlock(sources, block).ok);
+        EXPECT_EQ(block.ops[0].shift, decoded->shift_type);
+        EXPECT_EQ(block.ops[0].shift_amount, decoded->shift_amount);
+        const auto function = jit->compile(block, error); ASSERT_NE(function, nullptr) << error;
+        write16(fixture, kFlash, first); write16(fixture, kFlash + 2U, second);
+        for (const auto lhs : values) for (const auto rhs : values)
+        for (const bool carry : {false,true}) {
+            CpuState state; state.r[15] = kFlash; state.r[6] = lhs; state.r[5] = rhs;
+            state.r[0] = 0xdeadbeefU; state.r[14] = 0x87654321U;
+            state.xpsr |= fil::cpu::xpsr_q | fil::cpu::xpsr_v | (carry ? fil::cpu::xpsr_c : 0U);
+            fixture.cpu.state() = state;
+            const auto step = fixture.cpu.stepFast(); ASSERT_EQ(step.reason, fil::cpu::StopReason::step_complete);
+            fil::cpu::MicroCpu ir;
+            std::copy_n(state.r.begin(), ir.r.size(), ir.r.begin());
+            ir.pc = kFlash; ir.lr = state.r[14]; ir.xpsr = state.xpsr;
+            ASSERT_EQ(fil::cpu::interpretMicroBlock(block, ir, 1U), 1U);
+            ASSERT_EQ(function(&state, 1U) & 0xffffffffU, 1U);
+            EXPECT_TRUE(fil::cpu::bitwiseEqual(state, fixture.cpu.state()))
+                << subtract << '/' << type << '/' << amount << '/' << lhs << '/' << rhs << '/' << carry;
+            EXPECT_EQ(ir.xpsr, fixture.cpu.state().xpsr);
+            EXPECT_EQ(ir.pc, fixture.cpu.state().r[15]);
+            EXPECT_EQ(ir.r[6], lhs); EXPECT_EQ(ir.r[5], rhs);
+        }
+    }
 }
 
 TEST(MicroJitEmitterTest, NativeEntriesHaveReadableZeroFunctionProbePrefix) {

@@ -505,12 +505,12 @@ bool emitOp(Emitter& e, const MicroInst& op, std::string& error) {
         e.addSubImm(1U, 31U, wn, op.imm);
         return true;
     case MicroOp::cmp_reg:
-        // SUBS XZR, rn, rm: NZCV only, no register writeback.
-        e.addSubReg(3U, 31U, wn, wm);
-        return true;
     case MicroOp::cmn_reg:
-        // ADDS XZR, rn, rm: NZCV only, no register writeback.
-        e.addSubReg(1U, 31U, wn, wm);
+        if (!emitShiftValue(e, 17U, wm, op.shift, op.shift_amount)) {
+            error = "unsupported compare shift amount";
+            return false;
+        }
+        e.addSubReg(op.op == MicroOp::cmp_reg ? 3U : 1U, 31U, wn, 17U);
         return true;
     case MicroOp::tst_reg:
         e.andsKeepCv(31U, wn, wm);
