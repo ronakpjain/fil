@@ -2722,10 +2722,51 @@ TEST(JitTest, ColdTimingDecodeHasNoMemoryEffectsAndNeverFetchesMmio) {
     cost = 99U;
     EXPECT_FALSE(split_cpu.peekPredictableCycles(cost));
     EXPECT_EQ(cost, 99U);
+    EXPECT_FALSE(split_cpu.peekCycleUpperBound(cost));
+    EXPECT_EQ(cost, 99U);
     EXPECT_EQ(device.reads, 0);
     split_cpu.state().r[15] = flash_base + 2U;
     EXPECT_FALSE(split_cpu.peekPredictableCycles(cost));
+    EXPECT_FALSE(split_cpu.peekCycleUpperBound(cost));
     EXPECT_EQ(device.reads, 0);
+}
+
+TEST(JitTest, PipelineUpperBoundsCoverLoadedTargetsFaultsPredicatesAndDivides) {
+    for (const auto& words : {
+            halfwords({0xbd00U}),             // POP {pc}
+            halfwords({0xe8b0U,0x8000U}),      // LDM r0!,{pc}
+            halfwords({0xf8d0U,0xf000U}),      // LDR pc,[r0]
+            halfwords({0x4687U}),             // MOV pc,r0
+            halfwords({0x4487U}),             // ADD pc,r0
+            halfwords({0xe8d0U,0xf001U}),      // TBB [r0,r1]
+            halfwords({0xe8d0U,0xf011U}),      // TBH [r0,r1,LSL #1]
+            halfwords({0x4700U}),             // BX r0, including invalid state
+            halfwords({0xfbb1U,0xf0f2U})}) {  // UDIV r0,r1,r2
+        auto bus = basicBus(); ASSERT_TRUE(bus.loadBytes(flash_base, words));
+        fil::cpu::CortexM4 cpu(bus);
+        for (const auto target : {0U,flash_base + 2U,flash_base + 9U,0xfffffff9U})
+        for (const auto address : {ram_base,0x40000000U})
+        for (const auto divisor : {0U,1U,0x80000000U})
+        for (const auto it : {0U,0x08U,0x18U})
+        for (std::uint32_t flags = 0U; flags < 16U; ++flags) {
+            prepare(cpu); cpu.state().r[0] = address; cpu.state().r[1] = 0U;
+            cpu.state().r[2] = divisor; cpu.state().xpsr |= flags << 28U;
+            cpu.state().setItState(static_cast<std::uint8_t>(it));
+            ASSERT_TRUE(bus.write32(ram_base, target));
+            ASSERT_TRUE(bus.write32(cpu.state().msp, target));
+            const auto initial = cpu.state();
+            const auto checkpoint = bus.sideEffectCheckpoint();
+            const auto footprint = bus.readFootprint();
+            std::uint16_t bound = 99U;
+            ASSERT_TRUE(cpu.peekCycleUpperBound(bound));
+            EXPECT_TRUE(fil::cpu::bitwiseEqual(cpu.state(), initial));
+            EXPECT_EQ(bus.sideEffectCheckpoint().mutation_sequence, checkpoint.mutation_sequence);
+            EXPECT_EQ(bus.sideEffectCheckpoint().mmio_generation, checkpoint.mmio_generation);
+            EXPECT_EQ(bus.readFootprint().words, footprint.words);
+            const auto result = cpu.stepFast();
+            EXPECT_LE(result.cycles, bound) << static_cast<unsigned>(words.front()) << '/' << flags << '/' << it;
+        }
+    }
 }
 
 TEST(JitTest, CachedUnconditionalFastPathMatchesInterpreter) {

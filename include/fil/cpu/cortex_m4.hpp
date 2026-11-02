@@ -236,6 +236,9 @@ public:
      */
     [[nodiscard]] bool peekPredictableCycles(std::uint16_t& cycles_out) const noexcept;
 
+    /** @brief Peeks a side-effect-free pipeline bound, including loaded PC targets. */
+    [[nodiscard]] bool peekCycleUpperBound(std::uint16_t& cycles_out) const noexcept;
+
     /** @brief Executes until budget exhaustion, breakpoint, halt, or a fault. */
     [[nodiscard]] RunResult run(std::uint64_t instruction_budget);
 
@@ -508,6 +511,8 @@ public:
     void setSystemControl(const cortexm::SystemControl* system) noexcept { system_ = system; }
 
 private:
+    [[nodiscard]] bool peekPipelineCycles(std::uint16_t& cycles_out, bool upper_bound) const noexcept;
+
     struct StepInstruction {
         std::uint32_t raw{0};
         DecodedInstruction decoded{};

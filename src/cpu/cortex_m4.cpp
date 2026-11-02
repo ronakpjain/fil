@@ -3055,6 +3055,14 @@ std::optional<CortexM4::JitBlockPreview> CortexM4::peekJitBlock(
 }
 
 bool CortexM4::peekPredictableCycles(std::uint16_t& cycles_out) const noexcept {
+    return peekPipelineCycles(cycles_out, false);
+}
+
+bool CortexM4::peekCycleUpperBound(std::uint16_t& cycles_out) const noexcept {
+    return peekPipelineCycles(cycles_out, true);
+}
+
+bool CortexM4::peekPipelineCycles(std::uint16_t& cycles_out, const bool upper_bound) const noexcept {
     if (state_.halted) return false;
     const std::uint32_t pc = state_.r[15];
     if (!state_.thumb || (state_.xpsr & xpsr_t) == 0U || (pc & 1U) != 0U) return false;
@@ -3065,13 +3073,15 @@ bool CortexM4::peekPredictableCycles(std::uint16_t& cycles_out) const noexcept {
     const auto& decoded = *instruction;
     const std::uint32_t fallthrough = pc + size;
     // Memory-loaded targets (LDR/MOV-to-PC, LDM/POP-to-PC) need execute-
-    // time knowledge (loaded value, fault behavior), so refuse. Direct
+    // time knowledge (loaded value, fault behavior), so exact peeks refuse. Direct
     // branches evaluate exactly from pre-state below, replicating stepFast's
     // `r15 != fallthrough` refill rule including pathological coincidences.
+    bool loaded_target = false;
     switch (decoded.kind) {
     case InstrKind::tbb:
     case InstrKind::tbh:
-        return false;
+        loaded_target = true;
+        break;
     case InstrKind::mov:
     case InstrKind::ldr:
     case InstrKind::ldrb:
@@ -3079,15 +3089,16 @@ bool CortexM4::peekPredictableCycles(std::uint16_t& cycles_out) const noexcept {
     case InstrKind::ldrsb:
     case InstrKind::ldrsh:
     case InstrKind::ldrd:
-        if (decoded.rd == 15U) return false;
+        loaded_target = decoded.rd == 15U;
         break;
     case InstrKind::ldm:
     case InstrKind::pop:
-        if ((decoded.register_list & (std::uint16_t{1U} << 15U)) != 0U) return false;
+        loaded_target = (decoded.register_list & (std::uint16_t{1U} << 15U)) != 0U;
         break;
     default:
         break;
     }
+    if (loaded_target && !upper_bound) return false;
     const bool was_in_it = inItBlock(state_.it_state);
     const Condition effective = decoded.kind == InstrKind::it
         ? Condition::al
@@ -3095,6 +3106,18 @@ bool CortexM4::peekPredictableCycles(std::uint16_t& cycles_out) const noexcept {
     const bool cond_pass = conditionPasses(effective, state_.xpsr);
     if (!cond_pass) {
         cycles_out = 1U;
+        return true;
+    }
+    if (upper_bound && (decoded.kind == InstrKind::udiv || decoded.kind == InstrKind::sdiv)) {
+        cycles_out = divideCycles(state_.readRegister(decoded.rm));
+        return true;
+    }
+    if (upper_bound && (loaded_target || decoded.rd == 15U || decoded.ra == 15U
+        || (decoded.writeback && decoded.rn == 15U))) {
+        // The stepper charges at most one refill, only after successful
+        // discontinuous control flow. Faults and EXC_RETURN cannot cost more.
+        cycles_out = static_cast<std::uint16_t>(
+            basePipelineCycles(decoded) + takenBranchPenalty(decoded.kind));
         return true;
     }
     std::uint16_t base = 0U;
@@ -3117,7 +3140,12 @@ bool CortexM4::peekPredictableCycles(std::uint16_t& cycles_out) const noexcept {
             base = basePipelineCycles(decoded);
             break;
         }
-        if ((target & 1U) == 0U) return false; // fault path needs the stepper
+        if ((target & 1U) == 0U) {
+            if (!upper_bound) return false; // fault path needs the stepper
+            cycles_out = static_cast<std::uint16_t>(
+                basePipelineCycles(decoded) + takenBranchPenalty(decoded.kind));
+            return true;
+        }
         base = basePipelineCycles(decoded);
         branch_taken = (target & ~std::uint32_t{1}) != fallthrough;
         break;

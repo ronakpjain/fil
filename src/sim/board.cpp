@@ -2161,7 +2161,7 @@ bool Board::nativeCheckedStep(cpu::NativeRegionContext* const context) noexcept 
         if (context->retired_count >= context->instruction_limit
             || context->retired_cycles > context->cycle_limit) return false;
         std::uint16_t pipeline = 0U;
-        if (!board.cpu_->peekPredictableCycles(pipeline)) return false;
+        if (!board.cpu_->peekCycleUpperBound(pipeline)) return false;
         // FLASH_ACR can change during a checked store. The modeled LATENCY
         // field is three bits; reserve its worst post-write fetch charge before
         // any effects, and charge only the actual checked step afterwards.
