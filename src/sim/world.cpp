@@ -293,7 +293,7 @@ Result<WorldRunResult> World::runIndependent(const WorldRunOptions& options) {
     tracking.reserve(boards_.size());
     for (const auto& entry : boards_) {
         tracking.push_back(std::make_unique<mem::MemoryBus::TrackingScope>(
-            entry->board->memory(), false, true));
+            entry->board->memory(), false, false));
     }
     for (std::size_t i = 0; i < boards_.size(); ++i) {
         initializeSnapshot(output.boards[i], *boards_[i]->board, output.start_time_ns);

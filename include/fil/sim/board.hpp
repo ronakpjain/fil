@@ -7,6 +7,7 @@
 #include "fil/common/result.hpp"
 #include "fil/config/config.hpp"
 #include "fil/cpu/cortex_m4.hpp"
+#include "fil/cpu/native_region.hpp"
 #include "fil/elf/elf_loader.hpp"
 #include "fil/mem/memory_bus.hpp"
 #include "fil/sim/event_loop.hpp"
@@ -55,7 +56,7 @@ struct BoardRunOptions {
     bool detect_spin{false};                     ///< Stop on a proven exact-state loop.
     std::uint64_t spin_threshold{1'000'000};     ///< Logical instructions in a repeated exact-state loop.
     bool enable_loop_batching{true};             ///< Fast-forward proven side-effect-free loops.
-    bool enable_jit{true};                       ///< Cached hot-path compilation, enabled by default.
+    bool enable_jit{true};                       ///< Native compilation, enabled by default.
     std::uint32_t adc_decimation{1}; ///< Keep 1 of N continuous ADC scans; higher skips side effects.
 };
 
@@ -313,6 +314,9 @@ private:
     // World-owned bounded-skew execution. Only this owner's events advance;
     // shared communication is drained by World at window rendezvous.
     [[nodiscard]] BoardRunResult runOwnerSlice(const BoardRunOptions& options);
+    void prepareNativePrograms();
+    [[nodiscard]] std::optional<cpu::FastStepResult> stepNativeLocal(
+        std::size_t max_instructions, std::optional<SimTimeNs> deadline);
     [[nodiscard]] std::optional<cpu::FastStepResult> stepCommittedLocal(
         std::size_t max_instructions, std::optional<SimTimeNs> deadline);
     [[nodiscard]] std::optional<ConcurrentStepResult> stepMemoizedLocal(
@@ -517,6 +521,12 @@ private:
     std::unique_ptr<stm32g4::Stm32G4> peripherals_;
     mem::MemoryBus memory_;
     std::unique_ptr<cpu::CortexM4> cpu_;
+    // Eager executable-image ownership. Rebuild the whole image after an
+    // executable backing change; there is no runtime block admission table.
+    std::unique_ptr<cpu::MicroJit> program_compiler_;
+    std::array<std::unique_ptr<cpu::NativeProgram>, 8U> native_programs_{};
+    std::size_t native_program_count_{0U};
+    std::uint64_t program_execution_generation_{0U};
     std::unique_ptr<cortexm::ExceptionController> exceptions_;
     std::uint64_t time_fraction_{0};
     std::array<LoopObservation, 256> loop_observations_{};

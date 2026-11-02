@@ -887,7 +887,7 @@ TEST(WorldTimeTest, IndependentSchedulerRestoresTrackingWhenCallbacksThrow) {
             auto owner = world.value()->eventLoop().useOwner(0U);
             static_cast<void>(world.value()->eventLoop().scheduleAt(1U, [&memory] {
                 EXPECT_FALSE(memory.readFootprintTracking());
-                EXPECT_TRUE(memory.writeJournalTracking());
+                EXPECT_FALSE(memory.writeJournalTracking());
                 throw std::runtime_error("owner callback failure");
             }));
         }
@@ -1284,7 +1284,7 @@ TEST(WorldTimeTest, OwnerRamRunnerMatchesCheckedMmioAndInterruptsAfterWarmup) {
     }
 }
 
-TEST(WorldTimeTest, IndependentDiscoveryTracksReadsButCommittedEventsDoNot) {
+TEST(WorldTimeTest, IndependentExecutionUsesLiveRamWithoutReplayOrJournaling) {
     for (const bool previous_tracking : {false, true}) {
         TempWorldTimeConfigs files;
         auto world = fil::sim::World::load(files.network({files.writeBoard("alpha.json", "alpha")}));
@@ -1309,9 +1309,8 @@ TEST(WorldTimeTest, IndependentDiscoveryTracksReadsButCommittedEventsDoNot) {
             static_cast<void>(world.value()->eventLoop().scheduleAt(5'000'000U, [&] {
                 observed = true;
                 EXPECT_FALSE(memory.readFootprintTracking());
-                EXPECT_TRUE(memory.writeJournalTracking());
-                // A previously discovered constant loop must reject its cached
-                // dependency after this real external write.
+                EXPECT_FALSE(memory.writeJournalTracking());
+                // Execution must observe the real external write immediately.
                 EXPECT_TRUE(memory.write32(0x20000040U, 5U));
             }));
         }
@@ -1322,7 +1321,7 @@ TEST(WorldTimeTest, IndependentDiscoveryTracksReadsButCommittedEventsDoNot) {
         ASSERT_TRUE(result);
         EXPECT_TRUE(observed);
         EXPECT_EQ(board.cpu().state().r[0], 5U);
-        EXPECT_GT(result.value().memoized_prefixes, 0U);
+        EXPECT_EQ(result.value().memoized_prefixes, 0U);
         EXPECT_EQ(memory.readFootprintTracking(), previous_tracking);
         EXPECT_TRUE(memory.writeJournalTracking());
     }

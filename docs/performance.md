@@ -130,10 +130,14 @@ return target after checking Thumb state and excluding exception returns.
 An eager program compiler decodes every aligned entry in bounded code windows
 and links those windows before execution. Native transfers share a register ABI,
 preserving live registers, flags, memory accounting and budgets across windows.
-MMIO, aliases and accesses outside the bindings exit before effects. This API
-is separate from the CLI execution engine; system/IT/FP instructions return
-checked exits. Differential tests cover architectural state, memory, timing,
-and partial instruction and cycle budgets.
+MMIO, aliases and accesses outside the bindings exit before effects. The x86-64
+owner-window scheduler uses these programs with journaling and read-footprint
+tracking disabled for committed execution. An executable backing change
+discards the image's native sections and recompiles from current bytes.
+System/IT/FP instructions return checked exits. The scheduler advances retired
+cycles before the next checked operation, preserving MMIO observation time.
+Differential tests cover architectural state, memory, timing, executable
+writes, and partial instruction and cycle budgets.
 
 | Mechanism | Behavior |
 | --- | --- |

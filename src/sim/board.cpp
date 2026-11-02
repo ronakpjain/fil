@@ -2,6 +2,7 @@
 
 #include "fil/common/format.hpp"
 #include "fil/common/numeric.hpp"
+#include "fil/cpu/decoder.hpp"
 #include "fil/cortexm/exceptions.hpp"
 #include "fil/cortexm/system_control.hpp"
 #include "fil/mem/mcu_map.hpp"
@@ -214,6 +215,10 @@ Result<void> Board::reset() {
         mcu_config_, image_, {peripherals_->mmio(), *system_}
     );
     if (!mapped) return mapped.error();
+    native_programs_ = {};
+    native_program_count_ = 0U;
+    program_compiler_.reset();
+    program_execution_generation_ = 0U;
     memory_ = std::move(mapped).value();
     peripherals_->attachMemory(memory_);
     auto configured = peripherals_->configure(config_);
@@ -2270,6 +2275,104 @@ bool Board::nativeMmioMustStop(void* const context, const bool write) noexcept {
     return false;
 }
 
+void Board::prepareNativePrograms() {
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!cpu::MicroJit::hostSupported()) return;
+    if (program_compiler_ && program_execution_generation_ == memory_.executionGeneration()) return;
+    // Code ownership follows the executable image, rather than observed PCs.
+    // A backing change discards every section and recompiles from live bytes.
+    native_programs_ = {};
+    native_program_count_ = 0U;
+    std::string error;
+    program_compiler_ = cpu::MicroJit::create(error);
+    if (!program_compiler_) throw std::runtime_error(error);
+    for (const auto& segment : image_.segments()) {
+        if (!segment.executable || segment.file_size < 2U) continue;
+        if (native_program_count_ == native_programs_.size())
+            throw std::runtime_error("native-program: too many executable image segments");
+        mem::MemoryBus::DirectReadWindow backing;
+        if (!memory_.directReadWindow(segment.physical_address, backing))
+            throw std::runtime_error("native-program: executable backing unavailable");
+        const auto offset = segment.physical_address - backing.begin;
+        const auto size = segment.file_size & ~1U;
+        if (offset > backing.size || size > backing.size - offset)
+            throw std::runtime_error("native-program: executable segment exceeds backing");
+        auto program = program_compiler_->compileProgram(
+            {backing.bytes + offset, size}, segment.physical_address, error);
+        if (!program) throw std::runtime_error(error);
+        native_programs_[native_program_count_++] = std::move(program);
+    }
+    cpu_->mutableJitStats().native_compilations += program_compiler_->compilations();
+    program_execution_generation_ = memory_.executionGeneration();
+#endif
+}
+
+std::optional<cpu::FastStepResult> Board::stepNativeLocal(
+    const std::size_t max_instructions, const std::optional<SimTimeNs> deadline) {
+    if (max_instructions < 2U || blockBoundaryPending()) return std::nullopt;
+    prepareNativePrograms();
+    const auto start = cpu_->state().r[15];
+    cpu::NativeRegionFunction function = nullptr;
+    for (std::size_t i = 0U; i < native_program_count_; ++i) {
+        function = native_programs_[i]->entryFor(start);
+        if (function != nullptr) break;
+    }
+    if (function == nullptr) return std::nullopt;
+    const auto now = event_loop_->now();
+    const auto frequency = peripherals_->rcc().systemClockHz();
+    if (frequency == 0U || time_fraction_ >= frequency) return std::nullopt;
+    auto horizon = deadline;
+    if (const auto event = event_loop_->nextScheduledTime(event_loop_->activeOwner());
+        event && (!horizon || *event < *horizon)) horizon = event;
+    if (horizon && *horizon <= now) return std::nullopt;
+    const auto systick = system_->cyclesUntilSysTickInterrupt();
+    if (systick && *systick == 0U) return std::nullopt;
+    auto credit = systick ? *systick - 1U : std::numeric_limits<std::uint64_t>::max();
+    if (horizon && *horizon - now <= std::numeric_limits<std::uint64_t>::max() / frequency) {
+        const auto numerator = (*horizon - now) * frequency - 1U;
+        credit = std::min(credit, numerator >= time_fraction_
+            ? (numerator - time_fraction_) / nanoseconds_per_second : 0U);
+    }
+    credit = std::min<std::uint64_t>(credit, std::numeric_limits<std::uint16_t>::max());
+    if (credit == 0U) return std::nullopt;
+    cpu::NativeRegionContext context;
+    context.cpu_state = &cpu_->state();
+    context.instruction_limit = static_cast<std::uint32_t>(
+        std::min<std::size_t>(max_instructions, UINT32_MAX));
+    context.cycle_limit = credit;
+    context.have_fetch = have_last_fetch_;
+    context.fetch_end = last_fetch_end_;
+    const auto& flash = peripherals_->flash();
+    context.sequential_fetch_stall = flash.fetchStallCycles(start, true);
+    context.nonsequential_fetch_stall = flash.fetchStallCycles(start, false);
+    static_cast<void>(memory_.directReadWindow(start, context.code_read));
+    const auto sp = cpu_->state().activeSp();
+    // The top of a descending stack may be one byte beyond its RAM mapping.
+    const auto probe = sp == 0U ? 0U : sp - 1U;
+    static_cast<void>(memory_.directReadWindow(probe, context.ram_read));
+    static_cast<void>(memory_.directWriteWindow(probe, context.ram_write));
+    function(&context);
+    if (context.retired_count == 0U) return std::nullopt;
+    have_last_fetch_ = context.have_fetch;
+    last_fetch_end_ = context.fetch_end;
+    cpu::FastStepResult result;
+    result.instructions = context.retired_count;
+    result.cycles = static_cast<std::uint16_t>(context.retired_cycles);
+    result.instruction_address = cpu_->state().instruction_address;
+    const auto offset = result.instruction_address - context.code_read.begin;
+    if (offset < context.code_read.size && context.code_read.size - offset >= 2U) {
+        const auto* bytes = context.code_read.bytes + offset;
+        const auto first = static_cast<std::uint16_t>(bytes[0] | (bytes[1] << 8U));
+        result.instruction_size = cpu::is32BitThumbPrefix(first) ? 4U : 2U;
+        result.raw = first;
+        if (result.instruction_size == 4U && context.code_read.size - offset >= 4U)
+            result.raw = (static_cast<std::uint32_t>(first) << 16U) | bytes[2] | (bytes[3] << 8U);
+    }
+    auto& stats = cpu_->mutableJitStats();
+    ++stats.native_executions; stats.native_instructions += context.retired_count;
+    return result;
+}
+
 std::optional<cpu::FastStepResult> Board::stepCommittedLocal(
     const std::size_t max_instructions, const std::optional<SimTimeNs> deadline) {
     if (max_instructions < 2U || blockBoundaryPending()) {
@@ -2493,16 +2596,22 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
         const auto limit_time = deadline == 0U
             ? std::nullopt : std::optional<SimTimeNs>{deadline};
         span_accounted_cycles_ = 0U;
-        const auto memoized = owner_slice_active_ && jit_ok
+        const bool native_owner = owner_slice_active_ && jit_ok
+            && !options.stop_address && !options.detect_spin && !options.enable_loop_batching;
+        const auto native = native_owner
+            ? stepNativeLocal(static_cast<std::size_t>(std::min<std::uint64_t>(
+                options.max_instructions - aggregate.instructions, UINT32_MAX)), limit_time)
+            : std::nullopt;
+        const auto memoized = !native_owner && owner_slice_active_ && jit_ok
             ? stepMemoizedLocal(static_cast<std::size_t>(std::min<std::uint64_t>(
                 options.max_instructions - aggregate.instructions,
                 DeferredPurePrefix::max_memoized_instructions)), limit_time) : std::nullopt;
-        const auto committed = !memoized && owner_slice_active_ && jit_ok
+        const auto committed = !native_owner && !memoized && owner_slice_active_ && jit_ok
             ? stepCommittedLocal(jit_limit == 1U ? 1U : static_cast<std::size_t>(
                 std::min<std::uint64_t>(options.max_instructions - aggregate.instructions,
                     DeferredPurePrefix::max_memoized_instructions)), limit_time) : std::nullopt;
-        auto result = memoized ? memoized->cpu_result : committed ? *committed
-            : stepWithFetchTiming(jit_ok, limit_time, owner_slice_active_ ? 1U : jit_limit);
+        auto result = native ? *native : memoized ? memoized->cpu_result : committed ? *committed
+            : stepWithFetchTiming(jit_ok && !native_owner, limit_time, owner_slice_active_ ? 1U : jit_limit);
         if (memoized && local_prefix_->memoized_count != 0U) {
             ++aggregate.memoized_prefixes;
             aggregate.memoized_instructions += local_prefix_->memoized_count;
