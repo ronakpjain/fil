@@ -130,6 +130,57 @@ TEST(NativeRegionTest, LinkedProgramKeepsRegistersFlagsMemoryAndBudgetsAcrossWin
     EXPECT_EQ(jit->compilations(), 3U); // all entries were emitted before any execution
 }
 
+TEST(NativeRegionTest, ProgramLinksEveryHalfwordIncludingWideBoundaryInteriors) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    std::array<std::uint16_t,520U> words; words.fill(0xbe00U);
+    words[0] = 0x4700U; // BX r0
+    words[255] = 0xf240U; words[256] = 0x0207U; // MOVW spans two windows; its second half is a valid LSL.
+    words[257] = 0x3101U; words[511] = 0x3001U; words[512] = 0xbf00U;
+    const auto bytes = code(words);
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    const auto program = jit->compileProgram(bytes, pc, error); ASSERT_TRUE(program) << error;
+    fil::mem::MemoryBus memory;
+    ASSERT_TRUE(memory.mapRom(pc, bytes.size(), "halfword-linkage")); ASSERT_TRUE(memory.loadBytes(pc, bytes));
+    memory.setReadFootprintTracking(false);
+    CortexM4 reference(memory);
+    std::array<NativeRegionPlan,3U> plans;
+    for (std::uint32_t i = 0U; i < plans.size(); ++i) {
+        const auto offset = i * NativeProgram::window_bytes;
+        ASSERT_TRUE(buildNativeRegionWindow(bytes, pc, pc + offset,
+            std::min<std::uint32_t>(NativeProgram::window_bytes, bytes.size() - offset), plans[i], error));
+    }
+    for (std::uint32_t target = pc - 2U; target <= pc + bytes.size(); target += 2U)
+    for (const auto stall : {0U,2U})
+    for (std::uint32_t limit = 0U; limit <= 4U; ++limit)
+    for (std::uint64_t credit = 0U; credit <= 16U; ++credit) {
+        CpuState state; state.r[15] = pc; state.r[0] = target | 1U;
+        state.r[1] = 0xffffffffU; state.r[2] = 0x87654321U; state.xpsr |= xpsr_c | xpsr_v;
+        reference.state() = state;
+        NativeRegionContext context; context.cpu_state = &state;
+        context.instruction_limit = limit; context.cycle_limit = credit;
+        context.sequential_fetch_stall = stall; context.nonsequential_fetch_stall = stall;
+        std::uint32_t retired = 0U, fetch_end = 0U; std::uint64_t cycles = 0U;
+        NativeRegionExit reason;
+        for (;;) {
+            const auto next = reference.state().r[15];
+            if (next < pc || next - pc >= bytes.size()) { reason = NativeRegionExit::external_edge; break; }
+            if (retired == limit) { reason = NativeRegionExit::instruction_budget; break; }
+            const auto& op = plans[(next - pc) / NativeProgram::window_bytes]
+                .ops[((next - pc) % NativeProgram::window_bytes) / 2U];
+            if (op.flow == RegionFlow::checked) { reason = NativeRegionExit::checked_instruction; break; }
+            std::uint16_t pipeline = 0U; ASSERT_TRUE(reference.peekPredictableCycles(pipeline));
+            const auto charge = pipeline + stall;
+            if (charge > credit - cycles) { reason = NativeRegionExit::cycle_budget; break; }
+            const auto step = reference.stepFast(); ASSERT_EQ(step.reason, StopReason::step_complete);
+            ++retired; cycles += charge; fetch_end = next + step.instruction_size;
+        }
+        program->entryFor(pc)(&context);
+        EXPECT_TRUE(bitwiseEqual(state, reference.state())) << target << '/' << limit << '/' << credit;
+        EXPECT_EQ(context.retired_count, retired); EXPECT_EQ(context.retired_cycles, cycles);
+        EXPECT_EQ(context.exit_reason, reason); EXPECT_EQ(context.fetch_end, fetch_end);
+    }
+}
+
 TEST(NativeRegionTest, CheckedServicesResumeWithPublishedStateAndExactCumulativeBudgets) {
     if (!MicroJit::hostSupported()) GTEST_SKIP();
     std::array<std::uint16_t, 266U> words; words.fill(0xbe00U);
