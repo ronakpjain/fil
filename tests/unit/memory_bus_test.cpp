@@ -575,6 +575,43 @@ TEST(MemoryBusTest, WordDirtyLanesMatchByteStoresAndEveryRollbackPrefix) {
     }
 }
 
+TEST(MemoryBusTest, BulkWordJournalingMatchesByteStoresAcrossRingWrapAndOrigins) {
+    constexpr std::uint32_t base = 0x20000000U;
+    for (const auto count : {2U, 9U, 4100U}) {
+        for (const bool tracking : {false, true}) {
+            for (const auto pc : {0U, 0x08000000U}) {
+                fil::mem::MemoryBus fast, bytes;
+                const auto span = count * 4U;
+                ASSERT_TRUE(fast.mapRam(base, span + 4U, "bulk"));
+                ASSERT_TRUE(bytes.mapRam(base, span + 4U, "bytes"));
+                fast.setWriteJournalTracking(tracking); bytes.setWriteJournalTracking(tracking);
+                std::vector<std::uint32_t> values(count);
+                for (std::uint32_t w = 0U; w < count; ++w)
+                    values[w] = w % 3U == 0U ? 0U : 0x12345678U + w;
+                const fil::mem::AccessContext context{fil::mem::AccessType::data_write, pc};
+                ASSERT_TRUE(fast.tryFastWriteWords(base + 1U, count, values.data(), context));
+                for (std::uint32_t w = 0U; w < count; ++w)
+                    for (std::uint32_t lane = 0U; lane < 4U; ++lane)
+                        ASSERT_TRUE(bytes.write8(base + 1U + w * 4U + lane,
+                            static_cast<std::uint8_t>(values[w] >> (lane * 8U)), context));
+                EXPECT_EQ(fast.sideEffectGeneration(), bytes.sideEffectGeneration());
+                const auto final = fast.sideEffectCheckpoint();
+                EXPECT_EQ(final.mutation_sequence, bytes.sideEffectCheckpoint().mutation_sequence);
+                if (tracking) {
+                    for (const auto undone : {1U, 4U, 8U, 8192U}) {
+                        if (undone > final.mutation_sequence) continue;
+                        auto checkpoint = final; checkpoint.mutation_sequence -= undone;
+                        ASSERT_TRUE(fast.restoreSideEffects(checkpoint));
+                        ASSERT_TRUE(bytes.restoreSideEffects(checkpoint));
+                        for (std::uint32_t at = 0U; at < span + 4U; ++at)
+                            EXPECT_EQ(fast.read8(base + at).value(), bytes.read8(base + at).value());
+                    }
+                }
+            }
+        }
+    }
+}
+
 TEST(MemoryBusTest, StoreFootprintScopeTracksIdempotentAndAllStorePaths) {
     using fil::mem::AccessContext;
     using fil::mem::AccessType;
