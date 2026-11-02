@@ -95,6 +95,27 @@ bool buildRegion(const std::span<const std::uint8_t> bytes,
         if (wide) op.raw |= second;
         const auto decoded = wide ? decode32(first, second) : decode16(first);
         if (!decoded) continue;
+        if (decoded->kind == InstrKind::it && contains(op.pc, 6U)) {
+            const auto it = static_cast<std::uint8_t>(decoded->imm);
+            const auto second_it = advanceItState(it);
+            const auto then_mov = halfword(op.pc + 2U), else_mov = halfword(op.pc + 4U);
+            if (second_it != 0U && advanceItState(second_it) == 0U
+                && static_cast<unsigned>(currentItCondition(second_it))
+                    == (static_cast<unsigned>(currentItCondition(it)) ^ 1U)
+                && (then_mov & 0xf800U) == 0x2000U && (else_mov & 0xf800U) == 0x2000U) {
+                op.predicated_pair.values = {then_mov & 0xffU, else_mov & 0xffU};
+                op.predicated_pair.registers = {static_cast<std::uint8_t>((then_mov >> 8U) & 7U),
+                    static_cast<std::uint8_t>((else_mov >> 8U) & 7U)};
+                op.predicated_pair.condition = currentItCondition(it);
+                op.predicated_pair.valid = true;
+                // The fast path retires all three actual instructions. Ordinary
+                // entries and checked partial cuts retain the constituent PCs.
+                op.edges[0] = link(op.pc + 6U);
+                static_cast<void>(link(op.pc + 2U));
+                static_cast<void>(link(op.pc + 4U));
+                continue;
+            }
+        }
         const bool stack = decoded->kind == InstrKind::push || decoded->kind == InstrKind::pop;
         if (stack) {
             op.stack = NativeStackPlan(decoded->register_list, decoded->kind == InstrKind::push);
@@ -154,7 +175,7 @@ bool buildNativeRegionWindow(const std::span<const std::uint8_t> bytes,
 }
 
 namespace {
-bool regionStateValid(const NativeRegionContext* context) noexcept {
+bool regionStateValid(const NativeRegionContext* context, const bool allow_it = false) noexcept {
     if (context == nullptr) return false;
     const auto* state = context->cpu_state;
     const auto read_valid = [](const mem::MemoryBus::DirectReadWindow& view) {
@@ -165,7 +186,7 @@ bool regionStateValid(const NativeRegionContext* context) noexcept {
         && (write.size == 0U || (write.bytes != nullptr && write.mutation_sequence != nullptr
             && write.side_effect_generation != nullptr));
     return bindings_valid && state != nullptr && (state->r[15] & 1U) == 0U && !state->halted
-        && state->thumb && (state->xpsr & xpsr_t) != 0U && state->it_state == 0U
+        && state->thumb && (state->xpsr & xpsr_t) != 0U && (allow_it || state->it_state == 0U)
         && !state->pending_exception && !state->pending_exc_return;
 }
 } // namespace
@@ -183,16 +204,26 @@ bool nativeRegionEntryValid(NativeRegionContext* context) noexcept {
 bool nativeRegionContinue(NativeRegionContext* context) noexcept {
     if (context == nullptr || context->exit_reason != NativeRegionExit::checked_instruction
         || context->checked_step == nullptr) return false;
-    const auto count = context->retired_count;
-    const auto cycles = context->retired_cycles;
     const auto* cpu = context->cpu_state;
-    const auto resume = context->checked_step(context);
-    if (context->retired_count > count) context->checked_count += context->retired_count - count;
-    if (!resume) return false;
-    return context->cpu_state == cpu && context->retired_count > count
-        && context->retired_count <= context->instruction_limit
-        && context->retired_cycles >= cycles && context->retired_cycles <= context->cycle_limit
-        && regionStateValid(context);
+    // An IT instruction plus its at-most-four predicated instructions can be
+    // serviced without a scheduler round trip. Each service still admits and
+    // retires its own exact instruction, and may stop at any partial cut.
+    for (unsigned attempt = 0U; attempt < 5U; ++attempt) {
+        const auto service = context->checked_step;
+        if (service == nullptr) return false;
+        const auto count = context->retired_count;
+        const auto cycles = context->retired_cycles;
+        const auto resume = service(context);
+        if (context->retired_count > count) context->checked_count += context->retired_count - count;
+        if (!resume || context->cpu_state != cpu || context->retired_count <= count
+            || context->retired_count > context->instruction_limit
+            || context->retired_cycles < cycles || context->retired_cycles > context->cycle_limit
+            || !regionStateValid(context, true)) return false;
+        if (cpu->it_state == 0U) return true;
+        if (context->retired_count == context->instruction_limit
+            || context->retired_cycles == context->cycle_limit) return false;
+    }
+    return false;
 }
 
 } // namespace fil::cpu

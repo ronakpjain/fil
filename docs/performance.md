@@ -128,6 +128,11 @@ Region memory operations also support shifted register offsets, subtraction,
 and pre/post-index writeback. Range and budget checks precede all effects;
 writeback follows the access, including source/destination aliases and active
 stack-bank updates.
+Canonical `ITE` blocks containing two narrow immediate moves use native
+conditional writes after exact admission of all three instructions. Partial
+cuts retain per-instruction IT/xPSR state through the checked service. Other IT
+blocks can likewise finish in checked services within the native invocation,
+with a separate credit check before each predicated instruction.
 Canonical narrow and wide PUSH/POP transfers validate the complete stack frame
 before effects and use the active stack bank. POP PC dispatches to the actual
 return target after checking Thumb state and excluding exception returns.

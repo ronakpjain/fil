@@ -39,6 +39,7 @@ inline constexpr std::uint32_t xpsr_q = 1U << 27U;
 inline constexpr std::uint32_t xpsr_t = 1U << 24U;
 inline constexpr std::uint32_t xpsr_ge_mask = 0x000f0000U;
 inline constexpr std::uint32_t xpsr_ipsr_mask = 0x1ffU;
+inline constexpr std::uint32_t xpsr_it_mask = (0x3U << 25U) | (0x3fU << 10U);
 
 /** @brief Complete integer and FPv4-SP-D16 architectural state. */
 struct CpuState {

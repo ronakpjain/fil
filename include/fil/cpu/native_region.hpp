@@ -26,6 +26,12 @@ struct NativeRegionOp {
         std::uint8_t rm{0U}, shift{0U};
         bool register_offset{false}, add{true}, index{true}, writeback{false};
     } address{};
+    struct PredicatedPair {
+        std::array<std::uint32_t, 2U> values{};
+        std::array<std::uint8_t, 2U> registers{};
+        Condition condition{Condition::al};
+        bool valid{false};
+    } predicated_pair{};
     std::uint32_t pc{0U}, raw{0U};
     std::uint32_t fallthrough{0U}, target{0U};
     std::uint16_t fallthrough_cycles{0U}, taken_cycles{0U};

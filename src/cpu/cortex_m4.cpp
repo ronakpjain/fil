@@ -26,7 +26,6 @@
 namespace fil::cpu {
 namespace {
 
-constexpr std::uint32_t xpsr_it_mask = (0x3U << 25U) | (0x3fU << 10U);
 
 [[nodiscard]] constexpr std::uint64_t saturatingCounterAdd(
     const std::uint64_t left, const std::uint64_t right) noexcept {

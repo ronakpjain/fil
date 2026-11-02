@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -339,6 +340,159 @@ TEST(NativeRegionTest, RegisterOffsetTransfersUsePreAccessOperandsAndEveryLegalS
     for (const auto rd : {0U,1U,2U,14U}) {
         checkIndexedTransfer(*jit, static_cast<std::uint16_t>(opcode | 1U),
             static_cast<std::uint16_t>((rd << 12U) | (shift << 4U) | 2U));
+    }
+}
+
+TEST(NativeRegionTest, PredicatedMovesMatchEveryConditionFlagAndBudgetCut) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    fil::mem::MemoryBus memory; ASSERT_TRUE(memory.mapRom(pc, 16U, "predicated"));
+    CortexM4 checked(memory), reference(memory);
+    for (unsigned condition = 0U; condition < 14U; ++condition)
+    for (const unsigned else_register : {0U,5U}) {
+        const auto it = static_cast<std::uint16_t>(0xbf00U | (condition << 4U)
+            | ((condition & 1U) != 0U ? 4U : 12U));
+        const auto bytes = code(std::array<std::uint16_t,4U>{it,0x206fU,
+            static_cast<std::uint16_t>(0x20deU | (else_register << 8U)),0xbe00U});
+        ASSERT_TRUE(memory.loadBytes(pc, bytes));
+        NativeRegionPlan plan; ASSERT_TRUE(buildNativeRegion(bytes, pc, pc, plan, error));
+        ASSERT_TRUE(plan.ops[0].predicated_pair.valid);
+        const auto program = jit->compileProgram(bytes, pc, error); ASSERT_TRUE(program) << error;
+        for (unsigned flags = 0U; flags < 16U; ++flags)
+        for (const auto stalls : {std::array<std::uint32_t,2U>{0U,0U},
+                                 std::array<std::uint32_t,2U>{1U,3U}})
+        for (const bool have_fetch : {false,true})
+        for (const bool services : {false,true})
+        for (std::uint32_t limit = 0U; limit <= 4U; ++limit)
+        for (std::uint64_t credit = 0U; credit <= 16U; ++credit) {
+            CpuState state; state.r[15] = pc; state.r[0] = 0x12345678U; state.r[5] = 0x87654321U;
+            state.instruction_address = pc + 100U;
+            state.xpsr = xpsr_t | xpsr_q | (0xaU << 16U) | (flags << 28U)
+                | ((flags & 1U) != 0U ? xpsr_it_mask : 0U);
+            checked.state() = state; reference.state() = state;
+            NativeRegionContext context; context.cpu_state = &checked.state();
+            context.instruction_limit = limit; context.cycle_limit = credit;
+            context.sequential_fetch_stall = stalls[0]; context.nonsequential_fetch_stall = stalls[1];
+            context.have_fetch = have_fetch; context.fetch_end = have_fetch ? pc : 0U;
+            context.checked_context = &checked;
+            if (services) context.checked_step = +[](NativeRegionContext* ctx) noexcept -> bool {
+                auto& cpu = *static_cast<CortexM4*>(ctx->checked_context);
+                const auto next = cpu.state().r[15];
+                if (next == pc + 6U || ctx->retired_count == ctx->instruction_limit) return false;
+                std::uint16_t pipeline = 0U;
+                if (!cpu.peekPredictableCycles(pipeline)) return false;
+                const auto charge = pipeline + (ctx->have_fetch && ctx->fetch_end == next
+                    ? ctx->sequential_fetch_stall : ctx->nonsequential_fetch_stall);
+                if (charge > ctx->cycle_limit - ctx->retired_cycles) return false;
+                const auto step = cpu.stepFast(); EXPECT_EQ(step.reason, StopReason::step_complete);
+                ctx->retired_count += step.instructions; ctx->retired_cycles += charge;
+                ctx->have_fetch = true; ctx->fetch_end = next + step.instruction_size;
+                return true;
+            };
+            const auto group_charge = 3U + stalls[0] * 2U + stalls[have_fetch ? 0U : 1U];
+            const bool native = limit >= 3U && credit >= group_charge;
+            std::uint32_t retired = 0U, fetch_end = context.fetch_end;
+            std::uint64_t cycles = 0U; bool have = have_fetch;
+            if (native || services) {
+                while (retired < limit && retired < 3U) {
+                    const auto next = reference.state().r[15];
+                    const auto charge = 1U + stalls[have && fetch_end == next ? 0U : 1U];
+                    if (charge > credit - cycles) break;
+                    const auto step = reference.stepFast(); ASSERT_EQ(step.reason, StopReason::step_complete);
+                    ++retired; cycles += charge; have = true; fetch_end = next + step.instruction_size;
+                }
+            }
+            program->entryFor(pc)(&context);
+            EXPECT_TRUE(bitwiseEqual(checked.state(), reference.state()))
+                << condition << '/' << flags << '/' << else_register << '/' << services << '/' << limit << '/' << credit;
+            EXPECT_EQ(context.retired_count, retired); EXPECT_EQ(context.retired_cycles, cycles);
+            EXPECT_EQ(context.have_fetch, have); EXPECT_EQ(context.fetch_end, fetch_end);
+            EXPECT_EQ(context.checked_count, native ? 0U : retired);
+            EXPECT_EQ(context.exit_reason, limit == 0U || (retired == 3U && limit == 3U)
+                ? NativeRegionExit::instruction_budget : NativeRegionExit::checked_instruction);
+        }
+    }
+}
+
+TEST(NativeRegionTest, CheckedServicesCloseEveryItMaskWithPerInstructionCredit) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    fil::mem::MemoryBus memory; ASSERT_TRUE(memory.mapRom(pc, 16U, "it-masks"));
+    CortexM4 checked(memory), reference(memory);
+    for (unsigned mask = 1U; mask < 16U; ++mask) {
+        const auto bytes = code(std::array<std::uint16_t,6U>{static_cast<std::uint16_t>(0xbf10U | mask),
+            0x2001U,0x2102U,0x2203U,0x2304U,0xbe00U});
+        ASSERT_TRUE(memory.loadBytes(pc, bytes));
+        const auto program = jit->compileProgram(bytes, pc, error); ASSERT_TRUE(program);
+        for (const bool zero : {false,true})
+        for (std::uint32_t limit = 0U; limit <= 7U; ++limit)
+        for (std::uint64_t credit = 0U; credit <= 8U; ++credit) {
+            CpuState state; state.r[15] = pc; state.r[0] = state.r[1] = state.r[2] = state.r[3] = 77U;
+            state.xpsr |= xpsr_c | xpsr_v | xpsr_q | (zero ? xpsr_z : 0U);
+            checked.state() = state; reference.state() = state;
+            NativeRegionContext context; context.cpu_state = &checked.state(); context.checked_context = &checked;
+            context.instruction_limit = limit; context.cycle_limit = credit;
+            context.checked_step = +[](NativeRegionContext* ctx) noexcept {
+                auto& cpu = *static_cast<CortexM4*>(ctx->checked_context);
+                if (cpu.state().r[15] == pc + 10U || ctx->retired_count == ctx->instruction_limit
+                    || ctx->retired_cycles == ctx->cycle_limit) return false;
+                const auto step = cpu.stepFast(); EXPECT_EQ(step.reason, StopReason::step_complete);
+                ctx->retired_count += step.instructions; ctx->retired_cycles += step.cycles;
+                ctx->have_fetch = true; ctx->fetch_end = step.instruction_address + step.instruction_size;
+                return true;
+            };
+            const auto count = std::min<std::uint64_t>({5U,limit,credit});
+            for (std::uint64_t i = 0U; i < count; ++i)
+                ASSERT_EQ(reference.stepFast().reason, StopReason::step_complete);
+            program->entryFor(pc)(&context);
+            EXPECT_TRUE(bitwiseEqual(checked.state(), reference.state())) << mask << '/' << zero << '/' << limit << '/' << credit;
+            EXPECT_EQ(context.retired_count, count); EXPECT_EQ(context.retired_cycles, count);
+            EXPECT_LE(context.checked_count, context.retired_count);
+        }
+    }
+}
+
+TEST(NativeRegionTest, CheckedItServiceCanRemoveItselfBeforeTheNextPredicate) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    const auto bytes = code(std::array<std::uint16_t,4U>{0xbf0cU,0x2001U,0x2002U,0xbe00U});
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    const auto function = jit->compileRegion(bytes, pc, pc, error); ASSERT_NE(function, nullptr);
+    fil::mem::MemoryBus memory;
+    ASSERT_TRUE(memory.mapRom(pc, bytes.size(), "service-removal")); ASSERT_TRUE(memory.loadBytes(pc, bytes));
+    CortexM4 cpu(memory); cpu.state().r[15] = pc;
+    NativeRegionContext context; context.cpu_state = &cpu.state(); context.checked_context = &cpu;
+    context.instruction_limit = 2U; context.cycle_limit = 100U;
+    context.checked_step = +[](NativeRegionContext* ctx) noexcept {
+        auto& checked = *static_cast<CortexM4*>(ctx->checked_context);
+        const auto step = checked.stepFast();
+        ctx->retired_count += step.instructions; ctx->retired_cycles += step.cycles;
+        ctx->have_fetch = true; ctx->fetch_end = step.instruction_address + step.instruction_size;
+        ctx->checked_step = nullptr;
+        return true;
+    };
+    function(&context);
+    EXPECT_EQ(context.retired_count, 1U); EXPECT_EQ(context.checked_count, 1U);
+    EXPECT_EQ(context.exit_reason, NativeRegionExit::checked_instruction);
+    EXPECT_EQ(cpu.state().r[15], pc + 2U); EXPECT_NE(cpu.state().it_state, 0U);
+}
+
+TEST(NativeRegionTest, PredicatedPairConstituentsRemainOrdinaryStandaloneEntryPoints) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    const auto bytes = code(std::array<std::uint16_t,4U>{0xbf14U,0x2001U,0x2000U,0xbe00U});
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    const auto program = jit->compileProgram(bytes, pc, error); ASSERT_TRUE(program);
+    fil::mem::MemoryBus memory;
+    ASSERT_TRUE(memory.mapRom(pc, bytes.size(), "mov-entry")); ASSERT_TRUE(memory.loadBytes(pc, bytes));
+    CortexM4 reference(memory);
+    for (const auto offset : {2U,4U}) {
+        CpuState state; state.r[15] = pc + offset; state.r[0] = 0xdeadbeefU;
+        state.xpsr |= xpsr_n | xpsr_c | xpsr_v | xpsr_q;
+        reference.state() = state; ASSERT_EQ(reference.stepFast().reason, StopReason::step_complete);
+        NativeRegionContext context; context.cpu_state = &state;
+        context.instruction_limit = 1U; context.cycle_limit = 100U;
+        program->entryFor(state.r[15])(&context);
+        EXPECT_TRUE(bitwiseEqual(state, reference.state()));
+        EXPECT_EQ(context.retired_count, 1U); EXPECT_EQ(context.checked_count, 0U);
     }
 }
 

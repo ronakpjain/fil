@@ -2098,7 +2098,7 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
     for (std::size_t i = 0U; i < plan.count; ++i)
         labels[i] = {e.makeLabel(), e.makeLabel(), e.makeLabel(), e.makeLabel()};
     for (const auto reg : {3U,12U,13U,14U,15U,5U,10U}) e.pushReg(reg);
-    e.subRsp16(); // local operand spill for a validated POP return target
+    e.subRsp16(); // local spills for POP targets and memory writeback
     e.movRR64(ctx, 7U);
     e.movR64Imm(kEax, reinterpret_cast<std::uintptr_t>(&nativeRegionEntryValid));
     e.callReg(kEax); e.movzxEaxAl(); e.testRR(kEax, kEax); e.jcc(4U, early);
@@ -2400,11 +2400,44 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
         e.bindLabel(slow);
         return true;
     };
+    const auto predicated_pair = [&](const NativeRegionOp& op) {
+        const auto slow = e.makeLabel();
+        e.movR32M(kEax, ctx, off(offsetof(NativeRegionContext, instruction_limit)));
+        e.aluRR(5U, kEax, count); e.cmpR32Imm(kEax, 3U); e.jcc(2U, slow);
+        e.movR32M(kEax, ctx, off(offsetof(NativeRegionContext, sequential_fetch_stall)));
+        e.imulR64Imm32(kEdx, kEax, 2U);
+        const auto first_ready = e.makeLabel();
+        e.cmpR32Imm(fetch, op.pc); e.jcc(4U, first_ready);
+        e.movR32M(kEax, ctx, off(offsetof(NativeRegionContext, nonsequential_fetch_stall)));
+        e.bindLabel(first_ready); e.addR64R64(kEdx, kEax); e.addR64Imm8(kEdx, 3U);
+        e.movRR64(kEax, cycles); e.addR64R64(kEax, kEdx); e.jcc(2U, slow);
+        e.cmpR64M(kEax, ctx, off(offsetof(NativeRegionContext, cycle_limit))); e.jcc(7U, slow);
+        e.movRR64(cycles, kEax);
+        const auto then_path = e.makeLabel(), committed = e.makeLabel();
+        const auto& pair = op.predicated_pair;
+        if (!emitX86CondTaken(e, pair.condition, 0U, then_path, error, false)) return false;
+        storeGuestImmediate(e, offsets, pair.registers[1], pair.values[1]); e.jmp(committed);
+        e.bindLabel(then_path);
+        storeGuestImmediate(e, offsets, pair.registers[0], pair.values[0]);
+        e.bindLabel(committed);
+        // Both narrow MOVS suppress flag writes inside IT. The complete bundle
+        // ends with IT clear, including any stale input xPSR IT bits.
+        e.movR32M(kEax, cpu, offsets.xpsr); e.aluRImm(4U, kEax, ~xpsr_it_mask);
+        e.movM32R(cpu, offsets.xpsr, kEax);
+        e.aluRImm(0U, count, 3U);
+        e.movR64Imm(fetch, (static_cast<std::uint64_t>(op.pc + 4U) << 32U) | (op.pc + 6U));
+        if (op.edges[0] != NativeRegionOp::external) e.jmp(labels[op.edges[0]].entry);
+        else if (program != nullptr) { e.movR32Imm(kR10, op.pc + 6U); e.jmp(indirect_external); }
+        else exit(NativeRegionExit::external_edge, op.pc + 6U);
+        e.bindLabel(slow);
+        return true;
+    };
     for (std::size_t i = 0U; i < plan.count; ++i) {
         const auto& op = plan.ops[i];
         e.bindLabel(labels[i].entry);
         e.aluRM(7U, count, ctx, off(offsetof(NativeRegionContext, instruction_limit)));
         e.jcc(3U, labels[i].instructions);
+        if (op.predicated_pair.valid && !predicated_pair(op)) return nullptr;
         if (loops[i].length != 0U && !fast_loop(static_cast<std::uint16_t>(i), loops[i])) return nullptr;
         if (op.stack.count() != 0U) {
             prepare_stack(op, i);
