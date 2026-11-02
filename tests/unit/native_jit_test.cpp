@@ -279,6 +279,51 @@ TEST(NativeJitTest, SharedTraceExitPublishesEveryIntegerPrefix) {
     }
 }
 
+TEST(NativeJitTest, SharedTraceFlagStencilsMatchOracle) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
+    // ADD/SUB/CMP, logical and shifted flags.
+    for (const auto raw : std::array<std::uint16_t, 10>{0x3001U, 0x3801U, 0x2801U,
+             0x4008U, 0x4048U, 0x4308U, 0x4208U, 0x0048U, 0x0848U, 0x1048U}) {
+        const auto decoded = decode16(raw); ASSERT_TRUE(decoded);
+        std::array<NativeTraceOp, 2> ops{};
+        for (std::size_t i = 0; i < ops.size(); ++i) {
+            ops[i].decoded = *decoded; ops[i].raw = raw;
+            ops[i].pc = 0x08005000U + static_cast<std::uint32_t>(i * 2U);
+            ops[i].size = 2U; ops[i].expected_next_pc = ops[i].pc + 2U;
+        }
+        NativeTracePlan plan; std::string error;
+        ASSERT_TRUE(buildNativeTrace(ops, plan, error)) << error;
+        auto jit = MicroJit::create(error); ASSERT_TRUE(jit) << error;
+        const auto function = jit->compileNativeTrace(plan, error);
+        ASSERT_NE(function, nullptr) << error;
+        const std::array<std::uint32_t, 2> costs{1U, 1U};
+        const std::array<std::uint32_t, 3> prefix{0U, 1U, 2U};
+        for (const bool admitted : {false, true})
+        for (std::uint32_t flags = 0U; flags < 16U; ++flags)
+        for (const auto value : {0U, 1U, 0x7fffffffU, 0x80000000U, 0xffffffffU})
+        for (std::uint32_t limit = 0U; limit <= 2U; ++limit) {
+            SCOPED_TRACE(::testing::Message() << raw << '/' << admitted << '/' << flags
+                << '/' << value << '/' << limit);
+            CpuState expected_cpu;
+            expected_cpu.r[0] = value; expected_cpu.r[1] = value ^ 0x80000001U;
+            expected_cpu.r[15] = ops[0].pc; expected_cpu.xpsr = xpsr_t | (flags << 28U);
+            auto actual_cpu = expected_cpu;
+            NativeExecutionContext expected{&expected_cpu, nullptr, limit, 2U};
+            expected.charged_cycles = costs.data(); expected.charged_cycles_count = costs.size();
+            auto actual = expected; actual.cpu_state = &actual_cpu;
+            if (admitted) {
+                actual.admitted_cycle_prefix = prefix.data();
+                actual.admitted_cycle_prefix_count = prefix.size();
+            }
+            interpretNativeTrace(plan, expected); function(&actual);
+            EXPECT_TRUE(bitwiseEqual(actual_cpu, expected_cpu));
+            EXPECT_EQ(actual.retired_count, expected.retired_count);
+            EXPECT_EQ(actual.retired_cycles, expected.retired_cycles);
+            EXPECT_EQ(actual.exit_reason, expected.exit_reason);
+        }
+    }
+}
+
 TEST(NativeJitTest, NativeTraceCheckedPushPopCommitAndGuardedPopPc) {
     if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
     constexpr std::uint32_t flash = 0x08000000U, ram = 0x20000000U;

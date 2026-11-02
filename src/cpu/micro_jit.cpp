@@ -1638,6 +1638,10 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     const auto fast_read_size_off = off(offsetof(NativeExecutionContext, fast_read_size));
     X86Emitter e;
     e.nzcv = kNzcv;
+    const auto add_flags = e.add_flags = e.makeLabel();
+    const auto sub_flags = e.sub_flags = e.makeLabel();
+    const auto logic_flags = e.logic_flags = e.makeLabel();
+    const auto shift_flags = e.shift_flags = e.makeLabel();
     const auto done = e.makeLabel(), early = e.makeLabel();
     e.pushReg(3U); e.pushReg(12U); e.pushReg(13U); e.pushReg(14U); e.pushReg(15U);
     e.pushReg(5U); e.pushReg(10U); e.subRsp16();
@@ -1921,6 +1925,25 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     e.addRsp16(); e.popReg(10U); e.popReg(5U); e.popReg(15U); e.popReg(14U); e.popReg(13U); e.popReg(12U); e.popReg(3U); e.ret();
     e.bindLabel(early);
     e.addRsp16(); e.popReg(10U); e.popReg(5U); e.popReg(15U); e.popReg(14U); e.popReg(13U); e.popReg(12U); e.popReg(3U); e.ret();
+    // Calls preserve the arithmetic host flags and return without touching the
+    // helper scratch slot. Count these bodies once, including both cycle modes.
+    e.add_flags = e.sub_flags = e.logic_flags = e.shift_flags = X86Emitter::no_label;
+    const auto used = [&](std::size_t label) {
+        return std::any_of(e.fixups.begin(), e.fixups.end(),
+            [label](const auto& fixup) { return fixup.label == label; });
+    };
+    if (used(add_flags)) {
+        e.bindLabel(add_flags); endAddSub(e, offsets, false, 0U, false); e.ret();
+    }
+    if (used(sub_flags)) {
+        e.bindLabel(sub_flags); endAddSub(e, offsets, true, 0U, false); e.ret();
+    }
+    if (used(logic_flags)) {
+        e.bindLabel(logic_flags); endLogic(e, offsets, false, 0U, false); e.ret();
+    }
+    if (used(shift_flags)) {
+        e.bindLabel(shift_flags); endLogic(e, offsets, true, 0U, false); e.ret();
+    }
     if (!e.patchBranches(error)) { impl_->trace_cache.pop_back(); return nullptr; }
     code = std::move(e.code);
 #elif defined(FIL_MICRO_JIT_AARCH64)

@@ -25,6 +25,11 @@ public:
     // Trace kernels keep flags in callee-saved registers across RAM helpers;
     // arithmetic-only stencils retain their caller-saved, stack-free ABI.
     std::uint32_t nzcv{8U};
+    // Optional in-kernel flag subroutines. Trace emitters share these across
+    // both cycle kernels; stack-free arithmetic blocks keep inline stencils.
+    static constexpr std::size_t no_label = static_cast<std::size_t>(-1);
+    std::size_t add_flags{no_label}, sub_flags{no_label};
+    std::size_t logic_flags{no_label}, shift_flags{no_label};
     std::vector<std::uint8_t> code;
     struct Fixup {
         std::size_t pos{0}; // offset of the rel32 field
@@ -269,6 +274,11 @@ public:
         fixups.push_back({code.size(), label});
         u32(0U);
     }
+    void call(std::size_t label) {
+        u8(0xE8U);
+        fixups.push_back({code.size(), label});
+        u32(0U);
+    }
     void jmp(std::size_t label) {
         u8(0xE9U);
         fixups.push_back({code.size(), label});
@@ -335,9 +345,11 @@ inline void storeGuest(X86Emitter& e, const Offsets& o, std::uint8_t guest, std:
 // leave flags untouched, so the capture stays exact.
 inline void endAddSub(X86Emitter& e, const Offsets& o, bool is_sub,
                       std::uint8_t rd, bool do_store) {
+    if (do_store) e.movM32R(kState, guestDisp(o, rd), kEax);
+    const auto shared = is_sub ? e.sub_flags : e.add_flags;
+    if (shared != X86Emitter::no_label) { e.call(shared); return; }
     e.setcc(is_sub ? 3U : 2U, kEcx); // C
     e.setcc(0U, kEdx); // V
-    if (do_store) e.movM32R(kState, guestDisp(o, rd), kEax);
     e.testRR(kEax, kEax);
     e.setcc(4U, kR10); // Z
     e.setcc(8U, 4U); // N -> ah (eax dead: stored/tested above)
@@ -359,6 +371,8 @@ inline void endAddSub(X86Emitter& e, const Offsets& o, bool is_sub,
 inline void endLogic(X86Emitter& e, const Offsets& o, bool new_carry, std::uint8_t rd,
                      bool writeback = true) {
     if (writeback) e.movM32R(kState, guestDisp(o, rd), kEax);
+    const auto shared = new_carry ? e.shift_flags : e.logic_flags;
+    if (shared != X86Emitter::no_label) { e.call(shared); return; }
     e.testRR(kEax, kEax);
     e.setcc(8U, kEdx); // N
     e.setcc(4U, kR10); // Z
