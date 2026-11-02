@@ -20,6 +20,7 @@
 // CpuState field offsets come from offsetof: nothing is hardcoded.
 
 #include "fil/cpu/micro_jit.hpp"
+#include "fil/common/inline_buffer.hpp"
 
 #include "fil/cpu/cortex_m4.hpp"
 #include "fil/cpu/micro_jit_ir.hpp"
@@ -38,7 +39,6 @@
 #include <deque>
 #include <iterator>
 #include <mutex>
-#include <vector>
 
 #if defined(FIL_MICRO_JIT_DUMP)
 #include <iomanip>
@@ -88,7 +88,7 @@ constexpr std::uint32_t hostReg(std::uint8_t guest) noexcept {
 
 class Emitter {
 public:
-    std::vector<std::uint32_t> words;
+    InlineVector<std::uint32_t, 1024U> words;
 
     void emit(std::uint32_t w) { words.push_back(w); }
 
@@ -208,9 +208,9 @@ public:
         std::size_t target{0};
         std::uint8_t kind{0}; // 0=unused, 1=cbz/cbnz/b.cond (imm19), 2=b (imm26)
     };
-    std::vector<BranchFixup> fixups;
+    InlineVector<BranchFixup, 128U> fixups;
     // Returns a label id bound to the NEXT emitted word.
-    std::vector<std::size_t> labels;
+    InlineVector<std::size_t, 256U> labels;
     std::size_t makeLabel() {
         labels.push_back(words.size());
         return labels.size() - 1U;
@@ -1288,7 +1288,9 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
     impl_->native_sections.emplace_back();
     auto& entry = impl_->native_sections.back();
     entry.block = block;
-    std::vector<std::uint8_t> code;
+#if !defined(FIL_MICRO_JIT_X86_64) || defined(_WIN32)
+    InlineVector<std::uint8_t, 4096U> code;
+#endif
 #if defined(FIL_MICRO_JIT_X86_64) && !defined(_WIN32)
     using namespace x86detail;
     const Offsets cpu_offsets{static_cast<std::uint32_t>(offsetof(CpuState, r)),
@@ -1495,7 +1497,7 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
     e.movM32Imm(kCtx, kAdmittedMode, 0U);
     e.addRsp16(); e.popReg(15U); e.popReg(14U); e.popReg(13U); e.popReg(12U); e.popReg(3U); e.ret();
     if (!e.patchBranches(error)) { impl_->native_sections.pop_back(); return nullptr; }
-    code = std::move(e.code);
+    const auto& code = e.code;
 #elif defined(FIL_MICRO_JIT_AARCH64)
     if (!aarch64detail::emitBlock(entry.block, code, error)) {
         impl_->native_sections.pop_back(); return nullptr;
@@ -1535,7 +1537,9 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     impl_->trace_sections.emplace_back();
     auto& entry = impl_->trace_sections.back();
     entry.plan = std::move(plan);
-    std::vector<std::uint8_t> code;
+#if !defined(FIL_MICRO_JIT_X86_64) || defined(_WIN32)
+    InlineVector<std::uint8_t, 4096U> code;
+#endif
 #if defined(FIL_MICRO_JIT_X86_64) && !defined(_WIN32)
     using namespace x86detail;
     const Offsets offsets{static_cast<std::uint32_t>(offsetof(CpuState, r)),
@@ -2026,7 +2030,7 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
         e.bindLabel(shift_flags); endLogic(e, offsets, true, 0U, false); e.ret();
     }
     if (!e.patchBranches(error)) { impl_->trace_sections.pop_back(); return nullptr; }
-    code = std::move(e.code);
+    const auto& code = e.code;
 #elif defined(FIL_MICRO_JIT_AARCH64)
     if (!aarch64detail::emitTrace(entry.plan, code, error)) {
         impl_->trace_sections.pop_back(); return nullptr;

@@ -15,6 +15,32 @@ struct Guard {
     unsigned& live_;
 };
 
+TEST(InlineBufferTest, AppendOnlyListsKeepInlineStorageAndGrowWithoutLosingFixups) {
+    struct Fixup { std::uint32_t position{0U}, label{0U}; };
+    fil::InlineVector<Fixup, 4U> list;
+    const auto object = reinterpret_cast<std::uintptr_t>(&list);
+    const auto elements = reinterpret_cast<std::uintptr_t>(list.data());
+    EXPECT_TRUE(list.empty());
+    ASSERT_GE(elements, object); ASSERT_LT(elements, object + sizeof(list));
+    const auto* inline_data = list.data();
+    for (std::uint32_t i = 0U; i < 65U; ++i) {
+        list.push_back({i * 7U, i * 11U});
+        EXPECT_EQ(list.size(), i + 1U);
+        EXPECT_EQ(list.data() == inline_data, i < 4U);
+        for (std::uint32_t j = 0U; j <= i; ++j) {
+            EXPECT_EQ(list[j].position, j * 7U); EXPECT_EQ(list[j].label, j * 11U);
+        }
+    }
+    const auto& view = list;
+    std::uint32_t i = 0U;
+    for (const auto& fixup : view) EXPECT_EQ(fixup.label, i++ * 11U);
+    EXPECT_EQ(view.data(), list.data());
+    // A source element must remain valid when appending triggers growth.
+    fil::InlineVector<std::uint8_t, 1U> bytes;
+    bytes.push_back(0xa5U); bytes.push_back(bytes[0]);
+    EXPECT_EQ(bytes[0], 0xa5U); EXPECT_EQ(bytes[1], 0xa5U);
+}
+
 TEST(InlineBufferTest, NonmovableGuardsUnwindInInlineAndOverflowStorage) {
     for (const auto size : {0U,1U,8U,9U,65U}) {
         unsigned live = 0U;

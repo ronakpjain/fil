@@ -55,7 +55,7 @@ struct Op {
     const NativeStackPlan* stack_plan{nullptr};
 };
 
-bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::string& error) {
+bool emitNative(std::span<const Op> ops, InlineVector<std::uint8_t, 4096U>& code, std::string& error) {
     NativeEmitter e;
     constexpr std::uint32_t ctx = 19U, cpu = 20U, cost = 21U;
     constexpr auto r = offsetof(CpuState, r);
@@ -293,19 +293,20 @@ bool emitNative(std::span<const Op> ops, std::vector<std::uint8_t>& code, std::s
     e.emit(0x910103FFU); // add sp, sp, #64
     e.bindLabel(early); e.ret();
     if (!e.patchBranches(error)) return false;
-    code.resize(e.words.size() * sizeof(std::uint32_t));
-    std::memcpy(code.data(), e.words.data(), code.size());
+    for (const auto word : e.words)
+        for (unsigned byte = 0U; byte < 4U; ++byte)
+            code.push_back(static_cast<std::uint8_t>(word >> (byte * 8U)));
     return true;
 }
 
-bool emitBlock(const NativeBlock& block, std::vector<std::uint8_t>& code, std::string& error) {
-    std::vector<Op> ops;
+bool emitBlock(const NativeBlock& block, InlineVector<std::uint8_t, 4096U>& code, std::string& error) {
+    InlineVector<Op, NativeTracePlan::max_ops> ops;
     for (const auto& inst : block.ops) ops.push_back({inst, inst.pc + inst.size});
-    return emitNative(ops, code, error);
+    return emitNative({ops.data(), ops.size()}, code, error);
 }
 
-bool emitTrace(const NativeTracePlan& plan, std::vector<std::uint8_t>& code, std::string& error) {
-    std::vector<Op> ops;
+bool emitTrace(const NativeTracePlan& plan, InlineVector<std::uint8_t, 4096U>& code, std::string& error) {
+    InlineVector<Op, NativeTracePlan::max_ops> ops;
     for (const auto& inst : plan.ops) {
         const bool stack = inst.decoded.kind == InstrKind::push || inst.decoded.kind == InstrKind::pop;
         auto native = inst.native;
@@ -316,7 +317,7 @@ bool emitTrace(const NativeTracePlan& plan, std::vector<std::uint8_t>& code, std
             stack, inst.decoded.kind == InstrKind::push, inst.decoded.register_list,
             stack ? &inst.stack_plan : nullptr});
     }
-    return emitNative(ops, code, error);
+    return emitNative({ops.data(), ops.size()}, code, error);
 }
 
 } // namespace aarch64detail

@@ -33,13 +33,13 @@ public:
     static constexpr std::size_t no_label = static_cast<std::size_t>(-1);
     std::size_t add_flags{no_label}, sub_flags{no_label};
     std::size_t logic_flags{no_label}, shift_flags{no_label};
-    std::vector<std::uint8_t> code;
+    InlineVector<std::uint8_t, 4096U> code;
     struct Fixup {
         std::size_t pos{0}; // offset of the rel32 field
         std::size_t label{0};
     };
-    std::vector<Fixup> fixups;
-    std::vector<std::size_t> labels; // label -> code offset, SIZE_MAX unbound
+    InlineVector<Fixup, 128U> fixups;
+    InlineVector<std::size_t, 256U> labels; // label -> code offset, SIZE_MAX unbound
 
     std::size_t makeLabel() {
         labels.push_back(static_cast<std::size_t>(-1));
