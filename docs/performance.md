@@ -10,7 +10,7 @@ selects the exact scheduler with eligible guarded RAM capsules as a reference.
 Network loop batching is off;
 single-board `run` batches proven loops automatically. Diagnostic modes such as
 instruction tracing and spin detection retain safe correctness fallbacks and
-may disable optimized paths. Expectation-only `run-network` keeps parallel lanes:
+may disable optimized paths. Expectation-only `run` keeps parallel lanes:
 lane-local records are captured per lane and merged deterministically on the
 coordinator, so observers run single-threaded without serializing board execution.
 A requested `--trace` artifact now also traces lanes this way; `--trace-instr`
@@ -183,7 +183,7 @@ clock domains, rather than a per-cycle lookup table.
 | Bespoke stencil JIT | Compiles straight-line integer superblocks (ALU, shifts, conditional branches, terminal calls) directly to host machine code: one stencil per guest op in a bump-allocated arena, with scheduler prefix limits and taken-branch exits reported back to dispatch. A bounded exact-key cache reuses immutable kernels after decoded-block eviction, avoiding repeated emission and executable-memory permission changes. Register transfers are limited to the block's referenced and modified registers, preserving values across partial-prefix exits. Unshifted core-register MOVs are native, including N/Z updates that preserve C/V. Blocks with memory suffixes can use a native pure-integer leading prefix; every memory operation remains in checked handlers. Serves plain, trusted, and budgeted reversible block paths with identical guest state, cycles, and event ordering; unsupported, memory/MMIO, system, and floating-point work retains existing paths. Disabled with `FIL_ENABLE_MICRO_JIT=OFF`. |
 | Guarded native traces | Hot generation-tagged traces stitch supported integer/byte/word-memory operations, register compares and unshifted register TST, flag-setting register shifts, byte/halfword extends and bitfield extracts, direct calls/branches, guarded profiled register BLX calls, profiled conditional and CBZ/CBNZ edges, and narrow PUSH/POP across basic blocks. Both x86-64 and AArch64 emit direct integer, guard, and memory stencils; memory and stack transfers call checked scalar helpers. The trace builder admits these extra integer operations explicitly, so enum placement does not silently exclude them from the supported set. Conditional mismatches exit before the branch retires. POP PC validates Thumb state and excludes exception-return tokens before register/SP commit. CPU traces opt into retiring a valid alternative return target with an immediate terminal side exit: the actual target is retained and no predicted successor executes. Low-level native callers retain strict predicted-target guards by default. Whole-span stack stores retain journal and store-footprint tracking. Repeated PCs can be unrolled up to 64 operations in compact committed execution; the detailed reversible API remains capped at its 16-entry metadata capacity. Timing plans cache the full flash-timing snapshot, with prefix sums normalized to the cheaper first-fetch mode. An entry-mode bias is reserved before admission and charged only when an instruction retires, so alternating sequential/non-sequential entry does not rebuild the tables; detailed output still includes the exact first-fetch charge. Every represented instruction executes individually under exact instruction/cycle credit, and retirement metadata comes from the trace plan rather than a basic-block slot. AArch64 shares its integer stencils with the pure backend and publishes CPU metadata, NZCV and progress after each committed instruction. x86-64 selects admitted-prefix versus checked-cycle kernels once at trace entry, avoiding per-instruction mode checks while retaining instruction-limit, branch and memory guards in both kernels. Their shared exit stubs publish the exact prefix's cycle charge, PC, diagnostic address, NZCV and progress; guest register, LR, SP and RAM effects remain immediate. This requires synchronous RAM-only helpers that do not inspect deferred CPU/progress metadata; new PC/flag-reading operands or observers require materialization first. The trace cache preserves all 4096 prepared-block indices instead of folding them into 256 slots, so alternating hot prefixes do not repeatedly evict each other before compilation. Entry storage is allocated lazily on the heap, so non-native runs do not allocate this storage and CPU stack footprint does not grow. Plans, profiles, compilation attempts and executable storage remain bounded; unsupported forms, changed generations, IT, pending exceptions and custom fetch callbacks keep checked execution. Trace diagnostics count actual native work, including speculative certificate replay, not a speed guarantee. |
 | Mixed native RAM prefixes | Eligible reversible integer/word-memory prefixes, including normalized literal loads and read-only SP-relative bases, use emitted x86-64 and AArch64 stencils with precise instruction and cycle limits. Checked helpers retain RAM permissions, access attribution, read footprints and write journaling; declined memory operations remain unretired for exact fallback. Custom timing callbacks keep the existing handler path. SP-relative accesses select architectural MSP/PSP. Repeated first-access native declines at an unchanged address use the checked path; changed addresses retry native execution. AArch64 uses the same shared native emitter for mixed blocks and guarded traces, with per-instruction commit boundaries. Native retirement/decline diagnostics report coverage, not a speed guarantee. |
-| Validated network fast path | Plain `run-network` uses compact single-instruction dispatch without loop-proof state. Networks of up to eight boards use a fixed-width timestamp reduction, retaining all tied completions and deterministic board ordering. |
+| Validated network fast path | Plain `run` uses compact single-instruction dispatch without loop-proof state. Networks of up to eight boards use a fixed-width timestamp reduction, retaining all tied completions and deterministic board ordering. |
 | Guarded RAM capsules | Reversible private-RAM capsules are automatic on eligible network work. Preliminary safety checks resolve the first journal entry of each touched address with a single generation-stamped address set rather than rescanning the window per mutation, so multi-mutation windows stay linear. Capturing the speculative pass directly into the published evaluation record avoids a second per-instruction metadata copy. Observation barriers, bounded native prefixes, and rollback preserve modeled effects; validate changes against capsules-disabled execution. |
 | Build optimization | Release, supported IPO/LTO, and representative optional Clang PGO reduce host overhead without changing modeled ADC fidelity. |
 
@@ -239,12 +239,14 @@ make BUILD_DIR=build-release BUILD_TYPE=Release IPO=ON test
 make pgo
 ```
 
-The target cleans old PGO outputs, builds, trains, merges profiles, rebuilds with the profile, and tests. Default training uses the checked-in network configuration with JIT enabled and ADC decimation 1 for 1,000 ms with a 50 million instruction limit.
+The target cleans old PGO outputs, builds, trains, merges profiles, rebuilds with the profile, and tests. Default training runs `configs/networks/per_vehicle.json` for `1s` with an
+instruction budget of `50000000`:
+`PGO_TRAIN_ARGS ?= run configs/networks/per_vehicle.json --duration 1s --instruction-budget 50000000`.
 
-- Override training with `PGO_TRAIN_ARGS='run-network ...'`.
+- Override training with `PGO_TRAIN_ARGS='run ...'`.
 - Use matching `PGO_CXX` and `LLVM_PROFDATA` versions.
 - Retrain after material code, firmware, or toolchain changes.
-- Match the scheduling mode too. Plain `run-network` uses the validated fast
+- Match the scheduling mode too. Plain `run` uses the validated fast
   path; leave it unadorned to retain that mode. ADC
   decimation 1 retains every conversion.
 - Individual stages: `pgo-generate`, `pgo-train`, `pgo-merge`, `pgo-use`, `pgo-test`.
@@ -260,7 +262,7 @@ make pgo JOBS=6 CTEST_JOBS=4 \
   PGO_GENERATE_BUILD_DIR=build-runtime-pgo-generate \
   PGO_BUILD_DIR=build-runtime-native \
   NATIVE=ON \
-  PGO_TRAIN_ARGS='run-network configs/networks/per_vehicle.json --duration-ms 3000 --max-instructions 3000000000 --quantum 1024 --strict-mmio --adc-decimation 1'
+  PGO_TRAIN_ARGS='run configs/networks/per_vehicle.json --duration 3s --instruction-budget 3000000000 --quantum 1024 --strict-mmio --adc-decimation 1'
 ```
 
 `make pgo` replaces the selected PGO build directories. Host-tuned binaries may

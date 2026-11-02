@@ -48,6 +48,48 @@ std::optional<std::string_view> nextOptionValue(
     return args[++index];
 }
 
+/**
+ * @brief Parses a simulated-time limit into nanoseconds.
+ *
+ * A bare number is seconds; `ms`, `us`, `s`, and `m` suffixes select the unit.
+ * Zero means unlimited. The value is independent of the emulated clock.
+ *
+ * @param option Option name used in diagnostics.
+ * @param text User-supplied value.
+ * @return Nanoseconds, or an invalid-argument error.
+ */
+Result<std::uint64_t> parseDurationNs(
+    const std::string_view option,
+    const std::string_view text
+) {
+    std::string_view number = text;
+    std::uint64_t multiplier = 1'000'000'000ULL; // Bare numbers are seconds.
+    if (text.size() >= 2U && text.ends_with("ms")) {
+        number = text.substr(0U, text.size() - 2U);
+        multiplier = 1'000'000ULL;
+    } else if (text.size() >= 2U && text.ends_with("us")) {
+        number = text.substr(0U, text.size() - 2U);
+        multiplier = 1'000ULL;
+    } else if (text.size() >= 1U && text.ends_with('s')) {
+        number = text.substr(0U, text.size() - 1U);
+        multiplier = 1'000'000'000ULL;
+    } else if (text.size() >= 1U && text.ends_with('m')) {
+        number = text.substr(0U, text.size() - 1U);
+        multiplier = 60'000'000'000ULL;
+    }
+    const auto parsed = config::parseUnsigned(number);
+    if (!parsed) {
+        return Error{ErrorCategory::invalid_argument,
+                     std::string(option) + " requires a number with an optional us, ms, s, or m suffix",
+                     std::nullopt};
+    }
+    if (parsed.value() != 0U
+        && parsed.value() > std::numeric_limits<std::uint64_t>::max() / multiplier) {
+        return Error{ErrorCategory::invalid_argument, std::string(option) + " is too large", std::nullopt};
+    }
+    return parsed.value() * multiplier;
+}
+
 struct PendingCanInjection {
     std::string bus;
     std::uint64_t at_ms{0};
@@ -679,10 +721,10 @@ ExitCode runBoardCommand(
     std::ostream& err
 ) {
     if (args.size() < 2) {
-        err << "fil: run requires a board config path\n";
+        err << "fil: run requires a config path\n";
         return ExitCode::usage_error;
     }
-    std::optional<std::uint64_t> duration_ms;
+    std::optional<std::uint64_t> duration_ns;
     std::optional<std::uint64_t> max_instructions;
     std::optional<std::uint32_t> stop_address;
     std::optional<std::string> stop_symbol;
@@ -697,19 +739,28 @@ ExitCode runBoardCommand(
 
     for (std::size_t index = 2; index < args.size(); ++index) {
         const std::string_view option = args[index];
-        if (option == "--duration-ms" || option == "--max-instructions" || option == "--stop-address" || option == "--adc-decimation") {
+        if (option == "--duration" || option == "--instruction-budget"
+            || option == "--stop-address" || option == "--adc-decimation") {
             const auto value = nextOptionValue(args, index);
             if (!value) {
                 err << "fil: " << option << " requires a value\n";
                 return ExitCode::usage_error;
+            }
+            if (option == "--duration") {
+                auto parsed = parseDurationNs(option, *value);
+                if (!parsed) {
+                    err << "fil: " << parsed.error().message << '\n';
+                    return ExitCode::usage_error;
+                }
+                duration_ns = parsed.value();
+                continue;
             }
             auto parsed = config::parseUnsigned(*value);
             if (!parsed) {
                 err << "fil: invalid value for " << option << ": " << parsed.error().message << '\n';
                 return ExitCode::usage_error;
             }
-            if (option == "--duration-ms") duration_ms = parsed.value();
-            else if (option == "--max-instructions") max_instructions = parsed.value();
+            if (option == "--instruction-budget") max_instructions = parsed.value();
             else if (option == "--adc-decimation") {
                 if (parsed.value() == 0U || parsed.value() > 1024U) {
                     err << "fil: --adc-decimation requires a factor in [1, 1024]\n";
@@ -760,12 +811,21 @@ ExitCode runBoardCommand(
 
     sim::BoardRunOptions options;
     options.max_instructions = max_instructions.value_or(board_config.value().run.max_instructions);
-    const std::uint64_t configured_duration = duration_ms.value_or(board_config.value().run.default_duration_ms);
-    if (configured_duration > std::numeric_limits<std::uint64_t>::max() / 1'000'000ULL) {
-        err << "fil: duration is too large\n";
-        return ExitCode::usage_error;
+    if (options.max_instructions == 0U) {
+        options.max_instructions = std::numeric_limits<std::uint64_t>::max();
     }
-    options.duration_ns = configured_duration * 1'000'000ULL;
+    std::uint64_t resolved_duration_ns = 0U;
+    if (duration_ns) {
+        resolved_duration_ns = duration_ns.value();
+    } else if (board_config.value().run.default_duration_ms != 0U) {
+        if (board_config.value().run.default_duration_ms
+            > std::numeric_limits<std::uint64_t>::max() / 1'000'000ULL) {
+            err << "fil: configured duration is too large\n";
+            return ExitCode::usage_error;
+        }
+        resolved_duration_ns = board_config.value().run.default_duration_ms * 1'000'000ULL;
+    }
+    options.duration_ns = resolved_duration_ns;
     options.trace_instructions = trace_instructions;
     options.detect_spin = detect_spin;
     options.enable_loop_batching = enable_loop_batching;
@@ -996,6 +1056,9 @@ ExitCode compareStlinkCommand(
     run_options.max_instructions = max_instructions.value_or(
         board_config.value().run.max_instructions
     );
+    if (run_options.max_instructions == 0U) {
+        run_options.max_instructions = std::numeric_limits<std::uint64_t>::max();
+    }
     run_options.duration_ns = 0U;
     run_options.stop_address = stop_address;
     run_options.detect_spin = false;
@@ -1131,18 +1194,51 @@ Result<void> scheduleConfiguredStimuli(
     return {};
 }
 
+/**
+ * @brief Loads a network configuration, accepting one board as a one-board network.
+ *
+ * `watch` and `serve` operate on a network. Passing a board config wraps it in
+ * an anonymous network that reuses that board's declared CAN buses.
+ *
+ * @param path Network or board configuration path.
+ * @return Loaded network configuration, or a source-aware error.
+ */
+Result<config::NetworkConfig> loadNetworkView(const std::filesystem::path& path) {
+    auto network = config::loadNetworkConfig(path);
+    if (network) return network;
+
+    auto board = config::loadBoardConfig(path);
+    if (!board) return network.error();
+
+    config::NetworkConfig synthesized;
+    synthesized.name = board.value().name;
+    synthesized.source_path = board.value().source_path;
+    for (const config::CanControllerConfig& controller : board.value().can) {
+        const bool seen = std::any_of(
+            synthesized.buses.begin(), synthesized.buses.end(),
+            [&](const config::CanBusConfig& bus) { return bus.name == controller.bus; }
+        );
+        if (seen) continue;
+        config::CanBusConfig bus;
+        bus.name = controller.bus;
+        synthesized.buses.push_back(std::move(bus));
+    }
+    synthesized.board_paths.push_back(board.value().source_path);
+    return synthesized;
+}
+
 ExitCode runNetworkCommand(
     const std::span<const std::string_view> args,
     std::ostream& out,
     std::ostream& err
 ) {
     if (args.size() < 2) {
-        err << "fil: run-network requires a network config path\n";
+        err << "fil: run requires a config path\n";
         return ExitCode::usage_error;
     }
 
-    std::uint64_t duration_ms = 1'000U;
-    std::uint64_t max_instructions = 50'000'000U;
+    std::optional<std::uint64_t> duration_ns;
+    std::uint64_t max_instructions = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t quantum = 1'024U;
     sim::SimTimeNs cross_board_window_ns = sim::WorldRunOptions{}.cross_board_window_ns;
     bool enable_parallel_lanes = sim::WorldRunOptions{}.enable_parallel_lanes;
@@ -1159,8 +1255,20 @@ ExitCode runNetworkCommand(
 
     for (std::size_t index = 2; index < args.size(); ++index) {
         const std::string_view option = args[index];
-        if (option == "--duration-ms" || option == "--max-instructions" || option == "--quantum" || option == "--adc-decimation"
-            || option == "--cross-board-window-ns") {
+        if (option == "--duration") {
+            const auto value = nextOptionValue(args, index);
+            if (!value) {
+                err << "fil: " << option << " requires a value\n";
+                return ExitCode::usage_error;
+            }
+            auto parsed = parseDurationNs(option, *value);
+            if (!parsed) {
+                err << "fil: " << parsed.error().message << '\n';
+                return ExitCode::usage_error;
+            }
+            duration_ns = parsed.value();
+        } else if (option == "--instruction-budget" || option == "--quantum"
+                   || option == "--adc-decimation" || option == "--cross-board-window-ns") {
             const auto value = nextOptionValue(args, index);
             if (!value) {
                 err << "fil: " << option << " requires a value\n";
@@ -1171,8 +1279,7 @@ ExitCode runNetworkCommand(
                 err << "fil: invalid value for " << option << ": " << parsed.error().message << '\n';
                 return ExitCode::usage_error;
             }
-            if (option == "--duration-ms") duration_ms = parsed.value();
-            else if (option == "--max-instructions") max_instructions = parsed.value();
+            if (option == "--instruction-budget") max_instructions = parsed.value();
             else if (option == "--adc-decimation") {
                 if (parsed.value() == 0U || parsed.value() > 1024U) {
                     err << "fil: --adc-decimation requires a factor in [1, 1024]\n";
@@ -1209,16 +1316,12 @@ ExitCode runNetworkCommand(
         else if (option == "--no-detect-spin") detect_spin = false;
         else if (option == "--allow-breakpoint") allow_breakpoint = true;
         else {
-            err << "fil: unknown run-network option: " << option << '\n';
+            err << "fil: unknown run option: " << option << '\n';
             return ExitCode::usage_error;
         }
     }
-    if (duration_ms > std::numeric_limits<std::uint64_t>::max() / 1'000'000ULL) {
-        err << "fil: duration is too large\n";
-        return ExitCode::usage_error;
-    }
 
-    auto network_config = config::loadNetworkConfig(args[1]);
+    auto network_config = loadNetworkView(args[1]);
     if (!network_config) {
         err << "fil: " << formatError(network_config.error()) << '\n';
         return ExitCode::config_error;
@@ -1278,7 +1381,8 @@ ExitCode runNetworkCommand(
     );
 
     sim::WorldRunOptions options;
-    options.duration_ns = duration_ms * 1'000'000ULL;
+    options.duration_ns = duration_ns.value_or(0U);
+    if (max_instructions == 0U) max_instructions = std::numeric_limits<std::uint64_t>::max();
     options.max_instructions_per_board = max_instructions;
     options.instruction_quantum = quantum;
     options.cross_board_window_ns = cross_board_window_ns;
@@ -1399,13 +1503,13 @@ ExitCode networkMonitorCommand(
     std::ostream& err,
     const bool binary_protocol
 ) {
-    const std::string_view command_name = binary_protocol ? "serve-network" : "watch-network";
+    const std::string_view command_name = binary_protocol ? "serve" : "watch";
     if (args.size() < 2U) {
         err << "fil: " << command_name << " requires a network config path\n";
         return ExitCode::usage_error;
     }
 
-    std::uint64_t max_instructions = 50'000'000U;
+    std::uint64_t max_instructions = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t quantum = 1'024U;
     sim::SimTimeNs cross_board_window_ns = sim::WorldRunOptions{}.cross_board_window_ns;
     bool enable_parallel_lanes = sim::WorldRunOptions{}.enable_parallel_lanes;
@@ -1424,8 +1528,23 @@ ExitCode networkMonitorCommand(
 
     for (std::size_t index = 2U; index < args.size(); ++index) {
         const std::string_view option = args[index];
-        if (option == "--max-instructions" || option == "--quantum"
-            || option == "--duration-ms" || option == "--refresh-ms" || option == "--refresh-us"
+        if (option == "--duration") {
+            const auto value = nextOptionValue(args, index);
+            if (!value) {
+                err << "fil: " << option << " requires a value\n";
+                return ExitCode::usage_error;
+            }
+            auto parsed = parseDurationNs(option, *value);
+            if (!parsed) {
+                err << "fil: " << parsed.error().message << '\n';
+                return ExitCode::usage_error;
+            }
+            // Zero selects an unlimited simulated-time run.
+            duration_ns = parsed.value() == 0U
+                ? std::nullopt
+                : std::optional<std::uint64_t>{parsed.value()};
+        } else if (option == "--instruction-budget" || option == "--quantum"
+            || option == "--refresh-ms" || option == "--refresh-us"
             || option == "--adc-decimation" || option == "--cross-board-window-ns") {
             const auto value = nextOptionValue(args, index);
             if (!value) {
@@ -1438,7 +1557,7 @@ ExitCode networkMonitorCommand(
                     << parsed.error().message << '\n';
                 return ExitCode::usage_error;
             }
-            if (option == "--max-instructions") max_instructions = parsed.value();
+            if (option == "--instruction-budget") max_instructions = parsed.value();
             else if (option == "--quantum") quantum = parsed.value();
             else if (option == "--cross-board-window-ns") cross_board_window_ns = parsed.value();
             else if (option == "--adc-decimation") {
@@ -1447,15 +1566,6 @@ ExitCode networkMonitorCommand(
                     return ExitCode::usage_error;
                 }
                 adc_decimation = static_cast<std::uint32_t>(parsed.value());
-            } else if (option == "--duration-ms") {
-                if (parsed.value() > std::numeric_limits<std::uint64_t>::max() / 1'000'000ULL) {
-                    err << "fil: duration overflows nanoseconds\n";
-                    return ExitCode::usage_error;
-                }
-                // Zero selects an unlimited simulated-time run.
-                duration_ns = parsed.value() == 0U
-                    ? std::nullopt
-                    : std::optional<std::uint64_t>{parsed.value() * 1'000'000ULL};
             } else {
                 if (parsed.value() == 0U
                     || parsed.value() > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -1488,8 +1598,11 @@ ExitCode networkMonitorCommand(
             return ExitCode::usage_error;
         }
     }
+    if (max_instructions == 0U) {
+        max_instructions = std::numeric_limits<std::uint64_t>::max();
+    }
 
-    auto network_config = config::loadNetworkConfig(args[1]);
+    auto network_config = loadNetworkView(args[1]);
     if (!network_config) {
         err << "fil: " << formatError(network_config.error()) << '\n';
         return ExitCode::config_error;
@@ -1541,7 +1654,7 @@ ExitCode networkMonitorCommand(
         hello.u32(static_cast<std::uint32_t>(world.value()->canBusCount()));
         if (!writeProtocolFrame(out, network_protocol::MessageKind::hello, 0U,
                                 std::move(hello))) {
-            err << "fil: serve-network failed to write protocol hello\n";
+            err << "fil: serve failed to write protocol hello\n";
             return ExitCode::runtime_error;
         }
         if (!expectations.empty()) expectation_evaluator.begin(
@@ -1674,7 +1787,7 @@ ExitCode networkMonitorCommand(
         }
 
         if (status != ProtocolReplyStatus::ok) {
-            err << "fil: serve-network request " << request.request_id << ": " << message << '\n';
+            err << "fil: serve request " << request.request_id << ": " << message << '\n';
         }
         if (protocol_output_failed || !writeProtocolReply(
                 out, request.request_id, status, world.value()->eventLoop().now(), message)) {
@@ -1690,7 +1803,7 @@ ExitCode networkMonitorCommand(
                                     const std::string_view message = {}) {
         if (!binary_protocol) return code;
         if (!writeProtocolEnd(out, world.value()->eventLoop().now(), reason, code, message)) {
-            err << "fil: serve-network failed to write protocol END\n";
+            err << "fil: serve failed to write protocol END\n";
             return ExitCode::runtime_error;
         }
         return code;
@@ -1716,7 +1829,7 @@ ExitCode networkMonitorCommand(
         } while (count < 0 && errno == EINTR);
         if (count < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
-            err << "fil: failed to read serve-network stdio input\n";
+            err << "fil: failed to read serve stdio input\n";
             return false;
         }
         if (count == 0) return closeProtocolInput();
@@ -1735,7 +1848,7 @@ ExitCode networkMonitorCommand(
             }
             if (!frame.value()) break;
             if (!handleProtocolRequest(*frame.value())) {
-                err << "fil: serve-network failed to write protocol reply\n";
+                err << "fil: serve failed to write protocol reply\n";
                 return false;
             }
         }
@@ -1745,7 +1858,7 @@ ExitCode networkMonitorCommand(
         pollfd input{STDIN_FILENO, POLLIN, 0};
         const std::int32_t ready = ::poll(&input, 1, 0);
         if (ready < 0 && errno != EINTR) {
-            err << "fil: failed to poll serve-network stdio input\n";
+            err << "fil: failed to poll serve stdio input\n";
             return ExitCode::runtime_error;
         }
         if (ready > 0 && (input.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0) {
@@ -1767,7 +1880,7 @@ ExitCode networkMonitorCommand(
         const auto ready = ::poll(&input, 1, 0);
         if (ready < 0) {
             if (errno == EINTR) return true;
-            err << "fil: failed to poll serve-network stdio input\n";
+            err << "fil: failed to poll serve stdio input\n";
             window_controls_ok = false;
         } else if (ready > 0) {
             if ((input.revents & (POLLERR | POLLNVAL)) != 0
@@ -1812,7 +1925,7 @@ ExitCode networkMonitorCommand(
         }
         if (protocol_output_failed) {
             if (!expectations.empty()) expectation_evaluator.finish(world.value()->eventLoop().now());
-            err << "fil: serve-network failed to write protocol trace\n";
+            err << "fil: serve failed to write protocol trace\n";
             return ExitCode::runtime_error;
         }
         if (!result || !result.value().succeeded()) {
@@ -1953,7 +2066,7 @@ ExitCode networkMonitorCommand(
     if (duration_reached) end_reason = ProtocolEndReason::duration_reached;
     else if (stdin_eof && !stop_requested) end_reason = ProtocolEndReason::input_eof;
     if (protocol_output_failed) {
-        err << "fil: serve-network failed to write protocol trace\n";
+        err << "fil: serve failed to write protocol trace\n";
         return ExitCode::runtime_error;
     }
     // Total-duration exactness: the per-slice sleeps keep phase within a
@@ -1995,47 +2108,28 @@ ExitCode serveNetworkCommand(
     std::ostream& err
 ) {
     if (args.size() < 2U) {
-        err << "fil: serve-network requires a network config path and --transport stdio\n";
+        err << "fil: serve requires a network config path\n";
         return ExitCode::usage_error;
     }
 
-    bool transport_seen = false;
-    std::vector<std::string_view> monitor_args{"serve-network", args[1]};
+    std::vector<std::string_view> monitor_args{"serve", args[1]};
     for (std::size_t index = 2U; index < args.size(); ++index) {
         const std::string_view option = args[index];
-        if (option != "--transport") {
-            if (option == "--control-stdin") {
-                err << "fil: serve-network uses stdio protocol controls; --control-stdin is not applicable\n";
-                return ExitCode::usage_error;
-            }
-            monitor_args.push_back(option);
-            continue;
-        }
-        if (transport_seen) {
-            err << "fil: serve-network accepts --transport only once\n";
+        if (option == "--control-stdin") {
+            err << "fil: serve uses stdio protocol controls; --control-stdin is not applicable\n";
             return ExitCode::usage_error;
         }
-        if (index + 1U >= args.size()) {
-            err << "fil: --transport requires a value (supported: stdio)\n";
+        if (option == "--transport") {
+            err << "fil: serve always uses the stdio transport; --transport is not needed\n";
             return ExitCode::usage_error;
         }
-        const std::string_view transport = args[++index];
-        if (transport != "stdio") {
-            err << "fil: unsupported serve-network transport: " << transport
-                << " (supported: stdio)\n";
-            return ExitCode::usage_error;
-        }
-        transport_seen = true;
-    }
-    if (!transport_seen) {
-        err << "fil: serve-network requires --transport stdio\n";
-        return ExitCode::usage_error;
+        monitor_args.push_back(option);
     }
 
     if (&out == &std::cout && ::isatty(STDOUT_FILENO)) {
-        err << "fil: serve-network cannot write binary protocol frames to a terminal; "
+        err << "fil: serve cannot write binary protocol frames to a terminal; "
                "pipe stdout to a protocol client or redirect it to a file. "
-               "Use watch-network for terminal output.\n";
+               "Use watch for terminal output.\n";
         return ExitCode::usage_error;
     }
 
@@ -2044,6 +2138,26 @@ ExitCode serveNetworkCommand(
 }
 
 } // namespace
+
+ExitCode runCommand(
+    const std::span<const std::string_view> args,
+    std::ostream& out,
+    std::ostream& err
+) {
+    if (args.size() < 2U) {
+        err << "fil: run requires a config path\n";
+        return ExitCode::usage_error;
+    }
+    if (config::loadBoardConfig(args[1])) {
+        return runBoardCommand(args, out, err);
+    }
+    if (config::loadNetworkConfig(args[1])) {
+        return runNetworkCommand(args, out, err);
+    }
+    // Neither kind loads. Route through the board parser so option errors keep
+    // precedence over the configuration diagnostic.
+    return runBoardCommand(args, out, err);
+}
 
 void printHelp(std::ostream& out) {
     out << "fil - deterministic STM32G4 firmware emulator\n\n"
@@ -2054,17 +2168,16 @@ void printHelp(std::ostream& out) {
         << "  inspect-config <config.json>  Validate and normalize an MCU, board, network, or stimulus input\n"
         << "  inspect-elf <firmware.elf>     Inspect an ELF32 ARM firmware image\n"
         << "  disasm-window <firmware.elf>   Decode a bounded Thumb instruction window\n"
-        << "  run <board.json> [options]     Execute one firmware board deterministically\n"
-        << "  run-network <network.json>     Execute a deterministic network and its attached stimuli\n"
-        << "  watch-network <network.json>   Run a human-facing live network monitor\n"
-        << "  serve-network <network.json> --transport stdio\n"
-        << "                                  Serve binary stdio control and traces\n"
+        << "  run <config.json> [options]    Execute a board or network deterministically\n"
+        << "  watch <config.json> [options]  Run a human-facing live network monitor\n"
+        << "  serve <config.json> [options]  Serve binary stdio control and traces\n"
         << "  compare-stlink <board.json>    Compare emulator state with STM32G4 hardware\n\n"
-        << "Defaults: JIT on, network RAM capsules on, ADC decimation 1.\n"
-        << "Fidelity-preserving speedups are automatic; diagnostics retain safe fallbacks.\n"
-        << "ADC decimation above 1 trades fidelity for speed.\n\n"
+        << "Defaults: unlimited simulated time and instruction budget (runs to completion),\n"
+        << "JIT on, network RAM capsules on, ADC decimation 1.\n"
+        << "A bare --duration number is seconds; us, ms, s, and m suffixes select other units.\n"
+        << "ADC decimation above 1 trades fidelity for speed; diagnostics retain safe fallbacks.\n\n"
         << "Run options:\n"
-        << "  --duration-ms N --max-instructions N --trace FILE --trace-instr\n"
+        << "  --duration D --instruction-budget N --trace FILE --trace-instr\n"
         << "  --strict-mmio --stop-address ADDR --stop-at-symbol NAME --allow-breakpoint\n"
         << "  --detect-spin --adc-decimation N\n\n"
         << "ST-Link comparison options:\n"
@@ -2072,14 +2185,14 @@ void printHelp(std::ostream& out) {
         << "  --stop-address ADDR --stop-at-symbol NAME --max-instructions N\n"
         << "  --serial ID --openocd PATH --timeout-ms N --artifacts DIRECTORY\n\n"
         << "Network options:\n"
-        << "  --duration-ms N --max-instructions N --quantum N --trace FILE\n"
+        << "  --duration D --instruction-budget N --quantum N --trace FILE\n"
         << "  --cross-board-window-ns N (network commands: default 100000; 0 = exact)\n"
         << "  --parallel-lanes (default) | --no-parallel-lanes (validation reference)\n"
         << "  --strict-mmio --trace-instr --detect-spin --allow-breakpoint\n"
         << "  --adc-decimation N (keep 1 of N continuous ADC scans)\n"
         << "  --inject-can BUS[@TIME_MS]:ID:HEXDATA\n\n"
-        << "Watch-network options:\n"
-        << "  --duration-ms N --refresh-ms N --refresh-us N --max-instructions N --quantum N\n"
+        << "Watch options:\n"
+        << "  --duration D --refresh-ms N --refresh-us N --instruction-budget N --quantum N\n"
         << "  --adc-decimation N (keep 1 of N continuous ADC scans)\n"
         << "  --trace-type TYPE (alias: --live-filter; repeatable) --strict-mmio --trace-instr --detect-spin\n"
         << "  --control-stdin\n"
@@ -2087,9 +2200,9 @@ void printHelp(std::ostream& out) {
         << "  watch also stops early when all boards reach terminal CPU boundaries\n"
         << "  stdin: BUS:ID:HEXDATA, adc BOARD INSTANCE CHANNEL VALUE,\n"
         << "  gpio BOARD PORT PIN 0|1|release, quit, or exit\n"
-        << "\nServe-network options:\n"
-        << "  --transport stdio (required; binary protocol on stdin/stdout)\n"
-        << "  --duration-ms N --refresh-ms N --refresh-us N --max-instructions N --quantum N\n"
+        << "\nServe options:\n"
+        << "  Binary protocol on stdin/stdout; stdio is the only transport (no --transport).\n"
+        << "  --duration D --refresh-ms N --refresh-us N --instruction-budget N --quantum N\n"
         << "  --live-filter TYPE (repeatable), --trace-instr, --no-wall-pacing\n"
         << "  --adc-decimation N --strict-mmio --lenient-mmio --detect-spin\n"
         << "  See docs/serve_network.md for the versioned binary protocol.\n";
@@ -2167,18 +2280,14 @@ ExitCode run(
     }
 
     if (args.front() == "run") {
-        return runBoardCommand(args, out, err);
+        return runCommand(args, out, err);
     }
 
-    if (args.front() == "run-network") {
-        return runNetworkCommand(args, out, err);
-    }
-
-    if (args.front() == "watch-network") {
+    if (args.front() == "watch") {
         return watchNetworkCommand(args, out, err);
     }
 
-    if (args.front() == "serve-network") {
+    if (args.front() == "serve") {
         return serveNetworkCommand(args, out, err);
     }
 

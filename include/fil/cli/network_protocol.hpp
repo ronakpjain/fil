@@ -1,7 +1,7 @@
 #pragma once
 
 /** @file network_protocol.hpp
- *  @brief Framing primitives for the serve-network stdio protocol.
+ *  @brief Framing primitives for the serve stdio protocol.
  */
 
 #include "fil/common/result.hpp"

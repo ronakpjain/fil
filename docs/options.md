@@ -6,7 +6,10 @@ and `make help`.
 
 ## Defaults
 
-JIT and proven single-board loop batching are automatic. Network commands use
+JIT and proven single-board loop batching are automatic. Run, watch, and serve
+have unlimited simulated time and instruction budgets by default. A board config's
+nonzero `run.default_duration_ms` and `run.max_instructions` override those
+unlimited defaults; network configs use unlimited defaults. Network commands use
 independent board slices with a **1000 ns cross-board synchronization window**.
 This is a bounded-skew communication model, not exact cross-board instruction
 ordering. ADC, timers, DMA and interrupts still execute locally at full fidelity.
@@ -19,15 +22,23 @@ and their sample, DMA, and interrupt effects.
 
 ## Run a board or network
 
+| Command | Input / behavior |
+| --- | --- |
+| `fil run <config.json>` | Detects a board or network config and runs it to completion by default. |
+| `fil watch <config.json>` | Live monitor for a network config; a board config is accepted as a one-board network. |
+| `fil serve <config.json>` | Binary stdio service for a network config; a board config is accepted as a one-board network. |
+
+`serve` supports stdio only; it does not take a transport option.
+
 ```bash
-fil run board.json --duration-ms 1000
-fil run-network network.json --duration-ms 1000 --strict-mmio
+fil run board.json --duration 1s
+fil run network.json --duration 1s --strict-mmio
 ```
 
 | Option | Purpose / default |
 | --- | --- |
-| `--duration-ms N` | Board: config value (normally 1000); network: 1000. |
-| `--max-instructions N` | Board: config value (normally 50,000,000); network: 50,000,000 per board. |
+| `--duration D` | Unlimited unless a board config sets nonzero `run.default_duration_ms`; network default is unlimited. Bare values are seconds; `us`, `ms`, `s`, and `m` suffixes are supported. `0` means unlimited. |
+| `--instruction-budget N` | Unlimited unless a board config sets nonzero `run.max_instructions`; network default is unlimited, per board. `0` means unlimited. |
 | `--strict-mmio` / `--lenient-mmio` | Fault on unmodeled MMIO or allow compatibility behavior; default lenient. |
 | `--trace FILE` | Write JSONL events; off by default. |
 | `--trace-instr` | Include instruction events; off by default. |
@@ -59,22 +70,23 @@ See [Tracing](tracing.md) and [Performance](performance.md) for details.
 ## Live monitoring and binary service
 
 ```bash
-fil watch-network network.json
-fil serve-network network.json --transport stdio
+fil watch network.json
+fil serve network.json
 ```
 
-Both accept `--duration-ms`, `--max-instructions`, `--quantum`, MMIO controls,
+Both accept `--duration`, `--instruction-budget`, `--quantum`, MMIO controls,
 `--trace-instr`, `--detect-spin`, `--cross-board-window-ns`,
 `--parallel-lanes`, `--no-parallel-lanes`, and `--adc-decimation` from above.
-Duration defaults to unlimited; `0` also means unlimited. The instruction limit
-is 50,000,000 per board **per slice**. Neither accepts `--trace FILE`.
+Duration and instruction budget default to unlimited; `0` also means unlimited.
+For watch and serve, the instruction budget applies per board per run slice.
+Neither accepts `--trace FILE`. Stdio is the only serve transport; `--transport`
+is rejected.
 
 | Option | Purpose / default |
 | --- | --- |
 | `--refresh-ms N` | Simulated milliseconds per slice; default 1, must be nonzero. |
 | `--live-filter TYPE` / `--trace-type TYPE` | Repeatable event filter; default `can_tx`. The first explicit filter replaces the default. |
 | `--no-wall-pacing` | Run slices back-to-back instead of pacing to real time; live I/O stays active. |
-| `--transport stdio` | Required for `serve-network`; stdout is reserved for the binary protocol. |
 
 Watch stdin accepts CAN frames, ADC/GPIO changes, and `quit`/`exit`.
 Control is always active; `--control-stdin` is an optional watch-only
@@ -101,7 +113,7 @@ without flashing. Read [Hardware comparison](hardware_comparison.md) first.
 | `--memory ADDR:LENGTH` | Repeatable memory range; none by default. |
 | `--register NAME` / `--ignore-register NAME` | Repeatable register selection/exclusion; all known registers selected by default. |
 | `--stop-address ADDR` / `--stop-at-symbol NAME` | Optional, mutually exclusive stop controls. |
-| `--max-instructions N` | Config value; normally 50,000,000. |
+| `--max-instructions N` | Unlimited unless the board config sets nonzero `run.max_instructions`; `0` means unlimited. |
 | `--strict-mmio` / `--lenient-mmio` | Default lenient. |
 | `--serial ID` | Select a probe; no explicit selection by default. |
 | `--openocd PATH` | Default `openocd`. |

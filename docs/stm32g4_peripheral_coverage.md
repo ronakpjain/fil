@@ -271,7 +271,7 @@ reference-verified here**.
 
 ## Virtual CAN and multi-board world
 
-`run-network` creates named in-process buses, attaches configured FDCAN instances, and dispatches equal-time boards in configuration order; the instruction quantum caps only same-timestamp fairness bursts. CAN delivery is synchronous in node attachment order; loopback is optional per node. Frame validation covers 11- and 29-bit identifiers, classic CAN limits, CAN-FD DLC mapping, and BRS validity. Trace records include normalized transmit and receive frames. Their `dlc` field is the encoded CAN DLC and `length` is the decoded payload byte count; device-facing sources use `board.device`, while bus-facing sources use `bus/node`.
+`run` creates named in-process buses, attaches configured FDCAN instances, and dispatches equal-time boards in configuration order; the instruction quantum caps only same-timestamp fairness bursts. CAN delivery is synchronous in node attachment order; loopback is optional per node. Frame validation covers 11- and 29-bit identifiers, classic CAN limits, CAN-FD DLC mapping, and BRS validity. Trace records include normalized transmit and receive frames. Their `dlc` field is the encoded CAN DLC and `length` is the decoded payload byte count; device-facing sources use `board.device`, while bus-facing sources use `bus/node`.
 
 The CLI option `--inject-can BUS[@TIME_MS]:ID:HEXDATA` schedules an external frame
 on the shared event loop and may be repeated. A missing `@TIME_MS` means time zero.

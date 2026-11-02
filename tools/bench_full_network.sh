@@ -144,9 +144,9 @@ run_network() {
     raw_file="$work_dir/run-$run_number.parsed"
     normalized_file="$work_dir/run-$run_number.normalized"
     validation_file="$work_dir/run-$run_number.validation"
-    command=("$executable" run-network "$NETWORK"
-        --duration-ms "$duration"
-        --max-instructions "$((duration * 1000000))" --quantum 1024
+    command=("$executable" run "$NETWORK"
+        --duration "${duration}ms"
+        --instruction-budget "$((duration * 1000000))" --quantum 1024
         --strict-mmio --adc-decimation 1 --cross-board-window-ns "$cross_board_window_ns")
 
     TIMEFORMAT='%6R'

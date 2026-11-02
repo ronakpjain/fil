@@ -9,9 +9,9 @@ endforeach()
 # A failed run must not accidentally validate a trace left by an earlier pass.
 file(REMOVE "${TRACE_FILE}")
 execute_process(
-    COMMAND ${FIL_EMULATOR} "${FIL_EXECUTABLE}" run-network "${NETWORK_CONFIG}"
-        --duration-ms 20
-        --max-instructions 1000000
+    COMMAND ${FIL_EMULATOR} "${FIL_EXECUTABLE}" run "${NETWORK_CONFIG}"
+        --duration 20ms
+        --instruction-budget 1000000
         --quantum 512
         --strict-mmio
         --no-detect-spin

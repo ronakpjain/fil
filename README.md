@@ -12,8 +12,8 @@ Requires CMake 3.20+, a C++20 compiler, and GoogleTest for tests.
 make
 make test
 ./build/fil --help
-./build/fil run configs/boards/g4_testing.json --duration-ms 100 --strict-mmio
-./build/fil run-network configs/networks/per_vehicle.json --duration-ms 1000 --quantum 1024 --strict-mmio
+./build/fil run configs/boards/g4_testing.json --duration 100ms --strict-mmio
+./build/fil run configs/networks/per_vehicle.json --duration 1s --quantum 1024 --strict-mmio
 ```
 
 The checked-in board/network configurations reference external firmware images.
@@ -33,14 +33,13 @@ and timing effects are modeled. See [Architecture](docs/architecture.md),
 The [peripheral reference](docs/peripheral/index.md) describes each modeled
 device's behavior, usage, and limitations.
 
-`run` executes one board; `run-network` executes a configured network as a
-human-readable batch job; `watch-network` is the human-facing live monitor with
-text traces and CAN/ADC/GPIO stdin controls. `serve-network` requires
-`--transport stdio` and is the interprocess counterpart: stdin/stdout carry a
-documented, versioned binary protocol and stdout contains no human-readable output. See
-[Live monitoring](docs/watch_network.md) and [the stdio protocol](docs/serve_network.md).
-`--trace FILE` writes JSONL events for `run` and `run-network`; `--trace-instr`
-records individual instructions. `inspect-config`, `inspect-elf`, and
+`run` executes either a board or network config as a human-readable batch job;
+`watch` is the human-facing live monitor with text traces and CAN/ADC/GPIO stdin
+controls. `serve` is the interprocess counterpart: stdin/stdout carry a documented,
+versioned binary protocol and stdout contains no human-readable output. Stdio is
+its only transport. See [Live monitoring](docs/watch_network.md) and [the stdio
+protocol](docs/serve_network.md). `--trace FILE` writes JSONL events for `run`;
+`--trace-instr` records individual instructions. `inspect-config`, `inspect-elf`, and
 `disasm-window` inspect inputs.
 `compare-stlink` requires an attached ST-Link and controls/resets the physical
 target; flashing requires explicit `--flash`. See [Configuration](docs/configuration.md),
@@ -51,7 +50,7 @@ for contracts and safety.
 ## Performance
 
 Our recommended baseline is Release + supported IPO, automatic JIT, eligible
-guarded RAM capsules, and ADC decimation 1. Plain `run-network` uses the
+guarded RAM capsules, and ADC decimation 1. Plain `run` uses the
 validated fast path without enabling flags. JIT, proven single-board batching,
 and eligible guarded RAM capsules are automatic; network loop batching remains
 off. Diagnostic modes such as instruction tracing and spin detection safely

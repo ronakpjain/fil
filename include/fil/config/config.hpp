@@ -39,8 +39,8 @@ struct McuConfig {
 
 /** @brief Default stopping limits for a single emulator run. */
 struct RunConfig {
-    std::uint64_t default_duration_ms{1'000};   ///< Simulated duration limit in milliseconds.
-    std::uint64_t max_instructions{50'000'000}; ///< Executed instruction limit.
+    std::uint64_t default_duration_ms{0}; ///< Simulated duration limit in ms; zero means unlimited.
+    std::uint64_t max_instructions{0};    ///< Executed instruction limit; zero means unlimited.
 };
 
 /** @brief Initial value and tracing policy for one named GPIO pin. */

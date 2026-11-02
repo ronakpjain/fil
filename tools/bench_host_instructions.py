@@ -177,8 +177,8 @@ def measure(binary, args, label):
     if not args.analyze_only:
         command = [
             "valgrind", "--tool=callgrind", f"--callgrind-out-file={profile}",
-            str(binary.resolve()), "run-network", str(args.network.resolve()),
-            "--duration-ms", str(args.duration_ms), "--max-instructions", "1000000000",
+            str(binary.resolve()), "run", str(args.network.resolve()),
+            "--duration", f"{args.duration_ms}ms", "--instruction-budget", "1000000000",
             "--quantum", "1024", "--strict-mmio", "--adc-decimation", "1",
         ]
         with stdout_path.open("w") as stdout, stderr_path.open("w") as stderr:

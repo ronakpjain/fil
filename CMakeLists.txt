@@ -288,8 +288,8 @@ if(FIL_BUILD_TESTS)
                 add_test(
                     NAME "fil.per.run_${per_board}_10ms"
                     COMMAND fil run "${per_generated_config}"
-                        --duration-ms 10
-                        --max-instructions 1000000
+                        --duration 10ms
+                        --instruction-budget 1000000
                         --strict-mmio
                         --no-detect-spin
                 )

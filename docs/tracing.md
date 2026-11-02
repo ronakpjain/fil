@@ -1,14 +1,14 @@
 # JSONL trace contract
 
-`fil run` and `fil run-network` write deterministic JSON Lines when passed
-`--trace FILE`. Each line is one compact JSON object and one simulation event.
+`fil run` writes deterministic JSON Lines for board or network configs when
+passed `--trace FILE`. Each line is one compact JSON object and one simulation event.
 Without `--trace`, the CLI disables trace collection to avoid retaining diagnostic
 history. Add `--trace-instr` when instruction records are also required.
 
-`fil watch-network` instead prints selected events as human-readable lines while a
+`fil watch` instead prints selected events as human-readable lines while a
 network runs and accepts CAN/ADC/GPIO controls on standard input. Its live output
 is not JSONL; see [Live network monitoring](watch_network.md) for its text format.
-`fil serve-network --transport stdio` streams selected records in the binary
+`fil serve` streams selected records in the binary
 [network-service protocol](serve_network.md), preserving the generic trace fields
 and their order without retaining a full in-memory trace history.
 

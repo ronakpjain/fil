@@ -82,7 +82,7 @@ Current binding details matter when authoring tests:
   board initialization, and receives transmitted bytes immediately. `--trace` also
   captures timestamped USART transmit records. The log's parent directory must
   already exist.
-- CAN attachments are connected by `run-network`. A standalone `run` validates the FDCAN instance but has no virtual bus attachment.
+- Network-config `run` attaches configured FDCAN instances to virtual CAN buses. A board-config `run` validates the FDCAN instance but has no virtual bus attachment.
 - The ADC register model currently converts external channels 0 through 19. A
   conversion completes after a deterministic 5 us default delay and samples the
   configured source at that simulated timestamp. Constants return their configured
@@ -117,7 +117,7 @@ The repository provides `configs/networks/per_vehicle.json` for application firm
 
 ## Stimulus scripts
 
-A network's optional `stimuli` array contains paths to versioned JSON stimulus scripts. Paths are resolved relative to the network file. `run-network` and `watch-network` validate each script's targets and schedule its events relative to simulation time zero before emulation begins. Independent script files can be composed in one network, and event order is deterministic for events with equal timestamps.
+A network's optional `stimuli` array contains paths to versioned JSON stimulus scripts. Paths are resolved relative to the network file. `run` and `watch` validate each script's targets and schedule its events relative to simulation time zero before emulation begins. Independent script files can be composed in one network, and event order is deterministic for events with equal timestamps.
 
 ```json
 {
@@ -153,9 +153,9 @@ Two expectation kinds are supported:
 ]
 ```
 
-Expectation input records (`can_tx`, `gpio_output`) are internally recorded while checks are active, even if `--trace` was not requested; no trace artifact is written unless requested. Because they are recorded through the per-lane capture path, an expectation-only `run-network` keeps the parallel lane scheduler.
+Expectation input records (`can_tx`, `gpio_output`) are internally recorded while checks are active, even if `--trace` was not requested; no trace artifact is written unless requested. Because they are recorded through the per-lane capture path, an expectation-only `run` keeps the parallel lane scheduler.
 
-`run-network` prints `pass`/`fail`/`incomplete` for each expectation and exits nonzero for unmet checks. When a stimulus script contains expectations, both `run-network` and `watch-network` emit lifecycle trace records: `expectation_pending`, then exactly one of `expectation_pass`, `expectation_fail`, or `expectation_incomplete`. Each record includes stable, unique `check_id` (`stimulus/<stimulus_index>/<script>/expect/<expect_index>`), where `stimulus_index` is the zero-based position in the network config's `stimuli` array; this distinguishes repeated attachments and different scripts with the same name. Records also include script/index, the expected target and inclusive window timestamps, and for passes the matched record fields and time. A match is emitted as soon as the relevant record is observed.
+`run` prints `pass`/`fail`/`incomplete` for each expectation and exits nonzero for unmet checks. When a stimulus script contains expectations, both `run` and `watch` emit lifecycle trace records: `expectation_pending`, then exactly one of `expectation_pass`, `expectation_fail`, or `expectation_incomplete`. Each record includes stable, unique `check_id` (`stimulus/<stimulus_index>/<script>/expect/<expect_index>`), where `stimulus_index` is the zero-based position in the network config's `stimuli` array; this distinguishes repeated attachments and different scripts with the same name. Records also include script/index, the expected target and inclusive window timestamps, and for passes the matched record fields and time. A match is emitted as soon as the relevant record is observed.
 
 Select lifecycle events in the existing live watch trace with, for example, `--trace-type expectation_pending --trace-type expectation_pass --trace-type expectation_fail --trace-type expectation_incomplete` (`--live-filter` remains an alias). Expectation input records are retained internally while checks are active even if they are not selected for display. Existing trace JSONL serialization carries these same event records. The future DAQ integration should consume FIL trace/results as a dedicated FIL transport; it is independent of the existing HIL engine. `inspect-config` accepts stimulus-script files directly. For a complete example, see `configs/networks/per_vehicle_ready_to_drive.json` and `configs/stimuli/per_car_ready_to_drive.json`; this script combines GPIO input changes with CAN feedback injected on a separate bus.
 
@@ -176,19 +176,19 @@ CLI options override run defaults without modifying JSON:
 
 ```bash
 ./build/fil run configs/boards/g4_testing.json \
-  --duration-ms 1000 \
-  --max-instructions 50000000 \
+  --duration 1s \
+  --instruction-budget 50000000 \
   --strict-mmio
 
-./build/fil run-network configs/networks/per_vehicle.json \
-  --duration-ms 100 \
-  --max-instructions 5000000 \
+./build/fil run configs/networks/per_vehicle.json \
+  --duration 100ms \
+  --instruction-budget 5000000 \
   --quantum 1024 \
   --inject-can vcan@5:0x123:0102 \
   --inject-can vcan@20:0x456:aabb
 ```
 
-For `run-network`, `--duration-ms` is a shared simulated-time deadline and
-`--max-instructions` is an independent budget for each board. The repeatable
+For a network, `--duration` is a shared simulated-time deadline and
+`--instruction-budget` is an independent budget for each board. The repeatable
 `--inject-can BUS[@TIME_MS]:ID:HEXDATA` option schedules validated classic CAN or
 CAN-FD frames on a declared bus; omitting `@TIME_MS` means time zero.

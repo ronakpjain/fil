@@ -23,8 +23,6 @@ TEST(SmokeTest, HelpIsSuccessful) {
     EXPECT_TRUE(result == fil::cli::ExitCode::success) << "--help returns success";
     EXPECT_TRUE(out.str().find("Usage:") != std::string::npos) << "--help prints usage";
     EXPECT_TRUE(err.str().empty()) << "--help does not print an error";
-    EXPECT_EQ(out.str().find("--no-jit"), std::string::npos);
-    EXPECT_EQ(out.str().find("--no-loop-batching"), std::string::npos);
     EXPECT_EQ(out.str().find("--no-ram-capsules"), std::string::npos);
     EXPECT_NE(out.str().find("--adc-decimation"), std::string::npos);
     EXPECT_EQ(out.str().find("--deferred-prefixes"), std::string::npos);
@@ -47,16 +45,11 @@ TEST(SmokeTest, UnknownCommandIsAUsageError) {
 }
 
 TEST(SmokeTest, ExecutionSlowdownSwitchesAreRejected) {
-    for (const std::string_view command : {"run", "run-network", "watch-network", "serve-network"}) {
+    for (const std::string_view command : {"run", "watch", "serve"}) {
         for (const std::string_view option : {
-                 "--no-jit", "--no-ram-capsules", "--no-loop-batching",
-                 "--deferred-prefixes", "--jit", "--ram-capsules", "--loop-batching"}) {
+                 "--no-ram-capsules", "--deferred-prefixes", "--ram-capsules"}) {
             if (command == "run" && option == "--no-ram-capsules") continue;
             std::vector<std::string_view> args{command, "missing-jit-config.json", option};
-            if (command == "serve-network") {
-                args.push_back("--transport");
-                args.push_back("stdio");
-            }
             std::ostringstream out;
             std::ostringstream err;
             const auto result = fil::cli::run(args, out, err);
@@ -67,12 +60,8 @@ TEST(SmokeTest, ExecutionSlowdownSwitchesAreRejected) {
 }
 
 TEST(SmokeTest, FidelityReducingAdcDecimationRemainsExplicitlyAvailable) {
-    for (const std::string_view command : {"run", "run-network", "watch-network", "serve-network"}) {
+    for (const std::string_view command : {"run", "watch", "serve"}) {
         std::vector<std::string_view> args{command, "missing-adc-config.json", "--adc-decimation", "4"};
-        if (command == "serve-network") {
-            args.push_back("--transport");
-            args.push_back("stdio");
-        }
         std::ostringstream out;
         std::ostringstream err;
         EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::config_error) << command;
@@ -81,7 +70,7 @@ TEST(SmokeTest, FidelityReducingAdcDecimationRemainsExplicitlyAvailable) {
 }
 
 TEST(SmokeTest, RejectsInvalidWatchRefreshInterval) {
-    const std::string_view args[]{"watch-network", "missing.json", "--refresh-ms", "0"};
+    const std::string_view args[]{"watch", "missing.json", "--refresh-ms", "0"};
     std::ostringstream out;
     std::ostringstream err;
 
@@ -124,7 +113,7 @@ TEST(SmokeTest, HonorsRunStopControls) {
         "}\n";
     const std::string config_text = directory.write("config.json", config_contents).string();
     const std::string_view default_args[]{
-        "run", config_text, "--duration-ms", "0", "--max-instructions", "20",
+        "run", config_text, "--duration", "0", "--instruction-budget", "20",
         "--no-detect-spin",
     };
     std::ostringstream default_out;
@@ -136,7 +125,7 @@ TEST(SmokeTest, HonorsRunStopControls) {
         << "unrequested BKPT produces an explicit diagnostic";
 
     const std::string_view allowed_args[]{
-        "run", config_text, "--duration-ms", "0", "--max-instructions", "20",
+        "run", config_text, "--duration", "0", "--instruction-budget", "20",
         "--no-detect-spin", "--allow-breakpoint",
     };
     std::ostringstream allowed_out;

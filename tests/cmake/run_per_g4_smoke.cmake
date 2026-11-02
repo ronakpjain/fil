@@ -8,8 +8,8 @@ endforeach()
 
 execute_process(
     COMMAND ${FIL_EMULATOR} "${FIL_EXECUTABLE}" run "${BOARD_CONFIG}"
-        --duration-ms 1000
-        --max-instructions 50000000
+        --duration 1s
+        --instruction-budget 50000000
         --strict-mmio
         --no-detect-spin
     RESULT_VARIABLE run_result

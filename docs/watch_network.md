@@ -1,22 +1,22 @@
 # Live network monitoring
 
-`fil watch-network` runs a configured multi-board CAN network in short simulated-time
+`fil watch` runs a configured multi-board CAN network in short simulated-time
 slices, prints selected trace events as they occur, and accepts CAN frames on
 standard input. It is intended for interactive diagnostics and host-driven testing;
-use [`run-network`](options.md#network-only) with `--trace` when a persistent,
+use [`run`](options.md#run-a-board-or-network) with `--trace` when a persistent,
 byte-reproducible JSONL artifact is required. For interprocess control with
-binary stdio traces, use [`serve-network`](serve_network.md).
+binary stdio traces, use [`serve`](serve_network.md).
 
 ## Start a monitor
 
-`watch-network` paces simulation time to wall-clock time: after each slice it
+`watch` paces simulation time to wall-clock time: after each slice it
 waits until wall time catches up before running the next one, so live
 consumers observe real message rates. When the model runs slower than real
 time there is nothing to wait for and slices run back-to-back; trace order is
 unchanged either way. Pass `--no-wall-pacing` to always run back-to-back.
 
 ```bash
-./build/fil watch-network configs/networks/per_vehicle.json \
+./build/fil watch configs/networks/per_vehicle.json \
   --refresh-ms 10 \
   --live-filter can_tx \
   --live-filter can_rx \
@@ -78,11 +78,11 @@ error and ignored without stopping the simulation.
 
 | Option | Meaning |
 |---|---|
-| `--duration-ms N` | Stop after at most `N` milliseconds of simulated time; `0` runs without a simulated-time limit. The monitor also stops if all boards reach terminal CPU boundaries. Without a duration, it runs until `quit`, `exit`, standard-input EOF, or all boards stop. |
+| `--duration D` | Stop after at most `D` simulated time; bare values are seconds and suffixes `us`, `ms`, `s`, and `m` are accepted. `0` and the default mean unlimited. The monitor also stops if all boards reach terminal CPU boundaries. Without a duration, it runs until `quit`, `exit`, standard-input EOF, or all boards stop. |
 | `--refresh-ms N` | Run and poll input in slices of `N` simulated milliseconds; defaults to `1` and must be nonzero. |
 | `--no-wall-pacing` | Run slices back-to-back instead of pacing simulation time to wall-clock time. Pacing is on by default. |
 | `--live-filter TYPE` / `--trace-type TYPE` | Print one exact trace event type. Repeat to select more than one type; default `can_tx`. |
-| `--max-instructions N` | Set the per-board instruction budget used for each run slice. |
+| `--instruction-budget N` | Set the per-board instruction budget used for each run slice; default and `0` are unlimited. |
 | `--quantum N` | Set the deterministic network scheduling quantum; defaults to `1024`. |
 | `--adc-decimation N` | Keep one of every `N` continuous ADC scans; factor 1–1024, default 1. |
 | `--trace-instr` | Emit instruction trace events; add `--live-filter instr` to print them. This diagnostic safely disables eligible RAM capsules. |
@@ -96,10 +96,10 @@ automatic; network loop batching remains off. Capsule guards preserve event and
 observation ordering; custom callbacks and unsupported DMA paths remain barriers.
 Tracing and spin diagnostics safely disable capsules rather than failing because
 of their automatic availability.
-`watch-network` prints selected events as human-readable lines; the companion
-[`serve-network --transport stdio`](serve_network.md) uses a documented binary
+`watch` prints selected events as human-readable lines; the companion
+[`serve`](serve_network.md) uses a documented binary
 protocol instead.
 
-When `--duration-ms` is present, standard-input EOF does not end the run; the
+When a finite `--duration` is present, standard-input EOF does not end the run; the
 network continues toward the requested simulated-time limit unless all boards
 reach terminal CPU boundaries first. Without a duration, EOF stops the monitor.

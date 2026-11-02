@@ -299,9 +299,9 @@ case_names=(
     'pll170 x1'
 )
 declare -a case_args_0 case_args_1 case_args_2
-case_args_0=(run "$run_root/idle.json" --duration-ms 1000 --max-instructions 200000000 --strict-mmio)
-case_args_1=(run-network "$run_root/six.json" --duration-ms 1000 --max-instructions 200000000 --quantum 1024 --strict-mmio)
-case_args_2=(run "$run_root/pll.json" --duration-ms 1000 --max-instructions 400000000 --strict-mmio)
+case_args_0=(run "$run_root/idle.json" --duration 1s --instruction-budget 200000000 --strict-mmio)
+case_args_1=(run "$run_root/six.json" --duration 1s --instruction-budget 200000000 --quantum 1024 --strict-mmio)
+case_args_2=(run "$run_root/pll.json" --duration 1s --instruction-budget 400000000 --strict-mmio)
 
 printf '%-20s %12s %12s %6s %12s %10s %9s\n' \
     case instructions cycles cpi time_ns wall_s x_realtime

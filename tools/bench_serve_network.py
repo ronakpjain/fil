@@ -29,8 +29,8 @@ def main():
     if min(args.duration_ms, args.refresh_us, args.reps) <= 0:
         parser.error('duration, refresh, and reps must be positive')
     for repetition in range(args.reps):
-        command = [args.binary, 'serve-network', args.network, '--transport', 'stdio',
-                   '--duration-ms', str(args.duration_ms), '--refresh-us', str(args.refresh_us),
+        command = [args.binary, 'serve', args.network,
+                   '--duration', f'{args.duration_ms}ms', '--refresh-us', str(args.refresh_us),
                    '--no-wall-pacing', '--strict-mmio', '--adc-decimation', '1']
         started = time.monotonic()
         # Popen's stdin stays open; communicate() would close the control channel.

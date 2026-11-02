@@ -1,31 +1,31 @@
 # Binary network service
 
-`fil serve-network NETWORK --transport stdio` serves a live network to another
-process over standard input and standard output. Version 2 supports only the
-`stdio` transport. Version 2 adds the explicit queue-full reply status; clients
-must reject unsupported versions rather than interpreting it as another status. It is the binary counterpart to the human-facing
-[`watch-network`](watch_network.md): both run the same paced, sliced network
-monitor and support CAN, ADC, GPIO, and stop controls, but `serve-network` emits
+`fil serve NETWORK` serves a live network to another process over standard
+input and standard output; a board config is accepted as a one-board network.
+Stdio is the only transport; `--transport` is rejected. Version 2 adds an
+explicit queue-full reply status; clients must reject unsupported versions
+rather than interpreting it as another status. It is the binary counterpart to
+human-facing [`watch`](watch_network.md): both run the same paced, sliced network
+monitor and support CAN, ADC, GPIO, and stop controls, but `serve` emits
 only protocol frames on stdout. Diagnostics and rejected-request explanations go
-to stderr. `run-network` remains the deterministic batch command with its
+to stderr. `run` remains the deterministic batch command with its
 human-readable summary and optional JSONL trace file.
 
 ```bash
-./build/fil serve-network configs/networks/per_vehicle.json \
-  --transport stdio --refresh-ms 1 --live-filter can_tx
+./build/fil serve configs/networks/per_vehicle.json \
+  --refresh-ms 1 --live-filter can_tx
 ```
 
 The service sends a `HELLO` frame after loading the network, then streams selected
 trace records and replies to client requests. Trace filtering follows
-`watch-network`: the default is `can_tx`; use repeatable `--live-filter TYPE` (or
+`watch`: the default is `can_tx`; use repeatable `--live-filter TYPE` (or
 `--trace-type TYPE`) to select other event types. `--trace-instr` enables
-instruction records. `--duration-ms`, `--refresh-ms`, `--max-instructions`, `--quantum`,
+instruction records. `--duration`, `--refresh-ms`, `--instruction-budget`, `--quantum`,
 `--adc-decimation`, `--strict-mmio`, `--lenient-mmio`, `--no-wall-pacing`, and
 `--detect-spin` retain the corresponding watch behavior. JIT is automatic and
 guarded RAM capsules are automatic when eligible. Network loop batching remains
 off. Instruction tracing and spin detection retain diagnostic safety fallbacks
 that can disable capsules.
-`--transport stdio` is required; any other transport is rejected.
 
 ## Wire framing
 
@@ -80,7 +80,7 @@ and other multibyte values shown in wire order):
 `ADC_SET` accepts channels `0..19` and values `0..4095`. `GPIO_SET` accepts pins
 `0..15`; action `0` drives low, `1` drives high, and `2` releases the external
 drive. `STOP` acknowledges and then ends the session, equivalent to `quit` in
-`watch-network`.
+`watch`.
 
 ## Server frames
 
@@ -118,9 +118,9 @@ and does not attempt to resynchronize. Unknown message kinds and malformed
 request payloads receive a failed `REPLY` when the frame boundary is valid.
 
 Clean EOF at a frame boundary stops an unlimited service and emits `END`. If a
-finite `--duration-ms` is set, clean EOF does not stop the network; it runs until
+finite `--duration` is set, clean EOF does not stop the network; it runs until
 the duration limit or until all boards stop. A duration of `0` means unlimited,
-matching `watch-network`. Partial frames at EOF are errors, not clean EOF.
+matching `watch`. Partial frames at EOF are errors, not clean EOF.
 
 Frames are flushed as they are written. A slow stdout consumer applies normal
 pipe backpressure and may slow simulation wall-clock progress; the service does

@@ -51,7 +51,7 @@ PGO_PROFILE ?= $(PGO_GENERATE_BUILD_DIR)/fil.profdata
 PGO_PROFILE_PATH = $(call root_path,$(PGO_PROFILE))
 PGO_PROFILE_PATTERN ?= $(PGO_GENERATE_BUILD_DIR)/fil-%p.profraw
 # Representative default; override for a local firmware checkout or workload.
-PGO_TRAIN_ARGS ?= run-network configs/networks/per_vehicle.json --duration-ms 1000 --max-instructions 50000000 --quantum 1024 --strict-mmio --adc-decimation 1 --parallel-lanes
+PGO_TRAIN_ARGS ?= run configs/networks/per_vehicle.json --duration 1s --instruction-budget 50000000
 PGO_CXX ?= clang++
 
 ifeq ($(strip $(LLVM_PROFDATA)),)
@@ -75,7 +75,7 @@ ELF ?= tests/fixtures/elf/split_image.elf
 RUN_CONFIG ?= tests/fixtures/config/hardware_compare_board.json
 RUN_ARGS ?= --allow-breakpoint
 NETWORK_CONFIG ?= configs/networks/per_vehicle.json
-NETWORK_ARGS ?= --duration-ms 1000 --quantum 1024
+NETWORK_ARGS ?= --duration 1s --quantum 1024
 WATCH_ARGS ?= --refresh-ms 10 --live-filter can_tx --live-filter can_rx --control-stdin
 DISASM_ADDR ?= 0x08000000
 DISASM_COUNT ?= 8
@@ -84,7 +84,7 @@ CONFIRM_STLINK ?= NO
 
 .DEFAULT_GOAL := all
 .PHONY: all configure build clean clean-all help fil cli app-help version \
-        run run-network watch-network inspect-config inspect-elf disasm-window \
+        run run network watch inspect-config inspect-elf disasm-window \
         compare-stlink test check test-list test-per test-debug test-sanitize \
         release debug sanitize benchmark docs firmware-tests fixtures \
         pgo-generate pgo-train pgo-merge pgo-use pgo-test pgo clean-pgo
@@ -156,11 +156,11 @@ version: build
 run: build
 	"$(FIL_PATH)" run "$(RUN_CONFIG)" $(RUN_ARGS)
 
-run-network: build
-	"$(FIL_PATH)" run-network "$(NETWORK_CONFIG)" $(NETWORK_ARGS)
+network: build
+	"$(FIL_PATH)" run "$(NETWORK_CONFIG)" $(NETWORK_ARGS)
 
-watch-network: build
-	"$(FIL_PATH)" watch-network "$(NETWORK_CONFIG)" $(WATCH_ARGS)
+watch: build
+	"$(FIL_PATH)" watch "$(NETWORK_CONFIG)" $(WATCH_ARGS)
 
 inspect-config: build
 	"$(FIL_PATH)" inspect-config "$(CONFIG)"
@@ -227,7 +227,7 @@ pgo-generate:
 
 pgo-train:
 	@test -n "$(strip $(PGO_TRAIN_ARGS))" || { \
-		echo "Set PGO_TRAIN_ARGS to representative fil arguments (for example: run-network ...)." >&2; exit 2; }
+		echo "Set PGO_TRAIN_ARGS to representative fil arguments (for example: run ...)." >&2; exit 2; }
 	$(MAKE) pgo-generate
 	@mkdir -p "$(PGO_GENERATE_PATH)"
 	LLVM_PROFILE_FILE="$(call root_path,$(PGO_PROFILE_PATTERN))" \
@@ -258,7 +258,7 @@ pgo-test: pgo-use
 # Run a complete PGO cycle; validate the workload before removing prior PGO outputs.
 pgo:
 	@test -n "$(strip $(PGO_TRAIN_ARGS))" || { \
-		echo "Set PGO_TRAIN_ARGS to representative fil arguments (for example: run-network ...)." >&2; exit 2; }
+		echo "Set PGO_TRAIN_ARGS to representative fil arguments (for example: run ...)." >&2; exit 2; }
 	$(MAKE) clean-pgo
 	$(MAKE) pgo-train
 	$(MAKE) pgo-test
@@ -274,14 +274,14 @@ help:
 	  '                make test-debug | test-sanitize' \
 	  'App:            make cli CLI_ARGS="--help" | app-help | version' \
 	  'Commands:       make run [RUN_CONFIG=...] [RUN_ARGS="..."]' \
-	  '                make run-network [NETWORK_CONFIG=...] [NETWORK_ARGS="..."]' \
-	  '                make watch-network [NETWORK_CONFIG=...] [WATCH_ARGS="..."]' \
+	  '                make network [NETWORK_CONFIG=...] [NETWORK_ARGS="..."]' \
+	  '                make watch [NETWORK_CONFIG=...] [WATCH_ARGS="..."]' \
 	  '                make inspect-config [CONFIG=...] | inspect-elf [ELF=...]' \
 	  '                make disasm-window [ELF=...] [DISASM_ADDR=...] [DISASM_COUNT=...]' \
 	  '                make compare-stlink CONFIRM_STLINK=YES [COMPARE_CONFIG=...] [COMPARE_ARGS="..."]' \
 	  '                make docs | firmware-tests (rewrites fixture ELFs) | benchmark [BENCH_REPS=3]' \
 	  'PGO:            make pgo (full cycle; default: six-board PER workload)' \
-	  '                Override workload with PGO_TRAIN_ARGS="run-network ..."' \
+	  '                Override workload with PGO_TRAIN_ARGS="run ..."' \
 	  '                Stages: pgo-generate | pgo-train | pgo-merge | pgo-use | pgo-test' \
 	  '                Set PGO_CXX/LLVM_PROFDATA to matching LLVM versions' \
 	  'Cleanup:        make clean [BUILD_DIR=...] | clean-pgo | clean-all' \

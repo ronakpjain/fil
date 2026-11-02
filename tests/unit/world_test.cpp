@@ -308,7 +308,7 @@ TEST(WorldTest, StopsWatchNetworkWhenAllBoardsReachTerminalBoundaries) {
     const auto network_path = files.writeNetwork({files.writeBoard("watch.json", "watch")});
     const std::string path = network_path.string();
     const std::string_view args[]{
-        "watch-network", path, "--duration-ms", "5", "--refresh-ms", "2",
+        "watch", path, "--duration", "5ms", "--refresh-ms", "2",
         "--adc-decimation", "4", "--trace-instr", "--live-filter", "can_rx",
     };
     std::ostringstream out;
@@ -333,7 +333,7 @@ TEST(WorldTest, WatchNetworkStreamsExpectationPendingAndIncompleteLive) {
     const auto network_path = files.writeNetwork(
         {files.writeBoard("watch-live.json", "watch-live")}, stimulus);
     const std::string path = network_path.string();
-    const std::string_view args[]{"watch-network", path, "--no-wall-pacing",
+    const std::string_view args[]{"watch", path, "--no-wall-pacing",
         "--trace-type", "expectation_pending", "--trace-type", "expectation_incomplete"};
     std::istringstream input{"quit\n"};
     std::ostringstream out;
@@ -365,7 +365,7 @@ TEST(WorldTest, ExpectationCheckIdsDistinguishDuplicateScriptsAndAttachments) {
         {files.writeBoard("duplicate-checks.json", "duplicate-checks")},
         {first, second, first});
     const std::string path = network_path.string();
-    const std::string_view args[]{"watch-network", path, "--no-wall-pacing",
+    const std::string_view args[]{"watch", path, "--no-wall-pacing",
         "--trace-type", "expectation_pending", "--trace-type", "expectation_incomplete"};
     std::istringstream input{"quit\n"};
     std::ostringstream out;
@@ -385,7 +385,7 @@ TEST(WorldTest, ExpectationCheckIdsDistinguishDuplicateScriptsAndAttachments) {
 }
 
 TEST(WorldTest, RejectsInvalidWatchNetworkAdcDecimation) {
-    const std::string_view args[]{"watch-network", "missing.json", "--adc-decimation", "0"};
+    const std::string_view args[]{"watch", "missing.json", "--adc-decimation", "0"};
     std::ostringstream out;
     std::ostringstream err;
     EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::usage_error);
@@ -396,7 +396,7 @@ TEST(WorldTest, StopsWatchNetworkFromStdin) {
     TempWorldConfigs files;
     const auto network_path = files.writeNetwork({files.writeBoard("watch-quit.json", "watch")});
     const std::string path = network_path.string();
-    const std::string_view args[]{"watch-network", path, "--refresh-ms", "1"};
+    const std::string_view args[]{"watch", path, "--refresh-ms", "1"};
     std::istringstream input{"quit\n"};
     std::ostringstream out;
     std::ostringstream err;
@@ -412,8 +412,7 @@ TEST(WorldTest, StopsWatchNetworkFromStdin) {
 }
 
 TEST(WorldTest, NetworkMonitorRejectsZeroMicrosecondSlices) {
-    const std::string_view args[]{"serve-network", "missing.json", "--transport", "stdio",
-                                  "--refresh-us", "0"};
+    const std::string_view args[]{"serve", "missing.json", "--refresh-us", "0"};
     std::ostringstream out;
     std::ostringstream err;
     EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::usage_error);
@@ -421,24 +420,13 @@ TEST(WorldTest, NetworkMonitorRejectsZeroMicrosecondSlices) {
     EXPECT_TRUE(out.str().empty());
 }
 
-TEST(WorldTest, ServeNetworkRequiresAnExplicitSupportedTransport) {
-    const std::string_view missing_transport[]{"serve-network", "network.json"};
-    std::ostringstream missing_out;
-    std::ostringstream missing_err;
-    EXPECT_EQ(fil::cli::run(missing_transport, missing_out, missing_err),
-              fil::cli::ExitCode::usage_error);
-    EXPECT_TRUE(missing_out.str().empty());
-    EXPECT_NE(missing_err.str().find("--transport stdio"), std::string::npos);
-
-    const std::string_view unsupported_transport[]{
-        "serve-network", "network.json", "--transport", "tcp"
-    };
-    std::ostringstream unsupported_out;
-    std::ostringstream unsupported_err;
-    EXPECT_EQ(fil::cli::run(unsupported_transport, unsupported_out, unsupported_err),
-              fil::cli::ExitCode::usage_error);
-    EXPECT_TRUE(unsupported_out.str().empty());
-    EXPECT_NE(unsupported_err.str().find("supported: stdio"), std::string::npos);
+TEST(WorldTest, ServeRejectsTheObsoleteTransportFlag) {
+    const std::string_view args[]{"serve", "network.json", "--transport", "stdio"};
+    std::ostringstream out;
+    std::ostringstream err;
+    EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::usage_error);
+    EXPECT_TRUE(out.str().empty());
+    EXPECT_NE(err.str().find("stdio transport"), std::string::npos);
 }
 
 TEST(WorldTest, ServeNetworkRejectsBinaryOutputToATerminalBeforeLoadingNetwork) {
@@ -471,8 +459,7 @@ TEST(WorldTest, ServeNetworkRejectsBinaryOutputToATerminalBeforeLoadingNetwork) 
         terminal.original = ::dup(STDOUT_FILENO);
         ASSERT_GE(terminal.original, 0);
         ASSERT_GE(::dup2(terminal.slave, STDOUT_FILENO), 0);
-        const std::string_view args[]{"serve-network", "missing-network.json",
-                                      "--transport", "stdio"};
+        const std::string_view args[]{"serve", "missing-network.json"};
         result = fil::cli::run(args, std::cout, errors);
     }
     // Restore stdout before GoogleTest prints assertion results.
@@ -480,7 +467,7 @@ TEST(WorldTest, ServeNetworkRejectsBinaryOutputToATerminalBeforeLoadingNetwork) 
     EXPECT_EQ(result, fil::cli::ExitCode::usage_error);
     EXPECT_NE(errors.str().find("cannot write binary protocol frames to a terminal"),
               std::string::npos);
-    EXPECT_NE(errors.str().find("watch-network"), std::string::npos);
+    EXPECT_NE(errors.str().find("watch"), std::string::npos);
     EXPECT_EQ(::fcntl(master, F_SETFL, O_NONBLOCK), 0);
     char byte{};
     EXPECT_EQ(::read(master, &byte, 1), -1); // No protocol bytes were emitted.
@@ -545,8 +532,7 @@ TEST(WorldTest, ServeNetworkUsesBinaryStdioFramesForControlsAndTraces) {
 
     ScopedStdinPipe stdin_pipe;
     ASSERT_TRUE(stdin_pipe.redirect(request_bytes)) << "redirects test protocol requests to stdin";
-    const std::string_view args[]{"serve-network", path, "--transport", "stdio",
-                                  "--no-wall-pacing", "--refresh-us", "100", "--live-filter", "can_rx"};
+    const std::string_view args[]{"serve", path, "--no-wall-pacing", "--refresh-us", "100", "--live-filter", "can_rx"};
     std::ostringstream out(std::ios::out | std::ios::binary);
     std::ostringstream err;
     const auto result = fil::cli::run(args, out, err);
@@ -618,8 +604,7 @@ TEST(WorldTest, ServeNetworkReportsTimedCanQueueFullStatus) {
 
     ScopedStdinPipe input;
     ASSERT_TRUE(input.redirect(requests));
-    const std::string_view args[]{"serve-network", path, "--transport", "stdio",
-                                  "--no-wall-pacing"};
+    const std::string_view args[]{"serve", path, "--no-wall-pacing"};
     std::ostringstream output(std::ios::out | std::ios::binary);
     std::ostringstream errors;
     EXPECT_EQ(fil::cli::run(args, output, errors), fil::cli::ExitCode::success);
@@ -657,7 +642,7 @@ TEST(WorldTest, ServeNetworkStopsOnCleanUnlimitedStdioEof) {
     ScopedStdinPipe stdin_pipe;
     ASSERT_TRUE(stdin_pipe.redirect(no_input));
 
-    const std::string_view args[]{"serve-network", path, "--transport", "stdio"};
+    const std::string_view args[]{"serve", path};
     std::ostringstream out(std::ios::out | std::ios::binary);
     std::ostringstream err;
     EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::success);
@@ -696,8 +681,8 @@ TEST(WorldTest, NestedBusInjectionDoesNotSatisfyParentBusExpectation) {
     const auto network = files.writeNetwork(
         {files.writeBoard("inject-alpha.json", "inject-alpha", "vehicle/sub")}, stimulus, true);
     const std::string path = network.string();
-    const std::string_view args[]{"run-network", path, "--duration-ms", "0",
-        "--max-instructions", "10", "--inject-can", "vehicle/sub@0:0x123:01"};
+    const std::string_view args[]{"run", path, "--duration", "0",
+        "--instruction-budget", "10", "--inject-can", "vehicle/sub@0:0x123:01"};
     std::ostringstream out;
     std::ostringstream err;
     EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::runtime_error);
@@ -719,8 +704,8 @@ TEST(WorldTest, RunNetworkEvaluatesGpioExpectationWithParallelLanes) {
         {files.writeBoard("gpio-par-a.json", "gpio-par-a"),
          files.writeBoard("gpio-par-b.json", "gpio-par-b")}, stimulus);
     const std::string path = network_path.string();
-    const std::string_view args[]{"run-network", path, "--duration-ms", "0",
-        "--max-instructions", "10"};
+    const std::string_view args[]{"run", path, "--duration", "0",
+        "--instruction-budget", "10"};
     std::ostringstream out;
     std::ostringstream err;
     EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::runtime_error);
@@ -775,7 +760,7 @@ TEST(WorldTest, NetworkDefaultsUseParallelLanesAndHundredMicrosecondWindows) {
     for (std::size_t i = 0U; i < overrides.size(); ++i) {
         SCOPED_TRACE(i);
         std::vector<std::string_view> args{
-            "run-network", path, "--duration-ms", "0", "--max-instructions", "1",
+            "run", path, "--duration", "0", "--instruction-budget", "1",
         };
         args.insert(args.end(), overrides[i].begin(), overrides[i].end());
         std::ostringstream out, err;
@@ -795,7 +780,7 @@ TEST(WorldTest, WatchNetworkAcceptsParallelLaneOverrides) {
     const std::string path = files.writeNetwork({files.writeBoard("watch-lanes.json", "watch-lanes")}).string();
     for (const std::string_view option : {"--parallel-lanes", "--no-parallel-lanes"}) {
         SCOPED_TRACE(option);
-        const std::string_view args[]{"watch-network", path, "--duration-ms", "1",
+        const std::string_view args[]{"watch", path, "--duration", "1ms",
                                      "--no-wall-pacing", option};
         std::istringstream input{"quit\n"};
         std::ostringstream out, err;
@@ -818,7 +803,7 @@ TEST(WorldTest, ExecutesRunNetworkCli) {
     const std::filesystem::path trace_path = network_path.parent_path() / "cli-trace.jsonl";
     const std::string trace_path_text = trace_path.string();
     const std::string_view args[]{
-        "run-network", path, "--duration-ms", "0", "--max-instructions", "10",
+        "run", path, "--duration", "0", "--instruction-budget", "10",
         "--quantum", "1", "--inject-can", "vehicle@0:0x123:01", "--trace", trace_path_text,
         "--trace-instr", "--allow-breakpoint",
     };
@@ -826,20 +811,20 @@ TEST(WorldTest, ExecutesRunNetworkCli) {
     std::ostringstream err;
     const auto result = fil::cli::run(args, out, err);
     EXPECT_TRUE(result == fil::cli::ExitCode::success)
-        << "run-network CLI executes a fixture world";
+        << "run CLI executes a fixture world";
     EXPECT_TRUE(out.str().find("network: fixture-network") != std::string::npos)
-        << "run-network CLI prints an aggregate summary";
+        << "run CLI prints an aggregate summary";
     EXPECT_TRUE(out.str().find("board cli-alpha") != std::string::npos &&
                 out.str().find("board cli-beta") != std::string::npos)
-        << "run-network CLI prints per-board results";
-    EXPECT_TRUE(err.str().empty()) << "successful run-network CLI has no error output";
+        << "run CLI prints per-board results";
+    EXPECT_TRUE(err.str().empty()) << "successful run CLI has no error output";
     std::ifstream trace_input(trace_path, std::ios::binary);
     const std::string trace_text{
         std::istreambuf_iterator<char>(trace_input), std::istreambuf_iterator<char>()
     };
     EXPECT_TRUE(
         trace_text.find("\"source\":\"vehicle/external\",\"type\":\"can_tx\"") != std::string::npos)
-        << "run-network CLI schedules an external CAN injection into the trace";
+        << "run CLI schedules an external CAN injection into the trace";
     EXPECT_TRUE(trace_text.find("\"source\":\"vehicle/external\",\"type\":\"can_tx\"") <
                 trace_text.find("\"type\":\"instr\""))
         << "time-zero CAN injection is delivered before the first CPU instruction";
