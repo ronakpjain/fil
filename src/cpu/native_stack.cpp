@@ -19,7 +19,10 @@ NativeStackResult nativeStackTransferPrepared(NativeExecutionContext* c, std::ui
     const bool loads_pc = plan.loadsPc();
     const std::uint32_t count = plan.count();
     const std::uint64_t bytes = static_cast<std::uint64_t>(count) * 4U;
-    const std::uint32_t old_sp = s.readRegister(13U);
+    // Select the bank once for this RAM-only operation. Neither the transfer
+    // nor its checked backing helpers can change handler mode or CONTROL.
+    auto& banked_sp = ((s.xpsr & xpsr_ipsr_mask) != 0U || (s.control & 2U) == 0U) ? s.msp : s.psp;
+    const std::uint32_t old_sp = banked_sp;
     const std::uint32_t start = is_push ? old_sp - static_cast<std::uint32_t>(bytes) : old_sp;
     if (is_push) {
         if (old_sp < bytes) return NativeStackResult::memory_declined;
@@ -29,7 +32,7 @@ NativeStackResult nativeStackTransferPrepared(NativeExecutionContext* c, std::ui
         for (std::uint32_t n = 0U; n < count; ++n) values[n] = s.r[plan.reg(n)];
         if (!c->memory_bus->tryFastWriteWords(start, count, values.data(), {mem::AccessType::data_write, pc}, true))
             return NativeStackResult::memory_declined;
-        s.writeRegister(13U, start);
+        banked_sp = start; s.r[13] = start;
         return NativeStackResult::success;
     }
     // PC, when present, is always the last bit in the register list, so its
@@ -83,7 +86,7 @@ NativeStackResult nativeStackTransferPrepared(NativeExecutionContext* c, std::ui
         std::memcpy(&value, frame + n * 4U, sizeof(value));
         s.r[plan.reg(n)] = value;
     }
-    s.writeRegister(13U, old_sp + static_cast<std::uint32_t>(bytes));
+    banked_sp = old_sp + static_cast<std::uint32_t>(bytes); s.r[13] = banked_sp;
     if (loads_pc) s.r[15] = target & ~1U;
     return alternate_return ? NativeStackResult::dynamic_return : NativeStackResult::success;
 }
