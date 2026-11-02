@@ -29,6 +29,8 @@
 #include "fil/cpu/native_trace.hpp"
 
 #include <algorithm>
+#include <array>
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -74,24 +76,6 @@ constexpr std::uint32_t hostReg(std::uint8_t guest) noexcept {
     return guest == 14U ? 15U : static_cast<std::uint32_t>(2U + guest);
 }
 
-bool sameMicroInst(const MicroInst& a, const MicroInst& b) noexcept {
-    return a.op == b.op && a.rd == b.rd && a.rn == b.rn && a.rm == b.rm
-        && a.imm == b.imm && a.condition == b.condition && a.shift == b.shift
-        && a.shift_amount == b.shift_amount && a.set_flags == b.set_flags
-        && a.carry_valid == b.carry_valid && a.carry == b.carry
-        && a.shift_immediate == b.shift_immediate && a.extend_kind == b.extend_kind
-        && a.branch_offset == b.branch_offset
-        && a.pc == b.pc && a.size == b.size;
-}
-
-bool sameMicroBlock(const MicroBlock& a, const MicroBlock& b) noexcept {
-    if (a.entry_pc != b.entry_pc || a.ends_with_branch != b.ends_with_branch
-        || a.ops.size() != b.ops.size()) return false;
-    for (std::size_t i = 0U; i < a.ops.size(); ++i) {
-        if (!sameMicroInst(a.ops[i], b.ops[i])) return false;
-    }
-    return true;
-}
 
 } // namespace
 
@@ -802,16 +786,11 @@ bool emitOp(Emitter& e, const MicroInst& op, std::string& error) {
 
 struct MicroJit::Impl {
 #ifdef FIL_MICRO_JIT_NATIVE
-    struct CacheEntry {
-        MicroBlock block;
-        MicroFunction function{nullptr};
-    };
-    static constexpr std::size_t kCacheEntries = 128U;
-
     std::mutex mutex;
-    std::vector<CacheEntry> cache;
-    struct NativeCacheEntry { NativeBlock block; NativeFunction function{nullptr}; };
-    std::deque<NativeCacheEntry> native_cache;
+    struct NativeSection { NativeBlock block; NativeFunction function{nullptr}; };
+    // Own descriptor addresses embedded in generated code. Compilation never
+    // searches these sections for a previous result and never evicts them.
+    std::deque<NativeSection> native_sections;
     // One immutable record per committed prefix, plus the complete trace.
     // A shared native exit epilogue indexes these records; they are data, not
     // executable stencils repeated for each possible exit reason.
@@ -819,12 +798,12 @@ struct MicroJit::Impl {
         std::uint32_t current, previous, next, reserved;
     };
     static_assert(sizeof(TracePrefixPc) == 16U);
-    struct TraceCacheEntry {
+    struct TraceSection {
         NativeTracePlan plan;
         NativeFunction function{nullptr};
-        std::vector<TracePrefixPc> prefix_pcs;
+        std::array<TracePrefixPc, NativeTracePlan::max_ops + 1U> prefix_pcs;
     };
-    std::deque<TraceCacheEntry> trace_cache;
+    std::deque<TraceSection> trace_sections;
     std::uint8_t* base{nullptr};
     std::size_t capacity{0};
     std::size_t used{0};
@@ -1016,17 +995,6 @@ namespace {
     if (admitted) ctx->retired_cycles = ctx->admitted_cycle_prefix[ctx->retired_count];
 }
 
-bool sameNativeBlock(const NativeBlock& a, const NativeBlock& b) noexcept {
-    if (a.entry_pc != b.entry_pc || a.ops.size() != b.ops.size()) return false;
-    for (std::size_t i = 0; i < a.ops.size(); ++i) {
-        const auto& x = a.ops[i]; const auto& y = b.ops[i];
-        if (x.kind != y.kind || x.pc != y.pc || x.size != y.size || x.rd != y.rd
-            || x.rn != y.rn || x.offset != y.offset || x.absolute != y.absolute
-            || x.absolute_address != y.absolute_address
-            || (x.kind == NativeOp::integer && !sameMicroInst(x.integer, y.integer))) return false;
-    }
-    return true;
-}
 
 } // namespace
 
@@ -1069,20 +1037,7 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
         error = "micro-jit: bad block size";
         return nullptr;
     }
-    // Serialize compilation and cache lookup: a hit reuses immutable code
-    // while the arena remains owned by this MicroJit instance.
     std::lock_guard lock(impl_->mutex);
-    for (auto it = impl_->cache.begin(); it != impl_->cache.end(); ++it) {
-        if (sameMicroBlock(it->block, block)) {
-            const MicroFunction function = it->function;
-            if (std::next(it) != impl_->cache.end()) {
-                Impl::CacheEntry recent = std::move(*it);
-                impl_->cache.erase(it);
-                impl_->cache.push_back(std::move(recent));
-            }
-            return function;
-        }
-    }
     // Resolve terminal PC/LR effects now: branchTarget() + BL link value.
     std::uint32_t final_pc = 0U;
     std::uint32_t last_pc = 0U;
@@ -1109,7 +1064,8 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
     Emitter e;
     std::uint16_t read_mask = 0U;
     std::uint16_t write_mask = 0U;
-    std::vector<std::uint16_t> cumulative_write_masks{0U};
+    std::array<std::uint16_t, MicroBlock::max_ops + 1U> cumulative_write_masks{};
+    std::size_t write_prefix_count = 0U;
     const auto reg_bit = [](std::uint8_t reg) -> std::uint16_t {
         return reg <= 12U ? static_cast<std::uint16_t>(1U << reg)
             : reg == 14U ? static_cast<std::uint16_t>(1U << 13U) : 0U;
@@ -1142,8 +1098,7 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
         case MicroOp::nop: case MicroOp::b: case MicroOp::b_cond: break;
         }
         write_mask |= op_write_mask;
-        cumulative_write_masks.push_back(static_cast<std::uint16_t>(
-            cumulative_write_masks.back() | op_write_mask));
+        cumulative_write_masks[++write_prefix_count] = write_mask;
     }
     // Load every register referenced by the block, including destinations,
     // so a prefix ending before a later write can safely commit the old value.
@@ -1197,13 +1152,12 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
         e.movImm(17U, ia_value);
         e.strW(17U, addr_off);
     };
-    std::vector<std::size_t> exit_labels;
-    exit_labels.reserve(block.ops.size());
-    for (std::size_t i = 0; i < block.ops.size(); ++i) exit_labels.push_back(e.makeLabel());
+    std::array<std::size_t, MicroBlock::max_ops> exit_labels;
+    for (std::size_t i = 0; i < block.ops.size(); ++i) exit_labels[i] = e.makeLabel();
     // Taken-branch stubs, one per conditional op (bound after the epilogues).
-    std::vector<std::size_t> taken_labels(block.ops.size(), 0U);
-    std::vector<bool> has_taken(block.ops.size(), false);
-    std::vector<std::uint32_t> taken_targets(block.ops.size(), 0U);
+    std::array<std::size_t, MicroBlock::max_ops> taken_labels{};
+    std::bitset<MicroBlock::max_ops> has_taken;
+    std::array<std::uint32_t, MicroBlock::max_ops> taken_targets{};
     for (std::size_t i = 0; i < block.ops.size(); ++i) {
         const auto& op = block.ops[i];
         if (op.op == MicroOp::b_cond) {
@@ -1275,8 +1229,6 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
     bytes_emitted_ += bytes;
     MicroFunction fn = nullptr;
     std::memcpy(&fn, &slot, sizeof(fn));
-    if (impl_->cache.size() == Impl::kCacheEntries) impl_->cache.erase(impl_->cache.begin());
-    impl_->cache.push_back(Impl::CacheEntry{block, fn});
     return fn;
 #else
     (void)block;
@@ -1332,18 +1284,8 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
         }
     }
     std::lock_guard lock(impl_->mutex);
-    for (const auto& entry : impl_->native_cache)
-        if (sameNativeBlock(entry.block, block)) return entry.function;
-    // Startup alone exceeds 128 shapes on the real network. Keep a bounded
-    // cache large enough for steady-state kernels as well; executable
-    // storage is independently bounded by the arena.
-    constexpr std::size_t kNativeCacheEntries = 1024U;
-    if (impl_->native_cache.size() >= kNativeCacheEntries) {
-        error = "native-jit: bounded native cache full";
-        return nullptr;
-    }
-    impl_->native_cache.emplace_back();
-    auto& entry = impl_->native_cache.back();
+    impl_->native_sections.emplace_back();
+    auto& entry = impl_->native_sections.back();
     entry.block = block;
     std::vector<std::uint8_t> code;
 #if defined(FIL_MICRO_JIT_X86_64) && !defined(_WIN32)
@@ -1427,7 +1369,7 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
         e.bindLabel(skip_cycle_probe);
         if (op.kind == NativeOp::integer) {
             if (!emitX86Op(e, cpu_offsets, op.integer, error)) {
-                impl_->native_cache.pop_back();
+                impl_->native_sections.pop_back();
                 return nullptr;
             }
         } else {
@@ -1551,25 +1493,25 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
     e.bindLabel(skip_prefix_publish);
     e.movM32Imm(kCtx, kAdmittedMode, 0U);
     e.addRsp16(); e.popReg(15U); e.popReg(14U); e.popReg(13U); e.popReg(12U); e.popReg(3U); e.ret();
-    if (!e.patchBranches(error)) { impl_->native_cache.pop_back(); return nullptr; }
+    if (!e.patchBranches(error)) { impl_->native_sections.pop_back(); return nullptr; }
     code = std::move(e.code);
 #elif defined(FIL_MICRO_JIT_AARCH64)
     if (!aarch64detail::emitBlock(entry.block, code, error)) {
-        impl_->native_cache.pop_back(); return nullptr;
+        impl_->native_sections.pop_back(); return nullptr;
     }
 #else
     error = "native-jit: host ABI unsupported";
-    impl_->native_cache.pop_back();
+    impl_->native_sections.pop_back();
     return nullptr;
 #endif
     if (!impl_->makeWritable(error)) {
-        impl_->native_cache.pop_back();
+        impl_->native_sections.pop_back();
         return nullptr;
     }
     std::size_t bytes = 0U;
     void* slot = impl_->append(code.data(), code.size(), error, bytes);
     if (slot == nullptr || !impl_->seal(slot, bytes, error)) {
-        impl_->native_cache.pop_back();
+        impl_->native_sections.pop_back();
         return nullptr;
     }
     std::memcpy(&entry.function, &slot, sizeof(entry.function));
@@ -1586,33 +1528,11 @@ NativeFunction MicroJit::compileNative(const NativeBlock& block, std::string& er
 NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::string& error) {
 #if defined(FIL_ENABLE_MICRO_JIT) && FIL_ENABLE_MICRO_JIT && defined(FIL_MICRO_JIT_NATIVE)
     NativeTracePlan plan;
-    std::vector<NativeTraceOp> sources = input.ops;
-    if (!buildNativeTrace(sources, plan, error)) return nullptr;
+    if (!buildNativeTrace(input.ops, plan, error)) return nullptr;
     plan.generation = input.generation;
     std::lock_guard lock(impl_->mutex);
-    const auto equal = [](const NativeTracePlan& a, const NativeTracePlan& b) {
-        if (a.generation != b.generation || a.ops.size() != b.ops.size()) return false;
-        for (std::size_t i = 0; i < a.ops.size(); ++i) {
-            const auto& x = a.ops[i]; const auto& y = b.ops[i];
-            if (x.raw != y.raw || x.pc != y.pc || x.size != y.size
-                || x.decoded.kind != y.decoded.kind || x.decoded.register_list != y.decoded.register_list
-                || x.expected_next_pc != y.expected_next_pc || x.expected_taken != y.expected_taken
-                || x.execution_cycles != y.execution_cycles
-                || x.native.kind != y.native.kind || x.native.rd != y.native.rd
-                || x.native.rn != y.native.rn || x.native.offset != y.native.offset
-                || x.native.absolute != y.native.absolute
-                || x.native.absolute_address != y.native.absolute_address
-                || !sameMicroInst(x.native.integer, y.native.integer)) return false;
-        }
-        return true;
-    };
-    for (const auto& entry : impl_->trace_cache) if (equal(entry.plan, plan)) return entry.function;
-    if (impl_->trace_cache.size() >= 1024U) {
-        error = "native-trace: permanent descriptor cache full";
-        return nullptr;
-    }
-    impl_->trace_cache.emplace_back();
-    auto& entry = impl_->trace_cache.back();
+    impl_->trace_sections.emplace_back();
+    auto& entry = impl_->trace_sections.back();
     entry.plan = std::move(plan);
     std::vector<std::uint8_t> code;
 #if defined(FIL_MICRO_JIT_X86_64) && !defined(_WIN32)
@@ -1674,16 +1594,15 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     e.aluRImm(4U, kRetain, ~(kFlagN | kFlagZ | kFlagC | kFlagV));
     e.aluRImm(4U, kNzcv, kFlagN | kFlagZ | kFlagC | kFlagV);
     const std::size_t n = entry.plan.ops.size();
-    entry.prefix_pcs.reserve(n + 1U);
     for (std::size_t i = 0; i <= n; ++i) {
         const auto& current_op = entry.plan.ops[i == n ? n - 1U : i];
         const auto& previous_op = entry.plan.ops[i == 0U ? 0U : i - 1U];
-        entry.prefix_pcs.push_back({current_op.pc, previous_op.pc, previous_op.expected_next_pc, 0U});
+        entry.prefix_pcs[i] = {current_op.pc, previous_op.pc, previous_op.expected_next_pc, 0U};
     }
     struct ExitLabels { std::size_t instruction, cycle, unsupported, mismatch, helper, dynamic_return; };
-    std::vector<ExitLabels> exits; exits.reserve(n);
+    std::array<ExitLabels, NativeTracePlan::max_ops> exits;
     for (std::size_t i=0; i<n; ++i)
-        exits.push_back({e.makeLabel(),e.makeLabel(),e.makeLabel(),e.makeLabel(),e.makeLabel(),e.makeLabel()});
+        exits[i] = {e.makeLabel(),e.makeLabel(),e.makeLabel(),e.makeLabel(),e.makeLabel(),e.makeLabel()};
     const auto normal = e.makeLabel();
     const auto instruction_exit = e.makeLabel(), cycle_exit = e.makeLabel();
     const auto unsupported_exit = e.makeLabel(), mismatch_exit = e.makeLabel();
@@ -1693,8 +1612,9 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     // Allocate caller-saved registers across helper-free integer regions.
     // Helpers and control-flow guards remain materialization boundaries. Each
     // cold prefix exit spills the allocation live at that precise cut.
-    std::vector<X86Emitter::GuestHosts> allocations(n, X86Emitter::no_guest_hosts);
-    std::vector<bool> region_start(n, false), region_end(n, false);
+    std::array<X86Emitter::GuestHosts, NativeTracePlan::max_ops> allocations;
+    allocations.fill(X86Emitter::no_guest_hosts);
+    std::bitset<NativeTracePlan::max_ops> region_start, region_end;
     const auto register_region_op = [](const NativeTraceOp& op) {
         const auto kind = op.decoded.kind;
         const auto micro = op.native.integer.op;
@@ -1797,7 +1717,7 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
                     e.testRR(kEax, kEax);
                     e.jcc(inst.op == MicroOp::cbz ? 4U : 5U, actually_taken);
                 } else if (!emitX86CondTaken(e, inst.condition, 0U, actually_taken, error)) {
-                    impl_->trace_cache.pop_back(); return nullptr;
+                    impl_->trace_sections.pop_back(); return nullptr;
                 }
                 if (op.expected_taken) e.jmp(exits[i].mismatch); else e.jmp(guard_done);
                 e.bindLabel(actually_taken);
@@ -1861,7 +1781,7 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
                     e.bindLabel(slow_pop);
                 }
                 e.movRR64(7U, ctx); e.movR32Imm(6U, op.pc);
-                // The retained cache entry owns this immutable plan for the
+                // The compiled section owns this immutable plan for the
                 // generated function's entire lifetime (vector moves retain storage).
                 e.movR64Imm(kEdx, reinterpret_cast<std::uintptr_t>(&op.stack_plan));
                 e.movR32Imm(1U, op.expected_next_pc);
@@ -1879,7 +1799,7 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
                 e.bindLabel(stack_done);
             } else if (!(bx_lr || op.native.kind == NativeOp::blx_reg || conditional || inst.op == MicroOp::b || inst.op == MicroOp::bl)
                        && op.native.kind == NativeOp::integer) {
-                if (!emitX86Op(e, offsets, inst, error)) { impl_->trace_cache.pop_back(); return nullptr; }
+                if (!emitX86Op(e, offsets, inst, error)) { impl_->trace_sections.pop_back(); return nullptr; }
             } else if (!(bx_lr || op.native.kind == NativeOp::blx_reg || conditional || inst.op == MicroOp::b || inst.op == MicroOp::bl)) {
                 const auto& m = op.native; constexpr std::uint32_t addrreg = 2U, valuereg = 1U;
                 if (m.absolute) e.movR32Imm(addrreg, m.absolute_address);
@@ -1984,7 +1904,14 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     // Cold stubs carry only a prefix index. Each reason has one trampoline,
     // and every prefix/reason shares the same native publication code.
     const auto publish = e.makeLabel(), failed_exit = e.makeLabel();
-    std::vector<bool> referenced(e.labels.size(), false);
+    // Fixed trace/op limits also bound the emitter's internal labels. Keep
+    // reference bits inline and reject expansion beyond this checked capacity.
+    std::bitset<NativeTracePlan::max_ops * 64U + 256U> referenced;
+    if (e.labels.size() > referenced.size()) {
+        impl_->trace_sections.pop_back();
+        error = "native-trace: inline label capacity exceeded";
+        return nullptr;
+    }
     for (const auto& fixup : e.fixups) referenced[fixup.label] = true;
     const auto exit_stub = [&](std::size_t label, std::size_t target, std::size_t prefix,
                                std::size_t source) {
@@ -2097,19 +2024,19 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
     if (used(shift_flags)) {
         e.bindLabel(shift_flags); endLogic(e, offsets, true, 0U, false); e.ret();
     }
-    if (!e.patchBranches(error)) { impl_->trace_cache.pop_back(); return nullptr; }
+    if (!e.patchBranches(error)) { impl_->trace_sections.pop_back(); return nullptr; }
     code = std::move(e.code);
 #elif defined(FIL_MICRO_JIT_AARCH64)
     if (!aarch64detail::emitTrace(entry.plan, code, error)) {
-        impl_->trace_cache.pop_back(); return nullptr;
+        impl_->trace_sections.pop_back(); return nullptr;
     }
 #else
-    impl_->trace_cache.pop_back(); error = "native-trace: unsupported host"; return nullptr;
+    impl_->trace_sections.pop_back(); error = "native-trace: unsupported host"; return nullptr;
 #endif
-    if (!impl_->makeWritable(error)) { impl_->trace_cache.pop_back(); return nullptr; }
+    if (!impl_->makeWritable(error)) { impl_->trace_sections.pop_back(); return nullptr; }
     std::size_t bytes = 0U;
     void* slot = impl_->append(code.data(), code.size(), error, bytes);
-    if (slot == nullptr || !impl_->seal(slot, bytes, error)) { impl_->trace_cache.pop_back(); return nullptr; }
+    if (slot == nullptr || !impl_->seal(slot, bytes, error)) { impl_->trace_sections.pop_back(); return nullptr; }
     std::memcpy(&entry.function, &slot, sizeof(entry.function));
     ++compilations_; bytes_emitted_ += bytes;
     return entry.function;
@@ -2126,20 +2053,7 @@ MicroFunction MicroJit::compileX86(const MicroBlock& block, std::string& error) 
         error = "micro-jit: bad block size";
         return nullptr;
     }
-    // Serialize compilation and cache lookup: a hit reuses immutable code
-    // while the arena remains owned by this MicroJit instance.
     std::lock_guard lock(impl_->mutex);
-    for (auto it = impl_->cache.begin(); it != impl_->cache.end(); ++it) {
-        if (sameMicroBlock(it->block, block)) {
-            const MicroFunction function = it->function;
-            if (std::next(it) != impl_->cache.end()) {
-                Impl::CacheEntry recent = std::move(*it);
-                impl_->cache.erase(it);
-                impl_->cache.push_back(std::move(recent));
-            }
-            return function;
-        }
-    }
     // Resolve terminal PC/LR effects now: branchTarget() + BL link value.
     std::uint32_t final_pc = 0U;
     std::uint32_t last_pc = 0U;
@@ -2200,13 +2114,12 @@ MicroFunction MicroJit::compileX86(const MicroBlock& block, std::string& error) 
         e.ret();
     };
 
-    std::vector<std::size_t> exit_labels;
-    exit_labels.reserve(block.ops.size());
-    for (std::size_t i = 0; i < block.ops.size(); ++i) exit_labels.push_back(e.makeLabel());
+    std::array<std::size_t, MicroBlock::max_ops> exit_labels;
+    for (std::size_t i = 0; i < block.ops.size(); ++i) exit_labels[i] = e.makeLabel();
     // Taken-branch stubs, one per conditional op (bound after the epilogues).
-    std::vector<std::size_t> taken_labels(block.ops.size(), 0U);
-    std::vector<bool> has_taken(block.ops.size(), false);
-    std::vector<std::uint32_t> taken_targets(block.ops.size(), 0U);
+    std::array<std::size_t, MicroBlock::max_ops> taken_labels{};
+    std::bitset<MicroBlock::max_ops> has_taken;
+    std::array<std::uint32_t, MicroBlock::max_ops> taken_targets{};
     for (std::size_t i = 0; i < block.ops.size(); ++i) {
         const auto& op = block.ops[i];
         if (op.op == MicroOp::b_cond) {
@@ -2271,8 +2184,6 @@ MicroFunction MicroJit::compileX86(const MicroBlock& block, std::string& error) 
     bytes_emitted_ += bytes;
     MicroFunction fn = nullptr;
     std::memcpy(&fn, &slot, sizeof(fn));
-    if (impl_->cache.size() == Impl::kCacheEntries) impl_->cache.erase(impl_->cache.begin());
-    impl_->cache.push_back(Impl::CacheEntry{block, fn});
     return fn;
 }
 

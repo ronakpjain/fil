@@ -16,7 +16,6 @@
 #include <memory>
 #include <string>
 #include <type_traits>
-#include <unordered_map>
 
 namespace fil::elf {
 class ElfImage;
@@ -753,8 +752,6 @@ private:
     static constexpr std::uint16_t jit_compile_threshold = 50U;
     std::unique_ptr<MicroJit> micro_jit_;
     std::string micro_jit_error_;
-    // Kernels live in an immutable arena; verdicts survive block-cache eviction.
-    std::unordered_map<MicroFunction, bool> micro_admission_cache_;
     [[nodiscard]] bool ensureMicroJit();
     void prepareMicroBlock(JitBlockEntry& entry);
     void prepareNativeBlock(JitBlockEntry& entry);

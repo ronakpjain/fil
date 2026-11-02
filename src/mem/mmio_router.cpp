@@ -47,7 +47,6 @@ Result<void> MmioRouter::map(
     std::sort(routes_.begin(), routes_.end(), [](const Route& left, const Route& right) {
         return left.offset < right.offset;
     });
-    cached_route_ = routes_.size();
     return {};
 }
 
@@ -60,8 +59,6 @@ const MmioRouter::Route* MmioRouter::find(
         return offset >= route.offset
             && end <= static_cast<std::uint64_t>(route.offset) + route.size;
     };
-    if (cached_route_ < routes_.size() && contains(routes_[cached_route_]))
-        return &routes_[cached_route_];
     // Routes are non-overlapping and sorted: only the last start not greater
     // than this address can cover the complete access width.
     auto next = std::upper_bound(routes_.begin(), routes_.end(), offset,
@@ -69,7 +66,6 @@ const MmioRouter::Route* MmioRouter::find(
     if (next == routes_.begin()) return nullptr;
     --next;
     if (!contains(*next)) return nullptr;
-    cached_route_ = static_cast<std::size_t>(next - routes_.begin());
     return &*next;
 }
 

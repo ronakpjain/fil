@@ -510,7 +510,9 @@ TEST(NativeJitTest, StartupShapesDoNotPreventSteadyStateCompilation) {
         ASSERT_NE(function, nullptr) << i << ": " << error;
         if (i == 0U) { first = function; initial = block; }
     }
-    EXPECT_EQ(jit->compileNative(initial, error), first);
+    const auto repeated = jit->compileNative(initial, error);
+    ASSERT_NE(repeated, nullptr) << error;
+    EXPECT_NE(repeated, first);
     CpuState state;
     fil::mem::MemoryBus memory;
     const std::array<std::uint32_t, 1> cost{1U};

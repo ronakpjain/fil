@@ -6,6 +6,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <limits>
 
 namespace fil::mem {
@@ -269,22 +270,11 @@ Result<void> MemoryBus::mapMmio(
 }
 
 const MemoryBus::Region* MemoryBus::find(const std::uint32_t address) const {
-    const std::size_t cache_index = address >> 24U;
-    const Region* cached = region_lookup_cache_[cache_index];
-    if (cached != nullptr && cached->contains(address)) {
-        return cached;
-    }
-    for (const auto& region : regions_) {
-        if (region->contains(address)) {
-            region_lookup_cache_[cache_index] = region.get();
-            return region.get();
-        }
-        if (region->info.base > address) {
-            break;
-        }
-    }
-    region_lookup_cache_[cache_index] = nullptr;
-    return nullptr;
+    const auto next = std::upper_bound(regions_.begin(), regions_.end(), address,
+        [](std::uint32_t value, const auto& region) { return value < region->info.base; });
+    if (next == regions_.begin()) return nullptr;
+    const auto* region = std::prev(next)->get();
+    return region->contains(address) ? region : nullptr;
 }
 
 MemoryBus::Region* MemoryBus::find(const std::uint32_t address) {

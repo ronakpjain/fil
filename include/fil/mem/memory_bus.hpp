@@ -573,7 +573,6 @@ private:
     [[nodiscard]] Region* find(std::uint32_t address);
 
     std::vector<std::unique_ptr<Region>> regions_;
-    mutable std::array<const Region*, 256> region_lookup_cache_{};
     std::uint64_t execution_generation_{1};
     mutable std::uint64_t side_effect_generation_{1};
     mutable std::uint64_t mmio_generation_{1};

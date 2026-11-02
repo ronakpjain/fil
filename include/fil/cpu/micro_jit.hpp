@@ -19,10 +19,10 @@
  *  touches only r0-r12, LR, xPSR NZCV, r15, and instruction_address.
  *  Guest N/Z/C/V ride the host flags between ops on AArch64; Q/GE/IT/ISR/T bits
  *  are preserved. On x86_64 the guest flags live in a register instead.
- *  Cache slots own no resources: code lives in one
- *  bump-allocated RX arena for the CPU lifetime, so eviction is a
- *  slot-pointer clear and executable-write invalidation keeps working
- *  through the existing generation checks.
+ *  Code lives in a bump-allocated RX arena for the CPU lifetime. Each
+ *  compilation emits a distinct section; the compiler has no result-reuse
+ *  lookup or eviction policy. Owned descriptors retain addresses embedded
+ *  in generated code. Callers handle executable-write invalidation.
  */
 
 #include <array>

@@ -402,7 +402,7 @@ TEST(MicroJitEmitterTest, RegressionLsrs32SelfAliasCarry) {
     expectInterpretedAndJitted(inst, state);
 }
 
-TEST(MicroJitEmitterTest, RegressionExtendKindIsPartOfCacheKeyBothOrders) {
+TEST(MicroJitEmitterTest, DistinctExtendKindsCompileCorrectlyInBothOrders) {
     if (!MicroJit::hostSupported()) GTEST_SKIP() << "no micro-jit emitter on this host";
     for (const auto first_kind : {ExtendKind::uxtb, ExtendKind::sxtb}) {
         const auto second_kind = first_kind == ExtendKind::uxtb ? ExtendKind::sxtb : ExtendKind::uxtb;
@@ -516,7 +516,7 @@ TEST(MicroJitEmitterTest, TerminalBranch) {
     checkProgram({0xBF00U, 0xBF00U, 0xE000U}, 5U);
 }
 
-TEST(MicroJitEmitterTest, CompileCacheReusesExactBlocks) {
+TEST(MicroJitEmitterTest, EachCompileOwnsDistinctCodeWithoutReuseLookup) {
     if (!MicroJit::hostSupported()) GTEST_SKIP() << "no micro-jit emitter on this host";
     std::vector<MicroSource> sources{
         MicroSource{*fil::cpu::decode16(0x2001U), kFlash, 2U},
@@ -531,15 +531,20 @@ TEST(MicroJitEmitterTest, CompileCacheReusesExactBlocks) {
     ASSERT_NE(first, nullptr) << error;
     const auto first_bytes = jit->bytesEmitted();
     EXPECT_EQ(jit->compilations(), 1U);
-    ASSERT_NE(jit->compile(original, error), nullptr) << error;
-    EXPECT_EQ(jit->compile(original, error), first);
-    EXPECT_EQ(jit->compilations(), 1U);
-    EXPECT_EQ(jit->bytesEmitted(), first_bytes);
+    const auto second = jit->compile(original, error);
+    ASSERT_NE(second, nullptr) << error;
+    EXPECT_NE(second, first);
+    EXPECT_EQ(jit->compilations(), 2U);
+    EXPECT_GT(jit->bytesEmitted(), first_bytes);
+    CpuState first_state, second_state;
+    first(&first_state, 2U);
+    second(&second_state, 2U);
+    EXPECT_TRUE(fil::cpu::bitwiseEqual(first_state, second_state));
 
     MicroBlock changed_operand = original;
     ++changed_operand.ops[0].imm;
     ASSERT_NE(jit->compile(changed_operand, error), nullptr) << error;
-    EXPECT_EQ(jit->compilations(), 2U);
+    EXPECT_EQ(jit->compilations(), 3U);
     EXPECT_GT(jit->bytesEmitted(), first_bytes);
 
     MicroBlock changed_pc = original;
@@ -547,7 +552,7 @@ TEST(MicroJitEmitterTest, CompileCacheReusesExactBlocks) {
     changed_pc.ops[0].pc += 2U;
     changed_pc.ops[1].pc += 2U;
     ASSERT_NE(jit->compile(changed_pc, error), nullptr) << error;
-    EXPECT_EQ(jit->compilations(), 3U);
+    EXPECT_EQ(jit->compilations(), 4U);
 }
 
 TEST(MicroJitEmitterTest, PrefixExitsCommitPrecisely) {

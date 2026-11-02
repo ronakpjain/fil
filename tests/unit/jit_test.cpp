@@ -1825,7 +1825,7 @@ TEST(JitTest, BudgetedReversiblePrefixDebitsExactCommittedCosts) {
     EXPECT_EQ(stored.value(), cpu.state().r[0]);
 }
 
-TEST(JitTest, PerformanceAdmissionPreservesStateAndReusesKernelVerdicts) {
+TEST(JitTest, PerformanceAdmissionPreservesStateAndRechecksEachCompilation) {
     if (!fil::cpu::MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter";
     auto bus = basicBus();
     const auto code = halfwords({0x4620U, 0x4681U, 0x464aU, 0xe000U});
@@ -1855,15 +1855,15 @@ TEST(JitTest, PerformanceAdmissionPreservesStateAndReusesKernelVerdicts) {
     EXPECT_EQ(first.micro_instructions, 0U);
     EXPECT_EQ(first.block_executions, 0U);
     EXPECT_EQ(first.block_instructions, 0U);
-    // Re-decode identical code after generation invalidation. The immutable
-    // native kernel and its measured verdict must both be reused.
+    // Recompile after code generation changes. Each compilation receives a
+    // fresh measurement without reusing a previous kernel or verdict.
     ASSERT_TRUE(bus.loadBytes(flash_base, code));
     warm();
     const auto second = cpu.jitStats();
-    EXPECT_EQ(second.micro_compilations, first.micro_compilations);
-    EXPECT_EQ(second.micro_admitted, first.micro_admitted);
-    EXPECT_EQ(second.micro_rejected, first.micro_rejected);
-    EXPECT_EQ(second.micro_admission_cost_ns, first.micro_admission_cost_ns);
+    EXPECT_EQ(second.micro_compilations, first.micro_compilations + 1U);
+    EXPECT_EQ(second.micro_admitted + second.micro_rejected,
+              first.micro_admitted + first.micro_rejected + 1U);
+    EXPECT_GT(second.micro_admission_cost_ns, first.micro_admission_cost_ns);
 }
 
 TEST(JitTest, RegisterMovNativePrefixesKeepCyclesBranchesAndMemoryDeclinesExact) {

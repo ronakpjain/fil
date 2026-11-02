@@ -477,9 +477,6 @@ void CortexM4::prepareMicroBlock(JitBlockEntry& entry) {
 
 bool CortexM4::admitMicroBlock(const JitBlockEntry& entry,
     const MicroFunction function, const std::uint8_t prefix) {
-    if (const auto found = micro_admission_cache_.find(function);
-        found != micro_admission_cache_.end()) return found->second;
-
     const auto start = std::chrono::steady_clock::now();
     // Exercise the real budgeted dispatcher, limited to the lowered integer
     // prefix. No suffix, timing callback, journal, or simulated clock is touched.
@@ -568,7 +565,6 @@ bool CortexM4::admitMicroBlock(const JitBlockEntry& entry,
     const bool admitted = valid && microKernelProfitable(native_ns, handler_ns);
     jit_stats_ = restore.saved_stats;
     restore.keep_stats = true;
-    micro_admission_cache_.emplace(function, admitted);
     if (admitted) ++jit_stats_.micro_admitted;
     else ++jit_stats_.micro_rejected;
     const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1963,11 +1959,17 @@ std::optional<FastStepResult> CortexM4::executeNativeTrace(
     // the largest exact prefix that fits, so execution never needs to probe
     // beyond an unaffordable instruction. Keep all cut/budget decisions here,
     // after generation, fetch-timing, and native-plan guards have succeeded.
-    const auto prefix_end = entry.charged_prefix.begin()
-        + static_cast<std::ptrdiff_t>(available + 1U);
-    const auto admitted_end = std::upper_bound(entry.charged_prefix.begin(), prefix_end,
-        normalized_credit);
-    const auto planned = static_cast<std::size_t>(admitted_end - entry.charged_prefix.begin() - 1);
+    // Most owner-local entries have enough credit for the entire trace. Avoid
+    // walking the binary-search tree in that case; near an event or deadline
+    // retain the exact prefix search, including the zero-instruction cut.
+    auto planned = available;
+    if (entry.charged_prefix[available] > normalized_credit) {
+        const auto prefix_end = entry.charged_prefix.begin()
+            + static_cast<std::ptrdiff_t>(available + 1U);
+        const auto admitted_end = std::upper_bound(entry.charged_prefix.begin(), prefix_end,
+            normalized_credit);
+        planned = static_cast<std::size_t>(admitted_end - entry.charged_prefix.begin() - 1);
+    }
     if (planned == 0U) return std::nullopt;
     const auto* charges = entry.charges.data();
     const auto* charged_prefix = entry.charged_prefix.data();

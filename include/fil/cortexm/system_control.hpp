@@ -120,16 +120,10 @@ public:
         return pendsv_pending_ || systick_pending_ || external_pending_enabled_;
     }
 
-    /** @brief Exact cached test for an enabled exception that can preempt now. */
+    /** @brief Exact test for an enabled exception that can preempt now. */
     [[nodiscard]] bool hasTakablePending(
         std::uint32_t primask, std::uint32_t basepri, std::uint32_t faultmask
     ) const {
-        const PendingSelection& cached = selection_cache_;
-        if (cached.valid && cached.primask == primask && cached.basepri == basepri
-            && cached.faultmask == faultmask
-            && cached.generation == selection_generation_) {
-            return cached.has_value;
-        }
         return nextPending(primask, basepri, faultmask).has_value();
     }
 
@@ -160,20 +154,6 @@ private:
     [[nodiscard]] bool isPending(std::uint16_t exception_number) const noexcept;
     [[nodiscard]] bool isEnabled(std::uint16_t exception_number) const noexcept;
     void refreshPendingSummary() noexcept;
-    /**
-     * @brief Marks cached exception selection stale after a state change.
-     *
-     * Every mutation sites that feeds nextPending() funnels through here:
-     * NVIC enable/pending/active/line/priority writes, PendSV/SysTick pend
-     * and clear, SysTick wrap edges, exception enter/resume/leave, and
-     * reset. Over-marking only costs a rescan; under-marking would be a
-     * correctness bug, so new mutation sites must call this.
-     */
-    void noteSelectionChanged() noexcept {
-        ++selection_generation_;
-        selection_cache_.valid = false;
-    }
-
     std::array<std::uint32_t, 8> nvic_enable_{};
     std::array<std::uint32_t, 8> nvic_pending_{};
     std::array<std::uint32_t, 8> nvic_active_{};
@@ -206,25 +186,7 @@ private:
     bool systick_pending_{false};
     bool external_pending_enabled_{false};
     bool reset_requested_{false};
-    // Memoized nextPending() selection. Selection mutations invalidate this
-    // entry through noteSelectionChanged(); mask registers remain explicit
-    // key inputs because they are owned by CPU state, not SystemControl.
-    std::uint64_t selection_generation_{0};
-    struct PendingSelection {
-        bool valid{false};
-        bool has_value{false};
-        std::uint16_t value{0};
-        std::uint32_t primask{0};
-        std::uint32_t basepri{0};
-        std::uint32_t faultmask{0};
-        std::uint64_t generation{0};
-    };
-    mutable PendingSelection selection_cache_{};
-    [[nodiscard]] std::optional<std::uint16_t> selectPendingUncached(
-        std::uint32_t primask,
-        std::uint32_t basepri,
-        std::uint32_t faultmask
-    ) const;
+
 };
 
 } // namespace fil::cortexm

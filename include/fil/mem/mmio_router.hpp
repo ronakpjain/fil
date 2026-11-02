@@ -104,7 +104,6 @@ private:
     std::uint64_t unknown_read_value_{0};
     std::vector<Route> routes_;
     // An index survives vector relocation; successful map/sort invalidates it.
-    mutable std::size_t cached_route_{0U};
     std::vector<UnknownMmioAccess> unknown_;
 };
 
