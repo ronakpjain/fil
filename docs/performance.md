@@ -117,16 +117,16 @@ changes host scheduling only, not guest events or simulated timing.
 
 ## Execution optimizations
 
-An internal x86-64 control-flow region API compiles both branch paths and real
-loop backedges without branch profiles
-or compilation-result reuse. Full integer-loop iterations share budget admission;
-partial cuts preserve exact instruction state. Actual indirect targets use a
-generated address switch. Scalar byte, halfword and word RAM accesses use
+The x86-64 and AArch64 control-flow region emitters compile both branch paths
+and real loop backedges without branch profiles or compilation-result reuse.
+The x86-64 emitter shares budget admission across full integer-loop iterations;
+both backends preserve exact instruction state at partial cuts. Actual indirect
+targets use a generated address switch. Scalar byte, halfword and word RAM accesses use
 invocation-scoped backing bindings and native range checks. Stores accumulate
 exact changed-byte accounting in a host register and publish it at exits.
-Straight-line integer/RAM spans share full-span budget admission and retirement
-bookkeeping. Every memory address is still checked before its access. A failed
-guard publishes the completed prefix's exact cycles, fetch state and diagnostic
+On x86-64, straight-line integer/RAM spans share full-span budget admission and
+retirement bookkeeping. Every memory address is still checked before its access.
+A failed guard publishes the completed prefix's exact cycles, fetch state and diagnostic
 PC before checked execution; insufficient full-span credit uses per-instruction
 admission. Span selection is bounded and uses no execution history.
 Region memory operations also support shifted register offsets, subtraction,
@@ -148,9 +148,11 @@ again, including after CONTROL writes.
 An eager program compiler decodes every aligned entry in bounded code windows
 and links those windows before execution. Native transfers share a register ABI,
 preserving live registers, flags, memory accounting and budgets across windows.
-MMIO, aliases and accesses outside the bindings exit before effects. The x86-64
-owner-window scheduler uses these programs with journaling and read-footprint
-tracking disabled for committed execution. An executable backing change
+Certified MMIO words use live device bindings with exact bus accounting.
+Guarded writes may deassert certified internal IRQ routes; observer callbacks,
+new IRQ assertions, aliases and unbound accesses retain checked execution.
+The owner-window scheduler uses these programs on x86-64 and AArch64 with
+journaling and read-footprint tracking disabled for committed execution. An executable backing change
 discards the image's native sections and recompiles from current bytes.
 Unsupported operations enter an optional checked service after registers,
 flags, retirement state and RAM accounting have been published. Safe

@@ -66,6 +66,8 @@ public:
 
     /** True on hosts with a stencil emitter (AArch64, x86_64); else all compiles decline. */
     [[nodiscard]] static bool hostSupported() noexcept;
+    /** True when the control-flow region/program emitter is available. */
+    [[nodiscard]] static bool regionHostSupported() noexcept;
 
     [[nodiscard]] static std::unique_ptr<MicroJit> create(std::string& error);
 

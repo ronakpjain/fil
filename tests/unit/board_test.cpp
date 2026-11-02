@@ -799,7 +799,7 @@ TEST(BoardTest, OwnerNativeProgramsRebuildAfterExecutableWrites) {
     EXPECT_EQ(hinted_board->cpu().state().r[0], initial_r0 + 128U);
     EXPECT_TRUE(fil::cpu::bitwiseEqual(hinted_board->cpu().state(), reference_board->cpu().state()));
 #if defined(__x86_64__) && !defined(_WIN32)
-    if (fil::cpu::MicroJit::hostSupported())
+    if (fil::cpu::MicroJit::regionHostSupported())
         EXPECT_GT(hinted_board->cpu().jitStats().native_instructions, 0U);
 #endif
 }

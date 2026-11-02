@@ -2115,8 +2115,7 @@ BoardRunResult Board::runOwnerSlice(const BoardRunOptions& options) {
 }
 
 void Board::prepareNativePrograms() {
-#if defined(__x86_64__) && !defined(_WIN32)
-    if (!cpu::MicroJit::hostSupported()) return;
+    if (!cpu::MicroJit::regionHostSupported()) return;
     if (program_compiler_ && program_execution_generation_ == memory_.executionGeneration()) return;
     // Code ownership follows the executable image, rather than observed PCs.
     // A backing change discards every section and recompiles from live bytes.
@@ -2143,7 +2142,6 @@ void Board::prepareNativePrograms() {
     }
     cpu_->mutableJitStats().native_compilations += program_compiler_->compilations();
     program_execution_generation_ = memory_.executionGeneration();
-#endif
 }
 
 struct Board::NativeServiceState {

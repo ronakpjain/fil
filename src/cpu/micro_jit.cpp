@@ -778,6 +778,7 @@ bool emitOp(Emitter& e, const MicroInst& op, std::string& error) {
 }
 
 #include "aarch64_native_emit.hpp"
+#include "aarch64_region_emit.hpp"
 
 #endif // FIL_MICRO_JIT_AARCH64
 
@@ -1012,6 +1013,14 @@ bool MicroJit::hostSupported() noexcept {
 #else
     return false;
 #endif
+#else
+    return false;
+#endif
+}
+
+bool MicroJit::regionHostSupported() noexcept {
+#if defined(FIL_ENABLE_MICRO_JIT) && FIL_ENABLE_MICRO_JIT && (defined(FIL_MICRO_JIT_X86_64) || defined(FIL_MICRO_JIT_AARCH64)) && !defined(_WIN32)
+    return true;
 #else
     return false;
 #endif
@@ -2809,6 +2818,21 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
     void* slot = impl_->append(e.code.data(), e.code.size(), error, emitted);
     if (slot == nullptr || !impl_->seal(slot, emitted, error)) return nullptr;
     resume = static_cast<std::uint8_t*>(slot) + e.labels[indirect];
+    NativeRegionFunction function = nullptr;
+    std::memcpy(&function, &slot, sizeof(function));
+    ++compilations_; bytes_emitted_ += emitted;
+    return function;
+#elif defined(FIL_ENABLE_MICRO_JIT) && FIL_ENABLE_MICRO_JIT && defined(FIL_MICRO_JIT_AARCH64) && !defined(_WIN32)
+    std::lock_guard lock(impl_->mutex);
+    aarch64detail::RegionEmitter emitter;
+    std::size_t resume_label = 0U;
+    if (!aarch64detail::emitRegion(plan, program ? program->resumes_.data() : nullptr,
+        program ? program->base_ : 0U, program ? program->size_ : 0U, emitter, resume_label, error)
+        || !impl_->makeWritable(error)) return nullptr;
+    std::size_t emitted = 0U;
+    void* slot = impl_->append(emitter.words.data(), emitter.words.size() * sizeof(std::uint32_t), error, emitted);
+    if (slot == nullptr || !impl_->seal(slot, emitted, error)) return nullptr;
+    resume = static_cast<std::uint8_t*>(slot) + emitter.labels[resume_label] * sizeof(std::uint32_t);
     NativeRegionFunction function = nullptr;
     std::memcpy(&function, &slot, sizeof(function));
     ++compilations_; bytes_emitted_ += emitted;

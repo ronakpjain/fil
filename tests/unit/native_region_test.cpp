@@ -39,6 +39,9 @@ public:
         port.value = input; ++port.writes;
 #if defined(__x86_64__)
         asm volatile("" ::: "rdi", "rsi", "rdx", "rcx", "r8", "r9", "r10", "r11", "cc", "memory");
+#elif defined(__aarch64__)
+        asm volatile("" ::: "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
+            "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
 #endif
         return true;
     }
@@ -84,8 +87,23 @@ TEST(NativeRegionTest, CodeWindowsIncludeCheckedSuccessorsAndBoundaryWideFetches
     }
 }
 
+TEST(NativeRegionTest, RegionCapabilityMatchesTheAvailableEmitter) {
+    if (!MicroJit::hostSupported()) {
+        EXPECT_FALSE(MicroJit::regionHostSupported());
+        return;
+    }
+    const auto bytes = code(std::array<std::uint16_t,2U>{0x2001U,0xbe00U});
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit) << error;
+    const auto function = jit->compileRegion(bytes, pc, pc, error);
+    if (MicroJit::regionHostSupported()) EXPECT_NE(function, nullptr) << error;
+    else {
+        EXPECT_EQ(function, nullptr);
+        EXPECT_NE(error.find("host emitter unavailable"), std::string::npos) << error;
+    }
+}
+
 TEST(NativeRegionTest, LinkedProgramKeepsRegistersFlagsMemoryAndBudgetsAcrossWindows) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     std::array<std::uint16_t, 520U> words; words.fill(0xbe00U);
     words[0] = 0x3001U; words[1] = 0xe0fdU; // ADD r0; B window 1
     words[255] = 0xbf00U; // sequential window crossing is also an entry
@@ -156,7 +174,7 @@ TEST(NativeRegionTest, LinkedProgramKeepsRegistersFlagsMemoryAndBudgetsAcrossWin
 }
 
 TEST(NativeRegionTest, ProgramLinksEveryHalfwordIncludingWideBoundaryInteriors) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     std::array<std::uint16_t,520U> words; words.fill(0xbe00U);
     words[0] = 0x4700U; // BX r0
     words[255] = 0xf240U; words[256] = 0x0207U; // MOVW spans two windows; its second half is a valid LSL.
@@ -207,7 +225,7 @@ TEST(NativeRegionTest, ProgramLinksEveryHalfwordIncludingWideBoundaryInteriors) 
 }
 
 TEST(NativeRegionTest, CheckedServicesResumeWithPublishedStateAndExactCumulativeBudgets) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     std::array<std::uint16_t, 266U> words; words.fill(0xbe00U);
     words[0] = 0x2003U; words[1] = 0x6008U; // MOVS r0,3; STR r0,[r1]
     words[2] = 0x6822U; words[3] = 0x3201U; // checked MMIO LDR r2,[r4]; ADD r2,1
@@ -301,7 +319,7 @@ TEST(NativeRegionTest, CheckedServicesResumeWithPublishedStateAndExactCumulative
 }
 
 TEST(NativeRegionTest, CheckedServicesCanRetireAndStopOrLeaveAnItBoundary) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
     for (const auto first : {0x4350U,0xbf08U}) for (const bool resume : {false,true}) {
         const auto bytes = code(std::array<std::uint16_t,2U>{static_cast<std::uint16_t>(first),0xbe00U});
@@ -396,7 +414,7 @@ void checkIndexedTransfer(MicroJit& jit, std::uint16_t first, std::uint16_t seco
 }
 
 TEST(NativeRegionTest, IndexedTransfersKeepWritebackAliasesActiveStackBanksAndExactCuts) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
     for (const auto opcode : {0xf800U,0xf810U,0xf820U,0xf830U,0xf840U,0xf850U,0xf910U,0xf930U})
     for (const auto mode : {0x0b00U,0x0f00U,0x0900U,0x0d00U,0x0c00U})
@@ -411,7 +429,7 @@ TEST(NativeRegionTest, IndexedTransfersKeepWritebackAliasesActiveStackBanksAndEx
 }
 
 TEST(NativeRegionTest, RegisterOffsetTransfersUsePreAccessOperandsAndEveryLegalShift) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
     for (const auto opcode : {0xf800U,0xf810U,0xf820U,0xf830U,0xf840U,0xf850U,0xf910U,0xf930U})
     for (unsigned shift = 0U; shift < 4U; ++shift)
@@ -422,7 +440,7 @@ TEST(NativeRegionTest, RegisterOffsetTransfersUsePreAccessOperandsAndEveryLegalS
 }
 
 TEST(NativeRegionTest, PredicatedMovesMatchEveryConditionFlagAndBudgetCut) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
     fil::mem::MemoryBus memory; ASSERT_TRUE(memory.mapRom(pc, 16U, "predicated"));
     CortexM4 checked(memory), reference(memory);
@@ -493,7 +511,7 @@ TEST(NativeRegionTest, PredicatedMovesMatchEveryConditionFlagAndBudgetCut) {
 }
 
 TEST(NativeRegionTest, CheckedServicesCloseEveryItMaskWithPerInstructionCredit) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
     fil::mem::MemoryBus memory; ASSERT_TRUE(memory.mapRom(pc, 16U, "it-masks"));
     CortexM4 checked(memory), reference(memory);
@@ -531,7 +549,7 @@ TEST(NativeRegionTest, CheckedServicesCloseEveryItMaskWithPerInstructionCredit) 
 }
 
 TEST(NativeRegionTest, CheckedItServiceCanRemoveItselfBeforeTheNextPredicate) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t,4U>{0xbf0cU,0x2001U,0x2002U,0xbe00U});
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
     const auto function = jit->compileRegion(bytes, pc, pc, error); ASSERT_NE(function, nullptr);
@@ -555,7 +573,7 @@ TEST(NativeRegionTest, CheckedItServiceCanRemoveItselfBeforeTheNextPredicate) {
 }
 
 TEST(NativeRegionTest, PredicatedPairConstituentsRemainOrdinaryStandaloneEntryPoints) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t,4U>{0xbf14U,0x2001U,0x2000U,0xbe00U});
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
     const auto program = jit->compileProgram(bytes, pc, error); ASSERT_TRUE(program);
@@ -575,7 +593,7 @@ TEST(NativeRegionTest, PredicatedPairConstituentsRemainOrdinaryStandaloneEntryPo
 }
 
 TEST(NativeRegionTest, MixedSpansPublishOnlyTheCompletedPrefixAtEveryMemoryMiss) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t,9U>{
         0x2001U,0x7008U,0x3101U,0x681aU,0x4410U,0x8008U,0x782cU,0x3801U,0xbe00U});
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
@@ -639,7 +657,7 @@ TEST(NativeRegionTest, MixedSpansPublishOnlyTheCompletedPrefixAtEveryMemoryMiss)
 }
 
 TEST(NativeRegionTest, MixedSpanStackWritebackAndMissingReadBindingsKeepPreciseBankState) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t,7U>{0xf84dU,0x0d04U,0x2009U,0xf85dU,0x2b04U,0x3201U,0xbe00U});
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
     const auto function = jit->compileRegion(bytes, pc, pc, error); ASSERT_NE(function, nullptr) << error;
@@ -696,7 +714,7 @@ TEST(NativeRegionTest, MixedSpanStackWritebackAndMissingReadBindingsKeepPreciseB
 }
 
 TEST(NativeRegionTest, LinearSpanWideChargesAndInteriorEntriesMatchCheckedExecution) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t,4U>{0x2001U,0x3001U,0x7008U,0xbe00U});
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
     const auto program = jit->compileProgram(bytes, pc, error); ASSERT_TRUE(program) << error;
@@ -753,7 +771,7 @@ TEST(NativeRegionTest, LinearSpanWideChargesAndInteriorEntriesMatchCheckedExecut
 }
 
 TEST(NativeRegionTest, GuardedMmioWritesPreserveCallerRegistersWritebackAndEveryPartialExit) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t,10U>{
         0x2001U,0x6008U,0x3001U,0x6010U,0xf843U,0x0b04U,0x3001U,0x6020U,0x6835U,0xbe00U});
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
@@ -827,7 +845,7 @@ TEST(NativeRegionTest, GuardedMmioWritesPreserveCallerRegistersWritebackAndEvery
 }
 
 TEST(NativeRegionTest, DirectMmioLoadsPublishExactEffectsAtEveryBudgetAndLaterGuardMiss) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t,8U>{
         0x2001U,0x680aU,0x3001U,0x6823U,0x602aU,0x683eU,0x2802U,0xbe00U});
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
@@ -910,7 +928,7 @@ TEST(NativeRegionTest, DirectMmioLoadsPublishExactEffectsAtEveryBudgetAndLaterGu
 }
 
 TEST(NativeRegionTest, DenseReturnDispatchPreservesWideInstructionGapsAndExternalEdges) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t,8U>{
         0xf000U,0xf804U,0xf240U,0x0200U,0x3301U,0xbe00U,0x4700U,0xbe00U});
     std::string error; NativeRegionPlan plan;
@@ -951,7 +969,7 @@ TEST(NativeRegionTest, DenseReturnDispatchPreservesWideInstructionGapsAndExterna
 }
 
 TEST(NativeRegionTest, SpanFlagElisionPreservesCarryAndGuardExitFlags) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     // ADDS; MOVS; CMP; ADD with RRX; ADDS; LDR; SUBS; MOVS; CMP; BKPT.
     const auto bytes = code(std::array<std::uint16_t,11U>{
         0x3001U,0x2200U,0x2800U,0xeb01U,0x0330U,0x3201U,
@@ -993,7 +1011,7 @@ TEST(NativeRegionTest, SpanFlagElisionPreservesCarryAndGuardExitFlags) {
 }
 
 TEST(NativeRegionTest, ResidentStackPublishesBeforeControlWritesAndReloadsTheSelectedBank) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t,7U>{0xf84dU,0x0d04U,0xf381U,0x8814U,0xf85dU,0x2b04U,0xbe00U});
     const auto control = decode32(0xf381U,0x8814U); ASSERT_TRUE(control); ASSERT_EQ(control->kind, InstrKind::msr);
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
@@ -1044,7 +1062,7 @@ TEST(NativeRegionTest, ResidentStackPublishesBeforeControlWritesAndReloadsTheSel
 }
 
 TEST(NativeRegionTest, ResidentStackSurvivesLinkedWindowsAndRestoresAnInitiallyStaleMirror) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     std::array<std::uint16_t,516U> words; words.fill(0xbe00U);
     words[0] = 0xf000U; words[1] = 0xf8feU; // BL pc+512
     words[256] = 0xb501U; words[257] = 0xe0fdU; // PUSH r0,LR; B pc+1024
@@ -1197,9 +1215,8 @@ TEST(NativeRegionTest, CanonicalNarrowAndWideStackFramesContinueGraphFormation) 
     }
 }
 
-#if defined(__x86_64__) && !defined(_WIN32)
 TEST(NativeRegionTest, StackCallsMatchCpuRamAndTimingAcrossAllBudgetCutsAndBanks) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     const auto narrow = code(std::array<std::uint16_t, 9>{
         0x2055U,0xf000U,0xf802U,0x3201U,0xbe00U,0xb503U,0x2007U,0x3101U,0xbd03U});
     const auto wide = code(std::array<std::uint16_t, 11>{
@@ -1279,7 +1296,7 @@ TEST(NativeRegionTest, StackCallsMatchCpuRamAndTimingAcrossAllBudgetCutsAndBanks
 }
 
 TEST(NativeRegionTest, StackAdmissionAndExceptionalReturnsDeclineWithoutPartialEffects) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
     for (const auto word : {0xb503U,0xbd03U}) {
         const bool push = word == 0xb503U;
@@ -1332,7 +1349,7 @@ TEST(NativeRegionTest, StackAdmissionAndExceptionalReturnsDeclineWithoutPartialE
 }
 
 TEST(NativeRegionTest, PlainStackPopsPreserveLrDataWithoutInventingAReturn) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t, 5>{
         0xe92dU,0x5001U,0xe8bdU,0x5001U,0xbe00U}); // r0, r12, LR; no PC
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
@@ -1368,7 +1385,7 @@ TEST(NativeRegionTest, PlainStackPopsPreserveLrDataWithoutInventingAReturn) {
 }
 
 TEST(NativeRegionTest, PopPcUsesActualInternalOrExternalTargetsWithExactRefillCosts) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t, 1>{0xbd03U});
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
     const auto function = jit->compileRegion(bytes, pc, pc, error); ASSERT_NE(function, nullptr);
@@ -1397,7 +1414,7 @@ TEST(NativeRegionTest, PopPcUsesActualInternalOrExternalTargetsWithExactRefillCo
 }
 
 TEST(NativeRegionTest, GuardedRamLoopMatchesCpuMemoryAndCountersAtEveryCut) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t, 6>{
         0x6808U,0x3001U,0x6008U,0x3a01U,0xd1faU,0xbe00U});
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
@@ -1451,7 +1468,7 @@ TEST(NativeRegionTest, GuardedRamLoopMatchesCpuMemoryAndCountersAtEveryCut) {
 }
 
 TEST(NativeRegionTest, StoresRetainExactChangedByteCountsForEveryWidthAndAlignment) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
     for (const auto word : {0x6008U,0x7008U,0x8008U}) {
         const auto bytes = code(std::array<std::uint16_t, 2>{static_cast<std::uint16_t>(word),0xbe00U});
@@ -1487,7 +1504,7 @@ TEST(NativeRegionTest, StoresRetainExactChangedByteCountsForEveryWidthAndAlignme
 }
 
 TEST(NativeRegionTest, LoadsCoverSignedWidthsUnalignedDataAndBothReadBindings) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
     for (const auto first : {0x680aU,0x780aU,0x880aU,0xf991U,0xf9b1U}) {
         const bool wide = first >= 0xf000U;
@@ -1518,7 +1535,7 @@ TEST(NativeRegionTest, LoadsCoverSignedWidthsUnalignedDataAndBothReadBindings) {
 }
 
 TEST(NativeRegionTest, MissesAndTinyBindingsExitBeforeMemoryOrPeripheralEffects) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
     for (const auto word : {0x6808U,0x6008U,0x8808U,0x8008U}) {
         const auto bytes = code(std::array<std::uint16_t, 2>{static_cast<std::uint16_t>(word),0xbe00U});
@@ -1548,7 +1565,7 @@ TEST(NativeRegionTest, MissesAndTinyBindingsExitBeforeMemoryOrPeripheralEffects)
 }
 
 TEST(NativeRegionTest, StackRelativeScalarAccessUsesTheActiveBankRatherThanTheR13Mirror) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
     for (const auto word : {0x9a00U,0x9200U}) {
         const auto bytes = code(std::array<std::uint16_t, 2>{static_cast<std::uint16_t>(word),0xbe00U});
@@ -1586,7 +1603,7 @@ TEST(NativeRegionTest, StackRelativeScalarAccessUsesTheActiveBankRatherThanTheR1
 }
 
 TEST(NativeRegionTest, LiteralLoadsReadLiveBackingThroughEitherBinding) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t, 4>{0x4800U,0xbe00U,0xcdefU,0x89abU});
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
     const auto function = jit->compileRegion(bytes, pc, pc, error); ASSERT_NE(function, nullptr);
@@ -1609,7 +1626,7 @@ TEST(NativeRegionTest, LiteralLoadsReadLiveBackingThroughEitherBinding) {
 }
 
 TEST(NativeRegionTest, EmittedLoopsMatchCheckedCpuAtEveryInstructionAndCycleCut) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t, 4>{0x3001U,0x3901U,0xd1fcU,0xbe00U});
     std::string error;
     auto jit = MicroJit::create(error); ASSERT_TRUE(jit) << error;
@@ -1667,7 +1684,7 @@ TEST(NativeRegionTest, EmittedLoopsMatchCheckedCpuAtEveryInstructionAndCycleCut)
 }
 
 TEST(NativeRegionTest, MillionInstructionLoopStaysInOneCompiledInvocation) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t, 2>{0x3001U,0xe7fdU});
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
     const auto function = jit->compileRegion(bytes, pc, pc, error);
@@ -1685,7 +1702,7 @@ TEST(NativeRegionTest, MillionInstructionLoopStaysInOneCompiledInvocation) {
 }
 
 TEST(NativeRegionTest, CallsAndCheckedMemoryExitsPreserveStateAndZeroCredit) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t, 6>{
         0xf000U,0xf802U,0x2009U,0xbe00U,0x3101U,0x4770U});
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
@@ -1723,7 +1740,7 @@ TEST(NativeRegionTest, CallsAndCheckedMemoryExitsPreserveStateAndZeroCredit) {
 }
 
 TEST(NativeRegionTest, ActualIndirectTargetsKeepExactCostsAndRejectExceptionalReturns) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t, 3>{0x4770U,0x2009U,0xbe00U});
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
     const auto function = jit->compileRegion(bytes, pc, pc, error); ASSERT_NE(function, nullptr);
@@ -1774,7 +1791,7 @@ TEST(NativeRegionTest, ActualIndirectTargetsKeepExactCostsAndRejectExceptionalRe
 }
 
 TEST(NativeRegionTest, LoopAdmissionUsesWideCycleArithmeticAndUncompiledEntriesExitUnchanged) {
-    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    if (!MicroJit::regionHostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t, 2>{0x4600U,0xe7fdU});
     std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
     const auto function = jit->compileRegion(bytes, pc, pc, error); ASSERT_NE(function, nullptr);
@@ -1812,5 +1829,5 @@ TEST(NativeRegionTest, LoopAdmissionUsesWideCycleArithmeticAndUncompiledEntriesE
     EXPECT_EQ(context.retired_count, 0U);
     EXPECT_TRUE(bitwiseEqual(state, before));
 }
-#endif
+
 } // namespace
