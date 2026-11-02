@@ -1,5 +1,6 @@
 #include "fil/cpu/native_region.hpp"
 #include "fil/cpu/cortex_m4.hpp"
+#include "fil/cpu/decoder.hpp"
 #include "fil/cpu/micro_jit.hpp"
 #include "fil/mem/memory_bus.hpp"
 
@@ -247,6 +248,97 @@ TEST(NativeRegionTest, CheckedServicesCanRetireAndStopOrLeaveAnItBoundary) {
             ? NativeRegionExit::external_edge : NativeRegionExit::checked_instruction);
         EXPECT_EQ(cpu.state().it_state != 0U, first == 0xbf08U);
         EXPECT_EQ(cpu.state().r[0], first == 0x4350U ? 21U : 7U);
+    }
+}
+
+void checkIndexedTransfer(MicroJit& jit, std::uint16_t first, std::uint16_t second) {
+    const auto decoded = decode32(first, second); ASSERT_TRUE(decoded);
+    const auto bytes = code(std::array<std::uint16_t,3U>{first,second,0xbe00U});
+    NativeRegionPlan plan; std::string error;
+    ASSERT_TRUE(buildNativeRegion(bytes, pc, pc, plan, error));
+    ASSERT_EQ(plan.ops[0].flow, RegionFlow::next) << std::hex << first << '/' << second;
+    const auto function = jit.compileRegion(bytes, pc, pc, error); ASSERT_NE(function, nullptr) << error;
+    fil::mem::MemoryBus memory, oracle;
+    for (auto* bus : {&memory, &oracle}) {
+        ASSERT_TRUE(bus->mapRom(pc, bytes.size(), "indexed")); ASSERT_TRUE(bus->loadBytes(pc, bytes));
+        ASSERT_TRUE(bus->mapRam(ram, 64U, "data"));
+        bus->setReadFootprintTracking(false); bus->setWriteJournalTracking(false);
+    }
+    CortexM4 reference(oracle);
+    NativeRegionContext binding;
+    ASSERT_TRUE(memory.directReadWindow(ram, binding.ram_read));
+    ASSERT_TRUE(memory.directWriteWindow(ram, binding.ram_write));
+    for (const unsigned bank : {0U,1U,2U})
+    for (const auto stalls : {std::array<std::uint32_t,2U>{0U,0U},
+                             std::array<std::uint32_t,2U>{2U,4U}})
+    for (std::uint32_t limit = 0U; limit < 3U; ++limit)
+    for (std::uint64_t credit = 0U; credit <= 16U; ++credit) {
+        for (std::uint32_t offset = 0U; offset < 64U; offset += 8U) {
+            const auto value = 0x89abcdef80706050ULL + offset * 0x0101010101010101ULL;
+            ASSERT_TRUE(memory.write64(ram + offset, value)); ASSERT_TRUE(oracle.write64(ram + offset, value));
+        }
+        CpuState state; state.r[15] = pc; state.r[0] = 0x80fedcbaU;
+        state.r[2] = 3U; state.r[1] = ram + 32U; state.r[14] = ram + 32U;
+        state.msp = ram + 32U; state.psp = ram + 24U; state.r[13] = ram + 60U;
+        state.control = bank == 0U ? 0U : 2U;
+        state.xpsr |= xpsr_c | xpsr_v | xpsr_q | (bank == 2U ? 3U : 0U);
+        reference.state() = state;
+        auto context = binding; context.cpu_state = &state;
+        context.instruction_limit = limit; context.cycle_limit = credit;
+        context.sequential_fetch_stall = stalls[0]; context.nonsequential_fetch_stall = stalls[1];
+        std::uint16_t pipeline = 0U; ASSERT_TRUE(reference.peekPredictableCycles(pipeline));
+        const auto charge = pipeline + stalls[1];
+        const bool retires = limit != 0U && credit >= charge;
+        if (retires) ASSERT_EQ(reference.stepFast().reason, StopReason::step_complete);
+        function(&context);
+        EXPECT_TRUE(bitwiseEqual(state, reference.state()))
+            << std::hex << first << '/' << second << '/' << std::dec << bank << '/' << limit << '/' << credit;
+        EXPECT_EQ(context.retired_count, retires ? 1U : 0U);
+        EXPECT_EQ(context.retired_cycles, retires ? charge : 0U);
+        EXPECT_EQ(context.exit_reason, limit == 0U ? NativeRegionExit::instruction_budget
+            : !retires ? NativeRegionExit::cycle_budget
+            : limit == 1U ? NativeRegionExit::instruction_budget : NativeRegionExit::checked_instruction);
+        for (std::uint32_t offset = 0U; offset < 64U; offset += 8U)
+            EXPECT_EQ(memory.read64(ram + offset).value(), oracle.read64(ram + offset).value());
+        EXPECT_EQ(memory.sideEffectCheckpoint().mutation_sequence, oracle.sideEffectCheckpoint().mutation_sequence);
+        EXPECT_EQ(memory.sideEffectGeneration(), oracle.sideEffectGeneration());
+    }
+    for (const auto base : {0x60000000U,0xfffffffeU}) {
+        CpuState state; state.r[15] = pc; state.r[0] = 0xdeadbeefU; state.r[2] = 3U;
+        state.r[decoded->rn] = base; state.r[13] = state.msp = state.psp = base;
+        const auto initial = state; const auto before = memory.sideEffectCheckpoint();
+        auto context = binding; context.cpu_state = &state;
+        context.instruction_limit = 2U; context.cycle_limit = 100U;
+        function(&context);
+        EXPECT_TRUE(bitwiseEqual(state, initial)); EXPECT_EQ(context.retired_count, 0U);
+        EXPECT_EQ(context.retired_cycles, 0U); EXPECT_EQ(context.exit_reason, NativeRegionExit::checked_instruction);
+        EXPECT_EQ(memory.sideEffectCheckpoint().mutation_sequence, before.mutation_sequence);
+    }
+}
+
+TEST(NativeRegionTest, IndexedTransfersKeepWritebackAliasesActiveStackBanksAndExactCuts) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    for (const auto opcode : {0xf800U,0xf810U,0xf820U,0xf830U,0xf840U,0xf850U,0xf910U,0xf930U})
+    for (const auto mode : {0x0b00U,0x0f00U,0x0900U,0x0d00U,0x0c00U})
+    for (const auto regs : {std::array<unsigned,2U>{0U,1U},
+                           std::array<unsigned,2U>{1U,1U},
+                           std::array<unsigned,2U>{0U,13U},
+                           std::array<unsigned,2U>{0U,14U},
+                           std::array<unsigned,2U>{14U,1U}}) {
+        checkIndexedTransfer(*jit, static_cast<std::uint16_t>(opcode | regs[1]),
+            static_cast<std::uint16_t>((regs[0] << 12U) | mode | 3U));
+    }
+}
+
+TEST(NativeRegionTest, RegisterOffsetTransfersUsePreAccessOperandsAndEveryLegalShift) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    for (const auto opcode : {0xf800U,0xf810U,0xf820U,0xf830U,0xf840U,0xf850U,0xf910U,0xf930U})
+    for (unsigned shift = 0U; shift < 4U; ++shift)
+    for (const auto rd : {0U,1U,2U,14U}) {
+        checkIndexedTransfer(*jit, static_cast<std::uint16_t>(opcode | 1U),
+            static_cast<std::uint16_t>((rd << 12U) | (shift << 4U) | 2U));
     }
 }
 

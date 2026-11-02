@@ -124,6 +124,10 @@ partial cuts preserve exact instruction state. Actual indirect targets use a
 generated address switch. Scalar byte, halfword and word RAM accesses use
 invocation-scoped backing bindings and native range checks. Stores accumulate
 exact changed-byte accounting in a host register and publish it at exits.
+Region memory operations also support shifted register offsets, subtraction,
+and pre/post-index writeback. Range and budget checks precede all effects;
+writeback follows the access, including source/destination aliases and active
+stack-bank updates.
 Canonical narrow and wide PUSH/POP transfers validate the complete stack frame
 before effects and use the active stack bank. POP PC dispatches to the actual
 return target after checking Thumb state and excluding exception returns.

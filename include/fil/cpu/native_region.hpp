@@ -20,6 +20,12 @@ enum class RegionFlow : std::uint8_t { next, jump, conditional, call, indirect, 
 struct NativeRegionOp {
     NativeInst instruction{};
     NativeStackPlan stack{};
+    // Region-only addressing. Legacy reversible stencils retain their original
+    // restricted NativeInst contract. Writeback commits after a guarded access.
+    struct Address {
+        std::uint8_t rm{0U}, shift{0U};
+        bool register_offset{false}, add{true}, index{true}, writeback{false};
+    } address{};
     std::uint32_t pc{0U}, raw{0U};
     std::uint32_t fallthrough{0U}, target{0U};
     std::uint16_t fallthrough_cycles{0U}, taken_cycles{0U};

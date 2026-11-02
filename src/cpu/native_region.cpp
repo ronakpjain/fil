@@ -8,6 +8,32 @@
 namespace fil::cpu {
 
 namespace {
+bool lowerRegionMemory(const DecodedInstruction& d, NativeRegionOp& op) {
+    NativeOp kind;
+    switch (d.kind) {
+    case InstrKind::ldr: kind = NativeOp::load_word; break;
+    case InstrKind::str: kind = NativeOp::store_word; break;
+    case InstrKind::ldrb: kind = NativeOp::load_byte; break;
+    case InstrKind::strb: kind = NativeOp::store_byte; break;
+    case InstrKind::ldrh: kind = NativeOp::load_half; break;
+    case InstrKind::strh: kind = NativeOp::store_half; break;
+    case InstrKind::ldrsb: kind = NativeOp::load_byte_signed; break;
+    case InstrKind::ldrsh: kind = NativeOp::load_half_signed; break;
+    default: return false;
+    }
+    const bool reg = d.form == OperandForm::register_value;
+    if ((!reg && d.form != OperandForm::immediate) || d.condition != Condition::al
+        || d.rd >= 15U || d.rd == 13U || d.rn >= 15U
+        || d.set_flags || d.fp_double || (!d.index && !d.writeback)
+        || (reg && (d.rm >= 15U || d.rm == 13U || d.shift_type != ShiftType::lsl
+            || d.shift_amount > 3U))) return false;
+    op.instruction.kind = kind;
+    op.instruction.pc = op.pc; op.instruction.size = op.size;
+    op.instruction.rd = d.rd; op.instruction.rn = d.rn; op.instruction.offset = d.imm;
+    op.address = {d.rm, d.shift_amount, reg, d.add, d.index, d.writeback};
+    return true;
+}
+
 bool buildRegion(const std::span<const std::uint8_t> bytes,
     const std::uint32_t base, const std::uint32_t entry_pc,
     NativeRegionPlan& out, std::string& error, const std::uint32_t window_bytes) {
@@ -73,7 +99,8 @@ bool buildRegion(const std::span<const std::uint8_t> bytes,
         if (stack) {
             op.stack = NativeStackPlan(decoded->register_list, decoded->kind == InstrKind::push);
             if (op.stack.count() == 0U) continue;
-        } else if (!tryLowerNativeInst({*decoded, op.pc, op.size}, op.instruction).ok) continue;
+        } else if (!tryLowerNativeInst({*decoded, op.pc, op.size}, op.instruction).ok
+            && !lowerRegionMemory(*decoded, op)) continue;
         op.fallthrough = op.pc + op.size;
         op.fallthrough_cycles = basePipelineCycles(*decoded);
         op.flow = RegionFlow::next;

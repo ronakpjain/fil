@@ -2129,6 +2129,7 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
         } else if (nativeOpIsMemory(inst.kind)) {
             if (!inst.absolute && inst.rn < uses.size()) ++uses[inst.rn];
             if (inst.rd < uses.size()) ++uses[inst.rd];
+            if (op.address.register_offset && op.address.rm < uses.size()) ++uses[op.address.rm];
         } else if (inst.kind == NativeOp::blx_reg) {
             if (inst.rn < uses.size()) ++uses[inst.rn];
         } else if (inst.kind == NativeOp::integer) {
@@ -2221,7 +2222,14 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
         else {
             if (inst.rn == 13U) read_sp(kR10);
             else loadGuest(e, kR10, offsets, inst.rn);
-            if (inst.offset != 0U) e.aluRImm(0U, kR10, inst.offset);
+            if (!op.address.index) e.movRR(kEcx, kR10);
+            if (op.address.register_offset) {
+                loadGuest(e, kEax, offsets, op.address.rm);
+                if (op.address.shift != 0U) e.shImm(4U, kEax, op.address.shift);
+                e.aluRR(op.address.add ? 0U : 5U, kR10, kEax);
+            } else if (inst.offset != 0U) e.aluRImm(op.address.add ? 0U : 5U, kR10, inst.offset);
+            if (op.address.writeback) e.movM32R(4U, 8U, kR10);
+            if (!op.address.index) e.movRR(kR10, kEcx);
         }
         guard_address(nativeOpWidth(inst.kind), !nativeOpIsLoad(inst.kind), inst.absolute, labels[index].checked);
     };
@@ -2262,7 +2270,8 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
         e.addR64R64(dirty, kEcx);
         e.bindLabel(unchanged);
     };
-    const auto memory_body = [&](const NativeInst& inst) {
+    const auto memory_body = [&](const NativeRegionOp& op) {
+        const auto& inst = op.instruction;
         if (nativeOpIsLoad(inst.kind)) {
             switch (inst.kind) {
             case NativeOp::load_byte: e.movzxR32M8(kEax, kR10, 0U); break;
@@ -2273,6 +2282,11 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
             }
             storeGuest(e, offsets, inst.rd, kEax);
         } else store_memory(nativeOpWidth(inst.kind), inst.rd, 0U);
+        if (op.address.writeback) {
+            e.movR32M(kEax, 4U, 8U);
+            if (inst.rn == 13U) write_sp();
+            else storeGuest(e, offsets, inst.rn, kEax);
+        }
     };
     const auto stack_body = [&](const NativeRegionOp& op) {
         // All frame and return-target checks and cycle admission precede these
@@ -2306,7 +2320,7 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
         e.movRR64(cycles, kEax);
         if (op.stack.count() != 0U) stack_body(op);
         else if (op.flow == RegionFlow::next) {
-            if (nativeOpIsMemory(op.instruction.kind)) memory_body(op.instruction);
+            if (nativeOpIsMemory(op.instruction.kind)) memory_body(op);
             else if (!emitX86Op(e, offsets, op.instruction.integer, error)) return false;
         } else if (op.flow == RegionFlow::call || op.instruction.kind == NativeOp::blx_reg) {
             e.movM32Imm(cpu, offsets.r + 56U, op.fallthrough | 1U);
