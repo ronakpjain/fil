@@ -2,6 +2,7 @@
 #include "lane_workers.hpp"
 
 #include "fil/common/numeric.hpp"
+#include "fil/common/inline_buffer.hpp"
 #include "fil/devices/can_bus.hpp"
 #include "fil/stm32g4/fdcan.hpp"
 #include "fil/stm32g4/stm32g4.hpp"
@@ -281,20 +282,16 @@ Result<WorldRunResult> World::runIndependent(const WorldRunOptions& options) {
     const auto initial_callbacks = event_loop_.executedCallbacks();
     output.end_time_ns = output.start_time_ns;
     output.boards.resize(boards_.size());
-    std::vector<std::uint8_t> runnable(boards_.size(), options.max_instructions_per_board != 0U);
-    std::vector<std::uint8_t> lane_failed(boards_.size(), 0U);
-    std::vector<std::uint64_t> lane_dispatches(boards_.size(), 0U);
-    std::vector<devices::DeferredCanOutbox> outboxes(boards_.size());
+    InlineBitset<64U> runnable(boards_.size(), options.max_instructions_per_board != 0U);
+    InlineBuffer<std::uint64_t, 8U> lane_dispatches(boards_.size());
+    InlineBuffer<devices::DeferredCanOutbox, 8U> outboxes(boards_.size());
     devices::DeferredCanOutbox pending;
     const bool parallel = options.enable_parallel_lanes && boards_.size() > 1U
         && boards_.size() <= 64U && std::thread::hardware_concurrency() > 1U
         && !event_loop_.hasObservationBarrier();
-    std::vector<std::unique_ptr<mem::MemoryBus::TrackingScope>> tracking;
-    tracking.reserve(boards_.size());
-    for (const auto& entry : boards_) {
-        tracking.push_back(std::make_unique<mem::MemoryBus::TrackingScope>(
-            entry->board->memory(), false, false));
-    }
+    InlineBuffer<std::optional<mem::MemoryBus::TrackingScope>, 8U> tracking(boards_.size());
+    for (std::size_t i = 0U; i < boards_.size(); ++i)
+        tracking[i].emplace(boards_[i]->board->memory(), false, false);
     for (std::size_t i = 0; i < boards_.size(); ++i) {
         initializeSnapshot(output.boards[i], *boards_[i]->board, output.start_time_ns);
         boards_[i]->board->peripherals().setAdcDecimation(options.adc_decimation);
@@ -337,9 +334,7 @@ Result<WorldRunResult> World::runIndependent(const WorldRunOptions& options) {
             accumulate(output.boards[i], result);
             ++lane_dispatches[i];
             if (result.reason != BoardStopReason::time_budget) {
-                runnable[i] = false;
                 output.boards[i].terminal = result.reason != BoardStopReason::instruction_budget;
-                lane_failed[i] = !result.succeeded();
             }
     };
     auto workers = parallel ? std::make_unique<detail::LaneWorkers>(boards_.size(),
@@ -353,7 +348,7 @@ Result<WorldRunResult> World::runIndependent(const WorldRunOptions& options) {
         if (events.same_time_limit_hit) throw std::runtime_error("shared event livelock");
     };
     for (;;) {
-        if (std::none_of(runnable.begin(), runnable.end(), [](auto value) { return value != 0U; })) break;
+        if (!runnable.any()) break;
         if (deadline != 0U && now >= deadline) break;
         end = saturatingAdd(now, options.cross_board_window_ns);
         if (deadline != 0U) end = std::min(end, deadline);
@@ -370,10 +365,16 @@ Result<WorldRunResult> World::runIndependent(const WorldRunOptions& options) {
         } else {
             for (std::size_t i = 0; i < boards_.size(); ++i) {
                 execute_lane(i);
-                if (lane_failed[i] && options.stop_on_board_failure) break;
+                if (!output.boards[i].result.succeeded() && options.stop_on_board_failure) break;
             }
         }
-        failed = std::any_of(lane_failed.begin(), lane_failed.end(), [](auto value) { return value != 0U; });
+        // Workers only read the packed runnable set. Publish bit changes after
+        // every worker has joined, avoiding shared-word races between lanes.
+        for (std::size_t i = 0U; i < boards_.size(); ++i)
+            if (lane_dispatches[i] != 0U && output.boards[i].result.reason != BoardStopReason::time_budget)
+                runnable.set(i, false);
+        failed = std::any_of(output.boards.begin(), output.boards.end(),
+            [](const auto& board) { return !board.result.succeeded(); });
         for (auto& outbox : outboxes) {
             for (auto& command : outbox) pending.push_back(std::move(command));
             outbox.clear();
