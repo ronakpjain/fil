@@ -124,7 +124,6 @@ partial cuts preserve exact instruction state. Actual indirect targets use a
 generated address switch. This API is not yet the CLI execution engine: guarded
 RAM/stack lowering and firmware-program integration remain in progress. Its
 differential tests establish local correctness, not a PER throughput result.
-See [the ongoing 10× work](per_10x_progress.md) for the remaining migration.
 
 | Mechanism | Behavior |
 | --- | --- |
