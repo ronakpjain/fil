@@ -1844,30 +1844,38 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
                 if (fast_load) {
                     const auto slow_load = e.makeLabel();
                     fast_word_done = e.makeLabel();
-                    e.movRR(kEax, addrreg);
-                    const auto begin_off = m.absolute
-                        ? off(offsetof(NativeExecutionContext, literal_read_begin)) : fast_read_begin_off;
-                    const auto size_off = m.absolute
-                        ? off(offsetof(NativeExecutionContext, literal_read_size)) : fast_read_size_off;
-                    const auto base_off = m.absolute
-                        ? off(offsetof(NativeExecutionContext, literal_read_base)) : fast_read_base_off;
-                    e.aluRM(5U, kEax, ctx, begin_off);
-                    // Guard the entire access, not just its first byte. The
-                    // size subtraction also rejects disabled/tiny windows.
-                    e.movR32M(kEcx, ctx, size_off);
-                    e.aluRImm(5U, kEcx, t_width); e.jcc(2U, slow_load);
-                    e.aluRR(7U, kEax, kEcx); e.jcc(7U, slow_load);
-                    e.movR64M(addrreg, ctx, base_off);
-                    e.addR64R64(addrreg, kEax);
-                    switch (m.kind) {
-                    case NativeOp::load_byte: e.movzxR32M8(kEax, addrreg, 0U); break;
-                    case NativeOp::load_half: e.movzxR32M16(kEax, addrreg, 0U); break;
-                    case NativeOp::load_byte_signed: e.movsxR32M8(kEax, addrreg, 0U); break;
-                    case NativeOp::load_half_signed: e.movsxR32M16(kEax, addrreg, 0U); break;
-                    default: e.movR32M(kEax, addrreg, 0U); break;
+                    const auto second_window = e.makeLabel();
+                    // Absolute literal loads prefer the code window; other
+                    // loads prefer the stack/data window. Either may legally
+                    // address the other backed region through a pointer.
+                    for (const bool primary : {true, false}) {
+                        const bool literal_window = primary == m.absolute;
+                        const auto miss = primary ? second_window : slow_load;
+                        const auto begin_off = literal_window
+                            ? off(offsetof(NativeExecutionContext, literal_read_begin)) : fast_read_begin_off;
+                        const auto size_off = literal_window
+                            ? off(offsetof(NativeExecutionContext, literal_read_size)) : fast_read_size_off;
+                        const auto base_off = literal_window
+                            ? off(offsetof(NativeExecutionContext, literal_read_base)) : fast_read_base_off;
+                        e.movRR(kEax, addrreg);
+                        e.aluRM(5U, kEax, ctx, begin_off);
+                        // Guard the entire access, including tiny windows.
+                        e.movR32M(kEcx, ctx, size_off);
+                        e.aluRImm(5U, kEcx, t_width); e.jcc(2U, miss);
+                        e.aluRR(7U, kEax, kEcx); e.jcc(7U, miss);
+                        e.movR64M(addrreg, ctx, base_off);
+                        e.addR64R64(addrreg, kEax);
+                        switch (m.kind) {
+                        case NativeOp::load_byte: e.movzxR32M8(kEax, addrreg, 0U); break;
+                        case NativeOp::load_half: e.movzxR32M16(kEax, addrreg, 0U); break;
+                        case NativeOp::load_byte_signed: e.movsxR32M8(kEax, addrreg, 0U); break;
+                        case NativeOp::load_half_signed: e.movsxR32M16(kEax, addrreg, 0U); break;
+                        default: e.movR32M(kEax, addrreg, 0U); break;
+                        }
+                        storeGuest(e, offsets, m.rd, kEax);
+                        e.jmp(fast_word_done);
+                        if (primary) e.bindLabel(second_window);
                     }
-                    storeGuest(e, offsets, m.rd, kEax);
-                    e.jmp(fast_word_done);
                     e.bindLabel(slow_load);
                 }
                 // Publish the exact prefix cycle count for a committed-span MMIO

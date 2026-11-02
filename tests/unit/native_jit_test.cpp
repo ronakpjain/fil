@@ -114,7 +114,9 @@ TEST(NativeJitTest, DirectTraceReadWindowsGuardEveryByteAndLiteralPools) {
             const std::array<std::uint8_t, 8> data{0x11U, 0x22U, 0x33U, 0x44U, 0x55U, 0x66U, 0x77U, 0x88U};
             ASSERT_TRUE(bus.loadBytes(begin, std::span(data).first(size)));
             bus.setReadFootprintTracking(false);
-            for (std::uint32_t offset = 0U; offset <= size + 1U; ++offset) {
+            for (std::uint32_t trial = 0U; trial < 2U * (size + 2U); ++trial) {
+                const auto offset = trial % (size + 2U);
+                const bool literal_window = literal == (trial < size + 2U);
                 if (literal && offset != 0U) continue;
                 CpuState state; state.r[15] = pc; state.r[0] = 0xdeadbeefU;
                 state.r[1] = begin + offset; state.xpsr = xpsr_t | xpsr_c;
@@ -123,7 +125,7 @@ TEST(NativeJitTest, DirectTraceReadWindowsGuardEveryByteAndLiteralPools) {
                 NativeExecutionContext context{&state, &bus, 1U, 2U};
                 context.charged_cycles = &cost; context.charged_cycles_count = 1U;
                 NativeExecutionContext oracle = context; oracle.cpu_state = &expected;
-                if (literal) {
+                if (literal_window) {
                     ASSERT_TRUE(bus.directReadWindow(begin, &context.literal_read_base,
                         &context.literal_read_begin, &context.literal_read_size));
                 } else {
