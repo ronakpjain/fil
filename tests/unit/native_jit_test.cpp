@@ -140,6 +140,60 @@ TEST(NativeJitTest, DirectTraceReadWindowsGuardEveryByteAndLiteralPools) {
     }
 }
 
+TEST(NativeJitTest, InlinePopMatchesCheckedTransfersAcrossBanksTargetsAndCuts) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP() << "no native emitter on this host";
+    constexpr std::uint32_t pc = 0x08000000U, ram = 0x20000000U, target = pc + 0x80U;
+    for (const auto mask : std::array<std::uint32_t, 7>{1U, 2U, 0x55U, 0xffU, 0x8000U, 0x8055U, 0x80ffU}) {
+        const auto raw = static_cast<std::uint16_t>(0xbc00U | (mask & 0xffU) | ((mask & 0x8000U) ? 0x100U : 0U));
+        const auto decoded = decode16(raw); ASSERT_TRUE(decoded);
+        NativeTraceOp op;
+        op.decoded = *decoded; op.raw = raw; op.pc = pc; op.size = 2U;
+        op.execution_cycles = 3U; op.expected_taken = (mask & 0x8000U) != 0U;
+        op.expected_next_pc = op.expected_taken ? target : pc + 2U;
+        NativeTracePlan plan; std::string error;
+        ASSERT_TRUE(buildNativeTrace(std::span(&op, 1U), plan, error)) << error;
+        auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+        const auto function = jit->compileNativeTrace(plan, error); ASSERT_NE(function, nullptr) << error;
+        for (unsigned mode = 0U; mode < 3U; ++mode) {
+            for (const auto return_pc : {target | 1U, (target + 4U) | 1U, target, 0xfffffff9U}) {
+                for (unsigned variant = 0U; variant < 24U; ++variant) {
+                    fil::mem::MemoryBus bus; ASSERT_TRUE(bus.mapRam(ram, 128U, "stack"));
+                    CpuState state;
+                    state.r[15] = pc; state.msp = ram + 16U; state.psp = ram + 64U;
+                    state.r[13] = 0xdeadcafeU;
+                    state.control = mode == 0U ? 0U : 2U;
+                    state.xpsr = xpsr_t | xpsr_n | xpsr_c | (mode == 2U ? 3U : 0U);
+                    const auto sp = state.readRegister(13U);
+                    const NativeStackPlan stack(mask, false);
+                    for (std::uint32_t n = 0U; n < stack.count(); ++n)
+                        ASSERT_TRUE(bus.write32(sp + n * 4U, stack.reg(n) == 15U ? return_pc : 0x12340000U + n));
+                    bus.setReadFootprintTracking(variant % 12U >= 8U);
+                    auto expected = state;
+                    const std::uint32_t cost = 3U;
+                    NativeExecutionContext context{&state, &bus, variant % 4U == 0U ? 0U : 1U,
+                        variant % 4U == 1U ? 2U : 3U};
+                    context.charged_cycles = &cost; context.charged_cycles_count = 1U;
+                    context.allow_dynamic_returns = variant % 2U != 0U;
+                    const std::array<std::uint32_t, 2> prefix{0U, cost};
+                    if (variant >= 12U && (context.instruction_limit == 0U || context.cycle_limit >= cost)) {
+                        context.admitted_cycle_prefix = prefix.data();
+                        context.admitted_cycle_prefix_count = prefix.size();
+                    }
+                    NativeExecutionContext oracle = context; oracle.cpu_state = &expected;
+                    (void)bus.directReadWindow(sp, &context.fast_read_base,
+                        &context.fast_read_begin, &context.fast_read_size);
+                    if (variant % 12U >= 4U && variant % 12U < 8U) context.fast_read_size = 1U; // checked fallback
+                    interpretNativeTrace(plan, oracle); function(&context);
+                    EXPECT_TRUE(bitwiseEqual(state, expected)) << mask << "/" << mode << "/" << return_pc << "/" << variant;
+                    EXPECT_EQ(context.retired_count, oracle.retired_count);
+                    EXPECT_EQ(context.retired_cycles, oracle.retired_cycles);
+                    EXPECT_EQ(context.exit_reason, oracle.exit_reason);
+                }
+            }
+        }
+    }
+}
+
 TEST(NativeJitTest, AdmittedCyclePrefixMatchesCheckedInterpreterAtEveryCut) {
     constexpr std::uint32_t pc = 0x08003000U;
     const auto nop = decode16(0xbf00U); ASSERT_TRUE(nop);

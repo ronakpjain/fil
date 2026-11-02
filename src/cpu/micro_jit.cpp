@@ -1760,6 +1760,46 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
             if (inst.op == MicroOp::bl || op.native.kind == NativeOp::blx_reg)
                 e.movM32Imm(kState, offsets.r + 56U, (op.pc + op.size) | 1U);
             if (op.decoded.kind == InstrKind::push || op.decoded.kind == InstrKind::pop) {
+                const auto stack_done = e.makeLabel();
+                if (op.decoded.kind == InstrKind::pop) {
+                    const auto slow_pop = e.makeLabel(), use_msp = e.makeLabel();
+                    const auto bytes = op.stack_plan.count() * 4U;
+                    // An immutable register list lets the emitter scatter the
+                    // admitted frame directly, without a helper's decode loop.
+                    // R8 holds the selected bank address, R9 the resulting SP.
+                    e.leaR64(8U, cpu, off(offsetof(CpuState, msp)));
+                    e.movR32M(kEax, cpu, offsets.xpsr);
+                    e.aluRImm(4U, kEax, xpsr_ipsr_mask); e.jcc(5U, use_msp);
+                    e.movR32M(kEax, cpu, off(offsetof(CpuState, control)));
+                    e.aluRImm(4U, kEax, 2U); e.jcc(4U, use_msp);
+                    e.leaR64(8U, cpu, off(offsetof(CpuState, psp)));
+                    e.bindLabel(use_msp);
+                    e.movR32M(9U, 8U, 0U);
+                    e.movRR(kEdx, 9U); e.aluRM(5U, kEdx, ctx, fast_read_begin_off);
+                    e.movR32M(kEax, ctx, fast_read_size_off);
+                    e.aluRImm(5U, kEax, bytes); e.jcc(2U, slow_pop);
+                    e.aluRR(7U, kEdx, kEax); e.jcc(7U, slow_pop);
+                    e.movR64M(kEax, ctx, fast_read_base_off); e.addR64R64(kEdx, kEax);
+                    if (op.stack_plan.loadsPc()) {
+                        e.movR32M(kEax, kEdx, bytes - 4U);
+                        // Only predicted ordinary Thumb returns take this fast
+                        // path. The checked helper owns alternate/exceptional
+                        // targets and their exact decline/commit semantics.
+                        if ((op.expected_next_pc & 0xfffffff0U) == 0xfffffff0U) e.jmp(slow_pop);
+                        e.cmpR32Imm(kEax, op.expected_next_pc | 1U); e.jcc(5U, slow_pop);
+                    }
+                    e.aluRImm(0U, 9U, bytes);
+                    for (std::uint32_t n = 0U; n < op.stack_plan.count(); ++n) {
+                        const auto reg = op.stack_plan.reg(n);
+                        if (reg == 15U) continue;
+                        e.movR32M(kEax, kEdx, n * 4U);
+                        e.movM32R(cpu, offsets.r + reg * 4U, kEax);
+                    }
+                    e.movM32R(8U, 0U, 9U); e.movM32R(cpu, offsets.r + 52U, 9U);
+                    if (op.stack_plan.loadsPc()) e.movM32Imm(cpu, offsets.r + 60U, op.expected_next_pc);
+                    e.jmp(stack_done);
+                    e.bindLabel(slow_pop);
+                }
                 e.movRR64(7U, ctx); e.movR32Imm(6U, op.pc);
                 // The retained cache entry owns this immutable plan for the
                 // generated function's entire lifetime (vector moves retain storage).
@@ -1774,6 +1814,7 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
                 e.cmpR32Imm(kEax, static_cast<std::uint32_t>(NativeStackResult::branch_mismatch));
                 e.jcc(4U, exits[i].mismatch);
                 e.testRR(kEax, kEax); e.jcc(5U, exits[i].helper);
+                e.bindLabel(stack_done);
             } else if (!(bx_lr || op.native.kind == NativeOp::blx_reg || conditional || inst.op == MicroOp::b || inst.op == MicroOp::bl)
                        && op.native.kind == NativeOp::integer) {
                 if (!emitX86Op(e, offsets, inst, error)) { impl_->trace_cache.pop_back(); return nullptr; }
