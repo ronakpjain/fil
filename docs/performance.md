@@ -117,6 +117,15 @@ changes host scheduling only, not guest events or simulated timing.
 
 ## Execution optimizations
 
+The JIT redesign also provides an internal x86-64 control-flow region API.
+It compiles both branch paths and real loop backedges without branch profiles
+or compilation-result reuse. Full integer-loop iterations share budget admission;
+partial cuts preserve exact instruction state. Actual indirect targets use a
+generated address switch. This API is not yet the CLI execution engine: guarded
+RAM/stack lowering and firmware-program integration remain in progress. Its
+differential tests establish local correctness, not a PER throughput result.
+See [the ongoing 10× work](per_10x_progress.md) for the remaining migration.
+
 | Mechanism | Behavior |
 | --- | --- |
 | Direct firmware decoding and routing | Fallback instructions decode from firmware bytes on each step; memory and MMIO routing use the authoritative sorted maps. Translation and timing peeks read executable backed memory only, without MMIO effects. |

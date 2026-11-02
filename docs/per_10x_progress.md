@@ -48,11 +48,54 @@ are in `/tmp/fil-per-10x/cache-removal-per.txt`. Retaining removed caches to
 recover that interim performance would violate the user's direction; finish
 the direct-execution replacement instead.
 
-Remaining: CPU instruction decode cache, prepared block and trace caches,
+Remaining: prepared block and trace caches,
 period/transition replay caches and board
 timing caches. Replace their execution responsibilities with direct compiled
 program sections, then complete long-loop execution and guarded memory lowering.
 No claim that all caches are removed or that 10× has been reached is justified.
+
+Commit `6d66167` removes the 65,536-entry per-CPU decode cache. Fallback stepping
+decodes directly; translation and timing admission use side-effect-free reads
+of executable backed memory. The new cold-peek test covers updated firmware
+bytes and a wide instruction whose second halfword is MMIO. All 592 tests
+passed. A 1000 ms PER comparison still matched counters and final PCs, with
+1.623 s reference / 2.194 s candidate (`decode-removal-per.txt` in the results
+directory). This remains a regression during migration, not progress toward
+the speed threshold by itself.
+
+Commit `b27adc0` implements FIL's own control-flow region compiler. It constructs
+a bounded graph from firmware bytes, emits both conditional paths and real
+native backedges, and resolves actual BX LR / BLX targets with a generated
+address switch. There are no branch profiles, predicted-return guards, runtime
+compilation-result lookups, or replay certificates in this new backend. All
+new graph, label, register-allocation and loop metadata is inline; boolean sets
+use bitsets. Graph formation is compile-time work and its IR is not retained by
+the generated function.
+
+Selected guest registers, NZCV, the retired instruction count, cycle count,
+and packed fetch/last-instruction state remain in host registers across loops.
+A complete eligible integer-loop iteration receives one conservative budget
+admission; partial instruction/cycle cuts take the exact instruction path.
+The generated entry switch also permits resumption at any compiled instruction
+without retranslating or storing an entry lookup result. Basic and extended
+FP EXC_RETURN tokens decline before branch effects.
+
+All 600 tests pass, including differential sweeps of every small instruction
+and cycle budget, four resumption points, three fetch-timing modes, actual
+return targets, 64-bit cycle costs, and a million-instruction loop in a single
+native invocation. This is functional evidence for the new execution model;
+it is not an end-to-end PER speedup claim. The region compiler is an internal
+API and is not yet selected by CLI firmware execution. It executes the supported
+integer/control-flow subset; RAM, stack, system, IT and FP work currently exits
+before effects to checked execution. Other host emitters are not implemented
+for this API yet.
+
+Next required work: lower guarded RAM/stack operations in the region backend,
+construct and bind compiled firmware programs before execution, wire exact
+owner/event/interrupt budgets into region entry and exits, and remove the legacy
+block/trace/replay/timing caches rather than retaining them as the execution
+engine. Then measure the actual six-board PER workload against the preserved
+starting binary with full ADC fidelity and the 10× gate.
 
 The workload is the six-board `configs/networks/per_vehicle.json` network,
 loading firmware from `~/coding/PER/monorepo/firmware/output`. Preserve ADC
