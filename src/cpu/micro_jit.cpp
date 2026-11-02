@@ -1808,7 +1808,9 @@ NativeFunction MicroJit::compileNativeTrace(const NativeTracePlan& input, std::s
                 // generated function's entire lifetime (vector moves retain storage).
                 e.movR64Imm(kEdx, reinterpret_cast<std::uintptr_t>(&op.stack_plan));
                 e.movR32Imm(1U, op.expected_next_pc);
-                e.movR64Imm(kEax, reinterpret_cast<std::uintptr_t>(&nativeStackTransferPrepared)); e.callReg(kEax);
+                const auto stack_helper = op.decoded.kind == InstrKind::push
+                    ? &nativePushTransferPrepared : &nativeStackTransferPrepared;
+                e.movR64Imm(kEax, reinterpret_cast<std::uintptr_t>(stack_helper)); e.callReg(kEax);
                 e.movRR64(7U, cpu);
                 if (op.decoded.kind == InstrKind::pop && (op.decoded.register_list & 0x8000U)) {
                     e.cmpR32Imm(kEax, static_cast<std::uint32_t>(NativeStackResult::dynamic_return));

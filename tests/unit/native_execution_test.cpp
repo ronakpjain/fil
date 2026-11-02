@@ -41,6 +41,12 @@ TEST(NativeExecutionTest, PreparedStackHelpersRejectEmptyPlansWithoutEffects) {
     fil::cpu::NativeExecutionContext context{&state, &bus, 1U, 100U};
     EXPECT_EQ(fil::cpu::nativeStackTransferPrepared(&context, 0x08000000U, {}, 0U),
         fil::cpu::NativeStackResult::memory_declined);
+    EXPECT_EQ(fil::cpu::nativePushTransferPrepared(&context, 0x08000000U, {}, 0U),
+        fil::cpu::NativeStackResult::memory_declined);
+    EXPECT_EQ(fil::cpu::nativePushTransferPrepared(&context, 0x08000000U,
+        fil::cpu::NativeStackPlan(1U, false), 0U), fil::cpu::NativeStackResult::memory_declined);
+    EXPECT_EQ(fil::cpu::nativePushTransferPrepared(nullptr, 0U,
+        fil::cpu::NativeStackPlan(1U, true), 0U), fil::cpu::NativeStackResult::memory_declined);
     EXPECT_TRUE(fil::cpu::bitwiseEqual(state, before));
     EXPECT_EQ(fil::cpu::nativeStackTransferPrepared(nullptr, 0U,
         fil::cpu::NativeStackPlan(1U, true), 0U), fil::cpu::NativeStackResult::memory_declined);
@@ -209,7 +215,8 @@ TEST(NativeExecutionTest, SmallPreparedStackTransfersCoverEveryRegisterPairAndSp
                         else expected.msp = new_sp;
                         const auto first_value = state.r[first], second_value = state.r[second];
                         NativeExecutionContext context{&state, &bus, 1U, 100U};
-                        ASSERT_EQ(nativeStackTransferPrepared(&context, 0x08000000U, plan, target),
+                        const auto transfer = push ? &nativePushTransferPrepared : &nativeStackTransferPrepared;
+                        ASSERT_EQ(transfer(&context, 0x08000000U, plan, target),
                             NativeStackResult::success) << first << "/" << second << "/" << mode << "/" << push;
                         EXPECT_TRUE(bitwiseEqual(state, expected));
                         if (push) {

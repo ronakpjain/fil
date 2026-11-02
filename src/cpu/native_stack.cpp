@@ -10,12 +10,32 @@ NativeStackResult nativeStackTransfer(NativeExecutionContext* c, std::uint32_t p
     return nativeStackTransferPrepared(c, pc, plan, expected_pc);
 }
 
+NativeStackResult nativePushTransferPrepared(NativeExecutionContext* c, std::uint32_t pc,
+    const NativeStackPlan& plan, std::uint32_t) noexcept {
+    if (!c || !c->cpu_state || !c->memory_bus || !plan.push() || plan.count() == 0U)
+        return NativeStackResult::memory_declined;
+    CpuState& s = *c->cpu_state;
+    auto& banked_sp = ((s.xpsr & xpsr_ipsr_mask) != 0U || (s.control & 2U) == 0U) ? s.msp : s.psp;
+    const auto count = plan.count();
+    const auto bytes = count * 4U;
+    if (banked_sp < bytes) return NativeStackResult::memory_declined;
+    const auto start = banked_sp - bytes;
+    // Only the transferred entries are initialized; checked backing still
+    // owns full-span permissions, exact byte journaling and store footprints.
+    std::array<std::uint32_t, 16> values;
+    for (std::uint32_t n = 0U; n < count; ++n) values[n] = s.r[plan.reg(n)];
+    if (!c->memory_bus->tryFastWriteWords(start, count, values.data(), {mem::AccessType::data_write, pc}, true))
+        return NativeStackResult::memory_declined;
+    banked_sp = start; s.r[13] = start;
+    return NativeStackResult::success;
+}
+
 NativeStackResult nativeStackTransferPrepared(NativeExecutionContext* c, std::uint32_t pc,
     const NativeStackPlan& plan, std::uint32_t expected_pc) noexcept {
+    if (plan.push()) return nativePushTransferPrepared(c, pc, plan, expected_pc);
     if (!c || !c->cpu_state || !c->memory_bus || plan.count() == 0U)
         return NativeStackResult::memory_declined;
     CpuState& s = *c->cpu_state;
-    const bool is_push = plan.push();
     const bool loads_pc = plan.loadsPc();
     const std::uint32_t count = plan.count();
     const std::uint64_t bytes = static_cast<std::uint64_t>(count) * 4U;
@@ -23,18 +43,7 @@ NativeStackResult nativeStackTransferPrepared(NativeExecutionContext* c, std::ui
     // nor its checked backing helpers can change handler mode or CONTROL.
     auto& banked_sp = ((s.xpsr & xpsr_ipsr_mask) != 0U || (s.control & 2U) == 0U) ? s.msp : s.psp;
     const std::uint32_t old_sp = banked_sp;
-    const std::uint32_t start = is_push ? old_sp - static_cast<std::uint32_t>(bytes) : old_sp;
-    if (is_push) {
-        if (old_sp < bytes) return NativeStackResult::memory_declined;
-        // Only the first `count` entries are written and read; clearing all
-        // sixteen would cost a 64-byte store per transferred stack frame.
-        std::array<std::uint32_t, 16> values;
-        for (std::uint32_t n = 0U; n < count; ++n) values[n] = s.r[plan.reg(n)];
-        if (!c->memory_bus->tryFastWriteWords(start, count, values.data(), {mem::AccessType::data_write, pc}, true))
-            return NativeStackResult::memory_declined;
-        banked_sp = start; s.r[13] = start;
-        return NativeStackResult::success;
-    }
+    const std::uint32_t start = old_sp;
     // PC, when present, is always the last bit in the register list, so its
     // slot is the final transferred word. Resolving it arithmetically keeps
     // the pop path to a single walk over the mask.

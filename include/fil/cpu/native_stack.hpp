@@ -13,6 +13,9 @@ enum class NativeStackResult : std::uint32_t {
  */
 [[nodiscard]] NativeStackResult nativeStackTransfer(NativeExecutionContext*, std::uint32_t instruction_pc,
     std::uint32_t register_list, std::uint32_t push, std::uint32_t expected_pc) noexcept;
+/** Checked PUSH-only entry, keeping POP state/return handling off its hot frame. */
+[[nodiscard]] NativeStackResult nativePushTransferPrepared(NativeExecutionContext*,
+    std::uint32_t instruction_pc, const NativeStackPlan&, std::uint32_t expected_pc) noexcept;
 /** Same checked transfer semantics, with ISA decoding supplied by an immutable plan. */
 [[nodiscard]] NativeStackResult nativeStackTransferPrepared(NativeExecutionContext*,
     std::uint32_t instruction_pc, const NativeStackPlan&, std::uint32_t expected_pc) noexcept;
