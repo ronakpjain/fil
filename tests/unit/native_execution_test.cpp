@@ -176,6 +176,53 @@ TEST(NativeExecutionTest, MmioBridgeKeepsReadBoundariesAndAlwaysStopsAfterWrites
     EXPECT_EQ(device.reads, 2);
 }
 
+TEST(NativeExecutionTest, SmallPreparedStackTransfersCoverEveryRegisterPairAndSpBank) {
+    using namespace fil::cpu;
+    constexpr std::uint32_t ram = 0x20000000U, target = 0x08000080U;
+    fil::mem::MemoryBus bus;
+    ASSERT_TRUE(bus.mapRam(ram, 256U, "stack"));
+    for (const bool tracking : {false, true}) {
+        bus.setReadFootprintTracking(tracking);
+        for (unsigned mode = 0U; mode < 3U; ++mode) {
+            for (const bool push : {false, true}) {
+                for (unsigned first = 0U; first < 16U; ++first) {
+                    for (unsigned second = first + 1U; second < 16U; ++second) {
+                        const NativeStackPlan plan((1U << first) | (1U << second), push);
+                        if (plan.count() == 0U) continue;
+                        CpuState state;
+                        for (unsigned r = 0U; r < 16U; ++r) state.r[r] = 0x12340000U + r;
+                        state.msp = ram + 64U; state.psp = ram + 128U;
+                        state.r[13] = ram + 32U; // Not the selected architectural SP.
+                        state.control = mode == 0U ? 0U : 2U;
+                        state.xpsr = xpsr_t | (mode == 2U ? 3U : 0U);
+                        CpuState expected = state;
+                        const auto sp = mode == 1U ? state.psp : state.msp;
+                        if (!push) {
+                            ASSERT_TRUE(bus.write32(sp, 0xa1b2c3d4U));
+                            ASSERT_TRUE(bus.write32(sp + 4U, target | 1U));
+                            expected.r[first] = 0xa1b2c3d4U;
+                            expected.r[second] = second == 15U ? target : target | 1U;
+                        }
+                        const auto new_sp = push ? sp - 8U : sp + 8U;
+                        expected.r[13] = new_sp;
+                        if (mode == 1U) expected.psp = new_sp;
+                        else expected.msp = new_sp;
+                        const auto first_value = state.r[first], second_value = state.r[second];
+                        NativeExecutionContext context{&state, &bus, 1U, 100U};
+                        ASSERT_EQ(nativeStackTransferPrepared(&context, 0x08000000U, plan, target),
+                            NativeStackResult::success) << first << "/" << second << "/" << mode << "/" << push;
+                        EXPECT_TRUE(bitwiseEqual(state, expected));
+                        if (push) {
+                            EXPECT_EQ(bus.read32(new_sp).value(), first_value);
+                            EXPECT_EQ(bus.read32(new_sp + 4U).value(), second_value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 TEST(NativeExecutionTest, CheckedStackTransferOrdersWordsAndKeepsDeclinesAtomic) {
     using namespace fil::cpu;
     fil::mem::MemoryBus bus;
