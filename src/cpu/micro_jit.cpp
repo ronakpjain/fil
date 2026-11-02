@@ -2450,6 +2450,28 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
         e.movM64R(4U, 0U, kEax);
         std::array<std::size_t, max_span_ops> misses;
         misses.fill(X86Emitter::no_label);
+        // Full admission prevents budget exits inside the span. Flags are
+        // observable at its end and at every guarded memory access. Between
+        // those points, a full NZCV producer kills earlier flag writes.
+        std::bitset<max_span_ops> dead_flags;
+        bool flags_live = true;
+        for (std::size_t n = span.length; n-- != 0U;) {
+            const auto& op = plan.ops[span.ops[n]];
+            if (nativeOpIsMemory(op.instruction.kind)) { flags_live = true; continue; }
+            const auto& inst = op.instruction.integer;
+            const bool compare = inst.op == MicroOp::cmp_imm || inst.op == MicroOp::cmn_imm
+                || inst.op == MicroOp::cmp_reg || inst.op == MicroOp::cmn_reg;
+            const bool arithmetic = compare || inst.op == MicroOp::add_imm
+                || inst.op == MicroOp::sub_imm || inst.op == MicroOp::add_reg
+                || inst.op == MicroOp::sub_reg || inst.op == MicroOp::add_shift
+                || inst.op == MicroOp::sub_shift;
+            const bool writes = inst.set_flags || compare || inst.op == MicroOp::tst_reg;
+            if (writes && !flags_live) dead_flags.set(n);
+            if (writes && arithmetic) flags_live = false;
+            // Partial producers retain C/V. Conservatively retain their input
+            // flags; RRX also consumes C as part of the register result.
+            if (inst.op == MicroOp::rrx || inst.shift == ShiftType::rrx) flags_live = true;
+        }
         for (std::size_t n = 0U; n < span.length; ++n) {
             const auto index = span.ops[n];
             const auto& op = plan.ops[index];
@@ -2457,7 +2479,16 @@ NativeRegionFunction MicroJit::compileRegionPlan(const NativeRegionPlan& plan,
                 misses[n] = e.makeLabel();
                 prepare_memory(op, index, misses[n]);
                 memory_body(op);
-            } else if (!emitX86Op(e, offsets, op.instruction.integer, error)) return false;
+            } else {
+                auto inst = op.instruction.integer;
+                if (dead_flags[n]) {
+                    if (inst.op == MicroOp::cmp_imm || inst.op == MicroOp::cmn_imm
+                        || inst.op == MicroOp::cmp_reg || inst.op == MicroOp::cmn_reg
+                        || inst.op == MicroOp::tst_reg) continue;
+                    inst.set_flags = false;
+                }
+                if (!emitX86Op(e, offsets, inst, error)) return false;
+            }
         }
         const auto& last = plan.ops[span.ops[span.length - 1U]];
         e.movR64M(cycles, 4U, 0U); e.aluRImm(0U, count, span.length);

@@ -674,6 +674,48 @@ TEST(NativeRegionTest, LinearSpanWideChargesAndInteriorEntriesMatchCheckedExecut
     }
 }
 
+TEST(NativeRegionTest, SpanFlagElisionPreservesCarryAndGuardExitFlags) {
+    if (!MicroJit::hostSupported()) GTEST_SKIP();
+    // ADDS; MOVS; CMP; ADD with RRX; ADDS; LDR; SUBS; MOVS; CMP; BKPT.
+    const auto bytes = code(std::array<std::uint16_t,11U>{
+        0x3001U,0x2200U,0x2800U,0xeb01U,0x0330U,0x3201U,
+        0x682cU,0x3801U,0x2201U,0x2a00U,0xbe00U});
+    std::string error; auto jit = MicroJit::create(error); ASSERT_TRUE(jit);
+    const auto function = jit->compileRegion(bytes, pc, pc, error); ASSERT_NE(function, nullptr) << error;
+    fil::mem::MemoryBus memory;
+    ASSERT_TRUE(memory.mapRom(pc, bytes.size(), "span-flags")); ASSERT_TRUE(memory.loadBytes(pc, bytes));
+    ASSERT_TRUE(memory.mapRam(ram, 4U, "data")); ASSERT_TRUE(memory.write32(ram, 0x87654321U));
+    memory.setReadFootprintTracking(false); memory.setWriteJournalTracking(false);
+    CortexM4 reference(memory);
+    NativeRegionContext binding;
+    ASSERT_TRUE(memory.directReadWindow(ram, binding.ram_read));
+    for (std::uint32_t flags = 0U; flags < 16U; ++flags)
+    for (const auto input : {0U,0x7fffffffU,0xffffffffU})
+    for (const bool bound : {false,true})
+    for (std::uint32_t limit = 0U; limit <= 10U; ++limit)
+    for (std::uint64_t credit = 0U; credit <= 20U; ++credit) {
+        CpuState state; state.r[15] = pc; state.r[0] = input;
+        state.r[1] = 0x12345679U; state.r[5] = ram; state.xpsr |= flags << 28U;
+        reference.state() = state;
+        auto context = binding; context.cpu_state = &state;
+        if (!bound) context.ram_read = {};
+        context.instruction_limit = limit; context.cycle_limit = credit;
+        std::uint32_t retired = 0U; std::uint64_t cycles = 0U;
+        for (;;) {
+            if (retired == limit) break;
+            const auto next = reference.state().r[15];
+            if (next == pc + 20U || (!bound && next == pc + 12U)) break;
+            std::uint16_t charge = 0U; ASSERT_TRUE(reference.peekPredictableCycles(charge));
+            if (charge > credit - cycles) break;
+            ASSERT_EQ(reference.stepFast().reason, StopReason::step_complete);
+            ++retired; cycles += charge;
+        }
+        function(&context);
+        EXPECT_TRUE(bitwiseEqual(state, reference.state())) << flags << '/' << input << '/' << bound << '/' << limit << '/' << credit;
+        EXPECT_EQ(context.retired_count, retired); EXPECT_EQ(context.retired_cycles, cycles);
+    }
+}
+
 TEST(NativeRegionTest, ResidentStackPublishesBeforeControlWritesAndReloadsTheSelectedBank) {
     if (!MicroJit::hostSupported()) GTEST_SKIP();
     const auto bytes = code(std::array<std::uint16_t,7U>{0xf84dU,0x0d04U,0xf381U,0x8814U,0xf85dU,0x2b04U,0xbe00U});
