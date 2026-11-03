@@ -221,9 +221,12 @@ firmware-tests: configure
 fixtures: firmware-tests
 
 # PGO is Clang-only. Start fresh with `make clean-pgo`, then train a representative workload.
+# The instrumented test suite is built too so training covers cold fil_core paths
+# a single CLI workload never reaches; without those counters the profiled build
+# reports -Wprofile-instr-unprofiled for every uncovered translation unit.
 pgo-generate:
 	@CXX="$(PGO_CXX)" $(MAKE) BUILD_DIR="$(PGO_GENERATE_BUILD_DIR)" BUILD_TYPE=Release \
-		IPO=OFF TESTS=OFF DOCS=OFF ASAN=OFF UBSAN=OFF PGO_GENERATE=ON FIL_PGO_PROFILE= build
+		IPO=OFF TESTS=ON DOCS=OFF ASAN=OFF UBSAN=OFF PGO_GENERATE=ON FIL_PGO_PROFILE= build
 
 pgo-train:
 	@test -n "$(strip $(PGO_TRAIN_ARGS))" || { \
@@ -232,6 +235,10 @@ pgo-train:
 	@mkdir -p "$(PGO_GENERATE_PATH)"
 	LLVM_PROFILE_FILE="$(call root_path,$(PGO_PROFILE_PATTERN))" \
 		"$(PGO_GENERATE_PATH)/fil" $(PGO_TRAIN_ARGS)
+	@test -x "$(PGO_GENERATE_PATH)/tests/fil_tests" || { \
+		echo "Missing instrumented test binary; rerun make pgo-generate with TESTS=ON." >&2; exit 2; }
+	LLVM_PROFILE_FILE="$(call root_path,$(PGO_PROFILE_PATTERN))" \
+		"$(PGO_GENERATE_PATH)/tests/fil_tests" --gtest_brief=1
 
 pgo-merge:
 	@set -eu; \

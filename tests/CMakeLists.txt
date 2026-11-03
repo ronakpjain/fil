@@ -46,6 +46,14 @@ target_link_libraries(fil_tests PRIVATE fil_core GTest::gtest_main)
 target_compile_definitions(fil_tests PRIVATE FIL_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 fil_set_project_options(fil_tests)
 
+if(FIL_PGO_GENERATE)
+    # Training runs the instrumented test suite so every fil_core translation
+    # unit contributes counters, including cold paths a single CLI workload
+    # never reaches. The profile runtime must be linked for the instrumented
+    # fil_core objects; the test sources themselves stay uninstrumented.
+    target_link_options(fil_tests PRIVATE -fprofile-instr-generate)
+endif()
+
 include(GoogleTest)
 gtest_discover_tests(fil_tests TEST_PREFIX "fil.")
 

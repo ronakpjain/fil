@@ -256,8 +256,13 @@ make pgo
 The target cleans old PGO outputs, builds, trains, merges profiles, rebuilds with the profile, and tests. Default training runs `configs/networks/per_vehicle.json` for `1s` with an
 instruction budget of `50000000`:
 `PGO_TRAIN_ARGS ?= run configs/networks/per_vehicle.json --duration 1s --instruction-budget 50000000`.
+Training then runs the instrumented test suite with the same profile file
+pattern. The workload supplies hot-path counts while the tests cover cold
+`fil_core` translation units, so the profiled build stays free of
+`-Wprofile-instr-unprofiled` warnings.
 
 - Override training with `PGO_TRAIN_ARGS='run ...'`.
+- `pgo-generate` builds the tests so the coverage pass has a binary to run.
 - Use matching `PGO_CXX` and `LLVM_PROFDATA` versions.
 - Retrain after material code, firmware, or toolchain changes.
 - Match the scheduling mode too. Plain `run` uses the validated fast
