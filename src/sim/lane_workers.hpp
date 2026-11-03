@@ -47,8 +47,15 @@ inline std::uint64_t laneCycleCount() noexcept {
 #endif
 }
 
-/** Cycle counts for one microsecond. Calibrated once against a steady clock. */
+/** Cycle counts for one microsecond. */
 inline std::uint64_t laneCyclesPerMicrosecond() noexcept {
+#if defined(__aarch64__)
+    // The generic counter frequency is architectural, so no calibration spin
+    // (and no wall-clock read) is needed on AArch64.
+    std::uint64_t frequency = 0U;
+    __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(frequency));
+    if (frequency >= 1000000U) return frequency / 1000000U;
+#endif
     static const std::uint64_t value = [] {
         const auto begin_time = std::chrono::steady_clock::now();
         const auto begin = laneCycleCount();
@@ -238,14 +245,13 @@ public:
     void setWidthLimited(const bool limited) noexcept { width_limited_ = limited; }
 
 private:
-    // Spin for a fraction of the last observed window, so a parked executor
-    // does not pay a futex round trip when the next window is already queued.
+    // Spin for a few window lengths, so a parked executor does not pay a futex
+    // round trip when the next window is already queued. Windows are only a few
+    // microseconds of wall time, so the floor matters more than the multiple.
     void updateSpinCycles() noexcept {
         const auto per_microsecond = laneCyclesPerMicrosecond();
-        const auto quarter = observed_window_cycles_ / 4U;
-        const auto lower = per_microsecond * 2U;
-        const auto upper = per_microsecond * 100U;
-        spin_cycles_ = std::clamp(quarter, lower, upper);
+        const auto target = observed_window_cycles_ * 4U;
+        spin_cycles_ = std::clamp(target, per_microsecond * 10U, per_microsecond * 250U);
     }
 
     void drain() noexcept {
@@ -272,8 +278,7 @@ private:
     std::size_t worker_count_;
     std::size_t spin_limit_;
     std::size_t execution_slots_ = 1U;
-    std::uint64_t spin_cycles_ = laneCyclesPerMicrosecond() * 20U;
-    std::uint64_t observed_window_cycles_ = 0U;
+    std::uint64_t spin_cycles_ = laneCyclesPerMicrosecond() * 20U;    std::uint64_t observed_window_cycles_ = 0U;
     bool width_limited_ = false;
     alignas(64) std::atomic<std::uint64_t> generation_{0U};
     alignas(64) std::atomic<std::size_t> remaining_{0U};
