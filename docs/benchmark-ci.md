@@ -104,13 +104,15 @@ for line in open('bench-data/results/x86_64.jsonl'):
 
 ## Releases
 
+Every push to `main` refreshes a rolling **`continuous`** pre-release with
+portable `fil` binaries for the latest commit (`fil-linux-x86_64`,
+`fil-linux-aarch64`, `fil-macos-arm64`, plus `SHA256SUMS`). Cut a stable
+version any time with:
+
 ```bash
 git tag v0.2.0 && git push origin v0.2.0
 ```
 
-`release.yml` builds portable Release binaries on Linux x86_64, Linux
-aarch64, and macOS arm64 (no tests/docs in the binaries, same code as CI),
-smoke-tests `--version`/`--help`, and attaches
-`fil-linux-x86_64`, `fil-linux-aarch64`, `fil-macos-arm64`, and `SHA256SUMS`
-to the release with generated notes. There is no macOS Intel runner; Intel
-Macs can run the arm64 binary under Rosetta or build from source.
+which publishes a non-prerelease `v0.2.0` release instead. There is no macOS
+Intel runner; Intel Macs can run the arm64 binary under Rosetta or build
+from source.
