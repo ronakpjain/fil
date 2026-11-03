@@ -55,7 +55,6 @@ struct BoardRunOptions {
     bool trace_instructions{false};              ///< Emit one trace record per instruction.
     bool detect_spin{false};                     ///< Stop on a proven exact-state loop.
     std::uint64_t spin_threshold{1'000'000};     ///< Logical instructions in a repeated exact-state loop.
-    bool enable_loop_batching{true};             ///< Fast-forward proven side-effect-free loops.
     bool enable_jit{true};                       ///< Native compilation, enabled by default.
     std::uint32_t adc_decimation{1}; ///< Keep 1 of N continuous ADC scans; higher skips side effects.
 };
@@ -348,12 +347,6 @@ private:
         std::uint64_t flash_acr_generation{0};
     };
 
-    struct LoopSkip {
-        std::uint64_t instructions{0};
-        std::uint64_t cycles{0};
-        SimTimeNs elapsed_ns{0};
-    };
-
     struct LoopObservation {
         bool valid{false};
         std::uint64_t generation{0};
@@ -384,7 +377,7 @@ private:
      * this wrapper adds 0-LATENCY flash stall cycles based on whether the
      * fetch address is sequential to the previous fetch and on the cached
      * FLASH_ACR prefetch/cache enables. The stall is folded into
-     * `result.cycles` so instruction counters, loop batching, and the
+     * `result.cycles` so instruction counters and the
      * world scheduler all observe final cycle counts. Clock/ACR values are
      * cached with generation checks to keep the per-instruction overhead
      * to a few loads and compares.
@@ -454,22 +447,12 @@ private:
         std::uint64_t logical_instructions,
         std::uint64_t logical_cycles
     );
-    [[nodiscard]] std::uint64_t maximumLoopIterations(
-        const ProvenLoop& loop,
-        std::uint64_t instruction_budget,
-        std::optional<SimTimeNs> horizon_ns
-    ) const;
-    /** Applies iterations already bounded by maximumLoopIterations(). */
-    [[nodiscard]] LoopSkip applyLoopIterations(
-        const ProvenLoop& loop, std::uint64_t validated_iterations
-    );
     [[nodiscard]] bool loopProofStillValid(const ProvenLoop& loop) const noexcept;
     [[nodiscard]] bool loopHasNoMmioSince(const ProvenLoop& loop) const noexcept;
     [[nodiscard]] std::shared_ptr<const IdempotentPeriodCertificate> buildIdempotentPeriodCertificate(
         std::size_t period, std::uint64_t period_cycles);
     [[nodiscard]] std::shared_ptr<const WholeRamNeutralPeriodCertificate>
     buildWholeRamNeutralPeriodCertificate(std::size_t period, std::uint64_t period_cycles);
-    [[nodiscard]] std::optional<SimTimeNs> nextObservableTime(SimTimeNs boundary_time) const;
     [[nodiscard]] SimTimeNs nextInstructionElapsedNs() const noexcept {
         return elapsedForCycles(1U);
     }

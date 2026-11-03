@@ -92,8 +92,8 @@ error and ignored without stopping the simulation.
 | `--control-stdin` | Accepted compatibility marker; standard input is always monitored. |
 
 See [CLI options](options.md) for the command reference and defaults. JIT and eligible guarded RAM capsules are
-automatic; network loop batching remains off. Capsule guards preserve event and
-observation ordering; custom callbacks and unsupported DMA paths remain barriers.
+automatic. Capsule guards preserve event and observation ordering; custom
+callbacks and unsupported DMA paths remain barriers.
 Tracing and spin diagnostics safely disable capsules rather than failing because
 of their automatic availability.
 `watch` prints selected events as human-readable lines; the companion

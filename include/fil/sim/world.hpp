@@ -41,7 +41,6 @@ struct WorldRunOptions {
     bool trace_instructions{false}; ///< Emit instruction records into the shared trace.
     bool detect_spin{false}; ///< Stop a lane on a repeatedly proven exact-state loop.
     std::uint64_t spin_threshold{1'000'000}; ///< Logical loop instructions required before stopping.
-    bool enable_loop_batching{false}; ///< Alternative proven-loop scheduler; disables RAM capsules.
     bool enable_jit{true}; ///< Native compilation; preserves lane boundaries.
     bool enable_ram_capsules{true}; ///< Guarded reversible RAM prefixes; incompatible modes fall back automatically.
     bool stop_on_board_failure{true}; ///< Stop on failure; parallel lanes finish their current window before stopping.
@@ -72,10 +71,8 @@ struct WorldRunResult {
     std::uint64_t cycles{0}; ///< Sum consumed by all boards in this invocation.
     std::uint64_t rounds{0}; ///< Virtual-time frontiers at which one or more CPUs started work.
     std::size_t parallel_lanes{0}; ///< Concurrent owner executors used (zero for serial scheduling).
-    std::uint64_t dispatches{0}; ///< Total instruction and proven-loop batch dispatches.
+    std::uint64_t dispatches{0}; ///< Total instruction dispatches.
     std::uint64_t exact_dispatches{0}; ///< Target instructions executed by the interpreter.
-    std::uint64_t loop_batches{0}; ///< Proven-loop batches applied without interpretation.
-    std::uint64_t batched_instructions{0}; ///< Logical instructions represented by loop batches.
     std::uint64_t event_callbacks{0}; ///< Shared event callbacks executed during the run.
     std::uint64_t lockstep_bursts{0}; ///< Tight exact multi-board dispatch loops entered.
     std::uint64_t deferred_prefixes{0}; ///< Certified pure prefixes admitted without eager execution.
@@ -95,8 +92,7 @@ struct WorldRunResult {
  *
  * Each board advances on an independent CPU timeline. Boards ready at the same
  * virtual time are dispatched in network configuration order, then the shared
- * event loop advances to the earliest instruction, proven-loop batch, or event
- * frontier. Host execution speed and thread scheduling therefore cannot alter
+ * event loop advances to the earliest instruction or event frontier. Host execution speed and thread scheduling therefore cannot alter
  * simulation ordering.
  */
 class World {

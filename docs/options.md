@@ -6,7 +6,7 @@ and `make help`.
 
 ## Defaults
 
-JIT and proven single-board loop batching are automatic. Run, watch, and serve
+JIT is automatic. Run, watch, and serve
 have unlimited simulated time and instruction budgets by default. A board config's
 nonzero `run.default_duration_ms` and `run.max_instructions` override those
 unlimited defaults; network configs use unlimited defaults. Network commands use
@@ -14,7 +14,7 @@ independent board slices with a **1000 ns cross-board synchronization window**.
 This is a bounded-skew communication model, not exact cross-board instruction
 ordering. ADC, timers, DMA and interrupts still execute locally at full fidelity.
 Instruction tracing, spin detection and the alternative loop scheduler retain
-exact scheduling fallbacks. Network loop batching stays off.
+exact scheduling fallbacks.
 
 **ADC decimation defaults to 1 (full fidelity).** `--adc-decimation N` accepts
 1–1024; values above 1 trade fidelity for speed by skipping continuous ADC scans

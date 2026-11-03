@@ -425,9 +425,7 @@ TEST(WorldTimeTest, AcceleratedPhaseMismatchedLoopsMatchExactExecution) {
 
     auto exact_options = runOptions(150U);
     exact_options.max_instructions_per_board = 1'000U;
-    exact_options.enable_loop_batching = false;
     auto accelerated_options = exact_options;
-    accelerated_options.enable_loop_batching = true;
     const auto exact_result = exact.value()->run(exact_options);
     const auto accelerated_result = accelerated.value()->run(accelerated_options);
     EXPECT_TRUE(exact_result.hasValue() && accelerated_result.hasValue())
@@ -438,62 +436,17 @@ TEST(WorldTimeTest, AcceleratedPhaseMismatchedLoopsMatchExactExecution) {
                 exact_result.value().end_time_ns == accelerated_result.value().end_time_ns &&
                 exact_result.value().instructions == accelerated_result.value().instructions &&
                 exact_result.value().cycles == accelerated_result.value().cycles)
-        << "loop batching preserves world stop boundary and logical counters";
+        << "capsule execution preserves world stop boundary and logical counters";
     EXPECT_TRUE(fil::cpu::bitwiseEqual(exact.value()->board("alpha")->cpu().state(),
                     accelerated.value()->board("alpha")->cpu().state()) &&
                 fil::cpu::bitwiseEqual(exact.value()->board("beta")->cpu().state(),
                     accelerated.value()->board("beta")->cpu().state()))
-        << "loop batching preserves full CPU state across a scheduled wakeup";
+        << "capsule execution preserves full CPU state across a scheduled wakeup";
     EXPECT_TRUE(exact.value()->trace().jsonLines() == accelerated.value()->trace().jsonLines())
-        << "loop batching preserves observable callback and trace ordering";
+        << "capsule execution preserves observable callback and trace ordering";
 }
 
 
-
-TEST(WorldTimeTest, AcceleratedLoopsPreserveSysTickAndExceptionEntry) {
-    TempWorldTimeConfigs files;
-    const auto alpha = files.writeBoard("tick-alpha.json", "tick-alpha");
-    const auto beta = files.writeBoard("tick-beta.json", "tick-beta");
-    const auto config = files.network({alpha, beta});
-    auto exact = fil::sim::World::load(config);
-    auto accelerated = fil::sim::World::load(config);
-    if (!exact || !accelerated) {
-        EXPECT_TRUE(false) << "loads worlds for SysTick batching equivalence";
-        return;
-    }
-    EXPECT_TRUE(configureSysTickIdleLoop(*exact.value(), "tick-alpha", 1U) &&
-                configureSysTickIdleLoop(*exact.value(), "tick-beta", 2U) &&
-                configureSysTickIdleLoop(*accelerated.value(), "tick-alpha", 1U) &&
-                configureSysTickIdleLoop(*accelerated.value(), "tick-beta", 2U))
-        << "installs phase-mismatched idle loops with a real SysTick handler";
-
-    auto exact_options = runOptions(10'000U);
-    exact_options.max_instructions_per_board = 1'000U;
-    exact_options.enable_loop_batching = false;
-    auto accelerated_options = exact_options;
-    accelerated_options.enable_loop_batching = true;
-    const auto exact_result = exact.value()->run(exact_options);
-    const auto accelerated_result = accelerated.value()->run(accelerated_options);
-    EXPECT_TRUE(exact_result.hasValue() && accelerated_result.hasValue())
-        << "runs exact and accelerated SysTick worlds";
-    if (!exact_result || !accelerated_result) return;
-
-    EXPECT_TRUE(exact_result.value().reason == accelerated_result.value().reason &&
-                exact_result.value().end_time_ns == accelerated_result.value().end_time_ns &&
-                exact_result.value().instructions == accelerated_result.value().instructions &&
-                exact_result.value().cycles == accelerated_result.value().cycles)
-        << "SysTick-capped batching preserves stop boundary and logical counters";
-    EXPECT_TRUE(accelerated_result.value().rounds < exact_result.value().rounds)
-        << "SysTick equivalence exercises a real accelerated path";
-    EXPECT_TRUE(fil::cpu::bitwiseEqual(exact.value()->board("tick-alpha")->cpu().state(),
-                    accelerated.value()->board("tick-alpha")->cpu().state()) &&
-                fil::cpu::bitwiseEqual(exact.value()->board("tick-beta")->cpu().state(),
-                    accelerated.value()->board("tick-beta")->cpu().state()) &&
-                exact.value()->board("tick-alpha")->cpu().state().r[6] != 0U)
-        << "batching preserves SysTick handler execution and final CPU state";
-    EXPECT_TRUE(exact.value()->trace().jsonLines() == accelerated.value()->trace().jsonLines())
-        << "batching preserves SysTick exception-entry and return trace ordering";
-}
 
 void warmJit(fil::sim::Board& board) {
     const auto initial = board.cpu().state();
@@ -535,9 +488,7 @@ TEST(WorldTimeTest, CompactFrontierMatchesGeneralSchedulerAcrossPaddingBoundary)
         }
         auto options = runOptions(10'000U);
         options.max_instructions_per_board = 103U;
-        options.enable_loop_batching = false;
         const auto result = compact.value()->run(options);
-        options.enable_loop_batching = true;
         const auto reference = general.value()->run(options);
         ASSERT_TRUE(result && reference);
         EXPECT_EQ(result.value().reason, reference.value().reason);
@@ -569,9 +520,7 @@ TEST(WorldTimeTest, CompactQuantumMatchesGeneralAtSaturatedClock) {
     auto options = runOptions(0U);
     options.max_instructions_per_board = 11U;
     options.instruction_quantum = 1U;
-    options.enable_loop_batching = false;
     const auto result = compact.value()->run(options);
-    options.enable_loop_batching = true;
     const auto reference = general.value()->run(options);
     ASSERT_TRUE(result && reference);
     EXPECT_EQ(result.value().reason, reference.value().reason);
@@ -612,7 +561,6 @@ TEST(WorldTimeTest, SynchronizedPureJitBlocksMatchInterpreter) {
     schedule(*jit.value());
     auto options = runOptions(1'000'000U);
     options.max_instructions_per_board = 5'003U;
-    options.enable_loop_batching = false;
     options.enable_jit = false;
     options.enable_ram_capsules = false;
     const auto reference = exact.value()->run(options);
@@ -663,7 +611,6 @@ TEST(WorldTimeTest, SynchronizedJitAdmitsDifferentPurePrefixLengths) {
 
     auto options = runOptions(0U);
     options.max_instructions_per_board = 100U;
-    options.enable_loop_batching = false;
     options.enable_jit = false;
     options.enable_ram_capsules = false;
     const auto reference = exact.value()->run(options);
@@ -675,7 +622,7 @@ TEST(WorldTimeTest, SynchronizedJitAdmitsDifferentPurePrefixLengths) {
     EXPECT_EQ(result.value().cycles, reference.value().cycles);
     EXPECT_EQ(result.value().end_time_ns, reference.value().end_time_ns);
     EXPECT_EQ(result.value().dispatches, reference.value().dispatches)
-        << "no-loop-batching dispatches one instruction per board even with JIT";
+        << "JIT dispatches one instruction per board like the reference";
     EXPECT_EQ(result.value().exact_dispatches, result.value().instructions);
     EXPECT_EQ(jit.value()->trace().jsonLines(), exact.value()->trace().jsonLines());
     for (const auto name : {"prefix-long", "prefix-short"}) {
@@ -709,7 +656,6 @@ TEST(WorldTimeTest, SynchronizedJitMatchesMemoryStepToPureBatch) {
 
     auto options = runOptions(0U);
     options.max_instructions_per_board = 100U;
-    options.enable_loop_batching = false;
     options.enable_jit = false;
     options.enable_ram_capsules = false;
     const auto reference = exact.value()->run(options);
@@ -746,7 +692,6 @@ TEST(WorldTimeTest, JitPreservesDivergentLaneClocksAndBlockCosts) {
     warmJit(*jit.value()->board("mixed-beta"));
     auto options = runOptions(100'001U);
     options.max_instructions_per_board = 501U;
-    options.enable_loop_batching = false;
     options.enable_jit = false;
     const auto reference = exact.value()->run(options);
     options.enable_jit = true;
@@ -774,7 +719,6 @@ TEST(WorldTimeTest, StandaloneJitBlocksPreserveSysTickBoundaries) {
     fil::sim::BoardRunOptions options;
     options.max_instructions = 1'000U;
     options.duration_ns = 10'001U;
-    options.enable_loop_batching = false;
     options.enable_jit = false;
     const auto reference = exact.value()->board("jit-tick")->run(options);
     options.enable_jit = true;
@@ -826,7 +770,6 @@ TEST(WorldTimeTest, JitPreservesSmallBudgetsEventsAndSysTick) {
         schedule(*jit.value());
         auto options = runOptions(tick ? 10'001U : 100'000U);
         options.max_instructions_per_board = tick ? 1'000U : 3U;
-        options.enable_loop_batching = false;
         options.enable_jit = false;
         const auto reference = exact.value()->run(options);
         options.enable_jit = true;
@@ -865,7 +808,6 @@ TEST(WorldTimeTest, ExactSchedulerRestoresMemoryTrackingWhenCallbacksThrow) {
         throw std::runtime_error("test callback failure");
     }));
     auto options = runOptions(1'000U);
-    options.enable_loop_batching = false;
     options.enable_ram_capsules = false;
     EXPECT_THROW(static_cast<void>(world.value()->run(options)), std::runtime_error);
     EXPECT_TRUE(memory.readFootprintTracking());
@@ -930,7 +872,6 @@ TEST(WorldTimeTest, CompactExactSchedulerMatchesGeneralWithEventsAndZeroTimeStep
             auto options = runOptions(1'001U);
             options.max_instructions_per_board = 5'000U;
             options.instruction_quantum = 1U;
-            options.enable_loop_batching = false;
             options.enable_jit = jit;
             options.enable_ram_capsules = false;
             const auto candidate = exact.value()->run(options);
@@ -985,7 +926,6 @@ TEST(WorldTimeTest, CompactExactSchedulerPreservesFailureDrainingAndBudgets) {
             }
             auto options = runOptions(10'000U);
             options.max_instructions_per_board = budget;
-            options.enable_loop_batching = false;
             options.enable_jit = true;
             options.stop_on_board_failure = stop_on_failure;
             const auto candidate = exact.value()->run(options);

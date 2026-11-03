@@ -113,7 +113,7 @@ The current semantic event set is:
 ## Instruction-trace cost
 
 `--trace-instr` emits one `instr` record per executed instruction. It substantially
-increases memory use and JSON output, and it disables proven-loop batching so that
+increases memory use and JSON output, and it disables native batching so that
 no logical instruction is omitted. Use an instruction or time budget and combine it
 with `--trace FILE`; specifying `--trace-instr` alone does not enable the CLI trace
 recorder or create an output file.

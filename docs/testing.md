@@ -26,7 +26,7 @@ ctest --test-dir build --output-on-failure
 The tests cover ELF/config parsing, memory and MMIO faults, Thumb decode/execution,
 Cortex-M exceptions, peripheral register behavior, deterministic events and traces,
 CAN delivery and stimulus output-window checks, single- and multi-board scheduling, worker rollback, and exact-state
-loop batching. Firmware fixtures exercise reset, `.data` copying, `.bss` clearing,
+loop observation for spin detection. Firmware fixtures exercise reset, `.data` copying, `.bss` clearing,
 hard-float startup, SysTick scheduling, and deterministic breakpoint boundaries.
 
 ## Sanitizers

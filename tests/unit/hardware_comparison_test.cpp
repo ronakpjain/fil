@@ -63,7 +63,6 @@ TEST(HardwareComparisonTest, CapturesEmulatorRegistersAndMemory) {
     fil::sim::BoardRunOptions options;
     options.max_instructions = 20U;
     options.duration_ns = 0U;
-    options.enable_loop_batching = false;
     const auto result = board.value()->run(options);
     ASSERT_EQ(result.reason, fil::sim::BoardStopReason::breakpoint);
 
@@ -91,7 +90,6 @@ TEST(HardwareComparisonTest, ProbeFixtureInitializesTheCompleteComparisonState) 
     fil::sim::BoardRunOptions options;
     options.max_instructions = 100U;
     options.duration_ns = 0U;
-    options.enable_loop_batching = false;
     const auto result = board.value()->run(options);
     ASSERT_EQ(result.reason, fil::sim::BoardStopReason::breakpoint);
     EXPECT_EQ(result.instructions, 25U);

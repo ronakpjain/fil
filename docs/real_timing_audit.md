@@ -28,6 +28,6 @@ stalls; changing the clock must not arbitrarily inflate instruction CPI.
 
 ## Simulated time and performance
 
-`Board::accountCycles()` converts charged cycles at the current modeled system clock to nanoseconds while retaining the fractional remainder. Different clock settings and instruction mixes therefore change how many instructions execute in a fixed simulated duration. Loop batching carries the proven iteration's cycle cost forward without dispatching each instruction, provided clock and flash state remain stable for the proof.
+`Board::accountCycles()` converts charged cycles at the current modeled system clock to nanoseconds while retaining the fractional remainder. Different clock settings and instruction mixes therefore change how many instructions execute in a fixed simulated duration.
 
 A valid timing check uses `cycles >= instructions` and a simulated deadline close to the requested duration, not `cycles == instructions`. Benchmark host wall time separately: a higher modeled CPI can reduce the number of instructions needed to reach the same simulated deadline without making interpreter dispatch faster. The synthetic `make benchmark` fixtures check timing invariants but do not stand in for real ADC/DMA firmware.

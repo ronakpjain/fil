@@ -158,14 +158,6 @@ fallback. Regression tests and real-firmware comparisons against capsules-disabl
 execution cover prefix cuts, timing, and observable traces; this is validation of
 tested paths, not a proof for arbitrary firmware.
 
-### Loop batching
-
-When a side-effect-free polling loop returns to the exact same architectural and
-memory state, the scheduler may account for repeated iterations up to the next
-event, interrupt, deadline, budget, or scheduling frontier. Instruction tracing and
-spin diagnosis disable batching. The proof and benchmark controls are documented in
-[Performance](performance.md).
-
 ## Traces
 
 Every trace record has a simulated timestamp and monotonic insertion sequence.

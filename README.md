@@ -51,9 +51,9 @@ for contracts and safety.
 
 Our recommended baseline is Release + supported IPO, automatic JIT, eligible
 guarded RAM capsules, and ADC decimation 1. Plain `run` uses the
-validated fast path without enabling flags. JIT, proven single-board batching,
-and eligible guarded RAM capsules are automatic; network loop batching remains
-off. Diagnostic modes such as instruction tracing and spin detection safely
+validated fast path without enabling flags. JIT and eligible guarded RAM
+capsules are automatic. Diagnostic modes such as instruction tracing and spin
+detection safely
 fall back from optimizations when needed. Use strict MMIO for validation; the
 compatibility CLI default is lenient. Experimental scheduler implementations
 remain internal APIs, not CLI modes.
@@ -62,9 +62,8 @@ The default run is intended to preserve modeled instruction, event, and peripher
 behavior, but RAM-capsule replay on network commands is not yet verified cycle-exact
 against the non-capsule path on real firmware; see the known issue in
 [Performance](docs/performance.md).
-Prepared instruction blocks, bounded scheduler bursts, eligible
-guarded RAM capsules on network commands, and proven-loop batching on
-single-board `run` reduce host overhead. Network loop batching is off by default.
+Prepared instruction blocks, bounded scheduler bursts, and eligible
+guarded RAM capsules on network commands reduce host overhead.
 Release builds use IPO when supported. Makefile builds also enable host CPU
 tuning by default; use `NATIVE=OFF` for portable binaries. Optional `make pgo`
 trains on a representative workload and retains the same CPU-tuning setting.
@@ -77,4 +76,4 @@ Do not use it for fidelity comparisons.
 
 See [Performance](docs/performance.md) for the mechanisms, correctness boundaries,
 and reproducible benchmark procedure. Turn off `--trace-instr` for throughput
-measurements; instruction tracing intentionally disables batching.
+measurements; instruction tracing intentionally disables native execution.

@@ -7,8 +7,7 @@ baseline. Network commands use eligible parallel board lanes by default, with a
 100000 ns (100 µs) cross-board synchronization window. This deliberately relaxes
 cross-board ordering; it does not skip local peripheral work. `--cross-board-window-ns 0`
 selects the exact scheduler with eligible guarded RAM capsules as a reference.
-Network loop batching is off;
-single-board `run` batches proven loops automatically. Diagnostic modes such as
+Diagnostic modes such as
 instruction tracing and spin detection retain safe correctness fallbacks and
 may disable optimized paths. Expectation-only `run` keeps parallel lanes:
 lane-local records are captured per lane and merged deterministically on the
@@ -192,7 +191,6 @@ clock domains, rather than a per-cycle lookup table.
 | Conservative lane horizons | Allocation-free effect summaries convert validated native spans and proved private memory facts into an entry-anchored local prefix plus the earliest possible shared action. Unknown bases, MMIO, branches that may leave the span, and unproved stack ranges end the prefix conservatively; a coordinator frontier is the minimum finite bound across lanes, pending global events, and external inputs. Summaries carry no snapshot, journal, or replay state. Prepared native traces accumulate conservative compile-time counts of local prefix operations, traces that reach a shared access, traces with unresolved control flow, and zero-prefix traces; these describe horizon opportunity, not throughput. |
 | Forward instruction admission | A forward admission checks instruction, cycle, deadline, local-boundary, and shared-frontier credit before the first effect. Exact cost comes from prepared instruction metadata; when it is unavailable or exceeds credit the instruction stays on checked execution with no state change. A deferred-completion result keeps at most one issued instruction in flight so callbacks at an equal timestamp can run before its completion is published. |
 | Event-aware scheduling | Bounds execution by events, interrupts, instruction budgets, and simulated-time deadlines. Event insertion prunes retired owner-queue heads so global-only dispatch does not retain every completed ADC callback until shutdown; live event ordering and conversion effects are unchanged. |
-| Loop batching | Single-board `run` automatically batches proven repeated loops; network commands do not. Unproven paths execute normally; tracing retains instruction-level execution. |
 | Cached JIT handlers | JIT is automatic. Specialized handlers and prepared blocks fall back for unsupported or unsafe operations. |
 | Owner-local committed execution | Eager native programs execute owner windows with checked services in the same host invocation. Retirement credit stops before owner events, SysTick and the window deadline. Registers and RAM accounting are published before checked work; unsafe continuations return to the scheduler. The owner runner has no replay admission or PC-local discovery hints. |
 | Compact committed fallback | Compile-time detailed/compact specializations share checked execution, admission, and decline logic. The compact result avoids exporting per-instruction reversible metadata, while updating exact remaining cycle credit and fetch state in place. Detailed callers retain their output arrays; committed callers leave those arrays untouched. Trap-free IT entry and IT-predicated ordinary-register/immediate MOV execute directly after credit admission, without refetching or copying a rollback checkpoint; MOV still suppresses its implicit flags and advances architectural ITSTATE on failed predicates. Compact execution can retire a safe IT bundle under one unchanged credit, cutting before unsafe/memory forms. Detailed execution and custom fetch-timing callbacks retain one-instruction semantics and callback order. |
@@ -318,7 +316,7 @@ rejected; scheduling and cancellation from callbacks remain supported.
 `--cross-board-window-ns 0` retains the exact reference scheduler. In that
 scheduler, general lockstep bursts require a proven pure fixed-cost
 multi-instruction frontier; scalar timing predictions alone do not authorize
-a burst. Network loop batching remains off.
+a burst.
 
 Guarded RAM capsules are automatic on eligible exact-scheduler network work. Diagnostic safety fallbacks preserve behavior when tracing, spin detection, or other observation-sensitive conditions make capsule execution unsafe. Only journaled, reversible writes to non-executable private RAM are admitted; MMIO, FP/system operations, executable stores, unsupported handlers, and unsafe event boundaries end a span. CAN delivery and board-failure draining are observation barriers. CPU/RAM state must not be inspected or modified while a prefix is active except through scheduled callbacks, which materialize it first. Reentrant or concurrent mutation of a running World is unsupported. Run options are snapshotted per invocation.
 
@@ -400,7 +398,7 @@ capsule-disabled reference. It is currently performance-neutral on that
 workload, since MMIO declines were not the bottleneck.
 
 Unsupported or declined work retains checked execution. Execution must honor
-event, SysTick, interrupt, and instruction-budget boundaries; batching cannot
+event, SysTick, interrupt, and instruction-budget boundaries; no optimization may
 move peripheral effects ahead of their simulated instruction time.
 
 Native trace return stitching is limited to the canonical 16-bit `BX LR`

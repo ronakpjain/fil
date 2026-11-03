@@ -23,9 +23,8 @@ trace records and replies to client requests. Trace filtering follows
 instruction records. `--duration`, `--refresh-ms`, `--instruction-budget`, `--quantum`,
 `--adc-decimation`, `--strict-mmio`, `--lenient-mmio`, `--no-wall-pacing`, and
 `--detect-spin` retain the corresponding watch behavior. JIT is automatic and
-guarded RAM capsules are automatic when eligible. Network loop batching remains
-off. Instruction tracing and spin detection retain diagnostic safety fallbacks
-that can disable capsules.
+guarded RAM capsules are automatic when eligible. Instruction tracing and spin
+detection retain diagnostic safety fallbacks that can disable capsules.
 
 ## Wire framing
 

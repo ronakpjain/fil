@@ -1945,92 +1945,6 @@ SimTimeNs Board::elapsedForCycles(const std::uint64_t cycles) const noexcept {
     return cycleTimeQuotient(cycles * nanoseconds_per_second + time_fraction_, frequency);
 }
 
-std::optional<SimTimeNs> Board::nextObservableTime(const SimTimeNs boundary_time) const {
-    if (system_->nextPending(
-            cpu_->state().primask, cpu_->state().basepri, cpu_->state().faultmask)) {
-        return boundary_time;
-    }
-    const auto cycles = system_->cyclesUntilSysTickInterrupt();
-    if (!cycles) return std::nullopt;
-    const SimTimeNs elapsed = elapsedForCycles(*cycles);
-    if (elapsed > std::numeric_limits<SimTimeNs>::max() - boundary_time) {
-        return std::numeric_limits<SimTimeNs>::max();
-    }
-    return boundary_time + elapsed;
-}
-
-std::uint64_t Board::maximumLoopIterations(
-    const ProvenLoop& loop,
-    const std::uint64_t instruction_budget,
-    const std::optional<SimTimeNs> horizon_ns
-) const {
-    if (!loopProofStillValid(loop)) return 0U;
-    if (system_->nextPending(
-            cpu_->state().primask, cpu_->state().basepri, cpu_->state().faultmask)) {
-        return 0U;
-    }
-
-    std::uint64_t iterations = instruction_budget / loop.instructions_per_iteration;
-    if (iterations == 0U) return 0U;
-    const std::uint64_t maximum_accountable_cycles =
-        (std::numeric_limits<std::uint64_t>::max() - time_fraction_)
-        / nanoseconds_per_second;
-    iterations = std::min(
-        iterations, maximum_accountable_cycles / loop.cycles_per_iteration
-    );
-    if (iterations == 0U) return 0U;
-    if (const auto systick_cycles = system_->cyclesUntilSysTickInterrupt()) {
-        iterations = std::min(iterations, *systick_cycles / loop.cycles_per_iteration);
-    }
-    if (iterations == 0U) return 0U;
-
-    if (horizon_ns) {
-        const SimTimeNs now = event_loop_->now();
-        if (*horizon_ns <= now) return 0U;
-        const SimTimeNs available_ns = *horizon_ns - now;
-        const std::uint64_t frequency = peripherals_->rcc().systemClockHz();
-        if (frequency == 0U) return 0U;
-
-        // floor((cycles * 1e9 + fraction) / frequency) <= available
-        // exactly when the numerator is below (available + 1) * frequency.
-        // Solve that inequality directly instead of binary-searching iteration
-        // counts. If the right side cannot fit in uint64_t, the earlier
-        // accountable-cycle bound is already stricter than this horizon.
-        if (available_ns != std::numeric_limits<SimTimeNs>::max()
-            && available_ns + 1U
-                <= std::numeric_limits<std::uint64_t>::max() / frequency) {
-            const std::uint64_t exclusive_numerator =
-                (available_ns + 1U) * frequency;
-            if (exclusive_numerator <= time_fraction_) return 0U;
-            const std::uint64_t maximum_cycles =
-                (exclusive_numerator - 1U - time_fraction_)
-                / nanoseconds_per_second;
-            iterations = std::min(
-                iterations, maximum_cycles / loop.cycles_per_iteration
-            );
-        }
-    }
-    return iterations;
-}
-
-Board::LoopSkip Board::applyLoopIterations(
-    const ProvenLoop& loop,
-    const std::uint64_t validated_iterations
-) {
-    if (validated_iterations == 0U) return {};
-    LoopSkip skip;
-    skip.instructions = validated_iterations * loop.instructions_per_iteration;
-    skip.cycles = validated_iterations * loop.cycles_per_iteration;
-    skip.elapsed_ns = accountCycles(skip.cycles);
-    return skip;
-}
-
-// Outlined: the generation-wrap path value-initializes a ~90 KiB
-// observation table. Inlining it reserves that frame (and a chkstk probe)
-// in every hot caller (step/accounting); the wrap itself is near-impossible.
-#if defined(__clang__) || defined(__GNUC__)
-__attribute__((noinline))
-#endif
 void Board::invalidateLoopObservations() noexcept {
     ++loop_observation_generation_;
     read_footprint_boundary_.reset();
@@ -2323,10 +2237,9 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
             break;
         }
         const bool jit_ok = !options.trace_instructions && options.enable_jit;
-        // Proven loop batching already amortizes idle loops; avoid competing
-        // block preparation/preview overhead when that path is enabled.
+        // Spin diagnosis is exact single-step work, so skip block
+        // preparation and preview admission for it.
         const std::size_t jit_limit = options.stop_address || options.detect_spin
-            || options.enable_loop_batching
             ? 1U : static_cast<std::size_t>(std::min<std::uint64_t>(
                 options.max_instructions - aggregate.instructions,
                 owner_slice_active_ ? cpu::NativeTracePlan::max_ops
@@ -2335,7 +2248,7 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
             ? std::nullopt : std::optional<SimTimeNs>{deadline};
         span_accounted_cycles_ = 0U;
         const bool native_owner = owner_slice_active_ && jit_ok
-            && !options.stop_address && !options.detect_spin && !options.enable_loop_batching;
+            && !options.stop_address && !options.detect_spin;
         const auto native = native_owner
             ? stepNativeLocal(static_cast<std::size_t>(std::min<std::uint64_t>(
                 options.max_instructions - aggregate.instructions, UINT32_MAX)), limit_time)
@@ -2373,17 +2286,11 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
             break;
         }
 
-        // Proof work is skipped unless spin detection or usable batching
-        // needs it: with tracing on, batching is disabled, and without
-        // spin detection nothing consumes the proof.
-        const bool need_proof = options.detect_spin
-            || (options.enable_loop_batching && !options.trace_instructions);
-        std::optional<ProvenLoop> loop;
-        if (need_proof) {
-            loop = observeLoopBoundary(
-                result, aggregate.instructions, aggregate.cycles
-            );
-        }
+        // Exact-state loop observation exists for spin detection only.
+        if (!options.detect_spin) continue;
+        const auto loop = observeLoopBoundary(
+            result, aggregate.instructions, aggregate.cycles
+        );
         if (!loop) continue;
         if (proven_spin_pc && *proven_spin_pc == loop->boundary_pc) {
             proven_spin_instructions += loop->instructions_per_iteration;
@@ -2391,47 +2298,20 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
             proven_spin_pc = loop->boundary_pc;
             proven_spin_instructions = loop->instructions_per_iteration;
         }
-        if (options.detect_spin && proven_spin_instructions >= options.spin_threshold) {
-            aggregate.reason = BoardStopReason::spin_detected;
-            aggregate.message = "exact-state loop at " + hex32(loop->boundary_pc)
-                + " period_instructions=" + std::to_string(loop->instructions_per_iteration)
-                + " period_cycles=" + std::to_string(loop->cycles_per_iteration);
-            trace_->record(
-                event_loop_->now(), config_.name, "spin_detected",
-                {
-                    {"pc", hex32(loop->boundary_pc)},
-                    {"period_instructions", std::to_string(loop->instructions_per_iteration)},
-                    {"period_cycles", std::to_string(loop->cycles_per_iteration)},
-                }
-            );
-            break;
-        }
-        if (!options.enable_loop_batching || options.trace_instructions
-            || options.detect_spin) {
-            continue;
-        }
-
-        std::optional<SimTimeNs> horizon;
-        if (deadline != 0U) horizon = deadline;
-        if (const auto event_time = event_loop_->nextScheduledTime()) {
-            if (!horizon || *event_time < *horizon) horizon = *event_time;
-        }
-        const std::uint64_t remaining = options.max_instructions - aggregate.instructions;
-        const std::uint64_t iterations = maximumLoopIterations(*loop, remaining, horizon);
-        if (iterations == 0U) continue;
-        const LoopSkip skip = applyLoopIterations(*loop, iterations);
-        aggregate.instructions += skip.instructions;
-        aggregate.cycles += skip.cycles;
-        const auto events = event_loop_->advanceBy(skip.elapsed_ns);
-        if (events.same_time_limit_hit) {
-            trace_->record(event_loop_->now(), config_.name, "event_livelock");
-        }
-        refreshLoopObservation(*loop, aggregate.instructions, aggregate.cycles);
-        if (auto boundary = settleInstructionBoundary()) {
-            aggregate.reason = boundary->reason;
-            aggregate.message = std::move(boundary->message);
-            break;
-        }
+        if (proven_spin_instructions < options.spin_threshold) continue;
+        aggregate.reason = BoardStopReason::spin_detected;
+        aggregate.message = "exact-state loop at " + hex32(loop->boundary_pc)
+            + " period_instructions=" + std::to_string(loop->instructions_per_iteration)
+            + " period_cycles=" + std::to_string(loop->cycles_per_iteration);
+        trace_->record(
+            event_loop_->now(), config_.name, "spin_detected",
+            {
+                {"pc", hex32(loop->boundary_pc)},
+                {"period_instructions", std::to_string(loop->instructions_per_iteration)},
+                {"period_cycles", std::to_string(loop->cycles_per_iteration)},
+            }
+        );
+        break;
     }
 
     aggregate.time_ns = event_loop_->now();

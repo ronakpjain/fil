@@ -732,7 +732,6 @@ ExitCode runBoardCommand(
     bool strict_mmio = false;
     bool trace_instructions = false;
     bool detect_spin = false;
-    bool enable_loop_batching = true;
     bool enable_jit = true;
     bool allow_breakpoint = false;
     std::uint32_t adc_decimation = 1U;
@@ -828,7 +827,6 @@ ExitCode runBoardCommand(
     options.duration_ns = resolved_duration_ns;
     options.trace_instructions = trace_instructions;
     options.detect_spin = detect_spin;
-    options.enable_loop_batching = enable_loop_batching;
     options.enable_jit = enable_jit;
     options.adc_decimation = adc_decimation;
     options.stop_address = stop_address;
@@ -1062,7 +1060,6 @@ ExitCode compareStlinkCommand(
     run_options.duration_ns = 0U;
     run_options.stop_address = stop_address;
     run_options.detect_spin = false;
-    run_options.enable_loop_batching = false;
     const sim::BoardRunResult run_result = board.value()->run(run_options);
     const sim::BoardStopReason expected_stop = stop_address
         ? sim::BoardStopReason::target_reached : sim::BoardStopReason::breakpoint;
@@ -1246,7 +1243,6 @@ ExitCode runNetworkCommand(
     bool strict_mmio = false;
     bool trace_instructions = false;
     bool detect_spin = false;
-    bool enable_loop_batching = false;
     bool enable_jit = true;
     bool enable_ram_capsules = true;
     bool allow_breakpoint = false;
@@ -1389,7 +1385,6 @@ ExitCode runNetworkCommand(
     options.enable_parallel_lanes = enable_parallel_lanes;
     options.trace_instructions = trace_instructions;
     options.detect_spin = detect_spin;
-    options.enable_loop_batching = enable_loop_batching;
     options.enable_jit = enable_jit;
     options.enable_ram_capsules = enable_ram_capsules;
     options.adc_decimation = adc_decimation;
@@ -1411,12 +1406,10 @@ ExitCode runNetworkCommand(
         << "time_ns: " << result.value().end_time_ns << '\n'
         << "rounds: " << result.value().rounds << '\n'
         << "parallel_lanes: " << result.value().parallel_lanes << '\n'
-        << "cross_board_window_ns: " << (trace_instructions || detect_spin || enable_loop_batching
+        << "cross_board_window_ns: " << (trace_instructions || detect_spin
             ? 0U : cross_board_window_ns) << '\n'
         << "dispatches: " << result.value().dispatches << '\n'
         << "exact_dispatches: " << result.value().exact_dispatches << '\n'
-        << "loop_batches: " << result.value().loop_batches << '\n'
-        << "batched_instructions: " << result.value().batched_instructions << '\n'
         << "event_callbacks: " << result.value().event_callbacks << '\n'
         << "lockstep_bursts: " << result.value().lockstep_bursts << '\n';
     if (enable_ram_capsules) {
@@ -1517,7 +1510,6 @@ ExitCode networkMonitorCommand(
     sim::SimTimeNs refresh_ns = 100'000U;
     std::uint32_t adc_decimation = 1U;
     bool strict_mmio = false;
-    bool enable_loop_batching = false;
     bool enable_jit = true;
     bool enable_ram_capsules = true;
     bool trace_instructions = false;
@@ -1867,7 +1859,7 @@ ExitCode networkMonitorCommand(
     }
     const bool window_controls = binary_protocol && !wall_pacing
         && cross_board_window_ns != 0U && !trace_instructions && !detect_spin
-        && !enable_loop_batching && max_instructions >= 50'000'000U
+        && max_instructions >= 50'000'000U
         && (slice_ns % cross_board_window_ns == 0U || cross_board_window_ns % slice_ns == 0U);
     bool window_controls_ok = true;
     auto next_control_at = started_at + slice_ns;
@@ -1908,8 +1900,7 @@ ExitCode networkMonitorCommand(
         options.instruction_quantum = quantum;
         options.cross_board_window_ns = cross_board_window_ns;
         options.enable_parallel_lanes = enable_parallel_lanes;
-        options.enable_loop_batching = enable_loop_batching;
-        options.enable_jit = enable_jit;
+            options.enable_jit = enable_jit;
         options.enable_ram_capsules = enable_ram_capsules;
         options.adc_decimation = adc_decimation;
         options.trace_instructions = trace_instructions;

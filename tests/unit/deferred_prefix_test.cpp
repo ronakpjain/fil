@@ -159,7 +159,6 @@ TEST(DeferredPrefixTest, LocalAdcEventsAndNestedGlobalObserversMatchExactExecuti
         options.cross_board_window_ns = 0U; // Exact scheduler regression reference.
         options.duration_ns = 10000U;
         options.max_instructions_per_board = 10000U;
-        options.enable_loop_batching = false;
         const auto expected = reference.value()->run(options);
         options.enable_jit = true;
         options.enable_ram_capsules = true;
@@ -222,7 +221,6 @@ TEST(DeferredPrefixTest, PublicObserverReplacementCannotRemoveWorldMaterializati
     options.cross_board_window_ns = 0U;
     options.duration_ns = 10000U;
     options.max_instructions_per_board = 10000U;
-    options.enable_loop_batching = false;
     const auto expected = reference.value()->run(options);
     options.enable_jit = true;
     options.enable_ram_capsules = true;
@@ -254,7 +252,6 @@ TEST(DeferredPrefixTest, WarmIdleCallPeriodEveryCutMatchesExactCpuMemoryAndTimer
         ASSERT_TRUE(exact && speculative);
         fil::sim::BoardRunOptions options;
         options.duration_ns = 0U;
-        options.enable_loop_batching = false;
         options.enable_jit = true;
         options.max_instructions = 13U;
         for (auto* board : {exact.value().get(), speculative.value().get()}) {
@@ -335,7 +332,6 @@ TEST(DeferredPrefixTest, IdempotentPeriodAdmissionReusesRotatedPhasesWithoutExec
     ASSERT_TRUE(exact && cached);
     fil::sim::BoardRunOptions warm;
     warm.duration_ns = 0U;
-    warm.enable_loop_batching = false;
     warm.enable_jit = true;
     warm.max_instructions = 13U;
     for (auto* board : {exact.value().get(), cached.value().get()}) {
@@ -411,7 +407,6 @@ TEST(DeferredPrefixTest, RestorationInvalidatesImmutablePeriodAdmission) {
     installCode(*board.value(), code);
     fil::sim::BoardRunOptions warm;
     warm.duration_ns = 0U;
-    warm.enable_loop_batching = false;
     warm.enable_jit = true;
     warm.max_instructions = 13U;
     ASSERT_EQ(board.value()->run(warm).instructions, 13U);
@@ -461,7 +456,6 @@ TEST(DeferredPrefixTest, ReversibleRamEveryCutMatchesExactCpuMemoryAndTimers) {
         fil::sim::BoardRunOptions options;
         options.max_instructions = count;
         options.duration_ns = 0U;
-        options.enable_loop_batching = false;
         const auto reference = exact.value()->run(options);
         ASSERT_EQ(reference.instructions, count);
         EXPECT_EQ(committed.cpu_result.instructions, count);
@@ -515,7 +509,6 @@ TEST(DeferredPrefixTest, FailureTruncatesOtherCapsulesBeforeDraining) {
             options.cross_board_window_ns = 0U;
             options.duration_ns = 10000U;
             options.max_instructions_per_board = 1000U;
-            options.enable_loop_batching = false;
             options.stop_on_board_failure = stop_on_failure;
             const auto expected = exact.value()->run(options);
             options.enable_jit = true;
@@ -601,7 +594,6 @@ TEST(DeferredPrefixTest, SynchronousCanAtHiddenCompletionPreservesBoardOrder) {
         options.cross_board_window_ns = 0U; // Exact scheduler regression reference.
         options.duration_ns = 10000U;
         options.max_instructions_per_board = 1000U;
-        options.enable_loop_batching = false;
         const auto expected = reference.value()->run(options);
         options.enable_jit = true;
         const auto actual = candidate.value()->run(options);

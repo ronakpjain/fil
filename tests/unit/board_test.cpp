@@ -79,7 +79,6 @@ bool warmIdempotentPeriodCache(fil::sim::Board& board) {
     }
     fil::sim::BoardRunOptions warm;
     warm.duration_ns = 0U;
-    warm.enable_loop_batching = false;
     warm.enable_jit = true;
     warm.max_instructions = 13U;
     if (board.run(warm).instructions != 13U) return false;
@@ -147,7 +146,6 @@ TEST(BoardTest, EndpointDiscoveryKeepsCurrentTwoInstructionPrefixExactAtEveryCut
             EXPECT_EQ(prefix->folded_instructions, 0U);
             fil::sim::BoardRunOptions options;
             options.duration_ns = 0U;
-            options.enable_loop_batching = false;
             options.enable_jit = true;
             options.max_instructions = cut;
             const auto expected = exact.value()->run(options);
@@ -200,8 +198,7 @@ TEST(BoardTest, EndpointDiscoveryAdjustsPositiveAndNegativeFirstFetchStall) {
             // Seed a sequential incoming fetch at entry base+2.
             for (auto* board : {exact.value().get(), candidate.value().get()}) {
                 fil::sim::BoardRunOptions one;
-                one.duration_ns = 0U; one.max_instructions = 1U;
-                one.enable_loop_batching = false; one.enable_jit = true;
+                one.duration_ns = 0U; one.max_instructions = 1U; one.enable_jit = true;
                 ASSERT_EQ(board->run(one).instructions, 1U);
             }
         }
@@ -225,8 +222,7 @@ TEST(BoardTest, EndpointDiscoveryAdjustsPositiveAndNegativeFirstFetchStall) {
         ASSERT_TRUE(prefix->period_certificate) << which;
         const std::uint64_t observed_cycles = prefix->cumulative_cycles[1U];
         fil::sim::BoardRunOptions options;
-        options.duration_ns = 0U; options.max_instructions = 2U;
-        options.enable_loop_batching = false; options.enable_jit = true;
+        options.duration_ns = 0U; options.max_instructions = 2U; options.enable_jit = true;
         const auto expected = exact.value()->run(options);
         ASSERT_EQ(expected.instructions, 2U);
         const auto committed = candidate.value()->materializeReversibleRamPrefix(*prefix, 2U);
@@ -304,7 +300,6 @@ TEST(BoardTest, ColdPeriodCertificationKeepsLongCheckedSpansAndExactCuts) {
             ASSERT_TRUE(installWholeRamNeutralPeriod(*candidate.value(), 1U, false));
             fil::sim::BoardRunOptions options;
             options.duration_ns = 0U;
-            options.enable_loop_batching = false;
             if (recurring_entry) {
                 options.max_instructions = 4U;
                 ASSERT_EQ(exact.value()->run(options).instructions, 4U);
@@ -345,7 +340,6 @@ TEST(BoardTest, WholeRamNeutralPeriodFoldsAndReplaysEveryPartialCut) {
 
         fil::sim::BoardRunOptions options;
         options.duration_ns = 0U;
-        options.enable_loop_batching = false;
         options.max_instructions = 4U;
         ASSERT_EQ(exact.value()->run(options).instructions, 4U);
         const auto admission = cached.value()->prepareReversibleRamPrefix(12U);
@@ -399,7 +393,6 @@ TEST(BoardTest, WholeRamNeutralCachedPeriodCompressesAdmissionsThrough4096) {
 
         fil::sim::BoardRunOptions options;
         options.duration_ns = 0U;
-        options.enable_loop_batching = false;
         options.max_instructions = cut;
         const auto expected = exact.value()->run(options);
         ASSERT_EQ(expected.instructions, cut);
@@ -432,7 +425,6 @@ TEST(BoardTest, WholeRamNeutralHighClockKeepsBoundedStrictlyIncreasingTiming) {
     static_cast<void>(cached.value()->materializeReversibleRamPrefix(*discovery, discovery->count));
     fil::sim::BoardRunOptions options;
     options.duration_ns = 0U;
-    options.enable_loop_batching = false;
     options.max_instructions = 32U;
     ASSERT_EQ(exact.value()->run(options).instructions, 32U);
     const auto start = exact.value()->eventLoop().now();
@@ -495,7 +487,6 @@ TEST(BoardTest, WholeRamNeutralFreshFoldReplaysCpuCyclesWithFlashStalls) {
         static_cast<void>(folded.value()->materializeReversibleRamPrefix(*discovery, 4U));
         fil::sim::BoardRunOptions options;
         options.duration_ns = 0U;
-        options.enable_loop_batching = false;
         options.max_instructions = 4U;
         ASSERT_EQ(exact.value()->run(options).instructions, 4U);
 
@@ -669,7 +660,6 @@ TEST(BoardTest, ReversibleRamPrefixChainsBranchesAndReplaysLongCuts) {
     fil::sim::BoardRunOptions options;
     options.max_instructions = cut;
     options.duration_ns = 0U;
-    options.enable_loop_batching = false;
     const auto reference = exact.value()->run(options);
     EXPECT_EQ(reference.instructions, cut);
     EXPECT_EQ(committed.cpu_result.instructions, cut);
@@ -862,7 +852,6 @@ TEST(BoardTest, IdempotentPeriodCacheReusesNonzeroPeriodPhase) {
     const auto first = speculative.value()->materializeReversibleRamPrefix(*seed, 1U);
     fil::sim::BoardRunOptions one;
     one.duration_ns = 0U;
-    one.enable_loop_batching = false;
     one.max_instructions = 1U;
     const auto first_reference = exact.value()->run(one);
     ASSERT_EQ(first.cpu_result.instructions, first_reference.instructions);
@@ -921,7 +910,6 @@ TEST(BoardTest, CachedPeriodCutsDoNotUseSpeculativeRollbackSnapshot) {
 
         fil::sim::BoardRunOptions options;
         options.duration_ns = 0U;
-        options.enable_loop_batching = false;
         options.max_instructions = cut;
         const auto reference = exact.value()->run(options);
         EXPECT_EQ(result.cpu_result.instructions, reference.instructions);
@@ -1061,7 +1049,6 @@ TEST(BoardTest, DeferredPurePrefixWithFractionAndFlashWaitsMatchesExactExecution
     fil::sim::BoardRunOptions one;
     one.max_instructions = 1U;
     one.duration_ns = 0U;
-    one.enable_loop_batching = false;
     const auto exact_first = exact.value()->run(one);
     const auto deferred_first = deferred.value()->run(one);
     ASSERT_EQ(exact_first.instructions, 1U);
@@ -1135,7 +1122,6 @@ TEST(BoardTest, PureJitBlocksMatchExactAcrossFlashTimingChanges) {
     fil::sim::BoardRunOptions options;
     options.max_instructions = 37U; // Includes branches and a partial final block.
     options.duration_ns = 0U;
-    options.enable_loop_batching = false;
     // Rewrite ACR between spans to exercise generation invalidation, ART on
     // sequential fetches, taken branches, and the zero-latency fast path.
     for (const std::uint32_t acr : {4U, 4U | (1U << 8U), 2U | (1U << 9U), 0U, 3U}) {
@@ -1167,7 +1153,6 @@ TEST(BoardTest, SingleInstructionDispatchMatchesWithFlashWaits) {
     fil::sim::BoardRunOptions options;
     options.max_instructions = 10U;
     options.duration_ns = 0U;
-    options.enable_loop_batching = false;
     options.stop_address = target; // Forces exact one-instruction dispatch.
     options.enable_jit = false;
     const auto reference = exact.value()->run(options);
@@ -1198,7 +1183,6 @@ TEST(BoardTest, JitPreservesScheduledEventAndDeadlineBoundaries) {
         jit.value()->cpu().state().r[0] += 10U;
     }));
     fil::sim::BoardRunOptions options;
-    options.enable_loop_batching = false;
     options.max_instructions = 1'000U;
     options.duration_ns = 1'001U;
     options.enable_jit = false;
@@ -1220,7 +1204,6 @@ TEST(BoardTest, JitStopsBeforeInteriorTargetAndHonorsSmallBudget) {
         ASSERT_TRUE(installAndWarmJitLoop(*board.value()));
         const auto start = board.value()->cpu().state().r[15];
         fil::sim::BoardRunOptions options;
-        options.enable_loop_batching = false;
         options.duration_ns = 0U;
         options.max_instructions = stop_at_target ? 100U : 2U;
         options.enable_jit = true;
@@ -1243,7 +1226,6 @@ TEST(BoardTest, JitTimesMmioAfterCommittedAluPrefix) {
     ASSERT_TRUE(exact.value()->memory().write32(0xe0001000U, 1U));
     ASSERT_TRUE(jit.value()->memory().write32(0xe0001000U, 1U));
     fil::sim::BoardRunOptions options;
-    options.enable_loop_batching = false;
     options.max_instructions = 19U;
     options.duration_ns = 0U;
     options.enable_jit = false;
@@ -1272,9 +1254,7 @@ TEST(BoardTest, LoopBatchingMatchesExactBoardExecution) {
     exact_options.max_instructions = 10'000U;
     exact_options.duration_ns = 0U;
     exact_options.detect_spin = false;
-    exact_options.enable_loop_batching = false;
     auto batched_options = exact_options;
-    batched_options.enable_loop_batching = true;
 
     const auto exact_result = exact.value()->run(exact_options);
     const auto batched_result = batched.value()->run(batched_options);
@@ -1306,7 +1286,6 @@ TEST(BoardTest, SpinDetectionTakesPriorityOverBatching) {
     options.duration_ns = 0U;
     options.detect_spin = true;
     options.spin_threshold = 20U;
-    options.enable_loop_batching = true;
     const auto result = board.value()->run(options);
     EXPECT_TRUE(result.reason == fil::sim::BoardStopReason::spin_detected &&
                 result.instructions >= options.spin_threshold &&
