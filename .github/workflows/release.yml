@@ -27,7 +27,7 @@ jobs:
           - runner: ubuntu-24.04-arm
             arch: aarch64
             asset: fil-linux-aarch64
-          - runner: macos-15
+          - runner: macos-26
             arch: arm64
             asset: fil-macos-arm64
     env:
@@ -50,19 +50,15 @@ jobs:
         if: startsWith(matrix.runner, 'macos')
         run: echo "MACOSX_DEPLOYMENT_TARGET=13.0" >> "$GITHUB_ENV"
 
-      - name: Diagnose AppleClang jthread (temporary)
+      - name: Verify macOS C++20 thread support
         if: startsWith(matrix.runner, 'macos')
         run: |
-          set -ux
-          xcode-select -p || true
-          xcodebuild -version || true
-          /usr/bin/clang++ --version | head -2
-          xcrun --show-sdk-path || true
-          xcrun --show-sdk-version || true
+          set -eux
+          xcodebuild -version
+          /usr/bin/clang++ --version
           printf '#include <thread>\nint main(){ std::jthread t; return 0; }\n' > /tmp/jt.cpp
-          /usr/bin/clang++ -std=c++20 /tmp/jt.cpp -o /tmp/jt-default 2>&1 | head -5 || true
-          /usr/bin/clang++ -std=c++20 -mmacosx-version-min=14.0 /tmp/jt.cpp -o /tmp/jt-14 2>&1 | head -5 || true
-          /usr/bin/clang++ -std=c++20 -mmacosx-version-min=15.0 /tmp/jt.cpp -o /tmp/jt-15 2>&1 | head -5 || true
+          /usr/bin/clang++ -std=c++20 -mmacosx-version-min=13.0 /tmp/jt.cpp -o /tmp/jt
+          /tmp/jt
 
       - name: Configure (Release, portable)
         run: |
