@@ -634,7 +634,6 @@ void AdcPeripheral::skippedScanEventThunk(void* context) {
 void AdcPeripheral::scheduleConversionEvent() {
     if (eventLoop() == nullptr || !next_conversion_ns_) return;
     if (skipped_scan_event_) {
-        const std::uint32_t skipped = skipped_scan_count_;
         static_cast<void>(conversion_event_.scheduleOwnerLocalBuiltinAt(
             *next_conversion_ns_, {&AdcPeripheral::skippedScanEventThunk, this},
             [this]() { return ownerLocalTrusted(); }));
