@@ -15,7 +15,6 @@
 
 namespace {
 
-constexpr fil::mem::AccessContext read_context{fil::mem::AccessType::data_read, 0};
 constexpr fil::mem::AccessContext write_context{fil::mem::AccessType::data_write, 0};
 
 
