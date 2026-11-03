@@ -27,6 +27,43 @@ inline void laneSpinPause() noexcept {
 #endif
 }
 
+/**
+ * Monotonic host cycle counter. This is a pure register read used only for
+ * host scheduling hints, so it can never observe guest state and never
+ * allocates. `steady_clock::now()` on macOS funnels through
+ * `clock_gettime_nsec_np`; at one sample per job per window that dominated the
+ * coordinator profile.
+ */
+inline std::uint64_t laneCycleCount() noexcept {
+#if defined(__aarch64__)
+    std::uint64_t value;
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(value));
+    return value;
+#elif defined(__x86_64__) || defined(_M_X64)
+    return static_cast<std::uint64_t>(__builtin_ia32_rdtsc());
+#else
+    return static_cast<std::uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+#endif
+}
+
+/** Cycle counts for one microsecond. Calibrated once against a steady clock. */
+inline std::uint64_t laneCyclesPerMicrosecond() noexcept {
+    static const std::uint64_t value = [] {
+        const auto begin_time = std::chrono::steady_clock::now();
+        const auto begin = laneCycleCount();
+        while (std::chrono::steady_clock::now() - begin_time
+               < std::chrono::microseconds{200}) {
+        }
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - begin_time).count();
+        const auto cycles = laneCycleCount() - begin;
+        if (elapsed <= 0 || cycles == 0U) return std::uint64_t{1000U};
+        return (cycles / static_cast<std::uint64_t>(elapsed)) * 1000U;
+    }();
+    return value;
+}
+
 // Bound runnable executors, not logical owners. On heterogeneous Apple hosts,
 // prefer the high-performance physical-core budget; this is not CPU affinity.
 inline std::size_t laneExecutionSlots() noexcept {
@@ -63,9 +100,10 @@ inline std::size_t laneActiveExecutionSlots(const std::vector<std::uint64_t>& co
 // conservative park-first budget is kept there.
 inline std::size_t laneSpinBudget(
     const std::size_t executors, const std::size_t max_slots) noexcept {
-    const auto slots = laneExecutionSlots();
+    const auto slots = std::max(laneExecutionSlots(),
+        static_cast<std::size_t>(std::thread::hardware_concurrency()));
     const auto used = std::min(executors, max_slots);
-    return slots >= used + 2U ? 32U * 1024U : 64U;
+    return slots >= used + 1U ? 32U * 1024U : 256U;
 }
 
 // Persistent owner executors. Release/acquire publishes each window's active
@@ -91,15 +129,23 @@ public:
                     if (startup_failed_.load(std::memory_order_relaxed)) return;
                     std::uint64_t observed = 0U;
                     for (;;) {
-                        std::size_t spins = 0U;
-                        std::uint64_t next;
-                        while ((next = generation_.load(std::memory_order_acquire)) == observed) {
-                            if (spins++ < spin_limit_) laneSpinPause();
-                            else generation_.wait(observed, std::memory_order_acquire);
+                        const auto spin_until = laneCycleCount() + spin_cycles_;
+                        while (generation_.load(std::memory_order_acquire) == observed) {
+                            if (laneCycleCount() < spin_until) {
+                                laneSpinPause();
+                                continue;
+                            }
+                            // Announce parking before the (atomically
+                            // rechecked) wait so the coordinator can skip the
+                            // futex syscall entirely while we still spin.
+                            parked_.fetch_add(1U, std::memory_order_seq_cst);
+                            generation_.wait(observed, std::memory_order_seq_cst);
+                            parked_.fetch_sub(1U, std::memory_order_seq_cst);
                         }
+                        const auto next = generation_.load(std::memory_order_acquire);
                         observed = next;
                         if (stopping_.load(std::memory_order_relaxed)) return;
-                        if (worker + 1U < execution_slots_) drain();
+                        if (!width_limited_ || worker + 1U < execution_slots_) drain();
                         // Acknowledge only after the final queue access and all
                         // per-job scopes unwind. Last-job completion alone is
                         // insufficient: another consumer may still claim work.
@@ -145,19 +191,33 @@ public:
         std::sort(order_.begin(), order_.end(), [&](auto a, auto b) {
             return costs_[a] != costs_[b] ? costs_[a] > costs_[b] : a < b;
         });
-        execution_slots_ = laneActiveExecutionSlots(
-            costs_, std::min(count_, worker_count_ + 1U));
+        // Every job must finish before the window can advance, so extra
+        // executors can only shorten the critical path. Width limiting is
+        // retained solely for callers that ask for it; the default keeps all
+        // available executors draining the shared queue.
+        execution_slots_ = width_limited_
+            ? laneActiveExecutionSlots(costs_, std::min(count_, worker_count_ + 1U))
+            : std::min(count_, worker_count_ + 1U);
         next_index_.store(0U, std::memory_order_relaxed);
         remaining_.store(worker_count_, std::memory_order_relaxed);
+        const auto window_begin = laneCycleCount();
         generation_.fetch_add(1U, std::memory_order_release);
-        generation_.notify_all();
+        if (parked_.load(std::memory_order_acquire) != 0U) generation_.notify_all();
         drain();
         std::size_t spins = 0U;
+        const auto wait_until = window_begin + spin_cycles_;
         for (auto remaining = remaining_.load(std::memory_order_acquire); remaining != 0U;
              remaining = remaining_.load(std::memory_order_acquire)) {
-            if (spins++ < spin_limit_) laneSpinPause();
-            else remaining_.wait(remaining, std::memory_order_acquire);
+            if (spins++ < spin_limit_ || laneCycleCount() < wait_until) {
+                laneSpinPause();
+                continue;
+            }
+            coordinator_parked_.fetch_add(1U, std::memory_order_seq_cst);
+            remaining_.wait(remaining, std::memory_order_seq_cst);
+            coordinator_parked_.fetch_sub(1U, std::memory_order_seq_cst);
         }
+        observed_window_cycles_ = laneCycleCount() - window_begin;
+        updateSpinCycles();
         // Clear every slot before throwing, including simultaneous failures at
         // higher owner IDs. Host scheduling must not choose exception priority.
         std::exception_ptr first;
@@ -168,21 +228,38 @@ public:
         if (first) std::rethrow_exception(first);
     }
 
+    /**
+     * @brief Limits active executors to the measured useful width.
+     *
+     * The shared queue makes extra executors strictly helpful for the window
+     * barrier, so this is off by default and only used by callers that need
+     * the historical measured-width policy.
+     */
+    void setWidthLimited(const bool limited) noexcept { width_limited_ = limited; }
+
 private:
+    // Spin for a fraction of the last observed window, so a parked executor
+    // does not pay a futex round trip when the next window is already queued.
+    void updateSpinCycles() noexcept {
+        const auto per_microsecond = laneCyclesPerMicrosecond();
+        const auto quarter = observed_window_cycles_ / 4U;
+        const auto lower = per_microsecond * 2U;
+        const auto upper = per_microsecond * 100U;
+        spin_cycles_ = std::clamp(quarter, lower, upper);
+    }
+
     void drain() noexcept {
         for (;;) {
             const auto position = next_index_.fetch_add(1U, std::memory_order_relaxed);
             if (position >= count_) return;
             const auto index = order_[position];
-            const auto start = std::chrono::steady_clock::now();
+            const auto start = laneCycleCount();
             try {
                 work_(index);
             } catch (...) {
                 failures_[index] = std::current_exception();
             }
-            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - start).count();
-            const auto cost = elapsed > 0 ? static_cast<std::uint64_t>(elapsed) : 0U;
+            const auto cost = laneCycleCount() - start;
             costs_[index] = std::max(costs_[index] / 2U, cost);
         }
     }
@@ -195,9 +272,14 @@ private:
     std::size_t worker_count_;
     std::size_t spin_limit_;
     std::size_t execution_slots_ = 1U;
+    std::uint64_t spin_cycles_ = laneCyclesPerMicrosecond() * 20U;
+    std::uint64_t observed_window_cycles_ = 0U;
+    bool width_limited_ = false;
     alignas(64) std::atomic<std::uint64_t> generation_{0U};
     alignas(64) std::atomic<std::size_t> remaining_{0U};
     alignas(64) std::atomic<std::size_t> next_index_{0U};
+    alignas(64) std::atomic<std::size_t> parked_{0U};
+    alignas(64) std::atomic<std::size_t> coordinator_parked_{0U};
     std::atomic<bool> stopping_{false};
     std::atomic<bool> ready_{false};
     std::atomic<bool> startup_failed_{false};

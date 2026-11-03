@@ -100,6 +100,13 @@ struct EventLoop::Impl {
         return ids;
     }();
     std::atomic<std::size_t> active_lane_scopes{0U};
+    // Set for the whole lifetime of a lane-domain session by its coordinator.
+    // The coordinator cannot run a root operation while a lane scope is active
+    // (that case still takes the gate and throws), so lane scopes can skip the
+    // gate mutex entirely. Without this, whichever lane loses the race to
+    // observe `active_lane_scopes == 0` blocks on the gate for the duration of
+    // the winning lane's whole slice, serializing the window start.
+    std::atomic<bool> lane_gate_owned{false};
     // One cache line per owner: these flags are acquired and released once per
     // lane job, and packing 64 atomics into a single line would make every lane
     // job an RMW on a line all other lanes are also writing.
@@ -594,6 +601,7 @@ struct EventLoop::Impl {
         lane_coordinator = std::this_thread::get_id();
         lane_domains_orphaned.store(false, std::memory_order_release);
         lane_domains_active = true;
+        lane_gate_owned.store(true, std::memory_order_release);
     }
 
     void finishLaneDomains() {
@@ -708,6 +716,7 @@ struct EventLoop::Impl {
         lane_owner_count = 0U;
         lane_domains_active = false;
         lane_domains_orphaned.store(false, std::memory_order_release);
+        lane_gate_owned.store(false, std::memory_order_release);
         lane_coordinator = {};
     }
 
@@ -782,6 +791,7 @@ void EventLoop::finishLaneDomains() {
 }
 
 void EventLoop::orphanLaneDomains() noexcept {
+    impl_->lane_gate_owned.store(false, std::memory_order_release);
     impl_->lane_domains_orphaned.store(true, std::memory_order_release);
 }
 
@@ -826,7 +836,8 @@ EventLoop::LaneDomainScope::LaneDomainScope(
     // session's lane-domain table is immutable for as long as the session is
     // open, and the session is only closed while no scope is active.
     std::unique_lock<std::recursive_mutex> gate;
-    if (root.active_lane_scopes.load(std::memory_order_acquire) == 0U) {
+    if (!root.lane_gate_owned.load(std::memory_order_acquire)
+        && root.active_lane_scopes.load(std::memory_order_acquire) == 0U) {
         gate = std::unique_lock<std::recursive_mutex>(root.coordinator_gate_mutex);
     }
     if (!root.lane_domains_active || owner >= root.lane_owner_count) {
