@@ -97,23 +97,32 @@ slot stores a function pointer and device context instead of constructing a
 before the device callback runs.
 
 Parallel owner executors spin at window rendezvous, then park using C++20
-atomic wait/notify. The spin length is selected per pool: when the host has at
-least two cores beyond the active executors, an idle executor spins for a full
-window (32K pause instructions) before parking, because a bounded cross-board
+atomic wait/notify. The spin length adapts to the measured window: an idle
+executor spins for a small multiple of the last observed window, clamped to a
+few microseconds and a few hundred microseconds, because a bounded cross-board
 window synchronizes every `cross_board_window_ns` and the park/wake latency is
 paid on the critical path of each one while the parked executors would otherwise
-be idle; without that slack the conservative park-first budget is kept so the
-spin cannot compete with a working lane. Finishing a light lane does not leave
-its worker continuously competing for host execution resources while the
-ADC-heavy lanes finish. The coordinator also parks after its bounded spin.
+be idle. Executors announce that they are parking before they wait, so the
+coordinator skips the futex notification entirely while they still spin.
+Finishing a light lane does not leave its worker continuously competing for
+host execution resources while the ADC-heavy lanes finish. The coordinator also
+parks after its bounded spin.
 Window publication, completion, exception propagation, and shutdown retain
 release/acquire ordering.
-Owner costs are measured each window and expensive jobs start first. The pool
-limits active executors using the ceiling of total owner cost divided by the
-largest owner cost, bounded by available execution slots; balanced workloads
-retain full parallelism. Inactive workers still acknowledge every generation,
-so joins and deterministic exception handling retain the same guarantees. This
-changes host scheduling only, not guest events or simulated timing.
+Owner costs are measured each window and expensive jobs start first. Every job
+must finish before the window can advance, so the shared queue keeps every
+available executor draining by default; the measured-width policy that limits
+executors to the ceiling of total owner cost divided by the largest owner cost
+remains available as an opt-in width limit. Inactive workers still acknowledge
+every generation, so joins and deterministic exception handling retain the same
+guarantees. This changes host scheduling only, not guest events or simulated
+timing.
+
+Lane domain scopes skip the coordinator gate for the whole session. A root
+operation still takes the gate and refuses to run while any lane scope is
+active, but lane scopes themselves never block on it: otherwise whichever lane
+lost the race to observe an idle scope waited for the winning lane's entire
+slice, serializing every window start.
 
 ## Execution optimizations
 
@@ -129,6 +138,13 @@ retirement bookkeeping. Every memory address is still checked before its access.
 A failed guard publishes the completed prefix's exact cycles, fetch state and diagnostic
 PC before checked execution; insufficient full-span credit uses per-instruction
 admission. Span selection is bounded and uses no execution history.
+The AArch64 emitter admits straight-line runs of at least three integer
+operations the same way: one budget check, one fetch and pipeline charge for the
+whole run, and guest NZCV held in the host flags across the run instead of
+round-tripping per operation. Interior operations keep their own entries for
+indirect dispatch and partial cuts.
+Memory barriers retire as pipeline cycles inside native spans; this model never
+reorders guarded accesses, so the barrier itself has no effect to model.
 Region memory operations also support shifted register offsets, subtraction,
 and pre/post-index writeback. Range and budget checks precede all effects;
 writeback follows the access, including source/destination aliases and active
