@@ -46,6 +46,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build g++
 
+      - name: Set macOS deployment target
+        if: startsWith(matrix.runner, 'macos')
+        run: echo "MACOSX_DEPLOYMENT_TARGET=13.0" >> "$GITHUB_ENV"
+
       - name: Configure (Release, portable)
         run: |
           set -eux
