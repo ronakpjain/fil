@@ -85,6 +85,19 @@ MicroLowerResult tryLowerMicroInst(const MicroSource& source, MicroInst& out) no
         inst.op = MicroOp::nop;
         out = inst;
         return {true, MicroLowerReason::ok, {}};
+    case InstrKind::dmb:
+    case InstrKind::dsb:
+    case InstrKind::isb:
+        // Barriers order host and guest memory in hardware; this model never
+        // reorders accesses, so they retire as pure pipeline cycles.
+        if (d.set_flags || d.branch_offset != 0 || d.writeback || d.register_list != 0U
+            || d.fp_double || d.immediate_carry_valid || d.immediate_carry
+            || (d.form != OperandForm::immediate && d.form != OperandForm::none)) {
+            return {false, MicroLowerReason::bad_shape, "barrier shape"};
+        }
+        inst.op = MicroOp::nop;
+        out = inst;
+        return {true, MicroLowerReason::ok, {}};
     case InstrKind::mov:
         // MOV ignores rn (narrow decode carries rd; wide alias carries 15).
         if (registerShape(d) && d.shift_type == ShiftType::lsl
