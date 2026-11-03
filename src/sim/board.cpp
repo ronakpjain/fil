@@ -2202,7 +2202,9 @@ std::optional<cpu::FastStepResult> Board::stepNativeLocal(
         result.instruction_size = cpu::is32BitThumbPrefix(first) ? 4U : 2U;
         result.raw = first;
         if (result.instruction_size == 4U && context.code_read.size - offset >= 4U)
-            result.raw = (static_cast<std::uint32_t>(first) << 16U) | bytes[2] | (bytes[3] << 8U);
+            result.raw = (static_cast<std::uint32_t>(first) << 16U) |
+                         static_cast<std::uint32_t>(bytes[2]) |
+                         (static_cast<std::uint32_t>(bytes[3]) << 8U);
     }
     auto& stats = cpu_->mutableJitStats();
     ++stats.native_executions;
