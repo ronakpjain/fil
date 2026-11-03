@@ -107,6 +107,14 @@ public:
     [[nodiscard]] bool passesFilter(std::string_view type) const noexcept;
 
     /**
+     * @brief Reports whether a record of this type would actually be appended.
+     *
+     * Hot callers use this before formatting fields so a disabled recorder
+     * costs one load instead of a vector of heap-allocated fields.
+     */
+    [[nodiscard]] bool records(std::string_view type) const noexcept;
+
+    /**
      * @brief Appends one trace record and returns its assigned sequence.
      * @return Assigned sequence, or the unconsumed next sequence while disabled.
      */

@@ -63,6 +63,10 @@ bool TraceRecorder::passesFilter(const std::string_view type) const noexcept {
     return std::find(allowlist_.begin(), allowlist_.end(), type) != allowlist_.end();
 }
 
+bool TraceRecorder::records(const std::string_view type) const noexcept {
+    return enabled_ && passesFilter(type);
+}
+
 void TraceRecorder::beginLaneCapture(const std::size_t lane_count) {
     capturing_ = true;
     lane_records_.resize(lane_count);
