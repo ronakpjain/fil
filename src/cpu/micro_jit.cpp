@@ -341,6 +341,7 @@ public:
         // words (the x4 scaling is architectural), so deltas here are
         // already word-scaled and always aligned by construction.
         for (const auto& fix : fixups) {
+            if (fix.kind > 2U) continue;
             const std::int64_t delta = static_cast<std::int64_t>(labels[fix.target])
                 - static_cast<std::int64_t>(fix.word);
             if (fix.kind == 2U) {
@@ -356,6 +357,28 @@ public:
                 }
                 words[fix.word] |= static_cast<std::uint32_t>(
                     (static_cast<std::uint32_t>(delta) & 0x7ffffU) << 5U);
+            }
+        }
+        // ADR immediates and jump-table slots address labels directly and are
+        // patched once every label is bound.
+        for (const auto& fix : fixups) {
+            if (fix.kind < 3U) continue;
+            const std::int64_t bytes = (static_cast<std::int64_t>(labels[fix.target])
+                - static_cast<std::int64_t>(fix.word)) * 4;
+            if (fix.kind == 3U) {
+                if (bytes < -(1LL << 20) || bytes > ((1LL << 20) - 1LL)) {
+                    error = "micro-jit: adr out of range";
+                    return false;
+                }
+                const auto value = static_cast<std::uint32_t>(bytes);
+                words[fix.word] |= ((value & 3U) << 29U)
+                    | (((value >> 2U) & 0x7ffffU) << 5U);
+            } else {
+                if (bytes < -(1LL << 31) || bytes > ((1LL << 31) - 1LL)) {
+                    error = "micro-jit: jump table out of range";
+                    return false;
+                }
+                words[fix.word] = static_cast<std::uint32_t>(bytes);
             }
         }
         return true;

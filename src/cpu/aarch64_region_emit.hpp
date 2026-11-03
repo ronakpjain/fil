@@ -27,6 +27,21 @@ public:
     }
     void tag(std::uint32_t reg) { immX(16U, std::uint64_t{1U} << 63U); orrX(reg, reg, 16U); }
     void untag(std::uint32_t reg) { ubfm64(reg, reg, 0U, 62U); }
+    void addXShift1(std::uint32_t rd, std::uint32_t rn, std::uint32_t rm) {
+        emit(0x8B000000U | (1U << 10U) | (rm << 16U) | (rn << 5U) | rd); // add xd, xn, xm, lsl #1
+    }
+    void lsl1(std::uint32_t rd) { ubfm(rd, rd, 31U, 30U); }
+    void ldrswX(std::uint32_t rt, std::uint32_t rn) { emit(0xB9800000U | (rn << 5U) | rt); }
+    /** PC-relative address of a label, patched once every label is bound. */
+    void adr(std::uint32_t rd, std::size_t label) {
+        fixups.push_back({words.size(), label, 3U});
+        emit(0x10000000U | (rd & 31U));
+    }
+    /** One 32-bit jump-table slot holding the label's byte delta from its slot. */
+    void tableEntry(std::size_t label) {
+        fixups.push_back({words.size(), label, 4U});
+        emit(0U);
+    }
     void mulW(std::uint32_t rd, std::uint32_t rn, std::uint32_t rm) {
         emit(0x1B000000U | (rm << 16U) | (31U << 10U) | (rn << 5U) | rd); // madd wd, wn, wm, wzr
     }
@@ -394,6 +409,42 @@ bool emitRegion(const NativeRegionPlan& plan, const void* resume_table,
     std::array<std::uint16_t, NativeRegionPlan::max_ops> order;
     for (std::uint16_t i = 0U; i < plan.count; ++i) order[i] = i;
     std::sort(order.begin(), order.begin() + plan.count, [&](auto a, auto b) { return plan.ops[a].pc < plan.ops[b].pc; });
+    const auto tree_entry = e.makeLabel();
+    const auto dispatch_base = plan.ops[order[0]].pc;
+    const auto dispatch_extent = static_cast<std::uint64_t>(plan.ops[order[plan.count - 1U]].pc)
+        - dispatch_base + 2U;
+    const bool dense = plan.count >= 4U && dispatch_extent <= NativeRegionPlan::max_ops * 2U
+        && dispatch_extent <= plan.count * 4U;
+    if (dense) {
+        // Complete relative jump table: every halfword in a dense window
+        // resolves in constant time, so returns, indirect calls, and region
+        // entry no longer walk a comparison tree. Targets the table cannot
+        // resolve exactly (out of range, odd, or a gap between operations) fall
+        // through to the comparison tree, which owns every remaining case.
+        const auto dispatch_table = e.makeLabel();
+        e.movImm(0U, static_cast<std::uint32_t>(dispatch_base));
+        e.addSubReg(2U, 0U, target, 0U);
+        e.movImm(16U, static_cast<std::uint32_t>(dispatch_extent));
+        e.cmpW(0U, 16U); e.cond(2U, tree_entry);
+        e.movImm(16U, 1U); e.logicReg(0U, 17U, 0U, 16U); e.cbnzW(17U, tree_entry);
+        e.adr(17U, dispatch_table); e.addXShift1(17U, 17U, 0U);
+        e.ldrswX(0U, 17U); e.addX(17U, 17U, 0U); e.branchReg(17U);
+        e.bindLabel(dispatch_table);
+        for (std::uint64_t offset = 0U; offset < dispatch_extent; offset += 2U) {
+            std::size_t slot = NativeRegionPlan::max_ops;
+            for (std::size_t k = 0U; k < plan.count; ++k) {
+                if (plan.ops[k].pc == static_cast<std::uint32_t>(dispatch_base + offset)) {
+                    slot = labels[k].entry;
+                    break;
+                }
+            }
+            if (slot == NativeRegionPlan::max_ops) e.tableEntry(tree_entry);
+            else e.tableEntry(slot);
+        }
+        // Unreachable: the table block is entered only by `adr` above.
+        e.b(tree_entry);
+    }
+    e.bindLabel(tree_entry);
     const auto dispatch = [&](auto&& self, std::size_t begin, std::size_t end) -> void {
         if (begin == end) { e.b(external); return; }
         const auto middle = begin + (end - begin) / 2U;
