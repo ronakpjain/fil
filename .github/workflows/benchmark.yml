@@ -1,0 +1,191 @@
+name: Benchmark
+
+# Build fil and run the full real-firmware network benchmark on every commit,
+# on both architectures. Firmware ELFs come from the most recent
+# PurdueElectricRacing/monorepo "Build Firmware" workflow artifact that is
+# not newer than the benchmarked commit (i.e. the latest artifact for
+# present/future commits, the contemporary artifact for past commits).
+#
+# Results are stored as one JSONL row per (commit, arch) in the
+# `benchmark-data` branch (results/<arch>.jsonl) plus run artifacts.
+# Pushes to that branch happen only for main-branch runs, never for PRs.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      duration-ms:
+        description: Simulated duration per measurement in ms
+        default: "5000"
+        required: false
+      reps:
+        description: Repetitions per measurement
+        default: "3"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: bench (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    env:
+      CC: gcc
+      CXX: g++
+      CMAKE_GENERATOR: Ninja
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ ccache python3 unzip
+          # gh is preinstalled on GitHub-hosted runners; used by
+          # fetch_per_firmware.sh to download PER artifacts.
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: bench-${{ matrix.arch }}
+          restore-keys: bench-${{ matrix.arch }}
+
+      - name: Fetch PER firmware catalog
+        run: |
+          set -eux
+          tools/fetch_per_firmware.sh --mode catalog \
+            --catalog "$RUNNER_TEMP/per-catalog.tsv"
+
+      - name: Benchmark HEAD commit
+        run: |
+          set -eux
+          DURATION="${{ inputs.duration-ms }}"
+          REPS="${{ inputs.reps }}"
+          tools/bench_backfill.sh \
+            --commits "${GITHUB_SHA}" \
+            --shard-index 0 --shard-count 1 \
+            --catalog "$RUNNER_TEMP/per-catalog.tsv" \
+            --results "$RUNNER_TEMP/results-${{ matrix.arch }}.jsonl" \
+            --duration-ms "${DURATION:-5000}" \
+            --reps "${REPS:-3}" \
+            --work-root "$RUNNER_TEMP/backfill" \
+            --arch "${{ matrix.arch }}" \
+            --os "linux"
+          echo "=== result row keys ==="
+          python3 -c "import json; print(sorted(json.load(open('$RUNNER_TEMP/results-${{ matrix.arch }}.jsonl')).keys()))"
+
+      - name: Job summary
+        if: always()
+        run: |
+          python3 - "$RUNNER_TEMP/results-${{ matrix.arch }}.jsonl" >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          import json, sys
+          path = sys.argv[1]
+          try:
+              row = json.load(open(path))
+          except Exception as exc:
+              print(f"No result row: {exc}")
+              sys.exit(0)
+          bench = row.get("bench") or {}
+          print(f"## Benchmark {row.get('fil_sha', '')[:7]} ({row.get('arch')})")
+          print(f"firmware: `{row.get('per_artifact')}` "
+                f"({row.get('firmware_provenance')}), status: **{row.get('status')}**")
+          if row.get("status") == "success":
+              print(f"median wall: **{bench.get('median_wall_s')}s**, "
+                    f"throughput: **{bench.get('throughput_x')}x realtime**, "
+                    f"instructions: {bench.get('instructions')}")
+              print(f"flags: `{', '.join(bench.get('included_flags', []))}`")
+              if bench.get("omitted_unsupported"):
+                  print(f"unsupported by this fil era (omitted): "
+                        f"`{', '.join(bench.get('omitted_unsupported', []))}`")
+              if bench.get("warnings"):
+                  print("warnings:")
+                  for warning in bench["warnings"]:
+                      print(f"- {warning}")
+          else:
+              print(f"reason: {row.get('reason')}")
+          EOF
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.arch }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/results-${{ matrix.arch }}.jsonl
+            ${{ runner.temp }}/backfill/bench-*.log
+            ${{ runner.temp }}/backfill/net-*.log
+            ${{ runner.temp }}/backfill/build-*-*.log
+          if-no-files-found: warn
+          retention-days: 90
+
+  publish:
+    name: publish to benchmark-data
+    needs: [bench]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download result rows
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bench-*-${{ github.sha }}
+          path: bench-rows
+          merge-multiple: true
+
+      - name: Append rows and push
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          rm -rf benchmark-data
+          if git clone --branch benchmark-data --depth 1 \
+              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              benchmark-data 2>/dev/null; then
+            :
+          else
+            # First publish: start the history branch.
+            mkdir benchmark-data
+            cd benchmark-data
+            git init -b benchmark-data
+            git remote add origin \
+              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            cd ..
+          fi
+          cd benchmark-data
+          git checkout -B benchmark-data
+          mkdir -p results
+          for row in ../bench-rows/results-*.jsonl; do
+            arch=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['arch'])" "$row")
+            cat "$row" >> "results/${arch}.jsonl"
+          done
+          git config user.name "fil-benchmark"
+          git config user.email "fil-benchmark@users.noreply.github.com"
+          git add results/
+          git commit -m "benchmark ${GITHUB_SHA:0:7}" || exit 0
+          git fetch origin benchmark-data 2>/dev/null || true
+          for attempt in 1 2 3 4 5; do
+            if git push origin benchmark-data; then
+              exit 0
+            fi
+            git pull --rebase origin benchmark-data || git fetch origin benchmark-data
+          done
+          echo "failed to push benchmark-data after retries" >&2
+          exit 1

@@ -1,0 +1,73 @@
+name: CI
+
+# Build and test every commit on both architectures.
+# Present + future commits: push to main and pull requests.
+# Past commits: benchmark-backfill.yml (benchmarks) — use its `to`/`from`
+# range; CI itself is intentionally fast and covers the checked-out tree.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build+test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    env:
+      CC: gcc
+      CXX: g++
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ libgtest-dev ccache python3
+          # libgtest-dev ships sources; build and install the libraries so that
+          # find_package(GTest CONFIG REQUIRED) resolves.
+          cmake -S /usr/src/googletest -B /tmp/gtest-build \
+            -DCMAKE_BUILD_TYPE=Release
+          sudo cmake --build /tmp/gtest-build --parallel "$(nproc)"
+          sudo cmake --install /tmp/gtest-build
+          rm -rf /tmp/gtest-build
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: ci-${{ matrix.arch }}
+          restore-keys: ci-${{ matrix.arch }}
+
+      - name: Configure (Release, portable)
+        run: |
+          set -eux
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DFIL_BUILD_TESTS=ON \
+            -DFIL_BUILD_DOCS=OFF \
+            -DFIL_ENABLE_IPO=ON \
+            -DFIL_ENABLE_NATIVE=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        run: cmake --build build --parallel "$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --parallel "$(nproc)" --output-on-failure
