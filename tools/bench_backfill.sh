@@ -335,7 +335,7 @@ EOF
         if "$SCRIPT_DIR/bench_full_network.sh" \
                 --binary "$FIL_BIN" --network "$NETWORK" \
                 --duration-ms "$DURATION_MS" --reps "$REPS" \
-                --expect-boards "$GEN_EXPECT_BOARDS" --mmio "$MMIO" --lenient \
+                --expect-boards "$GEN_EXPECT" --mmio "$MMIO" --lenient \
                 --json-output "$BENCH_JSON" >"$BENCH_LOG" 2>&1; then
             BENCH_OK=1
             ATTEMPTS_JSON=$(python3 -c 'import json,sys; print(json.dumps([{"mmio":sys.argv[1],"validation":"lenient","status":"success"}]))' "$MMIO")
