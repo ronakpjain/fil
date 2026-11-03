@@ -27,6 +27,9 @@ public:
     }
     void tag(std::uint32_t reg) { immX(16U, std::uint64_t{1U} << 63U); orrX(reg, reg, 16U); }
     void untag(std::uint32_t reg) { ubfm64(reg, reg, 0U, 62U); }
+    void mulW(std::uint32_t rd, std::uint32_t rn, std::uint32_t rm) {
+        emit(0x1B000000U | (rm << 16U) | (31U << 10U) | (rn << 5U) | rd); // madd wd, wn, wm, wzr
+    }
 };
 
 // Every window uses this ABI, so linked transfers share the original frame.
@@ -250,6 +253,76 @@ bool emitRegion(const NativeRegionPlan& plan, const void* resume_table,
         else edge(op, taken);
         return true;
     };
+    // Straight-line integer runs admit one budget and charge the whole run, so
+    // the per-instruction entry check, fetch select, and cycle compare collapse
+    // to a single block. Guest NZCV stays live in the host flags across the run,
+    // which removes the per-op msr/mrs round trip. Interior operations keep
+    // their own entries for indirect dispatch and partial cuts.
+    constexpr std::size_t max_span_ops = 16U;
+    struct LinearSpan {
+        std::array<std::uint16_t, max_span_ops> ops{};
+        std::uint16_t length{0U};
+        std::uint32_t pipeline_cycles{0U};
+    };
+    std::array<LinearSpan, NativeRegionPlan::max_ops> spans{};
+    std::bitset<NativeRegionPlan::max_ops> covered;
+    for (std::uint16_t start = 0U; start < plan.count; ++start) {
+        if (covered[start] || plan.ops[start].predicated_pair.valid) continue;
+        LinearSpan span;
+        std::bitset<NativeRegionPlan::max_ops> seen;
+        auto cursor = start;
+        while (cursor != NativeRegionOp::external && span.length < span.ops.size()
+            && !covered[cursor] && !seen[cursor]) {
+            const auto& op = plan.ops[cursor];
+            if (op.flow != RegionFlow::next || op.stack.count() != 0U
+                || op.instruction.kind != NativeOp::integer || op.predicated_pair.valid) break;
+            seen.set(cursor);
+            span.ops[span.length++] = cursor;
+            span.pipeline_cycles += op.fallthrough_cycles;
+            const auto next = op.edges[0];
+            if (next != NativeRegionOp::external && plan.ops[next].pc != op.fallthrough) break;
+            cursor = next;
+        }
+        if (span.length < 3U) continue;
+        spans[start] = span;
+        for (std::size_t n = 0U; n < span.length; ++n) covered.set(span.ops[n]);
+    }
+    const auto span_charge = [&](const NativeRegionOp& first, std::uint32_t length,
+                                 std::uint32_t pipeline, std::size_t insufficient) {
+        const auto sequential = e.makeLabel(), ready = e.makeLabel();
+        e.movImm(16U, first.pc); e.cmpW(fetch, 16U); e.cond(0U, sequential);
+        e.load(0U, ctx, offsetof(NativeRegionContext, nonsequential_fetch_stall));
+        e.b(ready);
+        e.bindLabel(sequential);
+        e.load(0U, ctx, offsetof(NativeRegionContext, sequential_fetch_stall));
+        e.bindLabel(ready);
+        e.load(16U, ctx, offsetof(NativeRegionContext, sequential_fetch_stall));
+        e.movImm(17U, length - 1U); e.mulW(16U, 16U, 17U);
+        e.addSubReg(0U, 0U, 0U, 16U);
+        e.movImm(16U, pipeline); e.addSubReg(0U, 0U, 0U, 16U);
+        e.addsX(target, cycles, 0U); e.cond(2U, insufficient);
+        e.load(0U, ctx, offsetof(NativeRegionContext, cycle_limit), true);
+        e.cmp64(target, 0U); e.cond(8U, insufficient);
+    };
+    const auto linear_span = [&](const LinearSpan& span) {
+        const auto slow = e.makeLabel();
+        const auto& first = plan.ops[span.ops[0]];
+        const auto& last = plan.ops[span.ops[span.length - 1U]];
+        e.load(0U, ctx, offsetof(NativeRegionContext, instruction_limit));
+        e.addSubReg(2U, 0U, 0U, count); e.cmpImm(0U, span.length); e.cond(3U, slow);
+        span_charge(first, span.length, span.pipeline_cycles, slow);
+        e.movX(cycles, target);
+        e.msrNzcv(nzcv);
+        for (std::size_t n = 0U; n < span.length; ++n) {
+            if (!emitOp(e, plan.ops[span.ops[n]].instruction.integer, error)) return false;
+        }
+        e.mrsNzcv(nzcv);
+        e.addSubImm(0U, count, count, span.length);
+        pack_fetch(last.pc, last.fallthrough);
+        edge(last, false);
+        e.bindLabel(slow);
+        return true;
+    };
 
     e.sub64Imm(31U, 31U, frame_bytes);
     for (std::uint32_t reg = 19U; reg <= 30U; ++reg) e.store(reg, 31U, (reg - 19U) * 8U, true);
@@ -274,6 +347,7 @@ bool emitRegion(const NativeRegionPlan& plan, const void* resume_table,
         const auto& op = plan.ops[i];
         e.bindLabel(labels[i].entry);
         e.load(0U, ctx, offsetof(NativeRegionContext, instruction_limit)); e.cmpW(count, 0U); e.cond(2U, labels[i].instructions);
+        if (spans[i].length != 0U && !linear_span(spans[i])) return false;
         if (op.predicated_pair.valid) {
             const auto slow = e.makeLabel(), then_path = e.makeLabel(), committed = e.makeLabel();
             e.addSubReg(2U, 0U, 0U, count); e.cmpImm(0U, 3U); e.cond(3U, slow);
