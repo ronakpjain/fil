@@ -1,8 +1,7 @@
 # Benchmark CI
 
 Every commit is built and benchmarked on **x86_64** (`ubuntu-24.04`) and
-**aarch64** (`ubuntu-24.04-arm`): present and future commits automatically,
-past commits via the backfill workflow. Releases ship portable binaries for
+**aarch64** (`ubuntu-24.04-arm`). Releases ship portable binaries for
 Linux x86_64/aarch64 and macOS arm64.
 
 ## Workflows
@@ -11,12 +10,10 @@ Linux x86_64/aarch64 and macOS arm64.
 |---|---|---|
 | `ci.yml` | push to `main`, PRs | Build + `ctest` on both archs (Release, portable) |
 | `benchmark.yml` | push to `main`, PRs, manual | Full real-firmware network benchmark, one JSONL row per (commit, arch) |
-| `benchmark-backfill.yml` | manual (`workflow_dispatch`) | Benchmark a commit range (default: all history), sharded per arch |
 | `release.yml` | tag `v*` | Portable `fil` binaries + `SHA256SUMS` on a GitHub Release |
 
-`benchmark.yml` reuses the same driver as backfill
-(`tools/bench_backfill.sh --commits <sha>`), so the per-commit path and the
-historical path cannot drift apart.
+`benchmark.yml` drives the same script with `--commits <sha>` for a single
+commit, so the per-commit path and range sweeps share one code path.
 
 ## Benchmark workload
 
@@ -43,7 +40,7 @@ workflow artifacts (`firmware-master-*`), resolved by
   row records `"firmware_provenance": "fallback-oldest"`.
 
 `benchmark.yml` uses contemporary-to-commit-date (which equals latest for new
-commits). Backfill pre-fetches one artifact catalog and resolves each commit
+commits). The driver pre-fetches one artifact catalog and resolves each commit
 locally, downloading each distinct firmware version once.
 
 `tools/make_ci_network.py` generates a network config from **that commit's
@@ -71,7 +68,7 @@ value). Current PER firmware runs at 16 MHz HSE, which is recorded in
 `clocks_hz` rather than rejected. The probe results, warnings, and clocks
 are all part of the machine-readable output (`--json-output`).
 
-Backfill tries `--lenient` with strict MMIO first, then retries with lenient
+The driver tries `--lenient` with strict MMIO first, then retries with lenient
 MMIO; both attempts are recorded. Unbuildable commits, unparseable outputs,
 and genuine emulation gaps (e.g. an instruction the old fil never
 implemented) become `build_failed`/`bench_failed` rows with reasons — one bad
@@ -104,19 +101,6 @@ for line in open('bench-data/results/x86_64.jsonl'):
               r['bench']['median_wall_s'], r['per_artifact'][-7:])
 "
 ```
-
-## Backfilling past commits
-
-Actions → **Benchmark backfill** → Run workflow. Defaults cover all of
-`main` on both archs with 8 shards each. Narrow with `from`/`to` (commit
-SHAs; `from` is exclusive unless `include-from`), `arch`, `shards`,
-`duration-ms`, `reps`. Shards upload their rows; the merge job dedupes by
-`(fil_sha, arch)`, merges with existing history, and pushes once. Resume for
-free: recorded commits are skipped.
-
-Cost guidance: a cold shard builds fil once, then each commit is an
-incremental rebuild (ccache-assisted) plus ~3 short simulations. Expect on
-the order of an hour per shard for the full history.
 
 ## Releases
 

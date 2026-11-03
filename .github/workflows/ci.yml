@@ -1,9 +1,6 @@
 name: CI
 
-# Build and test every commit on both architectures.
-# Present + future commits: push to main and pull requests.
-# Past commits: benchmark-backfill.yml (benchmarks) — use its `to`/`from`
-# range; CI itself is intentionally fast and covers the checked-out tree.
+# Build and test every commit on both architectures (push to main and PRs).
 
 on:
   push:
