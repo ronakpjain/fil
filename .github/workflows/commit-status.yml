@@ -1,0 +1,78 @@
+name: Commit status
+
+# Matrix jobs belong to the workflow tip in GitHub's UI. Mirror their results
+# onto the SHA each job actually tested, including historical backfill commits.
+on:
+  workflow_run:
+    workflows: [CI, Benchmark]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run-id:
+        description: 'CI or Benchmark run ID to report (also supports running jobs)'
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  statuses: write
+
+jobs:
+  report:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # Do not check out or execute code/artifacts from the triggering run.
+      - name: Attach results to tested commits
+        uses: actions/github-script@v7
+        env:
+          RUN_ID: ${{ inputs.run-id || github.event.workflow_run.id }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const run_id = Number(process.env.RUN_ID);
+            if (!Number.isSafeInteger(run_id) || run_id <= 0) {
+              throw new Error('Invalid run ID');
+            }
+            const { data: run } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id });
+            // Never trust job names from a PR workflow with this write token.
+            if (!['CI', 'Benchmark'].includes(run.name) || run.event === 'pull_request' ||
+                run.head_branch !== 'main' || run.head_repository?.full_name !== `${owner}/${repo}`) {
+              throw new Error('Only CI/Benchmark runs from this repository main branch may report');
+            }
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              owner, repo, run_id, filter: 'latest', per_page: 100
+            });
+            let reported = 0;
+            for (const job of jobs) {
+              const match = /^(build\+test|bench) \((x86_64|aarch64), ([0-9a-f]{40})\)$/.exec(job.name);
+              if (!match) continue;
+              const [, kind, arch, sha] = match;
+              if ((run.name === 'CI') !== (kind === 'build+test')) continue;
+              let state = 'pending';
+              if (job.status === 'completed') {
+                state = job.conclusion === 'success' ? 'success' :
+                  ['failure', 'timed_out'].includes(job.conclusion) ? 'failure' : 'error';
+              }
+              const statusContext = `${run.name} / ${arch}`;
+              // A manually refreshed older run must not overwrite newer results.
+              const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+                owner, repo, ref: sha, per_page: 100
+              });
+              const previous = statuses.find(status => status.context === statusContext);
+              const previousRun = previous?.target_url?.match(/\/actions\/runs\/(\d+)/);
+              if (previousRun && Number(previousRun[1]) > run_id) continue;
+              const description = job.status === 'completed'
+                ? `${kind} ${job.conclusion}` : `${kind} ${job.status}`;
+              if (previous?.state === state && previous?.target_url === job.html_url &&
+                  previous?.description === description) continue;
+              await github.rest.repos.createCommitStatus({
+                owner, repo, sha, state, context: statusContext,
+                description, target_url: job.html_url
+              });
+              reported++;
+            }
+            core.info(`Published ${reported} per-commit statuses from ${run.html_url}`);
+            await core.summary.addHeading('Per-commit statuses')
+              .addRaw(`Published ${reported} statuses from [${run.name}](${run.html_url}).`)
+              .write();

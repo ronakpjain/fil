@@ -11,6 +11,7 @@ Linux x86_64/aarch64 and macOS arm64.
 | `ci.yml` | push to `main`, PRs | Build + `ctest` on both archs (Release, portable) |
 | `benchmark.yml` | push to `main`, PRs, manual | Full real-firmware network benchmark, one JSONL row per (commit, arch) |
 | `release.yml` | tag `v*` | Portable `fil` binaries + `SHA256SUMS` on a GitHub Release |
+| `commit-status.yml` | CI/Benchmark completion, manual | Mirror per-architecture results onto each tested commit SHA |
 
 Both CI and Benchmark enumerate every newly pushed commit on `main`, or every
 commit in a PR, and create a separate job per commit and architecture. Manual
@@ -33,6 +34,20 @@ unique commit/architecture name. Publishing merges rows by commit and
 architecture, retains an existing success over a failed retry, and retries
 against the latest branch tip if another run publishes concurrently. Available
 rows are published even if another benchmark job fails.
+
+GitHub natively attaches matrix checks to the workflow tip, not each matrix
+SHA. `commit-status.yml` mirrors completed main-branch jobs as `CI / <arch>`
+and `Benchmark / <arch>` statuses on the tested commits, so the commit list
+shows their own status icons with links to the corresponding jobs. It does
+not execute code or artifacts from the source run and rejects PR runs.
+To import an older run, or show a snapshot of its currently running jobs:
+
+```bash
+gh workflow run commit-status.yml --ref main -f run-id=<run-id>
+```
+
+Completion updates these statuses automatically; manual snapshots of queued
+or running jobs appear pending.
 
 ## Benchmark workload
 
