@@ -16,6 +16,10 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      since:
+        description: 'Backfill starting at this SHA (inclusive); blank benchmarks HEAD'
+        required: false
+        type: string
       duration-ms:
         description: Simulated duration per measurement in ms
         default: "5000"
@@ -29,13 +33,73 @@ permissions:
   contents: read
 
 jobs:
+  commits:
+    name: Find commits to benchmark
+    runs-on: ubuntu-24.04
+    outputs:
+      shas: ${{ steps.commits.outputs.shas }}
+    steps:
+      - name: Check out history
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Enumerate commits
+        id: commits
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          SINCE: ${{ inputs.since }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          head = os.environ['HEAD']
+          base = os.environ['BASE'] if os.environ['EVENT_NAME'] == 'pull_request' else os.environ['BEFORE']
+          if os.environ['EVENT_NAME'] == 'workflow_dispatch':
+              since = os.environ['SINCE']
+              if since:
+                  since = subprocess.check_output(
+                      ['git', 'rev-parse', '--verify', '--end-of-options', f'{since}^{{commit}}'], text=True
+                  ).strip()
+                  subprocess.run(['git', 'merge-base', '--is-ancestor', since, head], check=True)
+                  revision = f'{since}^..{head}'
+              else:
+                  revision = f'{head}^..{head}'
+          elif base and set(base) != {'0'}:
+              # A force-push may leave the previous tip outside fetched history.
+              subprocess.run(['git', 'fetch', '--no-tags', 'origin', base], check=True)
+              revision = f'{base}..{head}'
+          else:
+              # A newly created main branch has no previous tip.
+              revision = head
+          shas = subprocess.check_output(
+              ['git', 'rev-list', '--reverse', revision], text=True
+          ).splitlines()
+          if not shas:
+              shas = [head]
+          # GitHub permits at most 256 matrix jobs (two architectures per SHA).
+          if len(shas) > 128:
+              raise SystemExit('More than 128 commits: split the push/PR to fit the 256-job matrix limit.')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'shas={json.dumps(shas)}\n')
+          PY
+
   bench:
-    name: bench (${{ matrix.arch }})
+    needs: commits
+    name: bench (${{ matrix.arch }}, ${{ matrix.sha }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
+        sha: ${{ fromJSON(needs.commits.outputs.shas) }}
+        arch: [x86_64, aarch64]
         include:
           - runner: ubuntu-24.04
             arch: x86_64
@@ -50,7 +114,9 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          # Keep current harness scripts; build matrix.sha in a separate worktree.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
 
       - name: Install dependencies
         run: |
@@ -66,29 +132,104 @@ jobs:
           key: bench-${{ matrix.arch }}
           restore-keys: bench-${{ matrix.arch }}
 
-      - name: Fetch PER firmware catalog
+      - name: Build and benchmark selected commit
+        env:
+          BENCH_SHA: ${{ matrix.sha }}
+          BENCH_ARCH: ${{ matrix.arch }}
+          DURATION: ${{ inputs.duration-ms }}
+          REPS: ${{ inputs.reps }}
         run: |
-          set -eux
-          tools/fetch_per_firmware.sh --mode catalog \
-            --catalog "$RUNNER_TEMP/per-catalog.tsv"
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
 
-      - name: Benchmark HEAD commit
-        run: |
-          set -eux
-          DURATION="${{ inputs.duration-ms }}"
-          REPS="${{ inputs.reps }}"
-          tools/bench_backfill.sh \
-            --commits "${GITHUB_SHA}" \
-            --shard-index 0 --shard-count 1 \
-            --catalog "$RUNNER_TEMP/per-catalog.tsv" \
-            --results "$RUNNER_TEMP/results-${{ matrix.arch }}.jsonl" \
-            --duration-ms "${DURATION:-5000}" \
-            --reps "${REPS:-3}" \
-            --work-root "$RUNNER_TEMP/backfill" \
-            --arch "${{ matrix.arch }}" \
-            --os "linux"
-          echo "=== result row keys ==="
-          python3 -c "import json; print(sorted(json.load(open('$RUNNER_TEMP/results-${{ matrix.arch }}.jsonl')).keys()))"
+          root = pathlib.Path.cwd()
+          work = pathlib.Path(os.environ['RUNNER_TEMP']) / 'backfill'
+          work.mkdir(exist_ok=True)
+          sha = os.environ['BENCH_SHA']
+          arch = os.environ['BENCH_ARCH']
+          duration = int(os.environ.get('DURATION') or '5000')
+          reps = int(os.environ.get('REPS') or '3')
+          if duration <= 0 or reps <= 0:
+              raise SystemExit('duration-ms and reps must be positive')
+          source = work / 'source'
+          build = work / 'build'
+          row = dict(fil_sha=sha, arch=arch, os='linux', duration_ms=duration,
+                     reps=reps, window_ns=100000, boards=[], dropped=[], attempts=[],
+                     expect_boards=0, bench=None, per_sha='', per_run_id='',
+                     per_artifact='', per_created_at='', firmware_provenance='',
+                     status='build_failed', reason='')
+          def capture(args):
+              return subprocess.check_output(args, text=True).strip()
+          def run(args, name):
+              with (work / name).open('w') as log:
+                  subprocess.run([str(a) for a in args], stdout=log,
+                                 stderr=subprocess.STDOUT, check=True)
+          def variables(path):
+              # Helpers emit literal KEY=VALUE lines; ignore diagnostic messages.
+              return {k: v for line in path.read_text().splitlines()
+                      if '=' in line for k, v in [line.split('=', 1)]
+                      if k.isupper() and k.replace('_', '').isalnum()}
+          failed = False
+          try:
+              row['fil_date'] = capture(['git', 'show', '-s', '--format=%cI', sha])
+              row['fil_subject'] = capture(['git', 'show', '-s', '--format=%s', sha])
+              row['compiler'] = capture(['g++', '--version']).splitlines()[0]
+              run(['git', 'worktree', 'add', '--detach', source, sha], 'checkout.log')
+              run(['cmake', '-S', source, '-B', build, '-G', 'Ninja',
+                   '-DCMAKE_BUILD_TYPE=Release', '-DFIL_BUILD_TESTS=OFF',
+                   '-DFIL_BUILD_DOCS=OFF', '-DFIL_ENABLE_IPO=ON',
+                   '-DFIL_ENABLE_NATIVE=OFF', '-DCMAKE_C_COMPILER_LAUNCHER=ccache',
+                   '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache'], 'configure.log')
+              run(['cmake', '--build', build, '--parallel', str(os.cpu_count() or 2)], 'build.log')
+              row['status'] = 'no_firmware'
+              run([root / 'tools/fetch_per_firmware.sh', '--mode', 'contemporary',
+                   '--date', row['fil_date'], '--dest', work / 'firmware'], 'firmware.log')
+              # Only parse the helper's KEY=VALUE records, not progress messages.
+              firmware = variables(work / 'firmware.log')
+              for key in ('PER_SHA', 'PER_RUN_ID', 'PER_ARTIFACT', 'PER_CREATED_AT'):
+                  row[key.lower()] = firmware[key]
+              row['firmware_provenance'] = firmware['PROVENANCE']
+              row['status'] = 'bench_failed'
+              run(['python3', root / 'tools/make_ci_network.py', '--repo', source,
+                   '--firmware-dir', firmware['FIRMWARE_DIR'], '--out-dir', work / 'network'],
+                  'network.log')
+              network = variables(work / 'network.log')
+              row['boards'] = network.get('BOARDS', '').split()
+              row['dropped'] = network.get('DROPPED', '').split()
+              row['expect_boards'] = int(network['EXPECT_BOARDS'])
+              if not row['expect_boards']:
+                  raise RuntimeError('No boards with firmware available')
+              for mmio in ('strict', 'lenient'):
+                  result = work / 'bench.json'
+                  result.unlink(missing_ok=True)
+                  try:
+                      run([root / 'tools/bench_full_network.sh', '--binary', build / 'fil',
+                           '--network', network['NETWORK'], '--duration-ms', str(duration),
+                           '--reps', str(reps), '--expect-boards', str(row['expect_boards']),
+                           '--mmio', mmio, '--lenient', '--json-output', result],
+                          f'bench-{mmio}.log')
+                  except subprocess.CalledProcessError:
+                      row['attempts'].append(dict(mmio=mmio, validation='lenient', status='failed'))
+                      continue
+                  row['bench'] = json.loads(result.read_text())
+                  row['attempts'].append(dict(mmio=mmio, validation='lenient', status='success'))
+                  row['status'] = 'success'
+                  break
+              else:
+                  raise RuntimeError('Benchmark failed with strict and lenient MMIO; see logs')
+          except Exception as exc:
+              row['reason'] = str(exc)
+              failed = True
+          finally:
+              output = pathlib.Path(os.environ['RUNNER_TEMP']) / f'results-{arch}.jsonl'
+              output.write_text(json.dumps(row, sort_keys=True) + '\n')
+              print(json.dumps(row, indent=2))
+          if failed:
+              raise SystemExit(1)
+          PY
 
       - name: Job summary
         if: always()
@@ -125,19 +266,17 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bench-${{ matrix.arch }}-${{ github.sha }}
+          name: bench-${{ matrix.arch }}-${{ matrix.sha }}
           path: |
             ${{ runner.temp }}/results-${{ matrix.arch }}.jsonl
-            ${{ runner.temp }}/backfill/bench-*.log
-            ${{ runner.temp }}/backfill/net-*.log
-            ${{ runner.temp }}/backfill/build-*-*.log
+            ${{ runner.temp }}/backfill/*.log
           if-no-files-found: warn
           retention-days: 90
 
   publish:
     name: publish to benchmark-data
     needs: [bench]
-    if: github.event_name != 'pull_request'
+    if: always() && !cancelled() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -146,46 +285,72 @@ jobs:
       - name: Download result rows
         uses: actions/download-artifact@v4
         with:
-          pattern: bench-*-${{ github.sha }}
+          pattern: bench-*
           path: bench-rows
-          merge-multiple: true
+          # Keep each artifact in its own directory to avoid row/log collisions.
+          merge-multiple: false
 
-      - name: Append rows and push
+      - name: Merge rows and push
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -eux
-          rm -rf benchmark-data
-          if git clone --branch benchmark-data --depth 1 \
-              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
-              benchmark-data 2>/dev/null; then
-            :
-          else
-            # First publish: start the history branch.
-            mkdir benchmark-data
-            cd benchmark-data
-            git init -b benchmark-data
-            git remote add origin \
-              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-            cd ..
-          fi
+          set -eu
+          # Use an auth header rather than persisting the token in a remote URL.
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::$AUTH"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $AUTH"
+          git init benchmark-data
           cd benchmark-data
-          git checkout -B benchmark-data
-          mkdir -p results
-          for row in ../bench-rows/results-*.jsonl; do
-            arch=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['arch'])" "$row")
-            cat "$row" >> "results/${arch}.jsonl"
-          done
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
           git config user.name "fil-benchmark"
           git config user.email "fil-benchmark@users.noreply.github.com"
-          git add results/
-          git commit -m "benchmark ${GITHUB_SHA:0:7}" || exit 0
-          git fetch origin benchmark-data 2>/dev/null || true
           for attempt in 1 2 3 4 5; do
-            if git push origin benchmark-data; then
+            if git ls-remote --exit-code --heads origin benchmark-data; then
+              git fetch --depth 1 origin benchmark-data
+              git checkout -B benchmark-data FETCH_HEAD
+            else
+              git checkout --orphan benchmark-data
+            fi
+            python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          incoming = sorted(Path('../bench-rows').rglob('results-*.jsonl'))
+          if not incoming:
+              raise SystemExit('No benchmark result rows were uploaded')
+          by_arch = {}
+          for path in incoming:
+              for line in path.read_text().splitlines():
+                  row = json.loads(line)
+                  arch = row['arch']
+                  if arch not in ('x86_64', 'aarch64'):
+                      raise SystemExit(f'Unexpected architecture: {arch}')
+                  by_arch.setdefault(arch, []).append(row)
+          Path('results').mkdir(exist_ok=True)
+          for arch, new_rows in by_arch.items():
+              path = Path('results') / f'{arch}.jsonl'
+              rows = {}
+              existing = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+              for row in existing + new_rows:
+                  sha = row['fil_sha']
+                  # Keep successful measurements if a later attempt fails.
+                  if sha not in rows or row['status'] == 'success' or rows[sha]['status'] != 'success':
+                      rows[sha] = row
+              ordered = sorted(rows.values(), key=lambda row: (row.get('fil_date', ''), row['fil_sha']))
+              path.write_text(''.join(json.dumps(row, sort_keys=True) + '\n' for row in ordered))
+          PY
+            git add results/
+            if git diff --cached --quiet; then
               exit 0
             fi
-            git pull --rebase origin benchmark-data || git fetch origin benchmark-data
+            git commit -m "benchmark ${GITHUB_SHA:0:7}"
+            if git push origin HEAD:refs/heads/benchmark-data; then
+              exit 0
+            fi
+            # Re-read the latest branch and re-merge rows, avoiding JSONL rebase conflicts.
+            sleep "$attempt"
           done
           echo "failed to push benchmark-data after retries" >&2
           exit 1

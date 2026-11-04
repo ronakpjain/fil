@@ -12,8 +12,27 @@ Linux x86_64/aarch64 and macOS arm64.
 | `benchmark.yml` | push to `main`, PRs, manual | Full real-firmware network benchmark, one JSONL row per (commit, arch) |
 | `release.yml` | tag `v*` | Portable `fil` binaries + `SHA256SUMS` on a GitHub Release |
 
-`benchmark.yml` drives the same script with `--commits <sha>` for a single
-commit, so the per-commit path and range sweeps share one code path.
+Both CI and Benchmark enumerate every newly pushed commit on `main`, or every
+commit in a PR, and create a separate job per commit and architecture. Manual
+runs accept an optional `since` SHA (inclusive) to backfill through the selected
+branch tip; without it, they test only the tip. The 256-job matrix limit allows
+up to 128 commits per run; larger ranges fail explicitly.
+
+Benchmark jobs check out each selected commit in an isolated worktree, build it
+directly, and use the workflow revision's firmware-fetch, network-generation,
+and measurement scripts. No separate history-sweep driver is used.
+
+To backfill benchmarks from the introduction of CI:
+
+```bash
+gh workflow run benchmark.yml --ref main -f since=0ee1e66
+```
+
+Only non-PR runs on `main` publish to `benchmark-data`. Each artifact has a
+unique commit/architecture name. Publishing merges rows by commit and
+architecture, retains an existing success over a failed retry, and retries
+against the latest branch tip if another run publishes concurrently. Available
+rows are published even if another benchmark job fails.
 
 ## Benchmark workload
 
@@ -72,7 +91,8 @@ The driver tries `--lenient` with strict MMIO first, then retries with lenient
 MMIO; both attempts are recorded. Unbuildable commits, unparseable outputs,
 and genuine emulation gaps (e.g. an instruction the old fil never
 implemented) become `build_failed`/`bench_failed` rows with reasons — one bad
-era never stops the sweep, and reruns skip commits already recorded.
+era never cancels other matrix jobs. Reruns replace the corresponding recorded
+row, except that a failed retry never overwrites a successful measurement.
 
 ## History (`benchmark-data` branch)
 
