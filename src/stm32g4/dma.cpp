@@ -116,6 +116,7 @@ bool DmaPeripheral::directClearFlags(void* const context, const std::uint32_t va
     auto changed = previous_levels ^ levels;
     if (changed != 0U && !dma.deviceLocalInterruptRouting()) return false;
     dma.setRegister(dma_isr, status); dma.setRegister(dma_ifcr, 0U);
+    dma.refreshStoppedChannelStates();
     while (changed != 0U) {
         const auto channel = static_cast<std::uint32_t>(std::countr_zero(changed));
         dma.setInterruptLevel(channel, false);
@@ -151,25 +152,31 @@ void DmaPeripheral::storeRegister(
         setRegister(dma_isr, status);
         setRegister(dma_ifcr, 0);
         updateInterruptLevels();
+        refreshStoppedChannelStates();
         return;
     }
 
     std::uint32_t channel = 0;
-    if (channelForOffset(word_offset, channel)
-        && ((previous & 1U) == 0U)
-        && ((value & 1U) != 0U)) {
-        initializeChannel(channel);
-        if ((value & (1U << 14U)) != 0U) {
-            const std::uint32_t count = reload_counts_[channel - 1U];
-            for (std::uint32_t item = 0; item < count; ++item) {
-                if (!request(channel)) break;
+    if (channelForOffset(word_offset, channel)) {
+        const bool was_enabled = (previous & 1U) != 0U;
+        const bool enabled = (value & 1U) != 0U;
+        if (!was_enabled && enabled) {
+            initializeChannel(channel);
+            channel_state_[channel - 1U] = ChannelState::armed;
+            if ((value & (1U << 14U)) != 0U) {
+                const std::uint32_t count = reload_counts_[channel - 1U];
+                for (std::uint32_t item = 0; item < count; ++item) {
+                    if (!request(channel)) break;
+                }
             }
+            if (enable_callback_) {
+                enable_callback_(channel);
+            }
+        } else if (was_enabled && !enabled) {
+            channel_state_[channel - 1U] = ChannelState::disabled;
         }
-        if (enable_callback_) {
-            enable_callback_(channel);
-        }
+        updateInterruptLevels();
     }
-    if (channelForOffset(word_offset, channel)) updateInterruptLevels();
 }
 
 bool DmaPeripheral::channelForOffset(
@@ -224,12 +231,17 @@ void DmaPeripheral::runChannelRequest(const std::uint32_t channel) {
         setChannelFlag(channel, 1U); // TCIF
         if ((control & (1U << 5U)) != 0U) {
             setRegister(base + 0x04U, reload_count);
+            channel_state_[channel - 1U] = ChannelState::armed;
         } else {
             setRegister(base, registerValue(base) & ~1U);
+            channel_state_[channel - 1U] = ChannelState::completed;
         }
     } else if (!success) {
         setChannelFlag(channel, 3U); // TEIF
         setRegister(base, registerValue(base) & ~1U);
+        channel_state_[channel - 1U] = ChannelState::failed;
+    } else {
+        channel_state_[channel - 1U] = ChannelState::active;
     }
 
     if (transfer_history_enabled_) {
@@ -289,6 +301,33 @@ mem::MemoryResult<std::uint64_t> DmaPeripheral::writeMemory(
         return memory_->write16(address, static_cast<std::uint16_t>(value));
     }
     return memory_->write32(address, static_cast<std::uint32_t>(value));
+}
+
+void DmaPeripheral::refreshStoppedChannelStates() noexcept {
+    const std::uint32_t status = registerValue(dma_isr);
+    for (std::uint32_t channel = 0; channel < channel_count_; ++channel) {
+        const std::uint32_t shift = channel * 4U;
+        switch (channel_state_[channel]) {
+        case ChannelState::completed:
+            if ((status & (1U << (shift + 1U))) == 0U) {
+                channel_state_[channel] = ChannelState::disabled;
+            }
+            break;
+        case ChannelState::failed:
+            if ((status & (1U << (shift + 3U))) == 0U) {
+                channel_state_[channel] = ChannelState::disabled;
+            }
+            break;
+        case ChannelState::disabled:
+        case ChannelState::armed:
+        case ChannelState::active:
+            break;
+        }
+    }
+}
+
+void DmaPeripheral::onReset() {
+    channel_state_.fill(ChannelState::disabled);
 }
 
 void DmaPeripheral::setChannelFlag(

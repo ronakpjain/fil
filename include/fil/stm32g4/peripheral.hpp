@@ -883,8 +883,18 @@ protected:
         std::uint32_t write_mask,
         const mem::AccessContext& context
     ) override;
+    void onReset() override;
 
 private:
+    /** @brief Explicit per-channel transfer lifecycle. */
+    enum class ChannelState : std::uint8_t {
+        disabled,  ///< EN clear: never started, stopped by software, or flags cleared.
+        armed,     ///< EN set with the full reload count remaining.
+        active,    ///< EN set and mid-transfer.
+        completed, ///< Normal completion stopped the channel; TCIF set.
+        failed,    ///< Transfer fault stopped the channel; TEIF set.
+    };
+
     static bool directClearFlags(void* context, std::uint32_t value) noexcept;
     [[nodiscard]] bool channelForOffset(std::uint32_t offset, std::uint32_t& channel) const noexcept;
     void initializeChannel(std::uint32_t channel);
@@ -900,12 +910,15 @@ private:
     );
     void setChannelFlag(std::uint32_t channel, std::uint32_t flag_bit);
     void updateInterruptLevels();
+    /** @brief Clears completed/failed states once their respective flag is gone. */
+    void refreshStoppedChannelStates() noexcept;
 
     std::uint32_t channel_count_{7};
     mem::MemoryBus* memory_{nullptr};
     InterruptCallback interrupt_callback_;
     EnableCallback enable_callback_;
     std::array<std::uint32_t, 8> reload_counts_{};
+    std::array<ChannelState, 8> channel_state_{};
     bool transfer_history_enabled_{true};
     std::vector<DmaTransfer> transfers_;
 };
