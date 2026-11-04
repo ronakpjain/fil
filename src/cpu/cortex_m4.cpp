@@ -496,7 +496,7 @@ bool CortexM4::admitMicroBlock(const JitBlockEntry& entry,
         }
     } restore{state_, slot, jit_stats_, state_, slot, jit_stats_};
     slot = entry;
-    slot.valid = true;
+    slot.state = JitBlockEntry::State::ready;
     // Pure-kernel calibration must compare its own backend against handlers,
     // never a separately compiled mixed kernel or its progress counters.
     slot.native_function = nullptr;
@@ -1373,7 +1373,7 @@ bool CortexM4::jitBlockReady() const noexcept {
     if (inItBlock(state_.it_state)) return false;
     if (state_.pending_exception || state_.pending_exc_return) return false;
     const auto& slot = (*jit_blocks_)[jitBlockIndex(entry_pc)];
-    return slot.valid && slot.pc == entry_pc
+    return slot.state == JitBlockEntry::State::ready && slot.pc == entry_pc
         && slot.generation == memory_.executionGeneration();
 }
 
@@ -1386,10 +1386,10 @@ bool CortexM4::prepareJitBlock(const bool allow_single) {
     const std::uint64_t generation = memory_.executionGeneration();
     auto& slot = (*jit_blocks_)[jitBlockIndex(entry_pc)];
     const std::size_t hot_index = jitBlockIndex(entry_pc);
-    const bool matching_attempt = slot.attempted && slot.pc == entry_pc
-        && slot.generation == generation;
+    const bool matching_attempt = slot.state != JitBlockEntry::State::empty
+        && slot.pc == entry_pc && slot.generation == generation;
     if (matching_attempt) {
-        if (slot.valid) return allow_single || slot.count >= 2U;
+        if (slot.state == JitBlockEntry::State::ready) return allow_single || slot.count >= 2U;
         // A previously rejected one-op region can link reversible capsules
         // across an otherwise supported BL/branch without scalar dispatch.
         if (!allow_single || slot.count != 1U) return false;
@@ -1402,7 +1402,7 @@ bool CortexM4::prepareJitBlock(const bool allow_single) {
     JitBlockEntry fresh{};
     fresh.pc = entry_pc;
     fresh.generation = generation;
-    fresh.attempted = true;
+    fresh.state = JitBlockEntry::State::attempted;
     std::uint32_t pc = entry_pc;
     for (std::size_t i = 0; i < JitStepOutcome::max_block; ++i) {
         std::uint32_t raw = 0;
@@ -1451,7 +1451,7 @@ bool CortexM4::prepareJitBlock(const bool allow_single) {
         slot = fresh;
         return false;
     }
-    fresh.valid = true;
+    fresh.state = JitBlockEntry::State::ready;
     // Precompute pure-integer fast-block metadata. Control-flow kinds always
     // terminate the block, so mid-block fast ops are straight-line ALU and
     // the block's final suppress flag and base cycle sum are compile-time.
@@ -1598,7 +1598,7 @@ bool CortexM4::peekReversibleBlockHeadDeclines(
     if (!prepareJitBlock(true)) return true;
     const std::uint32_t entry_pc = state_.r[15];
     const auto& slot = (*jit_blocks_)[jitBlockIndex(entry_pc)];
-    if (!slot.valid || slot.pc != entry_pc
+    if (slot.state != JitBlockEntry::State::ready || slot.pc != entry_pc
         || slot.generation != memory_.executionGeneration()
         || state_.halted || !state_.thumb || (state_.xpsr & xpsr_t) == 0U
         || (entry_pc & 1U) != 0U || inItBlock(state_.it_state)
@@ -2208,7 +2208,7 @@ auto CortexM4::executeTrustedReversibleJitBlockImpl(
     -> std::optional<std::conditional_t<Detailed, TimedJitStepOutcome, FastStepResult>> {
     const std::uint32_t entry_pc = state_.r[15];
     auto& slot = (*jit_blocks_)[jitBlockIndex(entry_pc)];
-    if (!slot.valid || slot.pc != entry_pc
+    if (slot.state != JitBlockEntry::State::ready || slot.pc != entry_pc
         || slot.generation != memory_.executionGeneration()
         || state_.halted || !state_.thumb || (state_.xpsr & xpsr_t) == 0U
         || (entry_pc & 1U) != 0U || inItBlock(state_.it_state)
@@ -2666,7 +2666,7 @@ std::optional<CortexM4::JitStepOutcome> CortexM4::tryStepJitBlockImpl(
     } else {
         // Caller prepared moments ago on this thread; recheck cheaply.
         const auto& slot = (*jit_blocks_)[jitBlockIndex(entry_pc)];
-        if (!slot.valid || slot.pc != entry_pc
+        if (slot.state != JitBlockEntry::State::ready || slot.pc != entry_pc
             || slot.generation != memory_.executionGeneration()
             || state_.halted || !state_.thumb || (state_.xpsr & xpsr_t) == 0U
             || (entry_pc & 1U) != 0U || inItBlock(state_.it_state)
@@ -3006,7 +3006,7 @@ bool CortexM4::prepareAndPeekJitBlock(
     // single lookup serves the preview fill (no second readiness probe).
     const std::uint32_t entry_pc = state_.r[15];
     const auto& slot = (*jit_blocks_)[jitBlockIndex(entry_pc)];
-    if (!slot.valid || slot.pc != entry_pc
+    if (slot.state != JitBlockEntry::State::ready || slot.pc != entry_pc
         || slot.generation != memory_.executionGeneration()) return false;
     const std::size_t count = std::min<std::size_t>(max_instructions, slot.count);
     const std::size_t available = extended ? slot.preview_extended_count : slot.preview_count;

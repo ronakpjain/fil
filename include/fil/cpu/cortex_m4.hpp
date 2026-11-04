@@ -594,11 +594,16 @@ private:
         str_word,
     };
     struct JitBlockEntry {
+        /** @brief Explicit block-cache entry lifecycle. */
+        enum class State : std::uint8_t {
+            empty,     ///< No preparation attempted for this PC/generation.
+            attempted, ///< Preparation ran but produced no usable block.
+            ready,     ///< Prepared metadata and handlers are usable.
+        };
         std::uint64_t generation{0};
         std::uint32_t pc{0};
         std::uint8_t count{0};
-        bool valid{false};
-        bool attempted{false};
+        State state{State::empty};
         /// Bespoke stencil kernel for the leading FilIR prefix (count in
         /// micro_prefix_count); the suffix keeps existing handlers.
         NativeFunction native_function{nullptr};
