@@ -29,6 +29,12 @@ struct EventLoop::Impl {
      * increasing EventId is the slot's generation: stale heap entries compare
      * their stored id against the slot and are discarded without an ABA risk.
      */
+    /** @brief Explicit slot lifecycle; a queued slot is referenced by live_events. */
+    enum class SlotState : std::uint8_t {
+        free,   ///< Not scheduled; reusable.
+        queued, ///< Scheduled and owned by a queue until dispatch or cancel.
+    };
+
     struct Slot {
         SimTimeNs at{0};
         EventId id{0};
@@ -38,7 +44,7 @@ struct EventLoop::Impl {
         BuiltinEvent builtin{};
         std::function<bool()> locality_guard;
         bool globally_observed{true};
-        bool live{false};
+        SlotState state{SlotState::free};
     };
 
     /** Key and slot reference carried by every pending queue entry. */
@@ -227,14 +233,14 @@ struct EventLoop::Impl {
 
     [[nodiscard]] bool entryLive(const Entry& entry) const noexcept {
         return entry.slot < slots.size()
-            && slots[entry.slot].live
+            && slots[entry.slot].state == SlotState::queued
             && slots[entry.slot].id == entry.id;
     }
 
     static void discardDeadFront(Queue& queue, const std::vector<Slot>& slots) {
         while (!queue.empty()) {
             const Entry& entry = queue.top();
-            if (entry.slot < slots.size() && slots[entry.slot].live
+            if (entry.slot < slots.size() && slots[entry.slot].state == SlotState::queued
                 && slots[entry.slot].id == entry.id) return;
             queue.pop();
         }
@@ -296,7 +302,7 @@ struct EventLoop::Impl {
         for (const auto& [id, ref] : live_events) {
             if (ref.slot >= slots.size()) continue;
             const Slot& slot = slots[ref.slot];
-            if (!slot.live || slot.id != id) continue;
+            if (slot.state != SlotState::queued || slot.id != id) continue;
             const Entry entry{slot.at, slot.sequence, ref.slot, id};
             events.push(entry);
             if (slot.globally_observed) globally_observed_events.push(entry);
@@ -331,7 +337,7 @@ struct EventLoop::Impl {
 
     void releaseSlot(const std::uint32_t index) noexcept {
         Slot& slot = slots[index];
-        slot.live = false;
+        slot.state = SlotState::free;
         slot.callback = {};
         slot.builtin = {};
         slot.locality_guard = {};
@@ -355,7 +361,7 @@ struct EventLoop::Impl {
             index = static_cast<std::uint32_t>(slots.size());
             slots.emplace_back();
         }
-        slots[index].live = true;
+        slots[index].state = SlotState::queued;
         return index;
     }
 
@@ -470,7 +476,7 @@ struct EventLoop::Impl {
         EventCallback callback = std::move(slot.callback);
         const BuiltinEvent builtin = slot.builtin;
         std::function<bool()> locality_guard = std::move(slot.locality_guard);
-        slot.live = false;
+        slot.state = SlotState::free;
         live_events.erase(id);
         free_slots.push_back(entry.slot);
         discardDeadFront(globally_observed_events);
@@ -533,7 +539,7 @@ struct EventLoop::Impl {
         std::vector<std::size_t> counts(owner_count, 0U);
         for (const auto& [id, ref] : live_events) {
             static_cast<void>(id);
-            if (ref.slot < slots.size() && slots[ref.slot].live
+            if (ref.slot < slots.size() && slots[ref.slot].state == SlotState::queued
                 && slots[ref.slot].owner < owner_count) {
                 ++counts[slots[ref.slot].owner];
             }
@@ -576,7 +582,7 @@ struct EventLoop::Impl {
         for (const auto& [id, ref] : live_events) {
             if (ref.slot >= slots.size()) continue;
             const Slot& source = slots[ref.slot];
-            if (!source.live || source.id != id) continue;
+            if (source.state != SlotState::queued || source.id != id) continue;
             Impl& destination = source.owner < owner_count
                 ? *domains[source.owner] : prepared_root;
             const auto destination_index = static_cast<std::uint32_t>(destination.slots.size());
@@ -632,7 +638,7 @@ struct EventLoop::Impl {
         auto append = [&](Impl& source, const EventId id, const SlotRef ref) {
             if (ref.slot >= source.slots.size()) return;
             const Slot& slot = source.slots[ref.slot];
-            if (!slot.live || slot.id != id) return;
+            if (slot.state != SlotState::queued || slot.id != id) return;
             const auto destination_index = static_cast<std::uint32_t>(prepared_root.slots.size());
             prepared_root.slots.push_back(slot);
             prepared_root.live_events.emplace(id, SlotRef{destination_index, id});
@@ -1177,7 +1183,7 @@ void EventLoop::clear() {
         domain.owner_events.clear();
         domain.live_events.clear();
         for (auto& slot : domain.slots) {
-            slot.live = false;
+            slot.state = Impl::SlotState::free;
             slot.callback = {};
             slot.builtin = {};
             slot.locality_guard = {};
