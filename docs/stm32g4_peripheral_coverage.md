@@ -280,7 +280,7 @@ Network buses default to timed classic-CAN arbitration at the configured bitrate
 
 ## Interpreting unknown MMIO
 
-The `unknown_mmio_addresses` counter records only addresses that miss every
+The `unknown_mmio` counter records only addresses that miss every
 top-level routed block. It does not count generic storage inside a modeled block or
 accesses absorbed by the ADC-common, SYSCFG, and EXTI sparse stubs. The tables above,
 not a zero unknown-address count, define peripheral fidelity. Strict MMIO remains

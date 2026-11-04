@@ -30,8 +30,6 @@ string(REPLACE "\r\n" "\n" normalized_stdout "${run_stdout}")
 set(padded_stdout "\n${normalized_stdout}\n")
 foreach(required_line IN ITEMS
     "board: g4_testing"
-    "stop: time-budget"
-    "unknown_mmio_addresses: 0"
 )
     string(FIND "${padded_stdout}" "\n${required_line}\n" line_position)
     if(line_position EQUAL -1)
@@ -42,9 +40,19 @@ foreach(required_line IN ITEMS
     endif()
 endforeach()
 
-string(REGEX MATCH "time_ns: ([0-9]+)" time_match "${normalized_stdout}")
+string(REGEX MATCH "\n  stop:[ ]+time-budget\n" stop_match "${padded_stdout}")
+if(stop_match STREQUAL "")
+    message(FATAL_ERROR "g4_testing smoke output is missing the time-budget stop\nstdout:\n${run_stdout}")
+endif()
+
+string(REGEX MATCH "\n  unknown_mmio:[ ]+0\n" mmio_match "${padded_stdout}")
+if(mmio_match STREQUAL "")
+    message(FATAL_ERROR "g4_testing smoke output is missing a zero unknown_mmio line\nstdout:\n${run_stdout}")
+endif()
+
+string(REGEX MATCH "\\(([0-9]+) ns\\)" time_match "${normalized_stdout}")
 if(time_match STREQUAL "")
-    message(FATAL_ERROR "g4_testing smoke output is missing a numeric time_ns line\nstdout:\n${run_stdout}")
+    message(FATAL_ERROR "g4_testing smoke output is missing a numeric time line\nstdout:\n${run_stdout}")
 endif()
 set(stop_time_ns "${CMAKE_MATCH_1}")
 if(stop_time_ns LESS 1000000000 OR stop_time_ns GREATER_EQUAL 1001000000)
@@ -54,9 +62,13 @@ if(stop_time_ns LESS 1000000000 OR stop_time_ns GREATER_EQUAL 1001000000)
     )
 endif()
 
-string(FIND "${run_stdout}" "unknown_mmio:" unknown_detail_position)
-if(NOT unknown_detail_position EQUAL -1)
-    message(FATAL_ERROR "g4_testing smoke reported an unknown MMIO detail:\n${run_stdout}")
+string(REGEX MATCHALL "\n    0x[0-9a-f]+  reads=[0-9]+ writes=[0-9]+" mmio_details
+    "${normalized_stdout}")
+list(LENGTH mmio_details mmio_detail_count)
+if(NOT mmio_detail_count EQUAL 0)
+    message(FATAL_ERROR
+        "g4_testing smoke reported ${mmio_detail_count} unknown MMIO detail lines:\n${run_stdout}"
+    )
 endif()
 
 message(STATUS "g4_testing reached the 1 s deadline within documented overshoot with zero unknown MMIO")

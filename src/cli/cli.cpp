@@ -664,55 +664,151 @@ ExitCode disassembleWindowCommand(
     return ExitCode::success;
 }
 
-void printJitStats(std::ostream& out, const cpu::CortexM4& cpu, const std::string_view name) {
+/** @brief One report field; an empty value leaves the key bare as a section head. */
+struct ReportLine {
+    std::string key;
+    std::string value;
+};
+
+/**
+ * @brief Prints report fields aligned under their longest key.
+ *
+ * @param out Destination stream.
+ * @param indent Leading spaces on every line.
+ * @param lines Fields in print order.
+ */
+void printReportLines(
+    std::ostream& out,
+    const std::size_t indent,
+    const std::vector<ReportLine>& lines
+) {
+    std::size_t width = 0U;
+    for (const ReportLine& line : lines) width = std::max(width, line.key.size());
+    for (const ReportLine& line : lines) {
+        out << std::string(indent, ' ') << line.key << ':';
+        if (!line.value.empty()) {
+            out << std::string(width - line.key.size() + 1U, ' ') << line.value;
+        }
+        out << '\n';
+    }
+}
+
+/** @brief Formats simulated-time with a readable unit and exact nanoseconds. */
+std::string formatSimTime(const std::uint64_t time_ns) {
+    std::ostringstream text;
+    text << std::fixed << std::setprecision(3);
+    if (time_ns >= 1'000'000'000ULL) text << static_cast<double>(time_ns) / 1e9 << " s";
+    else if (time_ns >= 1'000'000ULL) text << static_cast<double>(time_ns) / 1e6 << " ms";
+    else if (time_ns >= 1'000ULL) text << static_cast<double>(time_ns) / 1e3 << " us";
+    else return std::to_string(time_ns) + " ns";
+    return text.str() + " (" + std::to_string(time_ns) + " ns)";
+}
+
+/** @brief Formats a target word as a fixed-width hexadecimal address. */
+std::string formatHexWord(const std::uint32_t value) {
+    std::ostringstream text;
+    text << "0x" << std::hex << std::setfill('0') << std::setw(8) << value;
+    return text.str();
+}
+
+/** @brief One named internal JIT counter, reported only when nonzero. */
+struct JitCounter {
+    std::string_view name;
+    std::uint64_t value;
+};
+
+/**
+ * @brief Groups nonzero JIT counters for the opt-in `--jit-stats` report.
+ *
+ * @param cpu CPU whose counters are read.
+ * @return Named group lines in stable order; groups without nonzero counters
+ *         are omitted so short runs report almost nothing.
+ */
+std::vector<ReportLine> jitReportLines(const cpu::CortexM4& cpu) {
     const auto stats = cpu.jitStats();
-    out << "jit: board=" << name
-        << " micro_compilations=" << stats.micro_compilations
-        << " micro_executions=" << stats.micro_executions
-        << " micro_instructions=" << stats.micro_instructions
-        << " micro_failures=" << stats.micro_compilation_failures
-        << " native_compilations=" << stats.native_compilations
-        << " native_executions=" << stats.native_executions
-        << " native_instructions=" << stats.native_instructions
-        << " native_declines=" << stats.native_declines
-        << " trace_compilations=" << stats.trace_compilations
-        << " trace_compiled_instructions=" << stats.trace_compiled_instructions
-        << " trace_executions=" << stats.trace_executions
-        << " trace_instructions=" << stats.trace_instructions
-        << " trace_guard_mismatches=" << stats.trace_guard_mismatches
-        << " trace_memory_declines=" << stats.trace_memory_declines
-        << " trace_horizon_summaries=" << stats.trace_horizon_summaries
-        << " trace_horizon_instructions=" << stats.trace_horizon_instructions
-        << " trace_horizon_local_ops=" << stats.trace_horizon_local_ops
-        << " trace_horizon_shared=" << stats.trace_horizon_shared
-        << " trace_horizon_control_flow=" << stats.trace_horizon_control_flow
-        << " trace_horizon_zero_prefix=" << stats.trace_horizon_zero_prefix
-        << " trace_horizon_stack_local_ops=" << stats.trace_horizon_stack_local_ops
-        << " trace_horizon_stack_shared=" << stats.trace_horizon_stack_shared
-        << " micro_compile_cost_ns=" << stats.micro_compile_cost_ns
-        << " micro_admitted=" << stats.micro_admitted
-        << " micro_rejected=" << stats.micro_rejected
-        << " micro_admission_cost_ns=" << stats.micro_admission_cost_ns
-        << " block_executions=" << stats.block_executions
-        << " block_instructions=" << stats.block_instructions
-        << " block_compilations=" << stats.compilations
-        << " block_fallbacks=" << stats.fallbacks
-        << " block_decline_guard=" << stats.block_decline_guard
-        << " block_decline_empty=" << stats.block_decline_empty
-        << " block_prepare_failed=" << stats.block_prepare_failed
-        << " block_native_span_ok=" << stats.block_native_span_ok
-        << " span_skip_boundary=" << stats.span_skip_boundary
-        << " span_skip_clock=" << stats.span_skip_clock
-        << " span_skip_credit=" << stats.span_skip_credit
-        << " tb_fetch=" << stats.tb_fetch << " tb_lower=" << stats.tb_lower
-        << " tb_profile=" << stats.tb_profile << " tb_limit=" << stats.tb_limit
-        << " tb_ok=" << stats.tb_ok << " tb_ops=" << stats.tb_ops
-        << " span_skip_env=" << stats.span_skip_env
-        << " span_skip_retire=" << stats.span_skip_retire
-        << " single_fast=" << stats.single_fast
-        << " single_generic=" << stats.single_generic
-        << " block_generic=" << stats.block_generic
-        << " single_decline=" << stats.single_decline << '\n';
+    std::vector<ReportLine> groups;
+    const auto add = [&groups](
+        const std::string_view group,
+        const std::span<const JitCounter> counters
+    ) {
+        std::string value;
+        for (const JitCounter& counter : counters) {
+            if (counter.value == 0U) continue;
+            if (!value.empty()) value += ' ';
+            value += counter.name;
+            value += '=';
+            value += std::to_string(counter.value);
+        }
+        if (!value.empty()) {
+            groups.push_back(ReportLine{std::string(group), std::move(value)});
+        }
+    };
+    add("micro", std::array{
+        JitCounter{"compilations", stats.micro_compilations},
+        JitCounter{"executions", stats.micro_executions},
+        JitCounter{"instructions", stats.micro_instructions},
+        JitCounter{"failures", stats.micro_compilation_failures},
+        JitCounter{"cost_ns", stats.micro_compile_cost_ns},
+        JitCounter{"admitted", stats.micro_admitted},
+        JitCounter{"rejected", stats.micro_rejected},
+        JitCounter{"admission_cost_ns", stats.micro_admission_cost_ns},
+    });
+    add("native", std::array{
+        JitCounter{"compilations", stats.native_compilations},
+        JitCounter{"executions", stats.native_executions},
+        JitCounter{"instructions", stats.native_instructions},
+        JitCounter{"declines", stats.native_declines},
+    });
+    add("trace", std::array{
+        JitCounter{"compilations", stats.trace_compilations},
+        JitCounter{"compiled_instructions", stats.trace_compiled_instructions},
+        JitCounter{"executions", stats.trace_executions},
+        JitCounter{"instructions", stats.trace_instructions},
+        JitCounter{"guard_mismatches", stats.trace_guard_mismatches},
+        JitCounter{"memory_declines", stats.trace_memory_declines},
+    });
+    add("horizon", std::array{
+        JitCounter{"summaries", stats.trace_horizon_summaries},
+        JitCounter{"instructions", stats.trace_horizon_instructions},
+        JitCounter{"local_ops", stats.trace_horizon_local_ops},
+        JitCounter{"shared", stats.trace_horizon_shared},
+        JitCounter{"control_flow", stats.trace_horizon_control_flow},
+        JitCounter{"zero_prefix", stats.trace_horizon_zero_prefix},
+        JitCounter{"stack_local_ops", stats.trace_horizon_stack_local_ops},
+        JitCounter{"stack_shared", stats.trace_horizon_stack_shared},
+    });
+    add("blocks", std::array{
+        JitCounter{"executions", stats.block_executions},
+        JitCounter{"instructions", stats.block_instructions},
+        JitCounter{"compilations", stats.compilations},
+        JitCounter{"fallbacks", stats.fallbacks},
+        JitCounter{"decline_guard", stats.block_decline_guard},
+        JitCounter{"decline_empty", stats.block_decline_empty},
+        JitCounter{"prepare_failed", stats.block_prepare_failed},
+        JitCounter{"span_ok", stats.block_native_span_ok},
+    });
+    add("spans", std::array{
+        JitCounter{"skip_boundary", stats.span_skip_boundary},
+        JitCounter{"skip_clock", stats.span_skip_clock},
+        JitCounter{"skip_credit", stats.span_skip_credit},
+        JitCounter{"skip_env", stats.span_skip_env},
+        JitCounter{"skip_retire", stats.span_skip_retire},
+    });
+    add("budget", std::array{
+        JitCounter{"fetch", stats.tb_fetch},
+        JitCounter{"lower", stats.tb_lower},
+        JitCounter{"profile", stats.tb_profile},
+        JitCounter{"limit", stats.tb_limit},
+        JitCounter{"ok", stats.tb_ok},
+        JitCounter{"ops", stats.tb_ops},
+    });
+    add("single", std::array{
+        JitCounter{"fast", stats.single_fast},
+        JitCounter{"generic", stats.single_generic},
+        JitCounter{"block_generic", stats.block_generic},
+        JitCounter{"decline", stats.single_decline},
+    });
+    return groups;
 }
 
 ExitCode runBoardCommand(
@@ -733,6 +829,7 @@ ExitCode runBoardCommand(
     bool trace_instructions = false;
     bool detect_spin = false;
     bool enable_jit = true;
+    bool show_jit_stats = false;
     bool allow_breakpoint = false;
     std::uint32_t adc_decimation = 1U;
 
@@ -787,6 +884,7 @@ ExitCode runBoardCommand(
         else if (option == "--trace-instr") trace_instructions = true;
         else if (option == "--detect-spin") detect_spin = true;
         else if (option == "--no-detect-spin") detect_spin = false;
+        else if (option == "--jit-stats") show_jit_stats = true;
         else if (option == "--allow-breakpoint") allow_breakpoint = true;
         else {
             err << "fil: unknown run option: " << option << '\n';
@@ -844,28 +942,34 @@ ExitCode runBoardCommand(
     }
 
     const sim::BoardRunResult result = board.value()->run(options);
-    out << "board: " << board_config.value().name << '\n'
-        << "stop: " << sim::boardStopReasonName(result.reason) << '\n'
-        << "instructions: " << result.instructions << '\n'
-        << "cycles: " << result.cycles << '\n'
-        << "time_ns: " << result.time_ns << '\n'
-        << "pc: 0x" << std::hex << result.diagnostic.next_pc << std::dec << '\n';
+    const auto unknown = board.value()->peripherals().router().unknownAccesses();
+    const std::vector<ReportLine> jit_groups = show_jit_stats
+        ? jitReportLines(board.value()->cpu()) : std::vector<ReportLine>{};
+    std::vector<ReportLine> summary;
+    summary.push_back({"stop", std::string(sim::boardStopReasonName(result.reason))});
+    if (!result.message.empty()) summary.push_back({"message", result.message});
+    summary.push_back({"instructions", std::to_string(result.instructions)});
+    summary.push_back({"cycles", std::to_string(result.cycles)});
+    summary.push_back({"time", formatSimTime(result.time_ns)});
+    summary.push_back({"pc", formatHexWord(result.diagnostic.next_pc)});
     if (!result.succeeded()) {
         const auto& state = board.value()->cpu().state();
-        out << "msp: 0x" << std::hex << state.msp << '\n'
-            << "psp: 0x" << state.psp << '\n'
-            << "lr: 0x" << state.r[14] << '\n'
-            << "xpsr: 0x" << state.xpsr << std::dec << '\n';
+        summary.push_back({"msp", formatHexWord(state.msp)});
+        summary.push_back({"psp", formatHexWord(state.psp)});
+        summary.push_back({"lr", formatHexWord(state.r[14])});
+        summary.push_back({"xpsr", formatHexWord(state.xpsr)});
     }
-    if (!result.message.empty()) out << "message: " << result.message << '\n';
-    const auto unknown = board.value()->peripherals().router().unknownAccesses();
-    out << "unknown_mmio_addresses: " << unknown.size() << '\n';
+    summary.push_back({"unknown_mmio", std::to_string(unknown.size())});
+    if (show_jit_stats) {
+        summary.push_back({"jit", jit_groups.empty() ? "no recorded counters" : ""});
+    }
+    out << "board: " << board_config.value().name << '\n';
+    printReportLines(out, 2U, summary);
+    if (!jit_groups.empty()) printReportLines(out, 4U, jit_groups);
     for (const auto& access : unknown) {
-        out << "unknown_mmio: 0x" << std::hex << access.address << std::dec
-            << " reads=" << access.reads << " writes=" << access.writes << '\n';
+        out << "    " << formatHexWord(access.address)
+            << "  reads=" << access.reads << " writes=" << access.writes << '\n';
     }
-
-    if (enable_jit) printJitStats(out, board.value()->cpu(), board_config.value().name);
     if (trace_path) {
         std::ofstream trace(*trace_path, std::ios::binary | std::ios::trunc);
         if (!trace) {
@@ -1162,6 +1266,13 @@ std::string describeExpectation(const sim::Expectation& expectation) {
         std::ostringstream text;
         if constexpr (std::is_same_v<Specific, sim::CanExpectation>) {
             text << "CAN " << specific.bus << " id=0x" << std::hex << specific.id;
+            if (!specific.data.empty()) {
+                text << " data=";
+                for (const std::uint8_t byte : specific.data) {
+                    text << std::hex << std::setfill('0') << std::setw(2)
+                        << static_cast<unsigned>(byte);
+                }
+            }
         } else {
             text << "GPIO " << specific.board << '.' << specific.port << " pin "
                  << static_cast<unsigned>(specific.pin) << " level "
@@ -1169,6 +1280,95 @@ std::string describeExpectation(const sim::Expectation& expectation) {
         }
         return text.str();
     }, expectation);
+}
+
+/** @brief One end-of-run expectation line, ready for aligned printing. */
+struct ExpectationRow {
+    std::string marker;      ///< Status marker such as `[FAIL]`.
+    std::string status;      ///< Raw evaluator status used for ordering/headers.
+    std::string script;      ///< Stimulus script name.
+    std::string description; ///< Expected CAN frame or GPIO transition.
+    std::string window;      ///< Inclusive window as `[start, end] ms`.
+};
+
+/** @brief Ranks statuses so failures print first in the expectation report. */
+int expectationRank(const std::string_view status) noexcept {
+    if (status == "fail") return 0;
+    if (status == "incomplete") return 1;
+    if (status == "pass") return 2;
+    return 3;
+}
+
+/** @brief Builds the expectation report rows, most severe status first. */
+std::vector<ExpectationRow> buildExpectationRows(
+    const std::vector<sim::ExpectationCheck>& expectations,
+    const sim::ExpectationEvaluator& evaluator
+) {
+    std::vector<ExpectationRow> rows;
+    rows.reserve(expectations.size());
+    for (std::size_t index = 0; index < expectations.size(); ++index) {
+        const sim::ExpectationCheck& check = expectations[index];
+        std::string status(evaluator.status(index));
+        std::ostringstream window;
+        const std::uint64_t at_ms = sim::expectationStartMs(check.expectation);
+        window << '[' << at_ms << ", "
+               << (at_ms + sim::expectationWindowMs(check.expectation)) << "] ms";
+        std::string marker;
+        if (status == "fail") marker = "[FAIL]";
+        else if (status == "incomplete") marker = "[INCOMPLETE]";
+        else if (status == "pass") marker = "[pass]";
+        else marker = "[" + status + "]";
+        rows.push_back(ExpectationRow{
+            std::move(marker), std::move(status), check.script,
+            describeExpectation(check.expectation), window.str()
+        });
+    }
+    std::stable_sort(rows.begin(), rows.end(),
+        [](const ExpectationRow& left, const ExpectationRow& right) {
+            return expectationRank(left.status) < expectationRank(right.status);
+        });
+    return rows;
+}
+
+/** @brief Counts expectation outcomes, capitalizing any failures. */
+std::string summarizeExpectationRows(const std::vector<ExpectationRow>& rows) {
+    std::size_t failed = 0U, incomplete = 0U, passed = 0U, other = 0U;
+    for (const ExpectationRow& row : rows) {
+        if (row.status == "fail") ++failed;
+        else if (row.status == "incomplete") ++incomplete;
+        else if (row.status == "pass") ++passed;
+        else ++other;
+    }
+    std::vector<std::string> parts;
+    if (failed != 0U) parts.push_back(std::to_string(failed) + " FAILED");
+    if (incomplete != 0U) parts.push_back(std::to_string(incomplete) + " incomplete");
+    if (passed != 0U) parts.push_back(std::to_string(passed) + " passed");
+    if (other != 0U) parts.push_back(std::to_string(other) + " pending");
+    std::string summary;
+    for (const std::string& part : parts) {
+        if (!summary.empty()) summary += ", ";
+        summary += part;
+    }
+    return summary;
+}
+
+/** @brief Prints expectation rows in aligned columns, failures first. */
+void printExpectationRows(std::ostream& out, const std::vector<ExpectationRow>& rows) {
+    std::size_t marker_width = 0U, script_width = 0U, description_width = 0U;
+    for (const ExpectationRow& row : rows) {
+        marker_width = std::max(marker_width, row.marker.size());
+        script_width = std::max(script_width, row.script.size());
+        description_width = std::max(description_width, row.description.size());
+    }
+    const auto padded = [](const std::string& text, const std::size_t width) {
+        return text + std::string(width - text.size(), ' ');
+    };
+    for (const ExpectationRow& row : rows) {
+        out << "    " << padded(row.marker, marker_width) << "  "
+            << padded(row.script, script_width) << "  "
+            << padded(row.description, description_width) << "  "
+            << row.window << '\n';
+    }
 }
 
 Result<void> scheduleConfiguredStimuli(
@@ -1244,6 +1444,7 @@ ExitCode runNetworkCommand(
     bool trace_instructions = false;
     bool detect_spin = false;
     bool enable_jit = true;
+    bool show_jit_stats = false;
     bool enable_ram_capsules = true;
     bool allow_breakpoint = false;
     std::uint32_t adc_decimation = 1U;
@@ -1310,6 +1511,7 @@ ExitCode runNetworkCommand(
         else if (option == "--trace-instr") trace_instructions = true;
         else if (option == "--detect-spin") detect_spin = true;
         else if (option == "--no-detect-spin") detect_spin = false;
+        else if (option == "--jit-stats") show_jit_stats = true;
         else if (option == "--allow-breakpoint") allow_breakpoint = true;
         else {
             err << "fil: unknown run option: " << option << '\n';
@@ -1398,35 +1600,44 @@ ExitCode runNetworkCommand(
 
     if (!expectations.empty()) expectation_evaluator.finish(result.value().end_time_ns);
 
-    out << "network: " << network_config.value().name << '\n'
-        << "stop: " << sim::worldStopReasonName(result.value().reason) << '\n'
-        << "boards: " << result.value().boards.size() << '\n'
-        << "instructions: " << result.value().instructions << '\n'
-        << "cycles: " << result.value().cycles << '\n'
-        << "time_ns: " << result.value().end_time_ns << '\n'
-        << "rounds: " << result.value().rounds << '\n'
-        << "parallel_lanes: " << result.value().parallel_lanes << '\n'
-        << "cross_board_window_ns: " << (trace_instructions || detect_spin
-            ? 0U : cross_board_window_ns) << '\n'
-        << "dispatches: " << result.value().dispatches << '\n'
-        << "exact_dispatches: " << result.value().exact_dispatches << '\n'
-        << "event_callbacks: " << result.value().event_callbacks << '\n'
-        << "lockstep_bursts: " << result.value().lockstep_bursts << '\n';
-    if (enable_ram_capsules) {
-        out << "deferred_prefixes: " << result.value().deferred_prefixes << '\n'
-            << "memoized_prefixes: " << result.value().memoized_prefixes << '\n'
-            << "memoized_instructions: " << result.value().memoized_instructions << '\n'
-            << "deferred_instructions: " << result.value().deferred_instructions << '\n'
-            << "deferred_truncations: " << result.value().deferred_truncations << '\n';
+    std::vector<ReportLine> summary;
+    summary.push_back({"stop", std::string(sim::worldStopReasonName(result.value().reason))});
+    if (!result.value().message.empty()) summary.push_back({"message", result.value().message});
+    summary.push_back({"boards", std::to_string(result.value().boards.size())});
+    summary.push_back({"instructions", std::to_string(result.value().instructions)});
+    summary.push_back({"cycles", std::to_string(result.value().cycles)});
+    summary.push_back({"time", formatSimTime(result.value().end_time_ns)});
+    summary.push_back({"rounds", std::to_string(result.value().rounds)});
+    summary.push_back({"parallel_lanes", std::to_string(result.value().parallel_lanes)});
+    summary.push_back({"cross_board_window_ns", std::to_string(trace_instructions || detect_spin
+        ? 0U : cross_board_window_ns)});
+    summary.push_back({"dispatches", std::to_string(result.value().dispatches)});
+    summary.push_back({"exact_dispatches", std::to_string(result.value().exact_dispatches)});
+    summary.push_back({"event_callbacks", std::to_string(result.value().event_callbacks)});
+    summary.push_back({"lockstep_bursts", std::to_string(result.value().lockstep_bursts)});
+    if (enable_ram_capsules
+        && (result.value().deferred_prefixes != 0U || result.value().memoized_prefixes != 0U
+            || result.value().memoized_instructions != 0U
+            || result.value().deferred_instructions != 0U
+            || result.value().deferred_truncations != 0U)) {
+        summary.push_back({"deferred_prefixes", std::to_string(result.value().deferred_prefixes)});
+        summary.push_back({"memoized_prefixes", std::to_string(result.value().memoized_prefixes)});
+        summary.push_back({"memoized_instructions", std::to_string(result.value().memoized_instructions)});
+        summary.push_back({"deferred_instructions", std::to_string(result.value().deferred_instructions)});
+        summary.push_back({"deferred_truncations", std::to_string(result.value().deferred_truncations)});
     }
+    std::vector<ExpectationRow> expectation_rows = buildExpectationRows(
+        expectations, expectation_evaluator
+    );
+    if (!expectation_rows.empty()) {
+        summary.push_back({"expectations", summarizeExpectationRows(expectation_rows)});
+    }
+    out << "network: " << network_config.value().name << '\n';
+    printReportLines(out, 2U, summary);
+
     const bool unmet_expectation = expectation_evaluator.hasFailures();
     for (std::size_t index = 0; index < expectations.size(); ++index) {
         const auto& check = expectations[index];
-        const std::uint64_t at_ms = sim::expectationStartMs(check.expectation);
-        out << "expect " << check.script << ' ' << describeExpectation(check.expectation)
-            << " window_ms=[" << at_ms << ','
-            << (at_ms + sim::expectationWindowMs(check.expectation)) << "]: "
-            << expectation_evaluator.status(index) << '\n';
         if (expectation_evaluator.status(index) == "fail"
             || expectation_evaluator.status(index) == "incomplete") {
             const std::string_view kind = std::holds_alternative<sim::CanExpectation>(check.expectation)
@@ -1435,31 +1646,47 @@ ExitCode runNetworkCommand(
                 << check.script << "': " << describeExpectation(check.expectation) << '\n';
         }
     }
+    if (!expectation_rows.empty()) {
+        out << '\n';
+        printExpectationRows(out, expectation_rows);
+    }
     for (const auto& board : result.value().boards) {
-        out << "board " << board.name
-            << ": stop=" << sim::boardStopReasonName(board.result.reason)
-            << " instructions=" << board.result.instructions
-            << " pc=0x" << std::hex << board.result.diagnostic.next_pc << std::dec << '\n';
+        out << '\n' << "  board: " << board.name << '\n';
+        std::vector<ReportLine> fields;
+        fields.push_back({"stop", std::string(sim::boardStopReasonName(board.result.reason))});
         if (!board.result.message.empty() && !board.result.succeeded()) {
-            out << "  message: " << board.result.message << '\n';
+            fields.push_back({"message", board.result.message});
         }
-        if (enable_ram_capsules) {
-            out << "memoized_ram: board=" << board.name
-                << " prefixes=" << board.memoized_prefixes
-                << " admitted_instructions=" << board.memoized_instructions << '\n';
+        fields.push_back({"instructions", std::to_string(board.result.instructions)});
+        fields.push_back({"pc", formatHexWord(board.result.diagnostic.next_pc)});
+        if (enable_ram_capsules
+            && (board.memoized_prefixes != 0U || board.memoized_instructions != 0U)) {
+            fields.push_back({"memoized_ram", "prefixes=" + std::to_string(board.memoized_prefixes)
+                + " admitted_instructions=" + std::to_string(board.memoized_instructions)});
         }
-        if (sim::Board* instance = world.value()->board(board.name)) {
-            out << "clock: board=" << board.name << " hz="
-                << instance->peripherals().rcc().systemClockHz() << '\n';
-            if (enable_jit) printJitStats(out, instance->cpu(), board.name);
+        sim::Board* instance = world.value()->board(board.name);
+        const std::vector<ReportLine> jit_groups = show_jit_stats && instance != nullptr
+            ? jitReportLines(instance->cpu()) : std::vector<ReportLine>{};
+        if (instance != nullptr) {
+            fields.push_back({"clock", std::to_string(
+                instance->peripherals().rcc().systemClockHz()) + " Hz"});
+        }
+        if (show_jit_stats && instance != nullptr) {
+            fields.push_back({"jit", jit_groups.empty() ? "no recorded counters" : ""});
+        }
+        printReportLines(out, 4U, fields);
+        if (!jit_groups.empty()) printReportLines(out, 6U, jit_groups);
+        if (instance != nullptr) {
             const auto unknown = instance->peripherals().router().unknownAccesses();
-            for (const auto& access : unknown) {
-                out << "  unknown_mmio: 0x" << std::hex << access.address << std::dec
-                    << " reads=" << access.reads << " writes=" << access.writes << '\n';
+            if (!unknown.empty()) {
+                out << "    unknown_mmio: " << unknown.size() << '\n';
+                for (const auto& access : unknown) {
+                    out << "      " << formatHexWord(access.address)
+                        << "  reads=" << access.reads << " writes=" << access.writes << '\n';
+                }
             }
         }
     }
-    if (!result.value().message.empty()) out << "message: " << result.value().message << '\n';
 
     if (trace_path) {
         std::ofstream trace(*trace_path, std::ios::binary | std::ios::trunc);
@@ -2170,7 +2397,7 @@ void printHelp(std::ostream& out) {
         << "Run options:\n"
         << "  --duration D --instruction-budget N --trace FILE --trace-instr\n"
         << "  --strict-mmio --stop-address ADDR --stop-at-symbol NAME --allow-breakpoint\n"
-        << "  --detect-spin --adc-decimation N\n\n"
+        << "  --detect-spin --adc-decimation N --jit-stats\n\n"
         << "ST-Link comparison options:\n"
         << "  --flash --memory ADDR:LENGTH --register NAME --ignore-register NAME\n"
         << "  --stop-address ADDR --stop-at-symbol NAME --max-instructions N\n"
@@ -2180,7 +2407,7 @@ void printHelp(std::ostream& out) {
         << "  --cross-board-window-ns N (network commands: default 100000; 0 = exact)\n"
         << "  --parallel-lanes (default) | --no-parallel-lanes (validation reference)\n"
         << "  --strict-mmio --trace-instr --detect-spin --allow-breakpoint\n"
-        << "  --adc-decimation N (keep 1 of N continuous ADC scans)\n"
+        << "  --adc-decimation N (keep 1 of N continuous ADC scans) --jit-stats\n"
         << "  --inject-can BUS[@TIME_MS]:ID:HEXDATA\n\n"
         << "Watch options:\n"
         << "  --duration D --refresh-ms N --refresh-us N --instruction-budget N --quantum N\n"

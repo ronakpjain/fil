@@ -411,7 +411,7 @@ if(FIL_BUILD_TESTS)
                         --no-detect-spin
                 )
                 set_tests_properties("fil.per.run_${per_board}_10ms" PROPERTIES
-                    PASS_REGULAR_EXPRESSION "unknown_mmio_addresses: 0"
+                    PASS_REGULAR_EXPRESSION "unknown_mmio: +0"
                     TIMEOUT 30
                     LABELS "per;integration"
                 )

@@ -686,7 +686,9 @@ TEST(WorldTest, NestedBusInjectionDoesNotSatisfyParentBusExpectation) {
     std::ostringstream out;
     std::ostringstream err;
     EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::runtime_error);
-    EXPECT_NE(out.str().find("window_ms=[0,0]: fail"), std::string::npos);
+    EXPECT_NE(out.str().find("[FAIL]"), std::string::npos);
+    EXPECT_NE(out.str().find("CAN vehicle id=0x123 data=01"), std::string::npos);
+    EXPECT_NE(out.str().find("[0, 0] ms"), std::string::npos);
     EXPECT_NE(err.str().find("unmet CAN output expectation"), std::string::npos);
 }
 
@@ -709,9 +711,10 @@ TEST(WorldTest, RunNetworkEvaluatesGpioExpectationWithParallelLanes) {
     std::ostringstream out;
     std::ostringstream err;
     EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::runtime_error);
-    EXPECT_NE(out.str().find("parallel_lanes: 2"), std::string::npos);
+    EXPECT_EQ(fil::test::reportValue(out.str(), "parallel_lanes"), "2");
     EXPECT_NE(out.str().find("GPIO gpio-par-a.GPIOB pin 14 level 1"), std::string::npos);
-    EXPECT_NE(out.str().find("window_ms=[0,0]: fail"), std::string::npos);
+    EXPECT_NE(out.str().find("[FAIL]"), std::string::npos);
+    EXPECT_NE(out.str().find("[0, 0] ms"), std::string::npos);
     EXPECT_NE(err.str().find("unmet GPIO output expectation"), std::string::npos);
 }
 
@@ -765,12 +768,12 @@ TEST(WorldTest, NetworkDefaultsUseParallelLanesAndHundredMicrosecondWindows) {
         args.insert(args.end(), overrides[i].begin(), overrides[i].end());
         std::ostringstream out, err;
         ASSERT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::success) << err.str();
-        EXPECT_NE(out.str().find(i == 3U ? "cross_board_window_ns: 0\n"
-                                        : "cross_board_window_ns: 100000\n"), std::string::npos);
+        EXPECT_EQ(fil::test::reportValue(out.str(), "cross_board_window_ns"),
+                  i == 3U ? "0" : "100000");
         const bool parallel = (i == 0U || i == 2U)
             && std::thread::hardware_concurrency() > 1U;
-        EXPECT_NE(out.str().find(parallel ? "parallel_lanes: 2\n" : "parallel_lanes: 0\n"),
-                  std::string::npos);
+        EXPECT_EQ(fil::test::reportValue(out.str(), "parallel_lanes"),
+                  parallel ? "2" : "0");
         EXPECT_TRUE(err.str().empty());
     }
 }
@@ -814,8 +817,8 @@ TEST(WorldTest, ExecutesRunNetworkCli) {
         << "run CLI executes a fixture world";
     EXPECT_TRUE(out.str().find("network: fixture-network") != std::string::npos)
         << "run CLI prints an aggregate summary";
-    EXPECT_TRUE(out.str().find("board cli-alpha") != std::string::npos &&
-                out.str().find("board cli-beta") != std::string::npos)
+    EXPECT_TRUE(out.str().find("board: cli-alpha") != std::string::npos &&
+                out.str().find("board: cli-beta") != std::string::npos)
         << "run CLI prints per-board results";
     EXPECT_TRUE(err.str().empty()) << "successful run CLI has no error output";
     std::ifstream trace_input(trace_path, std::ios::binary);

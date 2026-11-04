@@ -185,12 +185,19 @@ parse_output() {
         {
             colon = index($0, ":")
             if (colon > 0) {
+                leading = match($0, /[^ ]/) - 1
                 key = substr($0, 1, colon - 1)
                 value = substr($0, colon + 1)
                 sub(/^[[:space:]]+/, "", key)
                 sub(/^[[:space:]]+/, "", value)
-                if (key == "instructions" || key == "cycles" || key == "time_ns")
+                if (leading != 2) next
+                if (key == "instructions" || key == "cycles") {
                     values[key] = value
+                } else if (key == "time" && match(value, /\([0-9]+ ns\)/)) {
+                    time_ns = substr(value, RSTART, RLENGTH)
+                    gsub(/[^0-9]/, "", time_ns)
+                    values["time_ns"] = time_ns
+                }
             }
         }
         END {

@@ -125,4 +125,4 @@ The trace is semantic, not an every-access bus log. There are no generic
 peripherals emit the side-effect events listed above. Explicit placeholder device
 blocks can emit `unknown_mmio_read` and `unknown_mmio_write`, while addresses handled
 by the top-level lenient MMIO router are aggregated in the CLI's
-`unknown_mmio_addresses` summary rather than written as individual trace records.
+`unknown_mmio` summary rather than written as individual trace records.

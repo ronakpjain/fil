@@ -329,38 +329,47 @@ run_network() {
 
     awk '
         {
-            separator = index($0, ": ")
+            separator = index($0, ":")
             if (separator > 0) {
+                leading = match($0, /[^ ]/) - 1
                 key = substr($0, 1, separator - 1)
-                value = substr($0, separator + 2)
-                if (key == "stop" || key == "boards" || key == "time_ns" ||
-                    key == "instructions" || key == "cycles" || key == "event_callbacks")
-                    summary[key] = value
-            }
-            if ($0 ~ /^clock: board=[^ ]+ hz=[0-9]+$/) {
-                name = $2; sub(/^board=/, "", name)
-                hz = $3; sub(/^hz=/, "", hz)
-                printf "C|%s|%s\n", name, hz
-            }
-            if ($0 ~ /^board .+: stop=[a-z-]+ instructions=[0-9]+ pc=0x[0-9a-fA-F]+$/) {
-                line = $0
-                sub(/^board /, "", line)
-                name = line
-                sub(/: stop=.*/, "", name)
-                fields = $0
-                sub(/^.*: stop=/, "", fields)
-                count = split(fields, pieces, " ")
-                reason = pieces[1]
-                instruction_count = pieces[2]
-                pc = pieces[3]
-                sub(/^instructions=/, "", instruction_count)
-                sub(/^pc=0x/, "", pc)
-                printf "B|%s|%s|%s|%s\n", name, reason, instruction_count, pc
+                value = substr($0, separator + 1)
+                sub(/^[[:space:]]+/, "", key)
+                sub(/[[:space:]]+$/, "", key)
+                sub(/^[[:space:]]+/, "", value)
+                sub(/[[:space:]]+$/, "", value)
+                if (leading == 2) {
+                    if (key == "board") {
+                        current = value
+                    } else if (key == "time" && match(value, /\([0-9]+ ns\)/)) {
+                        time_ns = substr(value, RSTART, RLENGTH)
+                        gsub(/[^0-9]/, "", time_ns)
+                        summary["time_ns"] = time_ns
+                    } else {
+                        summary[key] = value
+                    }
+                } else if (leading == 4 && current != "") {
+                    if (key == "stop") {
+                        board_stop[current] = value
+                    } else if (key == "instructions") {
+                        board_instructions[current] = value
+                    } else if (key == "pc") {
+                        board_pc[current] = value
+                    } else if (key == "clock") {
+                        hz = value
+                        sub(/ Hz$/, "", hz)
+                        board_clock[current] = hz
+                    }
+                }
             }
         }
         END {
             for (key in summary)
                 printf "S|%s|%s\n", key, summary[key]
+            for (name in board_stop)
+                printf "B|%s|%s|%s|%s\n", name, board_stop[name], board_instructions[name], board_pc[name]
+            for (name in board_clock)
+                printf "C|%s|%s\n", name, board_clock[name]
         }
     ' "$stdout_file" > "$raw_file"
 
@@ -379,6 +388,7 @@ run_network() {
                 board_stop[name] = $3
                 board_instructions[name] = $4 + 0
                 pc = tolower($5)
+                sub(/^0x/, "", pc)
                 sub(/^0+/, "", pc)
                 if (pc == "") pc = "0"
                 board_pc[name] = pc

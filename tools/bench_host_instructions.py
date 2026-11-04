@@ -142,31 +142,69 @@ def parse_callgrind(data):
     }
 
 
+# Human-readable JIT report groups map to the flat counter names used in reports.
+JIT_GROUP_PREFIX = {
+    "micro": "micro_",
+    "native": "native_",
+    "trace": "trace_",
+    "horizon": "trace_horizon_",
+    "blocks": "block_",
+    "spans": "span_",
+    "budget": "tb_",
+    "single": "single_",
+}
+JIT_COUNTER_ALIASES = {
+    ("micro", "cost_ns"): "micro_compile_cost_ns",
+    ("blocks", "span_ok"): "block_native_span_ok",
+    ("single", "block_generic"): "block_generic",
+}
+
+
 def parse_guest_counters(output):
     counters = {}
-    for key in ("instructions", "cycles", "time_ns"):
-        match = re.search(rf"^{key}: (\d+)$", output, re.MULTILINE)
+    for key in ("instructions", "cycles"):
+        match = re.search(rf"^  {key}: +([0-9]+)$", output, re.MULTILINE)
         if not match:
             raise ValueError(f"missing {key} in simulator output")
         counters[key] = int(match[1])
-    if not re.search(r"^stop: time-budget$", output, re.MULTILINE):
+    time_match = re.search(
+        r"^  time: +[0-9.]+ (?:ns|us|ms|s) \(([0-9]+) ns\)$", output, re.MULTILINE)
+    if not time_match:
+        raise ValueError("missing time in simulator output")
+    counters["time_ns"] = int(time_match[1])
+    if not re.search(r"^  stop: +time-budget$", output, re.MULTILINE):
         raise ValueError("run did not reach its time budget")
+
     boards = {}
-    for board, fields in re.findall(r"^jit: board=(\S+) (.*)$", output, re.MULTILINE):
-        if board in boards:
-            raise ValueError(f"duplicate JIT counters for board {board}")
-        values = {key: int(value) for key, value in re.findall(r"(\w+)=(\d+)", fields)}
-        required = {"native_instructions", "micro_instructions", "trace_instructions"}
-        if not required <= values.keys():
-            raise ValueError(f"missing JIT guest counters for board {board}")
+    current = None
+    for line in output.splitlines():
+        board_match = re.match(r"^ +board: +(\S+)$", line)
+        if board_match:
+            current = board_match.group(1)
+            boards.setdefault(current, {})
+            continue
+        group_match = re.match(
+            r"^ +(micro|native|trace|horizon|blocks|spans|budget|single): +(.*)$", line)
+        if group_match is None or current is None:
+            continue
+        group = group_match.group(1)
+        for key, value in re.findall(r"(\w+)=(\d+)", group_match.group(2)):
+            name = JIT_COUNTER_ALIASES.get(
+                (group, key), JIT_GROUP_PREFIX[group] + key)
+            boards[current][name] = int(value)
+
+    executed = {}
+    for board, values in boards.items():
+        for key in ("native_instructions", "micro_instructions", "trace_instructions"):
+            values.setdefault(key, 0)
         if values["trace_instructions"] > values["native_instructions"]:
             raise ValueError("trace instructions must be a subset of native instructions")
         # Native counters already include traces; never add trace_instructions.
-        boards[board] = values["native_instructions"] + values["micro_instructions"]
-    guest = sum(boards.values())
+        executed[board] = values["native_instructions"] + values["micro_instructions"]
+    guest = sum(executed.values())
     if guest <= 0 or guest > counters["instructions"]:
         raise ValueError("no valid JIT-executed guest instruction count")
-    return counters, boards
+    return counters, executed
 
 
 def measure(binary, args, label):
@@ -180,6 +218,7 @@ def measure(binary, args, label):
             str(binary.resolve()), "run", str(args.network.resolve()),
             "--duration", f"{args.duration_ms}ms", "--instruction-budget", "1000000000",
             "--quantum", "1024", "--strict-mmio", "--adc-decimation", "1",
+            "--jit-stats",
         ]
         with stdout_path.open("w") as stdout, stderr_path.open("w") as stderr:
             subprocess.run(command, stdout=stdout, stderr=stderr, check=True)

@@ -34,8 +34,6 @@ string(REPLACE "\r\n" "\n" normalized_stdout "${run_stdout}")
 set(padded_stdout "\n${normalized_stdout}\n")
 foreach(required_line IN ITEMS
     "network: per_vehicle_smoke"
-    "stop: time-budget"
-    "boards: 6"
 )
     string(FIND "${padded_stdout}" "\n${required_line}\n" line_position)
     if(line_position EQUAL -1)
@@ -46,9 +44,19 @@ foreach(required_line IN ITEMS
     endif()
 endforeach()
 
-string(REGEX MATCH "time_ns: ([0-9]+)" time_match "${normalized_stdout}")
+string(REGEX MATCH "\n  stop:[ ]+time-budget\n" stop_match "${padded_stdout}")
+if(stop_match STREQUAL "")
+    message(FATAL_ERROR "network smoke output is missing the time-budget stop\nstdout:\n${run_stdout}")
+endif()
+
+string(REGEX MATCH "\n  boards:[ ]+6\n" boards_match "${padded_stdout}")
+if(boards_match STREQUAL "")
+    message(FATAL_ERROR "network smoke output is missing a six-board count\nstdout:\n${run_stdout}")
+endif()
+
+string(REGEX MATCH "\\(([0-9]+) ns\\)" time_match "${normalized_stdout}")
 if(time_match STREQUAL "")
-    message(FATAL_ERROR "network smoke output is missing a numeric time_ns line\nstdout:\n${run_stdout}")
+    message(FATAL_ERROR "network smoke output is missing a numeric time line\nstdout:\n${run_stdout}")
 endif()
 set(stop_time_ns "${CMAKE_MATCH_1}")
 if(stop_time_ns LESS 20000000 OR stop_time_ns GREATER_EQUAL 21000000)
@@ -58,8 +66,8 @@ if(stop_time_ns LESS 20000000 OR stop_time_ns GREATER_EQUAL 21000000)
     )
 endif()
 
-string(REGEX MATCHALL "\nboard [^\n]*: stop=time-budget [^\n]*" board_stop_lines
-    "\n${normalized_stdout}")
+string(REGEX MATCHALL "\n    stop:[ ]+time-budget\n" board_stop_lines
+    "${normalized_stdout}")
 list(LENGTH board_stop_lines board_stop_count)
 if(NOT board_stop_count EQUAL 6)
     message(FATAL_ERROR
@@ -68,9 +76,12 @@ if(NOT board_stop_count EQUAL 6)
     )
 endif()
 
-string(FIND "${run_stdout}" "unknown_mmio:" unknown_detail_position)
-if(NOT unknown_detail_position EQUAL -1)
-    message(FATAL_ERROR "network smoke reported an unknown MMIO detail:\n${run_stdout}")
+string(REGEX MATCHALL "unknown_mmio:" mmio_lines "${normalized_stdout}")
+list(LENGTH mmio_lines mmio_line_count)
+if(NOT mmio_line_count EQUAL 0)
+    message(FATAL_ERROR
+        "network smoke reported ${mmio_line_count} unknown MMIO lines:\n${run_stdout}"
+    )
 endif()
 
 if(NOT EXISTS "${TRACE_FILE}")

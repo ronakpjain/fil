@@ -27,7 +27,8 @@ TEST(SmokeTest, HelpIsSuccessful) {
     EXPECT_NE(out.str().find("--adc-decimation"), std::string::npos);
     EXPECT_EQ(out.str().find("--deferred-prefixes"), std::string::npos);
     EXPECT_NE(out.str().find("trades fidelity for speed"), std::string::npos);
-    EXPECT_EQ(out.str().find("--jit"), std::string::npos);
+    EXPECT_EQ(out.str().find("--no-jit"), std::string::npos);
+    EXPECT_NE(out.str().find("--jit-stats"), std::string::npos);
 }
 
 /// @brief Verifies unknown commands produce a usage error.
@@ -123,10 +124,12 @@ TEST(SmokeTest, HonorsRunStopControls) {
         << "run rejects an unrequested firmware BKPT";
     EXPECT_TRUE(default_err.str().find("breakpoint") != std::string::npos)
         << "unrequested BKPT produces an explicit diagnostic";
+    EXPECT_TRUE(default_out.str().find("jit:") == std::string::npos)
+        << "JIT diagnostics stay hidden without --jit-stats";
 
     const std::string_view allowed_args[]{
         "run", config_text, "--duration", "0", "--instruction-budget", "20",
-        "--no-detect-spin", "--allow-breakpoint",
+        "--no-detect-spin", "--allow-breakpoint", "--jit-stats",
     };
     std::ostringstream allowed_out;
     std::ostringstream allowed_err;
@@ -134,17 +137,17 @@ TEST(SmokeTest, HonorsRunStopControls) {
         fil::cli::run(allowed_args, allowed_out, allowed_err) == fil::cli::ExitCode::success)
         << "--allow-breakpoint explicitly accepts a firmware BKPT";
     EXPECT_TRUE(allowed_err.str().empty()) << "an explicitly accepted BKPT has no error diagnostic";
-    EXPECT_NE(allowed_out.str().find("jit: board="), std::string::npos);
-    EXPECT_NE(allowed_out.str().find(" micro_compilations="), std::string::npos);
-    EXPECT_NE(allowed_out.str().find(" block_executions="), std::string::npos);
-    EXPECT_NE(allowed_out.str().find(" single_fast="), std::string::npos);
+    EXPECT_NE(allowed_out.str().find("jit:"), std::string::npos);
+    EXPECT_NE(allowed_out.str().find("single:"), std::string::npos);
+    EXPECT_NE(allowed_out.str().find("fast="), std::string::npos);
+    EXPECT_NE(allowed_out.str().find("generic="), std::string::npos);
 
     const std::string_view symbol_args[]{"run", config_text, "--stop-at-symbol", "Reset_Handler"};
     std::ostringstream symbol_out;
     std::ostringstream symbol_err;
     EXPECT_EQ(fil::cli::run(symbol_args, symbol_out, symbol_err), fil::cli::ExitCode::success);
-    EXPECT_NE(symbol_out.str().find("stop: target-reached"), std::string::npos);
-    EXPECT_NE(symbol_out.str().find("instructions: 0"), std::string::npos);
+    EXPECT_EQ(fil::test::reportValue(symbol_out.str(), "stop"), "target-reached");
+    EXPECT_EQ(fil::test::reportValue(symbol_out.str(), "instructions"), "0");
     EXPECT_TRUE(symbol_err.str().empty());
 
     const std::string_view missing_symbol_args[]{

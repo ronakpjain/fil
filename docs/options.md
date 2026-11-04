@@ -30,6 +30,12 @@ and their sample, DMA, and interrupt effects.
 
 `serve` supports stdio only; it does not take a transport option.
 
+Run prints an indented human-readable report: the first line names the board or
+network, summary fields are aligned underneath it, and each network board appears
+in its own `board:` section. Simulated time is shown with a unit and the exact
+nanosecond count. Stimulus expectations print as a dedicated block after the
+summary, with failures first; `--jit-stats` adds opt-in internal JIT counters.
+
 ```bash
 fil run board.json --duration 1s
 fil run network.json --duration 1s --strict-mmio
@@ -45,6 +51,7 @@ fil run network.json --duration 1s --strict-mmio
 | `--detect-spin` | Stop on proven repeated CPU state; off by default. Can stop legitimate idle loops. `--no-detect-spin` restores the default. |
 | `--allow-breakpoint` | Accept a firmware breakpoint as a successful stop; off by default. |
 | `--adc-decimation N` | Explicit fidelity-for-speed tradeoff; default 1. |
+| `--jit-stats` | Print internal JIT counter groups (debug only) in the run report; off by default. |
 
 Board-only stop controls: `--stop-address ADDR` or `--stop-at-symbol NAME`.
 If both are supplied, the symbol takes precedence.

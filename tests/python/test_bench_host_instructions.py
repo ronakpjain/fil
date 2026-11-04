@@ -33,6 +33,46 @@ fn=(4)
 """
 
 
+class GuestCounterParsingTest(unittest.TestCase):
+    REPORT = """network: per_vehicle
+  stop:                  time-budget
+  boards:                2
+  instructions:          815098
+  cycles:                1920004
+  time:                  20.000 ms (20000000 ns)
+
+  board: dashboard
+    stop:         time-budget
+    instructions: 132339
+    pc:           0x0800670a
+    clock:        16000000 Hz
+    jit:
+      native: compilations=85 executions=421 instructions=129075
+      single: fast=2 generic=1
+
+  board: main_module
+    stop:         time-budget
+    instructions: 134342
+    pc:           0x080040ca
+    clock:        16000000 Hz
+    jit:
+      native: compilations=47 executions=402 instructions=129755
+"""
+
+    def test_report_groups_map_to_flat_guest_counters(self):
+        counters, boards = BENCH.parse_guest_counters(self.REPORT)
+        self.assertEqual(counters, {
+            "instructions": 815098, "cycles": 1920004, "time_ns": 20000000})
+        self.assertEqual(boards, {"dashboard": 129075, "main_module": 129755})
+
+    def test_hidden_jit_stats_still_fail_closed(self):
+        without_stats = "\n".join(
+            line for line in self.REPORT.splitlines()
+            if not line.lstrip().startswith(("jit:", "native:", "single:")))
+        with self.assertRaisesRegex(ValueError, "no valid JIT-executed guest"):
+            BENCH.parse_guest_counters(without_stats)
+
+
 class HostInstructionAccountingTest(unittest.TestCase):
     def test_object_dictionary_can_be_defined_by_callee(self):
         result = BENCH.parse_callgrind(PROFILE)

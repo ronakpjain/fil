@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -84,6 +85,40 @@ inline config::BoardConfig fixtureBoardConfig(const std::string_view name = "fix
         / "tests/fixtures/elf/split_image.elf";
     config.vector_base = 0x08000000U;
     return config;
+}
+
+/**
+ * @brief Finds the trimmed value of the first `key:` line in a report.
+ *
+ * @param text Complete CLI output.
+ * @param key Field name without the colon.
+ * @return Trimmed value, or nothing when the key is absent.
+ */
+inline std::optional<std::string> reportValue(
+    const std::string_view text,
+    const std::string_view key
+) {
+    std::size_t line_start = 0U;
+    while (line_start <= text.size()) {
+        std::size_t line_end = text.find('\n', line_start);
+        if (line_end == std::string_view::npos) line_end = text.size();
+        const std::string_view line = text.substr(line_start, line_end - line_start);
+        const std::size_t colon = line.find(':');
+        if (colon != std::string_view::npos) {
+            std::string_view name = line.substr(0U, colon);
+            while (!name.empty() && name.front() == ' ') name.remove_prefix(1U);
+            while (!name.empty() && name.back() == ' ') name.remove_suffix(1U);
+            if (name == key) {
+                std::string_view value = line.substr(colon + 1U);
+                while (!value.empty() && value.front() == ' ') value.remove_prefix(1U);
+                while (!value.empty() && value.back() == ' ') value.remove_suffix(1U);
+                return std::string(value);
+            }
+        }
+        if (line_end == text.size()) break;
+        line_start = line_end + 1U;
+    }
+    return std::nullopt;
 }
 
 } // namespace fil::test
