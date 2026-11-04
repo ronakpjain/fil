@@ -52,35 +52,54 @@ Result<void> FrameDecoder::append(const std::span<const std::uint8_t> bytes) {
 }
 
 Result<std::optional<Frame>> FrameDecoder::next() {
-    if (bytes_.size() < header_size) return std::optional<Frame>{};
+    switch (phase_) {
+    case Phase::header: {
+        if (bytes_.size() < header_size) return std::optional<Frame>{};
 
-    const std::span<const std::uint8_t> view{bytes_};
-    for (std::size_t index = 0U; index < magic.size(); ++index) {
-        if (view[index] != magic[index]) return parseError("invalid stdio protocol magic");
+        const std::span<const std::uint8_t> view{bytes_};
+        for (std::size_t index = 0U; index < magic.size(); ++index) {
+            if (view[index] != magic[index]) return parseError("invalid stdio protocol magic");
+        }
+        if (view[4U] != protocol_version) return parseError("unsupported stdio protocol version");
+        if (readU16(view, 6U) != 0U) {
+            return parseError("stdio protocol flags must be zero in version 1");
+        }
+
+        payload_size_ = readU32(view, 8U);
+        if (payload_size_ > maximum_payload_size) {
+            return parseError("stdio protocol payload exceeds the 64 KiB limit");
+        }
+        phase_ = Phase::payload;
+        [[fallthrough]];
     }
-    if (view[4U] != protocol_version) return parseError("unsupported stdio protocol version");
-    if (readU16(view, 6U) != 0U) return parseError("stdio protocol flags must be zero in version 1");
+    case Phase::payload: {
+        const std::size_t frame_size = header_size + payload_size_;
+        if (bytes_.size() < frame_size) return std::optional<Frame>{};
 
-    const std::uint32_t payload_size = readU32(view, 8U);
-    if (payload_size > maximum_payload_size) {
-        return parseError("stdio protocol payload exceeds the 64 KiB limit");
+        Frame frame;
+        frame.kind = static_cast<MessageKind>(bytes_[5U]);
+        frame.request_id = readU32(bytes_, 12U);
+        frame.payload.assign(
+            bytes_.begin() + static_cast<std::ptrdiff_t>(header_size),
+            bytes_.begin() + static_cast<std::ptrdiff_t>(frame_size)
+        );
+        bytes_.erase(bytes_.begin(), bytes_.begin() + static_cast<std::ptrdiff_t>(frame_size));
+        payload_size_ = 0U;
+        phase_ = Phase::header;
+        return std::optional<Frame>{std::move(frame)};
     }
-    const std::size_t frame_size = header_size + static_cast<std::size_t>(payload_size);
-    if (bytes_.size() < frame_size) return std::optional<Frame>{};
-
-    Frame frame;
-    frame.kind = static_cast<MessageKind>(view[5U]);
-    frame.request_id = readU32(view, 12U);
-    frame.payload.assign(
-        bytes_.begin() + static_cast<std::ptrdiff_t>(header_size),
-        bytes_.begin() + static_cast<std::ptrdiff_t>(frame_size)
-    );
-    bytes_.erase(bytes_.begin(), bytes_.begin() + static_cast<std::ptrdiff_t>(frame_size));
-    return std::optional<Frame>{std::move(frame)};
+    }
+    return std::optional<Frame>{};
 }
 
 Result<void> FrameDecoder::finish() const {
-    if (!bytes_.empty()) return parseError("truncated stdio protocol frame at end of input");
+    switch (phase_) {
+    case Phase::header:
+        if (!bytes_.empty()) return parseError("truncated stdio protocol frame at end of input");
+        return {};
+    case Phase::payload:
+        return parseError("truncated stdio protocol frame at end of input");
+    }
     return {};
 }
 

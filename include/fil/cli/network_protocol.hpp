@@ -47,12 +47,23 @@ struct Frame {
  */
 class FrameDecoder {
 public:
+    /** @brief Explicit incremental decode phase. */
+    enum class Phase : std::uint8_t {
+        header,  ///< Waiting for or validating the 16-byte header.
+        payload, ///< Header validated; awaiting payload_size_ payload bytes.
+    };
+
     [[nodiscard]] Result<void> append(std::span<const std::uint8_t> bytes);
     [[nodiscard]] Result<std::optional<Frame>> next();
     [[nodiscard]] Result<void> finish() const;
 
+    /** @brief Current decode phase, for diagnostics. */
+    [[nodiscard]] Phase phase() const noexcept { return phase_; }
+
 private:
     std::vector<std::uint8_t> bytes_;
+    std::size_t payload_size_{0U};
+    Phase phase_{Phase::header};
 };
 
 /** @brief Writes one complete v1 frame and flushes the stream. */
