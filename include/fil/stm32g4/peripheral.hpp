@@ -739,6 +739,28 @@ private:
     void cancelConversion() noexcept;
     [[nodiscard]] std::uint64_t conversionCycleBudget(std::uint32_t rank) const noexcept;
 
+    /** @brief Explicit conversion-engine state; payload fields stay separate. */
+    enum class ConversionState : std::uint8_t {
+        idle,          ///< No armed conversion or held progress.
+        scheduled,     ///< Deadline armed with a completion event.
+        lazy,          ///< Deadline armed without an event; observed lazily.
+        skipped_gap,   ///< Completion event collapses an unobserved decimation gap.
+        lazy_gap,      ///< Gap deadline without an event; observed lazily.
+        suspended,     ///< Clock stopped; remaining progress held in the suspended fields.
+        suspended_gap, ///< Suspended decimation-gap progress.
+    };
+    /** @brief Whether the current state owns an armed completion event. */
+    [[nodiscard]] bool conversionEventArmed() const noexcept {
+        return conversion_state_ == ConversionState::scheduled
+            || conversion_state_ == ConversionState::skipped_gap;
+    }
+    /** @brief Whether the armed progress is a decimation-gap collapse. */
+    [[nodiscard]] bool conversionIsGap() const noexcept {
+        return conversion_state_ == ConversionState::skipped_gap
+            || conversion_state_ == ConversionState::lazy_gap
+            || conversion_state_ == ConversionState::suspended_gap;
+    }
+
     std::array<std::uint16_t, 20> channel_values_{};
     std::bitset<20U> channel_overrides_{};
     ChannelProvider channel_provider_;
@@ -762,7 +784,7 @@ private:
     std::uint64_t suspended_conversion_cycles_{0U};
     sim::SimTimeNs suspended_override_ns_{0U};
     bool reset_held_{false};
-    bool skipped_scan_event_{false};
+    ConversionState conversion_state_{ConversionState::idle};
     std::uint32_t skipped_scan_count_{0U};
     bool sample_history_enabled_{true};
     std::vector<AdcSample> samples_;

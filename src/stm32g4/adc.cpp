@@ -208,7 +208,9 @@ void AdcPeripheral::setInputClockHz(const std::uint64_t frequency_hz) {
 
     synchronizeLazyConversions();
     if (next_hz == 0U) {
-        if (next_conversion_ns_) {
+        const bool armed = next_conversion_ns_.has_value();
+        const bool gap = conversionIsGap();
+        if (armed) {
             const sim::SimTimeNs now = currentTime();
             const sim::SimTimeNs remaining_ns = *next_conversion_ns_ > now
                 ? *next_conversion_ns_ - now : 0U;
@@ -224,11 +226,15 @@ void AdcPeripheral::setInputClockHz(const std::uint64_t frequency_hz) {
         conversion_event_.cancel();
         next_conversion_ns_.reset();
         input_clock_hz_ = 0U;
+        conversion_state_ = armed
+            ? (gap ? ConversionState::suspended_gap : ConversionState::suspended)
+            : ConversionState::idle;
         return;
     }
     const std::uint64_t previous_hz = input_clock_hz_;
     const sim::SimTimeNs now = currentTime();
-    const bool event_pending = conversion_event_.pending();
+    const bool gap = conversionIsGap();
+    const bool event_pending = conversionEventArmed();
     std::optional<sim::SimTimeNs> rescheduled_time;
     if (suspended_override_ns_ != 0U) {
         if (suspended_override_ns_ > std::numeric_limits<sim::SimTimeNs>::max() - now)
@@ -269,11 +275,16 @@ void AdcPeripheral::setInputClockHz(const std::uint64_t frequency_hz) {
 
     if (event_pending) conversion_event_.cancel();
     input_clock_hz_ = next_hz;
-    if (rescheduled_time) next_conversion_ns_ = *rescheduled_time;
+    if (rescheduled_time) {
+        next_conversion_ns_ = *rescheduled_time;
+        conversion_state_ = gap ? ConversionState::skipped_gap : ConversionState::scheduled;
+    }
     if (!next_conversion_ns_ && (registerValue(cr) & adstart) != 0U) {
         const sim::SimTimeNs delay = conversionDelayForRank(sequence_rank_);
-        if (delay <= std::numeric_limits<sim::SimTimeNs>::max() - now)
+        if (delay <= std::numeric_limits<sim::SimTimeNs>::max() - now) {
             next_conversion_ns_ = now + delay;
+            conversion_state_ = ConversionState::scheduled;
+        }
     }
     if (event_pending || rescheduled_time || next_conversion_ns_) refreshConversionScheduling();
 }
@@ -440,6 +451,7 @@ void AdcPeripheral::startConversion() {
     if (input_clock_hz_ == 0U) {
         if (conversion_delay_override_ns_ != 0U) suspended_override_ns_ = conversion_delay_override_ns_;
         else suspended_conversion_cycles_ = conversionCycleBudget(sequence_rank_);
+        conversion_state_ = ConversionState::suspended;
         return;
     }
     if (eventLoop() == nullptr) {
@@ -482,11 +494,12 @@ void AdcPeripheral::completeConversion() {
         armNextConversion(currentTime() + delay);
     } else {
         setRegister(cr, registerValue(cr) & ~adstart);
+        conversion_state_ = ConversionState::idle;
     }
 }
 
 void AdcPeripheral::completeSkippedScans(const std::uint32_t skipped) {
-    skipped_scan_event_ = false;
+    conversion_state_ = ConversionState::idle;
     skipped_scan_count_ = 0U;
     sequence_rank_ = 0U;
     scan_index_ += skipped;
@@ -497,9 +510,13 @@ void AdcPeripheral::beginNextScan() {
     sequence_rank_ = 0U;
     if (!continuousMode() || (registerValue(cr) & adstart) == 0U) {
         setRegister(cr, registerValue(cr) & ~adstart);
+        conversion_state_ = ConversionState::idle;
         return;
     }
-    if (input_clock_hz_ == 0U) return;
+    if (input_clock_hz_ == 0U) {
+        conversion_state_ = ConversionState::idle;
+        return;
+    }
     // Jump the whole decimated gap in one event: scans scan_index_ .. the
     // next kept scan are unobservable while skipped, so their internal
     // event granularity collapses. The span repeats the live scan period;
@@ -542,7 +559,7 @@ void AdcPeripheral::armSkippedScans(const std::uint32_t count) {
         return;
     }
     next_conversion_ns_ = now + count * period;
-    skipped_scan_event_ = true;
+    conversion_state_ = ConversionState::skipped_gap;
     skipped_scan_count_ = count;
     refreshConversionScheduling();
 }
@@ -578,10 +595,21 @@ void AdcPeripheral::materializeConversion(
 }
 
 void AdcPeripheral::synchronizeLazyConversions() {
-    if (conversion_event_.pending() || !next_conversion_ns_) return;
+    switch (conversion_state_) {
+    case ConversionState::lazy:
+    case ConversionState::lazy_gap:
+        break;
+    case ConversionState::idle:
+    case ConversionState::scheduled:
+    case ConversionState::skipped_gap:
+    case ConversionState::suspended:
+    case ConversionState::suspended_gap:
+        return;
+    }
+    if (!next_conversion_ns_) return;
     const sim::SimTimeNs now = currentTime();
     if (now < *next_conversion_ns_) return;
-    if (skipped_scan_event_) {
+    if (conversion_state_ == ConversionState::lazy_gap) {
         const std::uint32_t skipped = skipped_scan_count_;
         next_conversion_ns_.reset();
         completeSkippedScans(skipped);
@@ -597,22 +625,43 @@ void AdcPeripheral::synchronizeLazyConversions() {
 
     if (latest > std::numeric_limits<sim::SimTimeNs>::max() - delay) {
         next_conversion_ns_.reset();
+        conversion_state_ = ConversionState::idle;
     } else {
         next_conversion_ns_ = latest + delay;
     }
 }
 
 void AdcPeripheral::refreshConversionScheduling() {
+    switch (conversion_state_) {
+    case ConversionState::idle:
+    case ConversionState::suspended:
+    case ConversionState::suspended_gap:
+        return;
+    case ConversionState::scheduled:
+    case ConversionState::skipped_gap:
+    case ConversionState::lazy:
+    case ConversionState::lazy_gap:
+        break;
+    }
     if (!next_conversion_ns_) return;
+    const bool gap = conversionIsGap();
     if (lazyConversionEligible()) {
         conversion_event_.cancel();
+        conversion_state_ = gap ? ConversionState::lazy_gap : ConversionState::lazy;
         return;
     }
+    if (eventLoop() == nullptr) {
+        // Without a loop no completion event can be armed; observe lazily.
+        conversion_state_ = gap ? ConversionState::lazy_gap : ConversionState::lazy;
+        return;
+    }
+    conversion_state_ = gap ? ConversionState::skipped_gap : ConversionState::scheduled;
     if (!conversion_event_.pending()) scheduleConversionEvent();
 }
 
 void AdcPeripheral::armNextConversion(const sim::SimTimeNs completion_time) {
     next_conversion_ns_ = completion_time;
+    conversion_state_ = ConversionState::scheduled;
     refreshConversionScheduling();
 }
 
@@ -620,6 +669,7 @@ void AdcPeripheral::conversionEventThunk(void* context) {
     auto* adc = static_cast<AdcPeripheral*>(context);
     adc->conversion_event_.retireInvocation();
     adc->next_conversion_ns_.reset();
+    adc->conversion_state_ = ConversionState::idle;
     adc->completeConversion();
 }
 
@@ -628,15 +678,25 @@ void AdcPeripheral::skippedScanEventThunk(void* context) {
     adc->conversion_event_.retireInvocation();
     const std::uint32_t skipped = adc->skipped_scan_count_;
     adc->next_conversion_ns_.reset();
+    adc->conversion_state_ = ConversionState::idle;
     adc->completeSkippedScans(skipped);
 }
 
 void AdcPeripheral::scheduleConversionEvent() {
     if (eventLoop() == nullptr || !next_conversion_ns_) return;
-    if (skipped_scan_event_) {
+    switch (conversion_state_) {
+    case ConversionState::skipped_gap:
         static_cast<void>(conversion_event_.scheduleOwnerLocalBuiltinAt(
             *next_conversion_ns_, {&AdcPeripheral::skippedScanEventThunk, this},
             [this]() { return ownerLocalTrusted(); }));
+        return;
+    case ConversionState::scheduled:
+        break;
+    case ConversionState::idle:
+    case ConversionState::lazy:
+    case ConversionState::lazy_gap:
+    case ConversionState::suspended:
+    case ConversionState::suspended_gap:
         return;
     }
     static_cast<void>(conversion_event_.scheduleOwnerLocalBuiltinAt(
@@ -649,8 +709,8 @@ void AdcPeripheral::cancelConversion() noexcept {
     suspended_conversion_cycles_ = 0U;
     suspended_override_ns_ = 0U;
     next_conversion_ns_.reset();
-    skipped_scan_event_ = false;
     skipped_scan_count_ = 0U;
+    conversion_state_ = ConversionState::idle;
 }
 
 } // namespace fil::stm32g4
