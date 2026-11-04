@@ -250,6 +250,9 @@ void FdcanPeripheral::detachBus() noexcept {
         bus_->cancelSender(bus_node_id_);
         bus_->detach(bus_node_id_);
         setRegister(txbrp, 0U);
+        for (auto& state : tx_buffer_state_) {
+            if (state == TxBufferState::pending) state = TxBufferState::idle;
+        }
         updateTxFifoStatus();
     }
     bus_ = nullptr;
@@ -273,8 +276,52 @@ void FdcanPeripheral::setInterruptLineCallback(const std::uint32_t line,
 }
 
 bool FdcanPeripheral::operational() const noexcept {
-    const std::uint32_t control = registerValue(cccr);
-    return (control & (cccrInit | cccrCsr | cccrCsa)) == 0U;
+    switch (controller_mode_) {
+    case ControllerMode::normal:
+        return true;
+    case ControllerMode::initialization:
+    case ControllerMode::sleep:
+        return false;
+    }
+    return false;
+}
+
+void FdcanPeripheral::applyControllerControl(const std::uint32_t value) {
+    std::uint32_t control = value & cccr_writable_mask;
+    if ((control & cccrCsr) != 0U) {
+        control |= cccrInit | cccrCsa;
+    } else {
+        control &= ~cccrCsa;
+    }
+    if ((control & cccrInit) == 0U) {
+        control &= ~cccrCce;
+    }
+    setRegister(cccr, control);
+    const bool initialization = (control & cccrInit) != 0U;
+    const bool sleep = (control & cccrCsr) != 0U;
+    switch (controller_mode_) {
+    case ControllerMode::normal:
+        if (sleep) controller_mode_ = ControllerMode::sleep;
+        else if (initialization) controller_mode_ = ControllerMode::initialization;
+        break;
+    case ControllerMode::initialization:
+        if (sleep) controller_mode_ = ControllerMode::sleep;
+        else if (!initialization) controller_mode_ = ControllerMode::normal;
+        break;
+    case ControllerMode::sleep:
+        if (!sleep) {
+            controller_mode_ = initialization
+                ? ControllerMode::initialization
+                : ControllerMode::normal;
+        }
+        break;
+    }
+}
+
+void FdcanPeripheral::setTxBufferState(
+    const std::uint32_t buffer_index, const TxBufferState state
+) noexcept {
+    if (buffer_index < tx_buffer_state_.size()) tx_buffer_state_[buffer_index] = state;
 }
 
 FdcanPeripheral::FilterDecision
@@ -438,6 +485,7 @@ bool FdcanPeripheral::transmitBuffer(const std::uint32_t buffer_index) {
     const std::uint32_t buffer_bit = 1U << buffer_index;
     if (!devices::validate(frame)) {
         setRegister(txbrp, registerValue(txbrp) & ~buffer_bit);
+        setTxBufferState(buffer_index, TxBufferState::idle);
         updateTxFifoStatus();
         setInterruptFlags(interrupt_protocol_arbitration_error);
         return false;
@@ -452,6 +500,7 @@ bool FdcanPeripheral::transmitBuffer(const std::uint32_t buffer_index) {
             } else {
                 const std::uint32_t bit = 1U << buffer_index;
                 setRegister(txbrp, registerValue(txbrp) & ~bit);
+                setTxBufferState(buffer_index, TxBufferState::idle);
                 updateTxFifoStatus();
                 setInterruptFlags(interrupt_protocol_arbitration_error);
             }
@@ -467,6 +516,7 @@ bool FdcanPeripheral::transmitBuffer(const std::uint32_t buffer_index) {
         }
         if (!sent) {
             setRegister(txbrp, registerValue(txbrp) & ~buffer_bit);
+            setTxBufferState(buffer_index, TxBufferState::idle);
             updateTxFifoStatus();
             setInterruptFlags(interrupt_protocol_arbitration_error);
             return false;
@@ -481,10 +531,12 @@ void FdcanPeripheral::completeTransmission(const std::uint32_t buffer_index,
                                             const std::uint64_t generation,
                                             const devices::CanFrame& frame) {
     if (tx_generation_[buffer_index] != generation) return;
+    // Canceled or reset ownership leaves the buffer out of the pending state.
+    if (tx_buffer_state_[buffer_index] != TxBufferState::pending) return;
     const std::uint32_t buffer_bit = 1U << buffer_index;
-    if ((registerValue(txbrp) & buffer_bit) == 0U) return; // canceled/reset ownership
     setRegister(txbrp, registerValue(txbrp) & ~buffer_bit);
     setRegister(txbto, registerValue(txbto) | buffer_bit);
+    setTxBufferState(buffer_index, TxBufferState::complete);
     updateTxFifoStatus();
     if ((registerValue(txbtie) & buffer_bit) != 0U) setInterruptFlags(interruptTransmissionComplete);
     const std::string_view tx_trace_type = bus_ != nullptr
@@ -623,16 +675,7 @@ void FdcanPeripheral::storeRegister(const std::uint32_t word_offset, const std::
                                     const mem::AccessContext& context) {
     static_cast<void>(context);
     if (word_offset == cccr) {
-        std::uint32_t control = value & cccr_writable_mask;
-        if ((control & cccrCsr) != 0U) {
-            control |= cccrInit | cccrCsa;
-        } else {
-            control &= ~cccrCsa;
-        }
-        if ((control & cccrInit) == 0U) {
-            control &= ~cccrCce;
-        }
-        setRegister(cccr, control);
+        applyControllerControl(value);
     } else if (word_offset == ir) {
         const std::uint32_t cleared = value & write_mask & interrupt_mask;
         setRegister(ir, previous & ~cleared);
@@ -662,11 +705,13 @@ void FdcanPeripheral::storeRegister(const std::uint32_t word_offset, const std::
         for (std::uint32_t buffer = 0; buffer < FdcanMessageRam::txFifoElementCount; ++buffer) {
             const std::uint32_t buffer_bit = 1U << buffer;
             const std::uint32_t pending = registerValue(txbrp);
-            if ((requests & buffer_bit) == 0U || (pending & buffer_bit) != 0U) {
+            if ((requests & buffer_bit) == 0U
+                || tx_buffer_state_[buffer] == TxBufferState::pending) {
                 continue;
             }
             if (pending == 0U) tx_get_index_ = static_cast<std::uint8_t>(buffer);
             setRegister(txbrp, pending | buffer_bit);
+            setTxBufferState(buffer, TxBufferState::pending);
             tx_put_index_ = static_cast<std::uint8_t>(
                 (buffer + 1U) % FdcanMessageRam::txFifoElementCount);
             updateTxFifoStatus();
@@ -692,6 +737,8 @@ void FdcanPeripheral::onReset() {
     rx_message_lost_ = false;
     tx_get_index_ = 0;
     tx_put_index_ = 0;
+    controller_mode_ = ControllerMode::initialization;
+    tx_buffer_state_.fill(TxBufferState::idle);
     interrupt_line_asserted_.reset();
     setRegister(cccr, cccrInit);
     setRegister(ir, 0);

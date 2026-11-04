@@ -218,7 +218,24 @@ private:
         std::uint8_t index{0x7fU};
     };
 
+    /** @brief Explicit M_CAN controller mode driven by CCCR.INIT/CSR. */
+    enum class ControllerMode : std::uint8_t {
+        initialization, ///< INIT set and clock-stop not requested.
+        normal,         ///< INIT and CSR clear; frames may be received and transmitted.
+        sleep,          ///< Clock-stop requested (CSR, with INIT and CSA set).
+    };
+    /** @brief Explicit per-TX-buffer lifecycle. */
+    enum class TxBufferState : std::uint8_t {
+        idle,     ///< Free or canceled; absent from TXBRP and TXBTO.
+        pending,  ///< Requested and awaiting bus completion; TXBRP set.
+        complete, ///< Transmitted successfully; TXBTO set.
+    };
+
     [[nodiscard]] FilterDecision filter(const devices::CanFrame& frame) const noexcept;
+    /** @brief Applies a CCCR write and its INIT/CSR/CCE side effects. */
+    void applyControllerControl(std::uint32_t value);
+    /** @brief Updates one TX buffer's explicit lifecycle state. */
+    void setTxBufferState(std::uint32_t buffer_index, TxBufferState state) noexcept;
     [[nodiscard]] bool transmitBuffer(std::uint32_t buffer_index);
     void completeTransmission(std::uint32_t buffer_index, std::uint64_t generation,
                               const devices::CanFrame& frame);
@@ -233,12 +250,14 @@ private:
     std::uint32_t instance_index_{0};
     devices::VirtualCanBus* bus_{nullptr};
     devices::VirtualCanBus::NodeId bus_node_id_{0};
+    ControllerMode controller_mode_{ControllerMode::initialization};
     std::uint8_t rx_fill_level_{0};
     std::uint8_t rx_get_index_{0};
     std::uint8_t rx_put_index_{0};
     bool rx_message_lost_{false};
     std::uint8_t tx_get_index_{0};
     std::uint8_t tx_put_index_{0};
+    std::array<TxBufferState, FdcanMessageRam::txFifoElementCount> tx_buffer_state_{};
     std::array<std::uint64_t, FdcanMessageRam::txFifoElementCount> tx_generation_{};
     InterruptCallback interrupt_callback_;
     std::array<LineInterruptCallback, 2> line_interrupt_callbacks_{};
