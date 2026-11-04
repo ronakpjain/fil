@@ -6,7 +6,9 @@ but is not cycle-accurate hardware.
 
 ## Build and run
 
-Requires CMake 3.20+, a C++20 compiler, and GoogleTest for tests.
+Requires CMake 3.20+, a C++20 compiler, and GoogleTest for tests. The default
+`make` target is tuned for fast iteration (Ninja when available, ccache when
+installed, no IPO); `make release` builds the fully optimized binary.
 
 ```bash
 make
@@ -64,7 +66,8 @@ against the non-capsule path on real firmware; see the known issue in
 [Performance](docs/performance.md).
 Prepared instruction blocks, bounded scheduler bursts, and eligible
 guarded RAM capsules on network commands reduce host overhead.
-Release builds use IPO when supported. Makefile builds also enable host CPU
+`make release` uses IPO when supported; the default `make` build skips IPO so
+incremental links stay fast. Makefile builds also enable host CPU
 tuning by default; use `NATIVE=OFF` for portable binaries. Optional `make pgo`
 trains on a representative workload and retains the same CPU-tuning setting.
 

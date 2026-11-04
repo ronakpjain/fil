@@ -39,6 +39,7 @@ option(FIL_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(FIL_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
 option(FIL_ENABLE_IPO "Enable supported interprocedural optimization in non-sanitized builds" ON)
 option(FIL_ENABLE_NATIVE "Optimize for the build host CPU (non-portable binaries)" OFF)
+option(FIL_ENABLE_PCH "Precompile common standard-library headers for faster compiles" ON)
 option(FIL_ENABLE_MICRO_JIT "Build the bespoke FilIR stencil JIT backend" ON)
 option(FIL_MICRO_JIT_DUMP "Enable debug output of emitted micro-JIT words" OFF)
 option(FIL_PGO_GENERATE "Instrument a Clang build to generate a PGO profile" OFF)
@@ -57,6 +58,117 @@ if((FIL_PGO_GENERATE OR FIL_PGO_PROFILE)
 endif()
 if(FIL_PGO_PROFILE AND NOT EXISTS "${FIL_PGO_PROFILE}")
     message(FATAL_ERROR "FIL_PGO_PROFILE does not exist: ${FIL_PGO_PROFILE}")
+endif()
+
+# --- Build speed -------------------------------------------------------------
+# A precompiled header removes repeated standard-library parsing from every
+# translation unit. It deliberately contains only standard headers, so editing
+# a project header does not invalidate it. Restricted to Clang, the toolchain
+# used for development, where PCH + IPO + ccache are verified together. PGO
+# builds skip the PCH because the profile flow is sensitive to exact per-TU
+# instrumentation.
+set(FIL_PCH_HEADERS
+    <algorithm>
+    <array>
+    <atomic>
+    <bit>
+    <bitset>
+    <chrono>
+    <cstddef>
+    <cstdint>
+    <cstring>
+    <deque>
+    <filesystem>
+    <fstream>
+    <functional>
+    <iomanip>
+    <limits>
+    <map>
+    <memory>
+    <mutex>
+    <optional>
+    <span>
+    <sstream>
+    <stdexcept>
+    <string>
+    <string_view>
+    <thread>
+    <unordered_map>
+    <utility>
+    <variant>
+    <vector>
+)
+
+set(FIL_USE_PCH OFF)
+if(FIL_ENABLE_PCH
+    AND CMAKE_CXX_COMPILER_ID MATCHES "^(AppleClang|Clang)$"
+    AND NOT FIL_PGO_GENERATE
+    AND NOT FIL_PGO_PROFILE)
+    set(FIL_USE_PCH ON)
+endif()
+
+# Clang records include mtimes in a precompiled header, so the PCH bytes (and
+# with them every ccache entry for PCH-using translation units) would differ on
+# each fresh configure. Reproducible PCHs keep ccache hits across build trees.
+set(FIL_PCH_COMPILE_OPTIONS "")
+if(FIL_USE_PCH)
+    set(FIL_PCH_COMPILE_OPTIONS -Xclang -fno-pch-timestamp)
+endif()
+
+# Reuse ccache/sccache when it is installed. A compiler path that already
+# resolves to a cache wrapper (for example a ~/.local/bin/c++ symlink) must not
+# be wrapped a second time, so only the environment is prefixed in that case.
+set(FIL_COMPILER_CACHE OFF)
+if(NOT MSVC)
+    find_program(FIL_CCACHE_PROGRAM NAMES ccache sccache)
+    if(FIL_CCACHE_PROGRAM)
+        file(REAL_PATH "${CMAKE_CXX_COMPILER}" FIL_CXX_COMPILER_REAL)
+        get_filename_component(FIL_CXX_COMPILER_REAL_NAME "${FIL_CXX_COMPILER_REAL}" NAME)
+        if(FIL_CXX_COMPILER_REAL_NAME MATCHES "^(ccache|sccache)")
+            set(FIL_COMPILER_CACHE ON)
+        endif()
+    endif()
+endif()
+
+# ccache only caches translation units that use a precompiled header when the
+# pch_defines and time_macros sloppiness settings are active. The PCH here is
+# standard-library only (no __DATE__/__TIME__/project macros), so the sloppy
+# settings are safe, and `cmake -E env` supplies them without requiring every
+# developer to export them. An explicit CCACHE_SLOPPINESS from the environment
+# is preserved and extended.
+set(FIL_CCACHE_SLOPPINESS "pch_defines,time_macros")
+if(DEFINED ENV{CCACHE_SLOPPINESS} AND NOT "$ENV{CCACHE_SLOPPINESS}" STREQUAL "")
+    if("$ENV{CCACHE_SLOPPINESS}" MATCHES "pch_defines")
+        set(FIL_CCACHE_SLOPPINESS "$ENV{CCACHE_SLOPPINESS}")
+    else()
+        set(FIL_CCACHE_SLOPPINESS "$ENV{CCACHE_SLOPPINESS},pch_defines,time_macros")
+    endif()
+endif()
+
+if(NOT CMAKE_CXX_COMPILER_LAUNCHER)
+    if(FIL_COMPILER_CACHE)
+        if(FIL_USE_PCH)
+            set(CMAKE_CXX_COMPILER_LAUNCHER
+                "${CMAKE_COMMAND};-E;env;CCACHE_SLOPPINESS=${FIL_CCACHE_SLOPPINESS}"
+                CACHE STRING "Compiler launcher" FORCE)
+        endif()
+    elseif(FIL_CCACHE_PROGRAM)
+        set(FIL_COMPILER_CACHE ON)
+        if(FIL_USE_PCH)
+            set(CMAKE_CXX_COMPILER_LAUNCHER
+                "${CMAKE_COMMAND};-E;env;CCACHE_SLOPPINESS=${FIL_CCACHE_SLOPPINESS};${FIL_CCACHE_PROGRAM}"
+                CACHE STRING "Compiler launcher" FORCE)
+        else()
+            set(CMAKE_CXX_COMPILER_LAUNCHER "${FIL_CCACHE_PROGRAM}"
+                CACHE STRING "Compiler launcher" FORCE)
+        endif()
+        message(STATUS "Compiler cache: ${FIL_CCACHE_PROGRAM}")
+    endif()
+elseif(FIL_USE_PCH AND CMAKE_CXX_COMPILER_LAUNCHER MATCHES "ccache|sccache"
+    AND NOT CMAKE_CXX_COMPILER_LAUNCHER MATCHES "SLOPPINESS")
+    message(STATUS
+        "Precompiled headers need CCACHE_SLOPPINESS=${FIL_CCACHE_SLOPPINESS} "
+        "to remain cacheable; the configured compiler launcher does not set it")
 endif()
 
 set(FIL_IPO_SUPPORTED OFF)
@@ -198,6 +310,11 @@ target_include_directories(fil_core PUBLIC include)
 fil_set_project_options(fil_core)
 
 target_compile_definitions(fil_core PUBLIC FIL_ENABLE_MICRO_JIT=$<BOOL:${FIL_ENABLE_MICRO_JIT}>)
+
+if(FIL_USE_PCH)
+    target_compile_options(fil_core PRIVATE ${FIL_PCH_COMPILE_OPTIONS})
+    target_precompile_headers(fil_core PRIVATE ${FIL_PCH_HEADERS})
+endif()
 if(FIL_MICRO_JIT_DUMP)
     target_compile_definitions(fil_core PRIVATE FIL_MICRO_JIT_DUMP=1)
 endif()

@@ -46,6 +46,19 @@ target_link_libraries(fil_tests PRIVATE fil_core GTest::gtest_main)
 target_compile_definitions(fil_tests PRIVATE FIL_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 fil_set_project_options(fil_tests)
 
+# Tests validate fil_core behavior; cross-translation-unit inlining only makes
+# their link the slowest step of an incremental build. Keep tests non-LTO.
+set_property(TARGET fil_tests PROPERTY
+    INTERPROCEDURAL_OPTIMIZATION_RELEASE FALSE
+    INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO FALSE
+    INTERPROCEDURAL_OPTIMIZATION_MINSIZEREL FALSE
+)
+
+if(FIL_USE_PCH)
+    target_compile_options(fil_tests PRIVATE ${FIL_PCH_COMPILE_OPTIONS})
+    target_precompile_headers(fil_tests PRIVATE <gtest/gtest.h> ${FIL_PCH_HEADERS})
+endif()
+
 if(FIL_PGO_GENERATE)
     # Training runs the instrumented test suite so every fil_core translation
     # unit contributes counters, including cold paths a single CLI workload

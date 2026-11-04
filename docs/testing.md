@@ -13,12 +13,16 @@ make
 make test
 ```
 
-The defaults build optimized Release with tests enabled in `build/`. Choose a
-specific generator or build directory with `make GENERATOR=Ninja BUILD_DIR=build-ninja`;
-`make test` always builds before running CTest. The equivalent direct CMake workflow is:
+The defaults build Release with tests enabled in `build/`. Development builds
+skip IPO so incremental links stay fast, use Ninja when it is installed, reuse
+ccache when available, and precompile the standard library; `make release`
+builds the fully optimized (IPO) binary in `build-release/`. Choose a specific
+generator or build directory with `make GENERATOR=Ninja BUILD_DIR=build-ninja`;
+`make test` always builds before running CTest. The equivalent direct CMake
+workflow is:
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFIL_BUILD_TESTS=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFIL_BUILD_TESTS=ON -DFIL_ENABLE_IPO=OFF
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```

@@ -240,7 +240,9 @@ JIT is automatic when available, but does not guarantee a speedup. Synchronized 
 make BUILD_DIR=build-release BUILD_TYPE=Release IPO=ON test
 ```
 
-- IPO/LTO is enabled when supported. Debug and sanitizer builds retain extra diagnostic overhead.
+- IPO/LTO is enabled when supported and requested. `make release` (or
+  `IPO=ON`) builds with IPO; the default `make` build skips it so incremental
+  links stay fast. Debug and sanitizer builds retain extra diagnostic overhead.
 - Makefile builds default to `NATIVE=ON`, selecting a supported host CPU flag
   (`-march=native`, or `-mcpu=native` where supported). Use `NATIVE=OFF` for
   portable binaries. Cross-compilation skips host tuning; unsupported compilers

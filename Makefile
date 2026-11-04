@@ -10,13 +10,25 @@ BUILD_DIR ?= build
 BUILD_PATH = $(call root_path,$(BUILD_DIR))
 BUILD_TYPE ?= Release
 GENERATOR ?=
+# Prefer Ninja for fresh build trees: it schedules parallel builds better and
+# regenerates faster than Makefiles. A tree that is already configured keeps
+# its generator so switching this default does not invalidate it.
+ifeq ($(strip $(GENERATOR)),)
+ifneq ($(wildcard $(BUILD_PATH)/CMakeCache.txt),)
+GENERATOR := $(shell sed -n 's/^CMAKE_GENERATOR:INTERNAL=//p' "$(BUILD_PATH)/CMakeCache.txt" | head -n 1)
+else ifneq ($(shell command -v ninja 2>/dev/null),)
+GENERATOR := Ninja
+endif
+endif
 JOBS ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 # CTest concurrency; defaults to JOBS and can be tuned independently for heavy suites.
 CTEST_JOBS ?= $(JOBS)
 
 TESTS ?= ON
 DOCS ?= ON
-IPO ?= ON
+# Development default: skip IPO so incremental links stay fast. Use
+# `make release` (or IPO=ON) for the fully optimized binary.
+IPO ?= OFF
 # Local builds target this CPU; use NATIVE=OFF for portable binaries.
 NATIVE ?= ON
 ASAN ?= OFF
@@ -27,6 +39,11 @@ PER_FIRMWARE_DIR ?=
 CMAKE_ARGS ?=
 BUILD_ARGS ?=
 CTEST_ARGS ?=
+
+# ccache only caches precompiled-header translation units when these sloppiness
+# settings are active. `?=` preserves a caller-provided value.
+CCACHE_SLOPPINESS ?= pch_defines,time_macros
+export CCACHE_SLOPPINESS
 
 ifeq ($(strip $(GENERATOR)),)
 GENERATOR_ARGS :=
@@ -91,19 +108,33 @@ CONFIRM_STLINK ?= NO
 
 all: build
 
+# Re-running CMake costs about half a second even when nothing changed, which
+# dominates a one-file rebuild. Fingerprint the requested configuration and
+# configure only when the build tree is new or its options changed; CMake's own
+# regenerated rules still pick up CMakeLists.txt edits during the build.
+FIL_CONFIG_SIGNATURE := $(BUILD_TYPE)|$(TESTS)|$(DOCS)|$(IPO)|$(NATIVE)|$(ASAN)|$(UBSAN)|$(PGO_GENERATE)|$(FIL_PGO_PROFILE)|$(PER_FIRMWARE_DIR)|$(GENERATOR)|$(CMAKE_ARGS)
+FIL_CONFIG_STAMP = $(BUILD_PATH)/.fil-config-signature
+
 configure:
-	$(CMAKE) -S "$(ROOT_DIR)" -B "$(BUILD_PATH)" $(GENERATOR_ARGS) \
-		-DCMAKE_BUILD_TYPE="$(BUILD_TYPE)" \
-		-DFIL_BUILD_TESTS="$(TESTS)" \
-		-DFIL_BUILD_DOCS="$(DOCS)" \
-		-DFIL_ENABLE_IPO="$(IPO)" \
-		-DFIL_ENABLE_NATIVE="$(NATIVE)" \
-		-DFIL_ENABLE_ASAN="$(ASAN)" \
-		-DFIL_ENABLE_UBSAN="$(UBSAN)" \
-		-DFIL_PGO_GENERATE="$(PGO_GENERATE)" \
-		-DFIL_PGO_PROFILE:FILEPATH="$(FIL_PGO_PROFILE)" \
-		$(PER_FIRMWARE_ARG) \
-		$(CMAKE_ARGS)
+	@mkdir -p "$(BUILD_PATH)"
+	@printf '%s\n' '$(FIL_CONFIG_SIGNATURE)' > "$(FIL_CONFIG_STAMP).tmp"
+	@if [ -f "$(BUILD_PATH)/CMakeCache.txt" ] && cmp -s "$(FIL_CONFIG_STAMP).tmp" "$(FIL_CONFIG_STAMP)"; then \
+		rm -f "$(FIL_CONFIG_STAMP).tmp"; \
+	else \
+		$(CMAKE) -S "$(ROOT_DIR)" -B "$(BUILD_PATH)" $(GENERATOR_ARGS) \
+			-DCMAKE_BUILD_TYPE="$(BUILD_TYPE)" \
+			-DFIL_BUILD_TESTS="$(TESTS)" \
+			-DFIL_BUILD_DOCS="$(DOCS)" \
+			-DFIL_ENABLE_IPO="$(IPO)" \
+			-DFIL_ENABLE_NATIVE="$(NATIVE)" \
+			-DFIL_ENABLE_ASAN="$(ASAN)" \
+			-DFIL_ENABLE_UBSAN="$(UBSAN)" \
+			-DFIL_PGO_GENERATE="$(PGO_GENERATE)" \
+			-DFIL_PGO_PROFILE:FILEPATH="$(FIL_PGO_PROFILE)" \
+			$(PER_FIRMWARE_ARG) \
+			$(CMAKE_ARGS) && \
+		mv "$(FIL_CONFIG_STAMP).tmp" "$(FIL_CONFIG_STAMP)"; \
+	fi
 
 build: configure
 	$(CMAKE) --build "$(BUILD_PATH)" --parallel "$(JOBS)" --config "$(BUILD_TYPE)" $(BUILD_ARGS)
@@ -193,7 +224,7 @@ test-per:
 	$(CTEST) --test-dir "$(BUILD_PATH)" -L per --parallel "$(CTEST_JOBS)" --output-on-failure -C "$(BUILD_TYPE)" $(CTEST_ARGS)
 
 release:
-	$(MAKE) BUILD_DIR="$(RELEASE_BUILD_DIR)" BUILD_TYPE=Release build
+	$(MAKE) BUILD_DIR="$(RELEASE_BUILD_DIR)" BUILD_TYPE=Release IPO=ON build
 
 debug:
 	$(MAKE) BUILD_DIR="$(DEBUG_BUILD_DIR)" BUILD_TYPE=Debug IPO=OFF ASAN=OFF UBSAN=OFF build
@@ -277,6 +308,7 @@ clean-pgo:
 help:
 	@printf '%s\n' \
 	  'Build:          make [all] | configure | build | release | debug | sanitize' \
+	  '                make = fast Release dev build (no IPO); release = Release + IPO' \
 	  'Tests:          make test | test-list | test-per PER_FIRMWARE_DIR=/path/to/output' \
 	  '                make test-debug | test-sanitize' \
 	  'App:            make cli CLI_ARGS="--help" | app-help | version' \
