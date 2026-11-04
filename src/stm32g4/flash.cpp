@@ -23,6 +23,12 @@ constexpr std::uint32_t strt = 1U << 16U; ///< Start erase or programming.
 // FLASH_SR status bits.
 constexpr std::uint32_t eop = 1U << 0U; ///< End of operation.
 
+// RM0440 unlock key sequences, written in order.
+constexpr std::uint32_t flash_unlock_key1 = 0x45670123U;
+constexpr std::uint32_t flash_unlock_key2 = 0xcdef89abU;
+constexpr std::uint32_t option_unlock_key1 = 0x08192a3bU;
+constexpr std::uint32_t option_unlock_key2 = 0x4c5d6e7fU;
+
 /** @brief Reconstructs the flat page number from the contiguous CR PNB field. */
 std::uint32_t pageNumberFromControl(const std::uint32_t control) {
     return (control >> 3U) & 0x7fU;
@@ -85,23 +91,14 @@ void FlashPeripheral::storeRegister(
         return;
     }
     if (word_offset == keyr) {
-        if (value == 0x45670123U) {
-            key_step_ = 1;
-        } else if (key_step_ == 1U && value == 0xcdef89abU) {
+        if (advanceKeySequence(key_sequence_, value, flash_unlock_key1, flash_unlock_key2)) {
             setRegister(cr, registerValue(cr) & ~lock);
-            key_step_ = 0;
-        } else {
-            key_step_ = 0;
         }
         setRegister(keyr, 0);
     } else if (word_offset == optkeyr) {
-        if (value == 0x08192a3bU) {
-            option_key_step_ = 1;
-        } else if (option_key_step_ == 1U && value == 0x4c5d6e7fU) {
+        if (advanceKeySequence(
+                option_key_sequence_, value, option_unlock_key1, option_unlock_key2)) {
             setRegister(cr, registerValue(cr) & ~option_lock);
-            option_key_step_ = 0;
-        } else {
-            option_key_step_ = 0;
         }
         setRegister(optkeyr, 0);
     } else if (word_offset == sr) {
@@ -139,9 +136,29 @@ void FlashPeripheral::performPageErase(const std::uint32_t control) {
     }
 }
 
+bool FlashPeripheral::advanceKeySequence(
+    KeySequence& sequence,
+    const std::uint32_t value,
+    const std::uint32_t first_key,
+    const std::uint32_t second_key
+) noexcept {
+    switch (sequence) {
+    case KeySequence::first_key_seen:
+        if (value == second_key) {
+            sequence = KeySequence::idle;
+            return true;
+        }
+        break;
+    case KeySequence::idle:
+        break;
+    }
+    sequence = value == first_key ? KeySequence::first_key_seen : KeySequence::idle;
+    return false;
+}
+
 void FlashPeripheral::onReset() {
-    key_step_ = 0;
-    option_key_step_ = 0;
+    key_sequence_ = KeySequence::idle;
+    option_key_sequence_ = KeySequence::idle;
     acr_ = registerValue(acr);
     ++acr_generation_;
     if (acr_generation_ == 0U) acr_generation_ = 1U;

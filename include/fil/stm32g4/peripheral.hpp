@@ -359,10 +359,20 @@ protected:
     void onReset() override;
 
 private:
-    void performPageErase(std::uint32_t control);
+    /** @brief Position in the RM0440 two-write unlock sequence for KEYR/OPTKEYR. */
+    enum class KeySequence : std::uint8_t { idle, first_key_seen };
 
-    std::uint32_t key_step_{0};
-    std::uint32_t option_key_step_{0};
+    void performPageErase(std::uint32_t control);
+    /** @brief Advances one key write; true when the second key completes the sequence. */
+    static bool advanceKeySequence(
+        KeySequence& sequence,
+        std::uint32_t value,
+        std::uint32_t first_key,
+        std::uint32_t second_key
+    ) noexcept;
+
+    KeySequence key_sequence_{KeySequence::idle};
+    KeySequence option_key_sequence_{KeySequence::idle};
     std::uint32_t acr_{0};
     std::uint64_t acr_generation_{1};
     PageEraseCallback page_erase_callback_;
