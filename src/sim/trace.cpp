@@ -68,13 +68,13 @@ bool TraceRecorder::records(const std::string_view type) const noexcept {
 }
 
 void TraceRecorder::beginLaneCapture(const std::size_t lane_count) {
-    capturing_ = true;
+    capture_mode_ = CaptureMode::lane_buffered;
     lane_records_.resize(lane_count);
     for (auto& lane : lane_records_) lane.clear();
 }
 
 void TraceRecorder::flushLaneCapture() {
-    capturing_ = false;
+    capture_mode_ = CaptureMode::live;
     std::size_t captured = 0U;
     for (const auto& lane : lane_records_) captured += lane.size();
     std::vector<TraceRecord> pending;
@@ -117,10 +117,10 @@ std::uint64_t TraceRecorder::record(
     if (!enabled_) return next_sequence_;
     if (!passesFilter(type)) {
         // Capture keeps worker threads off the shared sequence counter.
-        if (capturing_) return next_sequence_;
+        if (capture_mode_ == CaptureMode::lane_buffered) return next_sequence_;
         return next_sequence_++;
     }
-    if (capturing_ && currentLane() != coordinator_lane
+    if (capture_mode_ == CaptureMode::lane_buffered && currentLane() != coordinator_lane
         && currentLane() < lane_records_.size()) {
         lane_records_[currentLane()].push_back(TraceRecord{
             time_ns, 0U, std::move(source), std::move(type), std::move(fields),
@@ -146,7 +146,7 @@ std::uint64_t TraceRecorder::recordCanFrame(
     // Skip field formatting for types no consumer selected; record() would
     // discard the formatted fields below, but only after paying for them.
     if (!passesFilter(transmit ? "can_tx" : "can_rx")) {
-        if (capturing_) return next_sequence_;
+        if (capture_mode_ == CaptureMode::lane_buffered) return next_sequence_;
         return next_sequence_++;
     }
     std::ostringstream id;
@@ -168,7 +168,7 @@ std::uint64_t TraceRecorder::recordCanFrame(
 void TraceRecorder::clear() noexcept {
     records_.clear();
     lane_records_.clear();
-    capturing_ = false;
+    capture_mode_ = CaptureMode::live;
     next_sequence_ = 0;
 }
 

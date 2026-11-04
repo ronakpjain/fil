@@ -88,8 +88,16 @@ public:
     /** @brief Merges captured lane records into the global stream in time order. */
     void flushLaneCapture();
 
+    /** @brief Explicit record-routing mode. */
+    enum class CaptureMode : std::uint8_t {
+        live,          ///< Records append directly to the shared stream.
+        lane_buffered, ///< Worker records buffer per lane until flushLaneCapture().
+    };
+
     /** @brief Whether lane capture is currently buffering worker records. */
-    [[nodiscard]] bool capturingLanes() const noexcept { return capturing_; }
+    [[nodiscard]] bool capturingLanes() const noexcept {
+        return capture_mode_ == CaptureMode::lane_buffered;
+    }
 
     /**
      * @brief Restricts recorded types to an allowlist (empty allows all).
@@ -158,7 +166,7 @@ private:
 
     bool enabled_{true};
     bool retain_records_{true};
-    bool capturing_{false};
+    CaptureMode capture_mode_{CaptureMode::live};
     std::uint64_t next_sequence_{0};
     std::vector<TraceRecord> records_;
     std::vector<std::vector<TraceRecord>> lane_records_;
