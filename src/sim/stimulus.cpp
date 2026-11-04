@@ -598,7 +598,7 @@ ExpectationEvaluator::ExpectationEvaluator(
         if (end_ns == std::numeric_limits<std::uint64_t>::max()) {
             throw std::invalid_argument("expectation deadline overflows simulated time");
         }
-        checks_.push_back(CheckState{std::move(check), "pending"});
+        checks_.push_back(CheckState{std::move(check)});
     }
 }
 
@@ -610,12 +610,18 @@ void ExpectationEvaluator::begin(const std::uint64_t now_ns, EventLoop& loop) {
     if (now_ns != loop.now()) {
         throw std::invalid_argument("expectation start time must equal the event-loop time");
     }
-    if (started_ || finished_) return;
-    started_ = true;
+    switch (lifecycle_) {
+    case Lifecycle::running:
+    case Lifecycle::finished:
+        return;
+    case Lifecycle::created:
+        break;
+    }
+    lifecycle_ = Lifecycle::running;
     loop_ = &loop;
     for (std::size_t index = 0; index < checks_.size(); ++index) {
         CheckState& state = checks_[index];
-        emit(state, "pending", loop.now());
+        emit(state, CheckStatus::pending, loop.now());
         const std::uint64_t end_ns = (expectationStartMs(state.check.expectation)
             + expectationWindowMs(state.check.expectation)) * ns_per_ms;
         // Window endpoints are inclusive; finalize at the next representable ns.
@@ -631,7 +637,7 @@ void ExpectationEvaluator::begin(const std::uint64_t now_ns, EventLoop& loop) {
 }
 
 void ExpectationEvaluator::observe(const TraceRecord& record) {
-    if (!started_ || finished_) return;
+    if (lifecycle_ != Lifecycle::running) return;
     // Only expectation-relevant record types reach the check scan; the trace may
     // carry unrelated event streams under a full allowlist.
     if (record.type != "can_tx" && record.type != "gpio_output") return;
@@ -639,52 +645,65 @@ void ExpectationEvaluator::observe(const TraceRecord& record) {
     // keep a stable snapshot while callbacks recurse through the observer.
     const TraceRecord snapshot = record;
     for (CheckState& state : checks_) {
-        if (state.status != "pending"
+        if (state.status != CheckStatus::pending
             || !matchesExpectation(state.check.expectation, snapshot)) continue;
-        state.status = "pass";
-        emit(state, "pass", snapshot.time_ns, &snapshot);
+        transition(state, CheckStatus::pass);
+        emit(state, CheckStatus::pass, snapshot.time_ns, &snapshot);
     }
 }
 
+bool ExpectationEvaluator::transition(CheckState& state, const CheckStatus next) noexcept {
+    switch (state.status) {
+    case CheckStatus::pending:
+        break;
+    case CheckStatus::pass:
+    case CheckStatus::fail:
+    case CheckStatus::incomplete:
+        return false;
+    }
+    state.status = next;
+    return true;
+}
+
 void ExpectationEvaluator::advance(const std::uint64_t now_ns) {
-    if (!started_ || finished_) return;
+    if (lifecycle_ != Lifecycle::running) return;
     if (loop_ != nullptr && now_ns != loop_->now()) {
         throw std::invalid_argument("expectation advance time must equal the event-loop time");
     }
     for (CheckState& state : checks_) {
-        if (state.status != "pending") continue;
+        if (state.status != CheckStatus::pending) continue;
         const std::uint64_t end_ns = (expectationStartMs(state.check.expectation)
             + expectationWindowMs(state.check.expectation)) * ns_per_ms;
         if (now_ns > end_ns) {
-            state.status = "fail";
-            emit(state, "fail", now_ns);
+            transition(state, CheckStatus::fail);
+            emit(state, CheckStatus::fail, now_ns);
         }
     }
 }
 
 void ExpectationEvaluator::finish(const std::uint64_t now_ns) {
-    if (!started_ || finished_) return;
+    if (lifecycle_ != Lifecycle::running) return;
     if (loop_ != nullptr && now_ns != loop_->now()) {
         throw std::invalid_argument("expectation finish time must equal the event-loop time");
     }
     advance(loop_ == nullptr ? now_ns : loop_->now());
     for (CheckState& state : checks_) {
-        if (state.status != "pending") continue;
-        state.status = "incomplete";
-        emit(state, "incomplete", loop_ == nullptr ? now_ns : loop_->now());
+        if (state.status != CheckStatus::pending) continue;
+        transition(state, CheckStatus::incomplete);
+        emit(state, CheckStatus::incomplete, loop_ == nullptr ? now_ns : loop_->now());
     }
-    finished_ = true;
+    lifecycle_ = Lifecycle::finished;
     cancelDeadlines();
 }
 
 bool ExpectationEvaluator::hasFailures() const noexcept {
     return std::any_of(checks_.begin(), checks_.end(), [](const CheckState& state) {
-        return state.status == "fail" || state.status == "incomplete";
+        return state.status == CheckStatus::fail || state.status == CheckStatus::incomplete;
     });
 }
 
 std::string_view ExpectationEvaluator::status(const std::size_t index) const noexcept {
-    return index < checks_.size() ? std::string_view{checks_[index].status} : std::string_view{};
+    return index < checks_.size() ? statusName(checks_[index].status) : std::string_view{};
 }
 
 void ExpectationEvaluator::cancelDeadlines() noexcept {
@@ -696,17 +715,18 @@ void ExpectationEvaluator::cancelDeadlines() noexcept {
 
 void ExpectationEvaluator::emit(
     CheckState& state,
-    const std::string_view status,
+    const CheckStatus status,
     const std::uint64_t time_ns,
     const TraceRecord* matched
 ) {
+    const std::string_view status_text = statusName(status);
     std::vector<TraceField> fields{
         {"check_id", "stimulus/" + std::to_string(state.check.stimulus_index) + "/"
             + state.check.script + "/expect/" + std::to_string(state.check.index)},
         {"script", state.check.script},
         {"stimulus_index", std::to_string(state.check.stimulus_index)},
         {"expect_index", std::to_string(state.check.index)},
-        {"status", std::string(status)},
+        {"status", std::string(status_text)},
     };
     std::visit([&](const auto& expectation) {
         using Specific = std::decay_t<decltype(expectation)>;
@@ -744,7 +764,7 @@ void ExpectationEvaluator::emit(
         fields.emplace_back("matched_time_ns", std::to_string(matched->time_ns));
     }
     static_cast<void>(trace_->record(time_ns, "expectation/" + state.check.script,
-        "expectation_" + std::string(status), std::move(fields)));
+        "expectation_" + std::string(status_text), std::move(fields)));
 }
 
 std::string normalizeStimulusScript(const StimulusScript& script) {

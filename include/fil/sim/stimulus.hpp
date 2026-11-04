@@ -141,6 +141,20 @@ public:
     ExpectationEvaluator(ExpectationEvaluator&&) = delete;
     ExpectationEvaluator& operator=(ExpectationEvaluator&&) = delete;
 
+    /** @brief Stable per-check lifecycle state. */
+    enum class CheckStatus : std::uint8_t {
+        pending,    ///< Awaiting a matching record inside its window.
+        pass,       ///< A matching record arrived in time.
+        fail,       ///< The window closed before a matching record arrived.
+        incomplete, ///< The evaluator finished with the window still open.
+    };
+    /** @brief Stable evaluator lifecycle state. */
+    enum class Lifecycle : std::uint8_t {
+        created,  ///< begin() has not run.
+        running,  ///< Windows and deadline callbacks are live.
+        finished, ///< finish() ran; no further transitions occur.
+    };
+
     void begin(std::uint64_t now_ns, EventLoop& loop);
     void observe(const TraceRecord& record);
     void advance(std::uint64_t now_ns);
@@ -148,21 +162,33 @@ public:
     [[nodiscard]] bool hasFailures() const noexcept;
     [[nodiscard]] std::string_view status(std::size_t index) const noexcept;
 
+    /** @brief Stable lowercase name for one check state. */
+    [[nodiscard]] static constexpr std::string_view statusName(const CheckStatus status) noexcept {
+        switch (status) {
+        case CheckStatus::pending: return "pending";
+        case CheckStatus::pass: return "pass";
+        case CheckStatus::fail: return "fail";
+        case CheckStatus::incomplete: return "incomplete";
+        }
+        return {};
+    }
+
 private:
     struct CheckState {
         ExpectationCheck check;
-        std::string status{"pending"};
+        CheckStatus status{CheckStatus::pending};
     };
 
-    void emit(CheckState& state, std::string_view status, std::uint64_t time_ns,
+    /** @brief Applies a pending-to-terminal check transition; false when terminal. */
+    static bool transition(CheckState& state, CheckStatus next) noexcept;
+    void emit(CheckState& state, CheckStatus status, std::uint64_t time_ns,
         const TraceRecord* matched = nullptr);
     void cancelDeadlines() noexcept;
     TraceRecorder* trace_{nullptr};
     EventLoop* loop_{nullptr};
     std::vector<EventId> deadline_events_;
     std::vector<CheckState> checks_;
-    bool started_{false};
-    bool finished_{false};
+    Lifecycle lifecycle_{Lifecycle::created};
 };
 
 /** @brief Produces stable human-readable output for a stimulus script. */
