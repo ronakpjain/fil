@@ -1069,10 +1069,26 @@ protected:
     void onReset() override;
 
 private:
+    /** @brief Explicit per-line state; the PR/IMR registers mirror it. */
+    enum class LineState : std::uint8_t {
+        idle,           ///< No latched request; interrupt masked.
+        armed,          ///< No latched request; interrupt unmasked.
+        pending,        ///< Latched request; interrupt unmasked.
+        pending_masked, ///< Latched request; interrupt masked.
+    };
+    /** @brief External events applied to a line's explicit state. */
+    enum class LineEvent : std::uint8_t { request, cleared, mask, unmask };
+    static constexpr std::uint32_t tracked_lines = 16U;
+
+    /** @brief Applies one event to a line, switching on its current state. */
+    void transitionLine(std::uint32_t line, LineEvent event) noexcept;
+    /** @brief Re-derives line states from PR/IMR after SWIER's rewritten image. */
+    void resyncPendingLines() noexcept;
     void updateInterruptLevels();
     [[nodiscard]] bool linePendingEnabled(std::uint32_t line) const noexcept;
 
     const SyscfgPeripheral* syscfg_{nullptr};
+    std::array<LineState, tracked_lines> line_state_{};
 };
 
 using TimPeripheral = TimerPeripheral;

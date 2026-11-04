@@ -64,6 +64,7 @@ void ExtiPeripheral::storeRegister(
             const std::uint32_t new_pr = registerValue(pr1) | set_bits;
             setRegister(pr1, new_pr);
             setRegister(swier1, 0);
+            resyncPendingLines();
             for (std::uint32_t line = 0; line < 32U; ++line) {
                 if ((set_bits & (1U << line)) != 0U) {
                     traceEvent("exti_pending", {
@@ -74,6 +75,7 @@ void ExtiPeripheral::storeRegister(
             }
         } else {
             setRegister(swier1, 0);
+            resyncPendingLines();
         }
         updateInterruptLevels();
         return;
@@ -87,6 +89,9 @@ void ExtiPeripheral::storeRegister(
         const std::uint32_t clear_bits = value & write_mask;
         const std::uint32_t new_pr = previous & ~clear_bits;
         setRegister(pr1, new_pr);
+        for (std::uint32_t line = 0; line < 32U; ++line) {
+            if ((clear_bits & (1U << line)) != 0U) transitionLine(line, LineEvent::cleared);
+        }
         if (clear_bits != 0U) {
             traceEvent("exti_clear", {
                 {"mask", std::to_string(clear_bits)},
@@ -95,7 +100,16 @@ void ExtiPeripheral::storeRegister(
         updateInterruptLevels();
         return;
     }
-    if (word_offset == imr1 || word_offset == emr1 || word_offset == rtsr1 || word_offset == ftsr1) {
+    if (word_offset == imr1) {
+        const std::uint32_t mask = registerValue(imr1);
+        for (std::uint32_t line = 0; line < tracked_lines; ++line) {
+            transitionLine(line,
+                (mask & (1U << line)) != 0U ? LineEvent::unmask : LineEvent::mask);
+        }
+        updateInterruptLevels();
+        return;
+    }
+    if (word_offset == emr1 || word_offset == rtsr1 || word_offset == ftsr1) {
         updateInterruptLevels();
         return;
     }
@@ -103,8 +117,60 @@ void ExtiPeripheral::storeRegister(
 }
 
 void ExtiPeripheral::onReset() {
+    resyncPendingLines();
     for (std::uint32_t line = 0; line < 8U; ++line) {
         setInterruptLevel(line, false);
+    }
+}
+
+void ExtiPeripheral::transitionLine(const std::uint32_t line, const LineEvent event) noexcept {
+    if (line >= tracked_lines) return;
+    switch (line_state_[line]) {
+    case LineState::idle:
+        switch (event) {
+        case LineEvent::request: line_state_[line] = LineState::pending_masked; break;
+        case LineEvent::unmask: line_state_[line] = LineState::armed; break;
+        case LineEvent::cleared:
+        case LineEvent::mask: break;
+        }
+        return;
+    case LineState::armed:
+        switch (event) {
+        case LineEvent::request: line_state_[line] = LineState::pending; break;
+        case LineEvent::mask: line_state_[line] = LineState::idle; break;
+        case LineEvent::cleared:
+        case LineEvent::unmask: break;
+        }
+        return;
+    case LineState::pending:
+        switch (event) {
+        case LineEvent::cleared: line_state_[line] = LineState::armed; break;
+        case LineEvent::mask: line_state_[line] = LineState::pending_masked; break;
+        case LineEvent::request:
+        case LineEvent::unmask: break;
+        }
+        return;
+    case LineState::pending_masked:
+        switch (event) {
+        case LineEvent::cleared: line_state_[line] = LineState::idle; break;
+        case LineEvent::unmask: line_state_[line] = LineState::pending; break;
+        case LineEvent::request:
+        case LineEvent::mask: break;
+        }
+        return;
+    }
+}
+
+void ExtiPeripheral::resyncPendingLines() noexcept {
+    const std::uint32_t pending = registerValue(pr1);
+    const std::uint32_t mask = registerValue(imr1);
+    for (std::uint32_t line = 0; line < tracked_lines; ++line) {
+        const std::uint32_t bit = 1U << line;
+        const bool latched = (pending & bit) != 0U;
+        const bool enabled = (mask & bit) != 0U;
+        line_state_[line] = latched
+            ? (enabled ? LineState::pending : LineState::pending_masked)
+            : (enabled ? LineState::armed : LineState::idle);
     }
 }
 
@@ -125,6 +191,7 @@ void ExtiPeripheral::notifyGpioEdge(
     const bool falling_armed = (ftsr & mask) != 0U;
     const bool triggered = (high && rising_armed) || (!high && falling_armed);
     if (!triggered) return;
+    transitionLine(pin, LineEvent::request);
     const std::uint32_t new_pr = registerValue(pr1) | mask;
     setRegister(pr1, new_pr);
     traceEvent("exti_pending", {
@@ -135,9 +202,16 @@ void ExtiPeripheral::notifyGpioEdge(
 }
 
 bool ExtiPeripheral::linePendingEnabled(const std::uint32_t line) const noexcept {
-    if (line > 15U) return false;
-    const std::uint32_t mask = 1U << line;
-    return (registerValue(pr1) & mask) != 0U && (registerValue(imr1) & mask) != 0U;
+    if (line >= tracked_lines) return false;
+    switch (line_state_[line]) {
+    case LineState::pending:
+        return true;
+    case LineState::idle:
+    case LineState::armed:
+    case LineState::pending_masked:
+        return false;
+    }
+    return false;
 }
 
 void ExtiPeripheral::updateInterruptLevels() {
