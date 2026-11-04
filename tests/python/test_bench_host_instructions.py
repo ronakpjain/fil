@@ -41,20 +41,11 @@ class GuestCounterParsingTest(unittest.TestCase):
   cycles:                1920004
   time:                  20.000 ms (20000000 ns)
 
-  board: dashboard
-    stop:         time-budget
-    instructions: 132339
-    pc:           0x0800670a
-    clock:        16000000 Hz
+  board: dashboard        stop: time-budget  instructions: 132339  pc: 0x0800670a  clock: 16000000 Hz
     jit:
       native: compilations=85 executions=421 instructions=129075
       single: fast=2 generic=1
-
-  board: main_module
-    stop:         time-budget
-    instructions: 134342
-    pc:           0x080040ca
-    clock:        16000000 Hz
+  board: main_module      stop: time-budget  instructions: 134342  pc: 0x080040ca  clock: 16000000 Hz
     jit:
       native: compilations=47 executions=402 instructions=129755
 """

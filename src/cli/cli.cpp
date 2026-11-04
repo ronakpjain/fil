@@ -1729,48 +1729,54 @@ ExitCode runNetworkCommand(
         out << '\n';
         printExpectationRows(out, expectation_rows, style);
     }
+    std::size_t board_name_width = 0U;
     for (const auto& board : result.value().boards) {
-        out << '\n' << style.bold() << "  board: " << board.name << style.reset() << '\n';
+        board_name_width = std::max(board_name_width, board.name.size());
+    }
+    if (!result.value().boards.empty()) out << '\n';
+    for (const auto& board : result.value().boards) {
         const bool board_breakpoint =
             board.result.reason == sim::BoardStopReason::breakpoint && !allow_breakpoint;
         const std::string_view stop_color = !board.result.succeeded()
             ? style.red() : (board_breakpoint ? style.yellow() : style.green());
-        std::vector<ReportLine> fields;
-        fields.push_back({"stop", std::string(sim::boardStopReasonName(board.result.reason)), {},
-            stop_color});
+        out << "  " << style.bold() << "board: " << board.name << style.reset()
+            << std::string(board_name_width - board.name.size(), ' ')
+            << "  stop: " << stop_color
+            << sim::boardStopReasonName(board.result.reason) << style.reset();
         if (!board.result.message.empty() && !board.result.succeeded()) {
-            fields.push_back({"message", board.result.message, {}, style.yellow()});
+            out << "  message: " << style.yellow() << board.result.message << style.reset();
         }
-        fields.push_back({"instructions", std::to_string(board.result.instructions)});
-        fields.push_back({"pc", formatHexWord(board.result.diagnostic.next_pc), {}, style.cyan()});
+        out << "  instructions: " << board.result.instructions
+            << "  pc: " << style.cyan() << formatHexWord(board.result.diagnostic.next_pc)
+            << style.reset();
         if (enable_ram_capsules
             && (board.memoized_prefixes != 0U || board.memoized_instructions != 0U)) {
-            fields.push_back({"memoized_ram", "prefixes=" + std::to_string(board.memoized_prefixes)
-                + " admitted_instructions=" + std::to_string(board.memoized_instructions)});
+            out << "  memoized_ram: prefixes=" << board.memoized_prefixes
+                << " admitted_instructions=" << board.memoized_instructions;
         }
         sim::Board* instance = world.value()->board(board.name);
-        const std::vector<ReportLine> jit_groups = show_jit_stats && instance != nullptr
-            ? jitReportLines(instance->cpu(), style) : std::vector<ReportLine>{};
+        std::vector<mem::UnknownMmioAccess> unknown;
         if (instance != nullptr) {
-            fields.push_back({"clock", std::to_string(
-                instance->peripherals().rcc().systemClockHz()) + " Hz"});
+            out << "  clock: " << instance->peripherals().rcc().systemClockHz() << " Hz";
+            unknown = instance->peripherals().router().unknownAccesses();
+        }
+        if (!unknown.empty()) {
+            out << "  unknown_mmio: " << style.red() << unknown.size() << style.reset();
+        }
+        out << '\n';
+        for (const auto& access : unknown) {
+            out << "    " << style.red() << "unknown_mmio: " << formatHexWord(access.address)
+                << "  reads=" << access.reads << " writes=" << access.writes
+                << style.reset() << '\n';
         }
         if (show_jit_stats && instance != nullptr) {
-            fields.push_back({"jit", jit_groups.empty() ? "no recorded counters" : "",
-                style.dim(), {}});
-        }
-        printReportLines(out, 4U, fields, style);
-        if (!jit_groups.empty()) printReportLines(out, 6U, jit_groups, style);
-        if (instance != nullptr) {
-            const auto unknown = instance->peripherals().router().unknownAccesses();
-            if (!unknown.empty()) {
-                out << "    " << style.red() << "unknown_mmio: " << unknown.size()
+            const std::vector<ReportLine> jit_groups = jitReportLines(instance->cpu(), style);
+            if (jit_groups.empty()) {
+                out << "    " << style.dim() << "jit: no recorded counters"
                     << style.reset() << '\n';
-                for (const auto& access : unknown) {
-                    out << "      " << style.red() << formatHexWord(access.address)
-                        << "  reads=" << access.reads << " writes=" << access.writes
-                        << style.reset() << '\n';
-                }
+            } else {
+                out << "    " << style.dim() << "jit:" << style.reset() << '\n';
+                printReportLines(out, 6U, jit_groups, style);
             }
         }
     }

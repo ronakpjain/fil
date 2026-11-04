@@ -32,7 +32,8 @@ and their sample, DMA, and interrupt effects.
 
 Run prints an indented human-readable report: the first line names the board or
 network, summary fields are aligned underneath it, and each network board appears
-in its own `board:` section. Simulated time is shown with a unit and the exact
+on its own `board:` line with its stop reason, instruction count, final PC, and
+clock. Simulated time is shown with a unit and the exact
 nanosecond count. Stimulus expectations print as a dedicated block after the
 summary, with failures first; `--jit-stats` adds opt-in internal JIT counters.
 The report uses colors only when stdout is an interactive terminal; a non-empty

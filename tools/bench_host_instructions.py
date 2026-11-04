@@ -178,7 +178,7 @@ def parse_guest_counters(output):
     boards = {}
     current = None
     for line in output.splitlines():
-        board_match = re.match(r"^ +board: +(\S+)$", line)
+        board_match = re.match(r"^ +board: +(\S+)", line)
         if board_match:
             current = board_match.group(1)
             boards.setdefault(current, {})

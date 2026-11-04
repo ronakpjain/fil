@@ -338,28 +338,29 @@ run_network() {
                 sub(/[[:space:]]+$/, "", key)
                 sub(/^[[:space:]]+/, "", value)
                 sub(/[[:space:]]+$/, "", value)
-                if (leading == 2) {
-                    if (key == "board") {
-                        current = value
-                    } else if (key == "time" && match(value, /\([0-9]+ ns\)/)) {
-                        time_ns = substr(value, RSTART, RLENGTH)
-                        gsub(/[^0-9]/, "", time_ns)
-                        summary["time_ns"] = time_ns
-                    } else {
-                        summary[key] = value
+                if (leading != 2) next
+                if (key == "board") {
+                    rest = value
+                    name = rest
+                    sub(/[ ].*$/, "", name)
+                    if (match(rest, /stop: [a-z-]+/)) {
+                        board_stop[name] = substr(rest, RSTART + 6, RLENGTH - 6)
                     }
-                } else if (leading == 4 && current != "") {
-                    if (key == "stop") {
-                        board_stop[current] = value
-                    } else if (key == "instructions") {
-                        board_instructions[current] = value
-                    } else if (key == "pc") {
-                        board_pc[current] = value
-                    } else if (key == "clock") {
-                        hz = value
-                        sub(/ Hz$/, "", hz)
-                        board_clock[current] = hz
+                    if (match(rest, /instructions: [0-9]+/)) {
+                        board_instructions[name] = substr(rest, RSTART + 14, RLENGTH - 14)
                     }
+                    if (match(rest, /pc: 0x[0-9a-f]+/)) {
+                        board_pc[name] = substr(rest, RSTART + 4, RLENGTH - 4)
+                    }
+                    if (match(rest, /clock: [0-9]+ Hz/)) {
+                        board_clock[name] = substr(rest, RSTART + 7, RLENGTH - 10)
+                    }
+                } else if (key == "time" && match(value, /\([0-9]+ ns\)/)) {
+                    time_ns = substr(value, RSTART, RLENGTH)
+                    gsub(/[^0-9]/, "", time_ns)
+                    summary["time_ns"] = time_ns
+                } else {
+                    summary[key] = value
                 }
             }
         }

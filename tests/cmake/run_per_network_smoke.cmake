@@ -66,7 +66,7 @@ if(stop_time_ns LESS 20000000 OR stop_time_ns GREATER_EQUAL 21000000)
     )
 endif()
 
-string(REGEX MATCHALL "\n    stop:[ ]+time-budget\n" board_stop_lines
+string(REGEX MATCHALL "\n  board: [^\n]*stop:[ ]+time-budget" board_stop_lines
     "${normalized_stdout}")
 list(LENGTH board_stop_lines board_stop_count)
 if(NOT board_stop_count EQUAL 6)
