@@ -191,33 +191,60 @@ Result<ProcessOutput> runProcess(
 
     ProcessOutput output;
     std::int32_t status = 0;
-    bool child_done = false;
-    bool pipe_done = false;
+    /** @brief Explicit drain phase for the spawned process and its output pipe. */
+    enum class DrainState : std::uint8_t {
+        running,      ///< Child and output pipe are both open.
+        pipe_closed,  ///< Pipe hit EOF/error; the child is still running.
+        child_exited, ///< Child was reaped; buffered output may remain.
+        complete,     ///< Both sources are done.
+    };
+    DrainState drain = DrainState::running;
     const auto started = std::chrono::steady_clock::now();
     std::array<char, 4096> buffer{};
 
-    while (!child_done || !pipe_done) {
+    while (drain != DrainState::complete) {
         pollfd descriptor{output_pipe[0], POLLIN | POLLHUP, 0};
         static_cast<void>(::poll(&descriptor, 1, 20));
-        while (!pipe_done) {
-            const ssize_t count = ::read(output_pipe[0], buffer.data(), buffer.size());
-            if (count > 0) {
-                output.text.append(buffer.data(), static_cast<std::size_t>(count));
-                continue;
+        switch (drain) {
+        case DrainState::running:
+        case DrainState::child_exited:
+            while (true) {
+                const ssize_t count = ::read(output_pipe[0], buffer.data(), buffer.size());
+                if (count > 0) {
+                    output.text.append(buffer.data(), static_cast<std::size_t>(count));
+                    continue;
+                }
+                if (count == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                    drain = drain == DrainState::child_exited
+                        ? DrainState::complete
+                        : DrainState::pipe_closed;
+                }
+                break;
             }
-            if (count == 0) pipe_done = true;
-            else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) pipe_done = true;
+            break;
+        case DrainState::pipe_closed:
+        case DrainState::complete:
             break;
         }
-        if (!child_done) {
-            const pid_t waited = ::waitpid(pid, &status, WNOHANG);
-            if (waited == pid) child_done = true;
+        switch (drain) {
+        case DrainState::running:
+        case DrainState::pipe_closed:
+            if (const pid_t waited = ::waitpid(pid, &status, WNOHANG); waited == pid) {
+                drain = drain == DrainState::pipe_closed
+                    ? DrainState::complete
+                    : DrainState::child_exited;
+            }
+            break;
+        case DrainState::child_exited:
+        case DrainState::complete:
+            break;
         }
-        if (!child_done && std::chrono::steady_clock::now() - started >= timeout) {
+        if ((drain == DrainState::running || drain == DrainState::pipe_closed)
+            && std::chrono::steady_clock::now() - started >= timeout) {
             output.timed_out = true;
             static_cast<void>(::kill(pid, SIGKILL));
             static_cast<void>(::waitpid(pid, &status, 0));
-            child_done = true;
+            drain = DrainState::child_exited;
         }
     }
     ::close(output_pipe[0]);
