@@ -933,7 +933,7 @@ public:
 
     void setResetCallback(ResetCallback callback) { reset_callback_ = std::move(callback); }
     void setResetEnabled(bool enabled);
-    [[nodiscard]] bool running() const noexcept { return running_; }
+    [[nodiscard]] bool running() const noexcept { return state_ == State::running; }
 
 protected:
     [[nodiscard]] std::uint32_t loadRegister(
@@ -950,12 +950,23 @@ protected:
     void onReset() override;
 
 private:
+    /** @brief Explicit independent-watchdog lifecycle. */
+    enum class State : std::uint8_t { stopped, running };
+    /** @brief Position in the two-write key-register unlock sequence. */
+    enum class UnlockState : std::uint8_t { locked, key1_seen };
+
+    /** @brief Applies one IWDG key write, driving unlock/start/reload transitions. */
+    void applyKey(std::uint16_t key);
+    /** @brief Transitions stopped to running, then arms the timeout. */
+    void enterRunning();
+    /** @brief Re-arms the timeout only while running. */
+    void reloadIfRunning();
     void reload();
     void cancelTimeout() noexcept { timeout_event_.cancel(); }
 
     bool reset_enabled_{false};
-    bool running_{false};
-    bool registers_unlocked_{false};
+    State state_{State::stopped};
+    UnlockState unlock_{UnlockState::locked};
     sim::ScheduledEvent timeout_event_;
     ResetCallback reset_callback_;
 };
@@ -987,10 +998,16 @@ protected:
     void onReset() override;
 
 private:
+    /** @brief Explicit window-watchdog lifecycle; WDGA mirrors this state. */
+    enum class State : std::uint8_t { stopped, running };
+
+    /** @brief Applies a CR write: enable starts or reloads, disable stops and cancels. */
+    void applyControl(std::uint32_t value);
     void reload();
     void cancelTimeout() noexcept { timeout_event_.cancel(); }
 
     bool reset_enabled_{false};
+    State state_{State::stopped};
     std::uint64_t peripheral_clock_hz_{16000000};
     sim::ScheduledEvent timeout_event_;
     ResetCallback reset_callback_;

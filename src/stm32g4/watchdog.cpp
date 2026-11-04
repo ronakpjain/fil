@@ -8,6 +8,10 @@
 namespace fil::stm32g4 {
 namespace {
 
+constexpr std::uint16_t key_unlock = 0x5555U;
+constexpr std::uint16_t key_start = 0xccccU;
+constexpr std::uint16_t key_reload = 0xaaaaU;
+
 sim::SimTimeNs boundedDuration(const long double duration) noexcept {
     if (duration >= static_cast<long double>(std::numeric_limits<sim::SimTimeNs>::max())) {
         return std::numeric_limits<sim::SimTimeNs>::max();
@@ -31,9 +35,7 @@ IwdgPeripheral::IwdgPeripheral(
 
 void IwdgPeripheral::setResetEnabled(const bool enabled) {
     reset_enabled_ = enabled;
-    if (running_) {
-        reload();
-    }
+    reloadIfRunning();
 }
 
 std::uint32_t IwdgPeripheral::loadRegister(
@@ -57,18 +59,10 @@ void IwdgPeripheral::storeRegister(
     static_cast<void>(write_mask);
     static_cast<void>(context);
     if (word_offset == 0x00U) {
-        const std::uint16_t key = static_cast<std::uint16_t>(value);
-        if (key == 0x5555U) {
-            registers_unlocked_ = true;
-        } else if (key == 0xccccU) {
-            running_ = true;
-            reload();
-        } else if (key == 0xaaaaU && running_) {
-            reload();
-        }
+        applyKey(static_cast<std::uint16_t>(value));
         setRegister(0x00, 0);
     } else if ((word_offset == 0x04U || word_offset == 0x08U || word_offset == 0x10U)
-        && !registers_unlocked_) {
+        && unlock_ == UnlockState::locked) {
         setRegister(word_offset, previous);
     } else if (word_offset == 0x04U) {
         setRegister(word_offset, value & 0x7U);
@@ -81,14 +75,57 @@ void IwdgPeripheral::storeRegister(
 
 void IwdgPeripheral::onReset() {
     cancelTimeout();
-    running_ = false;
-    registers_unlocked_ = false;
+    state_ = State::stopped;
+    unlock_ = UnlockState::locked;
+}
+
+void IwdgPeripheral::applyKey(const std::uint16_t key) {
+    switch (key) {
+    case key_unlock:
+        unlock_ = UnlockState::key1_seen;
+        return;
+    case key_start:
+        enterRunning();
+        return;
+    case key_reload:
+        reloadIfRunning();
+        return;
+    default:
+        return;
+    }
+}
+
+void IwdgPeripheral::enterRunning() {
+    switch (state_) {
+    case State::stopped:
+        state_ = State::running;
+        break;
+    case State::running:
+        break;
+    }
+    reload();
+}
+
+void IwdgPeripheral::reloadIfRunning() {
+    switch (state_) {
+    case State::stopped:
+        return;
+    case State::running:
+        reload();
+        return;
+    }
 }
 
 void IwdgPeripheral::reload() {
     cancelTimeout();
     traceEvent("watchdog_reload");
-    if (!running_ || eventLoop() == nullptr) {
+    switch (state_) {
+    case State::stopped:
+        return;
+    case State::running:
+        break;
+    }
+    if (eventLoop() == nullptr) {
         return;
     }
     const std::uint32_t divider_code = std::min(registerValue(0x04) & 0x7U, 6U);
@@ -121,8 +158,12 @@ WwdgPeripheral::WwdgPeripheral(
 
 void WwdgPeripheral::setResetEnabled(const bool enabled) {
     reset_enabled_ = enabled;
-    if ((registerValue(0x00) & (1U << 7U)) != 0U) {
+    switch (state_) {
+    case State::stopped:
+        return;
+    case State::running:
         reload();
+        return;
     }
 }
 
@@ -136,24 +177,46 @@ void WwdgPeripheral::storeRegister(
     static_cast<void>(write_mask);
     static_cast<void>(context);
     if (word_offset == 0x00U) {
-        setRegister(0x00, value & 0xffU);
-        if ((value & (1U << 7U)) != 0U) {
-            reload();
-        } else {
-            cancelTimeout();
-        }
+        applyControl(value);
     } else if (word_offset == 0x08U) {
         setRegister(0x08, previous & value);
     }
 }
 
 void WwdgPeripheral::onReset() {
+    state_ = State::stopped;
     cancelTimeout();
+}
+
+void WwdgPeripheral::applyControl(const std::uint32_t value) {
+    setRegister(0x00, value & 0xffU);
+    const bool enabled = (value & (1U << 7U)) != 0U;
+    switch (state_) {
+    case State::stopped:
+        if (!enabled) return;
+        state_ = State::running;
+        reload();
+        return;
+    case State::running:
+        if (enabled) {
+            reload();
+            return;
+        }
+        state_ = State::stopped;
+        cancelTimeout();
+        return;
+    }
 }
 
 void WwdgPeripheral::reload() {
     cancelTimeout();
     traceEvent("watchdog_reload");
+    switch (state_) {
+    case State::stopped:
+        return;
+    case State::running:
+        break;
+    }
     if (eventLoop() == nullptr) {
         return;
     }
