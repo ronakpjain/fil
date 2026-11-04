@@ -492,8 +492,17 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
         && !options.detect_spin && !options.trace_instructions
         && !deferred_enabled;
     struct SchedulerState {
-        bool runnable{true};
-        bool in_flight{false};
+        /** @brief Explicit lane scheduling phase. */
+        enum class Phase : std::uint8_t {
+            stopped,        ///< Terminal or budget-stopped; no further dispatch.
+            ready,          ///< Runnable with no pending completion.
+            step_in_flight, ///< Runnable; an eager step completes at ready_time_ns.
+            deferred,       ///< Runnable; an admitted deferred/RAM prefix completes at ready_time_ns.
+        };
+        /** @brief Lane phase transition events. */
+        enum class Event : std::uint8_t { stop, complete, start, admit_deferred };
+
+        Phase phase{Phase::ready};
         SimTimeNs ready_time_ns{0};
         std::optional<Board::ConcurrentStepResult> step;
         std::optional<Board::DeferredPurePrefix> deferred;
@@ -503,6 +512,19 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
         bool inside_proven_loop{false};
         std::uint64_t proven_loop_instructions{0};
         std::uint64_t same_time_dispatches{0};
+
+        [[nodiscard]] bool runnable() const noexcept { return phase != Phase::stopped; }
+        [[nodiscard]] bool inFlight() const noexcept {
+            return phase == Phase::step_in_flight || phase == Phase::deferred;
+        }
+        void apply(const Event event) noexcept {
+            switch (event) {
+            case Event::stop: phase = Phase::stopped; break;
+            case Event::complete: phase = Phase::ready; break;
+            case Event::start: phase = Phase::step_in_flight; break;
+            case Event::admit_deferred: phase = Phase::deferred; break;
+            }
+        }
     };
     std::vector<SchedulerState> states;
     if (!exact_single_fast_path) states.resize(boards_.size());
@@ -528,7 +550,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
         boards_[index]->board->peripherals().setAdcDecimation(options.adc_decimation);
         if (!exact_single_fast_path) states[index].ready_time_ns = output.start_time_ns;
         if (options.max_instructions_per_board == 0U) {
-            if (!exact_single_fast_path) states[index].runnable = false;
+            if (!exact_single_fast_path) states[index].apply(SchedulerState::Event::stop);
             stopBoard(
                 output.boards[index], *boards_[index]->board,
                 BoardStopReason::instruction_budget, "instruction budget exhausted",
@@ -608,12 +630,12 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                 board_output.result.diagnostic.raw = result.raw;
                 board_output.result.diagnostic.instruction_size = result.instruction_size;
                 state.step.reset();
-                state.in_flight = false;
+                state.apply(SchedulerState::Event::complete);
                 if (lane_boards[index]->settleInstructionBoundary()) {
                     throw std::logic_error("unexpected boundary in certified pure prefix");
                 }
                 if (board_output.result.instructions >= options.max_instructions_per_board) {
-                    state.runnable = false;
+                    state.apply(SchedulerState::Event::stop);
                     stopBoard(board_output, *lane_boards[index], BoardStopReason::instruction_budget,
                               "instruction budget exhausted", at);
                 } else if (index < dispatch_index) {
@@ -622,7 +644,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                     // is private and side-effect-free outside its own RAM.
                     state.step = lane_boards[index]->beginConcurrentStep(false, true);
                     state.ready_time_ns = saturatingAdd(at, state.step->elapsed_ns);
-                    state.in_flight = true;
+                    state.apply(SchedulerState::Event::start);
                     ++state.same_time_dispatches;
                     ++output.dispatches;
                     ++output.exact_dispatches;
@@ -897,19 +919,19 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
         // ending at this frontier before allowing any board to start another.
         for (std::size_t index = 0; index < boards_.size(); ++index) {
             SchedulerState& state = states[index];
-            if (!state.in_flight || state.ready_time_ns != now) continue;
+            if (!state.inFlight() || state.ready_time_ns != now) continue;
 
             Board& board = *boards_[index]->board;
             WorldBoardRunResult& board_output = output.boards[index];
             Board::ConcurrentStepResult completed = std::move(*state.step);
             state.step.reset();
-            state.in_flight = false;
+            state.apply(SchedulerState::Event::complete);
 
             if (completed.cpu_result.reason != cpu::StopReason::step_complete) [[unlikely]] {
                 BoardRunResult slice = board.cpuFailure(completed.cpu_result);
                 slice.time_ns = now;
                 accumulate(board_output, slice);
-                state.runnable = false;
+                state.apply(SchedulerState::Event::stop);
                 board_output.terminal = true;
                 state.proven_loop.reset();
                 state.inside_proven_loop = false;
@@ -940,7 +962,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
             const std::uint32_t pc_before_settle = board.cpu().state().r[15];
             const std::uint16_t ipsr_before_settle = board.cpu().state().ipsr();
             if (auto boundary = board.settleInstructionBoundary()) {
-                state.runnable = false;
+                state.apply(SchedulerState::Event::stop);
                 stopBoard(
                     board_output, board, boundary->reason, std::move(boundary->message), now
                 );
@@ -994,7 +1016,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                 state.inside_proven_loop = true;
                 if (options.detect_spin
                     && state.proven_loop_instructions >= options.spin_threshold) {
-                    state.runnable = false;
+                    state.apply(SchedulerState::Event::stop);
                     stopBoard(
                         board_output, board, BoardStopReason::spin_detected,
                         "exact-state loop period_instructions="
@@ -1013,7 +1035,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
             }
 
             if (deadline != 0U && now >= deadline) {
-                state.runnable = false;
+                state.apply(SchedulerState::Event::stop);
                 stopBoard(
                     board_output, board, BoardStopReason::time_budget,
                     "simulated-time budget exhausted", now
@@ -1022,7 +1044,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                 continue;
             }
             if (board_output.result.instructions >= options.max_instructions_per_board) {
-                state.runnable = false;
+                state.apply(SchedulerState::Event::stop);
                 stopBoard(
                     board_output, board, BoardStopReason::instruction_budget,
                     "instruction budget exhausted", now
@@ -1033,8 +1055,8 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
         if (deadline != 0U && now >= deadline) {
             time_exhausted = true;
             for (std::size_t index = 0; index < boards_.size(); ++index) {
-                if (!states[index].runnable || states[index].in_flight) continue;
-                states[index].runnable = false;
+                if (states[index].phase != SchedulerState::Phase::ready) continue;
+                states[index].apply(SchedulerState::Event::stop);
                 stopBoard(
                     output.boards[index], *boards_[index]->board,
                     BoardStopReason::time_budget, "simulated-time budget exhausted", now
@@ -1046,8 +1068,8 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
             && !stop_requested && !time_exhausted && !states.empty();
         bool all_lanes_proven = !states.empty();
         for (std::size_t index = 0; index < states.size(); ++index) {
-            burst_eligible = burst_eligible && states[index].runnable
-                && !states[index].in_flight && states[index].ready_time_ns == now
+            burst_eligible = burst_eligible && states[index].phase == SchedulerState::Phase::ready
+                && states[index].ready_time_ns == now
                 && output.boards[index].result.instructions + 64U
                     <= options.max_instructions_per_board;
             all_lanes_proven = all_lanes_proven
@@ -1224,7 +1246,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                         BoardRunResult slice = board.cpuFailure(step);
                         slice.time_ns = completion;
                         accumulate(board_output, slice);
-                        states[index].runnable = false;
+                        states[index].apply(SchedulerState::Event::stop);
                         board_output.terminal = true;
                         if (!slice.succeeded()) {
                             board_failed = true;
@@ -1252,7 +1274,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                     const std::uint32_t pc_before_settle = board.cpu().state().r[15];
                     const std::uint16_t ipsr_before_settle = board.cpu().state().ipsr();
                     if (auto boundary = board.settleInstructionBoundary()) {
-                        states[index].runnable = false;
+                        states[index].apply(SchedulerState::Event::stop);
                         stopBoard(
                             board_output, board, boundary->reason,
                             std::move(boundary->message), completion
@@ -1270,7 +1292,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                     }
 
                     if (deadline != 0U && completion >= deadline) {
-                        states[index].runnable = false;
+                        states[index].apply(SchedulerState::Event::stop);
                         stopBoard(
                             board_output, board, BoardStopReason::time_budget,
                             "simulated-time budget exhausted", completion
@@ -1279,7 +1301,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                         leave_burst = true;
                     } else if (board_output.result.instructions
                                >= options.max_instructions_per_board) {
-                        states[index].runnable = false;
+                        states[index].apply(SchedulerState::Event::stop);
                         stopBoard(
                             board_output, board, BoardStopReason::instruction_budget,
                             "instruction budget exhausted", completion
@@ -1304,7 +1326,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
 
             for (std::size_t index = 0; index < boards_.size(); ++index) {
                 SchedulerState& state = states[index];
-                if (!state.runnable || state.in_flight) continue;
+                if (state.phase != SchedulerState::Phase::ready) continue;
                 if (state.same_time_dispatches >= options.instruction_quantum) {
                     continue;
                 }
@@ -1312,7 +1334,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                 Board& board = *boards_[index]->board;
                 WorldBoardRunResult& board_output = output.boards[index];
                 if (board_output.result.instructions >= options.max_instructions_per_board) {
-                    state.runnable = false;
+                    state.apply(SchedulerState::Event::stop);
                     stopBoard(
                         board_output, board, BoardStopReason::instruction_budget,
                         "instruction budget exhausted", now
@@ -1352,7 +1374,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                         state.step = board.materializeReversibleRamPrefix(*state.ram, 1U);
                         state.ready_time_ns = state.ram->completionTime(0U);
                         state.ram_active = false;
-                        state.in_flight = true;
+                        state.apply(SchedulerState::Event::start);
                         ++output.dispatches;
                         ++output.exact_dispatches;
                         dispatched = true;
@@ -1362,7 +1384,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                         const auto& prefix = state.ram_active
                             ? static_cast<const Board::DeferredPurePrefix&>(*state.ram) : *state.deferred;
                         state.ready_time_ns = prefix.completionTime(prefix.count - 1U);
-                        state.in_flight = true;
+                        state.apply(SchedulerState::Event::admit_deferred);
                         ++state.same_time_dispatches;
                         ++output.dispatches;
                         ++output.deferred_prefixes;
@@ -1382,7 +1404,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                 state.step = board.beginConcurrentStep(
                     options.trace_instructions, options.enable_jit);
                 state.ready_time_ns = saturatingAdd(now, state.step->elapsed_ns);
-                state.in_flight = true;
+                state.apply(SchedulerState::Event::start);
                 ++state.same_time_dispatches;
                 ++output.dispatches;
                 ++output.exact_dispatches;
@@ -1394,12 +1416,12 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
 
         const bool any_in_flight = std::any_of(
             states.begin(), states.end(), [](const SchedulerState& state) {
-                return state.in_flight;
+                return state.inFlight();
             }
         );
         const bool any_runnable = std::any_of(
             states.begin(), states.end(), [](const SchedulerState& state) {
-                return state.runnable;
+                return state.runnable();
             }
         );
         if (!any_in_flight) {
@@ -1413,7 +1435,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
 
         SimTimeNs next_completion = std::numeric_limits<SimTimeNs>::max();
         for (const SchedulerState& state : states) {
-            if (state.in_flight) next_completion = std::min(next_completion, state.ready_time_ns);
+            if (state.inFlight()) next_completion = std::min(next_completion, state.ready_time_ns);
         }
         if (deferred_enabled) {
             const auto next_event = event_loop_.nextScheduledTime();
