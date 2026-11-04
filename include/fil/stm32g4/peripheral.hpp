@@ -588,13 +588,21 @@ protected:
     void onReset() override;
 
 private:
+    /** @brief Explicit timer lifecycle mirrored from CR1.CEN. */
+    enum class State : std::uint8_t { stopped, running };
+
     void captureCounter();
     [[nodiscard]] std::uint32_t liveCounter() const noexcept;
     void scheduleUpdate();
     void cancelUpdate() noexcept;
     void fireUpdate(bool forced);
+    /** @brief Transitions on a CR1 write from the requested CEN value. */
+    void applyControl(std::uint32_t control);
+    /** @brief Enters stopped without touching counter registers. */
+    void enterStopped() noexcept { state_ = State::stopped; }
 
     std::uint64_t input_clock_hz_{16000000};
+    State state_{State::stopped};
     sim::SimTimeNs counter_epoch_ns_{0};
     std::uint32_t counter_epoch_value_{0};
     sim::ScheduledEvent update_event_;

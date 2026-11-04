@@ -111,6 +111,9 @@ void TimerPeripheral::storeRegister(
         setRegister(word_offset, previous);
         captureCounter();
         setRegister(word_offset, value);
+        if (word_offset == cr1) {
+            applyControl(value);
+        }
         if (word_offset == cnt) {
             counter_epoch_value_ = value;
         }
@@ -134,8 +137,21 @@ void TimerPeripheral::storeRegister(
 
 void TimerPeripheral::onReset() {
     cancelUpdate();
+    applyControl(registerValue(cr1));
     counter_epoch_ns_ = currentTime();
     counter_epoch_value_ = registerValue(cnt);
+}
+
+void TimerPeripheral::applyControl(const std::uint32_t control) {
+    const bool enabled = (control & 1U) != 0U;
+    switch (state_) {
+    case State::stopped:
+        if (enabled) state_ = State::running;
+        return;
+    case State::running:
+        if (!enabled) state_ = State::stopped;
+        return;
+    }
 }
 
 void TimerPeripheral::captureCounter() {
@@ -145,7 +161,13 @@ void TimerPeripheral::captureCounter() {
 }
 
 std::uint32_t TimerPeripheral::liveCounter() const noexcept {
-    if ((registerValue(cr1) & 1U) == 0U || currentTime() <= counter_epoch_ns_) {
+    switch (state_) {
+    case State::stopped:
+        return counter_epoch_value_;
+    case State::running:
+        break;
+    }
+    if (currentTime() <= counter_epoch_ns_) {
         return counter_epoch_value_;
     }
     const std::uint64_t period = static_cast<std::uint64_t>(registerValue(arr)) + 1U;
@@ -157,7 +179,13 @@ std::uint32_t TimerPeripheral::liveCounter() const noexcept {
 
 void TimerPeripheral::scheduleUpdate() {
     cancelUpdate();
-    if (eventLoop() == nullptr || (registerValue(cr1) & 1U) == 0U) {
+    switch (state_) {
+    case State::stopped:
+        return;
+    case State::running:
+        break;
+    }
+    if (eventLoop() == nullptr) {
         return;
     }
     const std::uint64_t period = static_cast<std::uint64_t>(registerValue(arr)) + 1U;
@@ -190,6 +218,7 @@ void TimerPeripheral::fireUpdate(const bool forced) {
         update_callback_(currentTime());
     }
     if ((registerValue(cr1) & (1U << 3U)) != 0U) {
+        enterStopped();
         setRegister(cr1, registerValue(cr1) & ~1U);
     }
     scheduleUpdate();
