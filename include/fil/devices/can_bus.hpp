@@ -178,6 +178,13 @@ private:
         CompletionCallback completion;
     };
 
+    /** @brief Explicit timed-mode courier state. */
+    enum class TimedState : std::uint8_t {
+        idle,        ///< No frame on the wire and no arbitration event armed.
+        arbitrating, ///< An arbitration event is armed for the queued sender heads.
+        in_flight,   ///< One frame occupies the wire until its completion event.
+    };
+
     [[nodiscard]] Node* find(NodeId id) noexcept;
     [[nodiscard]] Result<void> submit(Transmission transmission);
     void scheduleArbitration();
@@ -205,6 +212,7 @@ private:
     std::uint64_t in_flight_fraction_before_start_{0};
     std::uint64_t next_transmission_sequence_{0};
     std::uint64_t timed_event_id_{0};
+    TimedState timed_state_{TimedState::idle};
 };
 
 } // namespace fil::devices

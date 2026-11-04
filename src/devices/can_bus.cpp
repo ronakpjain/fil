@@ -165,18 +165,29 @@ void VirtualCanBus::cancelSender(const NodeId sender) noexcept {
     pending_.erase(std::remove_if(pending_.begin(), pending_.end(), [sender](const auto& tx) {
         return tx.sender && *tx.sender == sender;
     }), pending_.end());
-    if (in_flight_ && in_flight_->sender && *in_flight_->sender == sender) {
+    switch (timed_state_) {
+    case TimedState::in_flight: {
+        const bool owned_by_sender = in_flight_ && in_flight_->sender
+            && *in_flight_->sender == sender;
+        if (!owned_by_sender) break;
         if (event_loop_ != nullptr && timed_event_id_ != 0U)
             static_cast<void>(event_loop_->cancel(timed_event_id_));
         timed_event_id_ = 0U;
         in_flight_.reset();
         fractional_numerator_ = in_flight_fraction_before_start_;
         if (event_loop_ != nullptr) next_start_ns_ = event_loop_->now();
-    } else if (!in_flight_ && timed_event_id_ != 0U && event_loop_ != nullptr) {
+        timed_state_ = TimedState::idle;
+        break;
+    }
+    case TimedState::arbitrating:
         // The deferred arbitration event may target a canceled head. Recompute
         // its deadline from the surviving sender heads.
-        static_cast<void>(event_loop_->cancel(timed_event_id_));
+        if (event_loop_ != nullptr) static_cast<void>(event_loop_->cancel(timed_event_id_));
         timed_event_id_ = 0U;
+        timed_state_ = TimedState::idle;
+        break;
+    case TimedState::idle:
+        break;
     }
     scheduleArbitration();
 }
@@ -296,9 +307,10 @@ Result<void> VirtualCanBus::submit(Transmission transmission) {
     pending_.push_back(std::move(transmission));
     // An idle bus may be waiting for a future sender head. A newly admitted
     // sender can become eligible earlier, so recompute the arbitration frontier.
-    if (!in_flight_ && timed_event_id_ != 0U) {
+    if (timed_state_ == TimedState::arbitrating) {
         static_cast<void>(event_loop_->cancel(timed_event_id_));
         timed_event_id_ = 0U;
+        timed_state_ = TimedState::idle;
     }
     scheduleArbitration();
     return {};
@@ -329,6 +341,7 @@ std::vector<bool> arbitrationKey(const CanFrame& frame) {
 void VirtualCanBus::arbitrationEvent(void* context) {
     auto* bus = static_cast<VirtualCanBus*>(context);
     bus->timed_event_id_ = 0U;
+    bus->timed_state_ = TimedState::idle;
     bus->arbitrate();
 }
 
@@ -339,8 +352,14 @@ void VirtualCanBus::completionEvent(void* context) {
 }
 
 void VirtualCanBus::scheduleArbitration() {
-    if (mode_ != DeliveryMode::timed || in_flight_ || pending_.empty()
-        || event_loop_ == nullptr || timed_event_id_ != 0U) return;
+    switch (timed_state_) {
+    case TimedState::in_flight:
+    case TimedState::arbitrating:
+        return;
+    case TimedState::idle:
+        break;
+    }
+    if (mode_ != DeliveryMode::timed || pending_.empty() || event_loop_ == nullptr) return;
     std::uint64_t earliest = std::numeric_limits<std::uint64_t>::max();
     for (std::size_t i = 0; i < pending_.size(); ++i) {
         bool has_earlier_from_sender = false;
@@ -357,10 +376,18 @@ void VirtualCanBus::scheduleArbitration() {
     auto owner = event_loop_->useOwner(sim::shared_event_owner);
     timed_event_id_ = event_loop_->scheduleBuiltinAt(
         at, {&VirtualCanBus::arbitrationEvent, this});
+    timed_state_ = TimedState::arbitrating;
 }
 
 void VirtualCanBus::arbitrate() {
-    if (mode_ != DeliveryMode::timed || in_flight_ || pending_.empty() || event_loop_ == nullptr) return;
+    switch (timed_state_) {
+    case TimedState::in_flight:
+        return;
+    case TimedState::idle:
+    case TimedState::arbitrating:
+        break;
+    }
+    if (mode_ != DeliveryMode::timed || pending_.empty() || event_loop_ == nullptr) return;
     const std::uint64_t start = std::max(next_start_ns_, event_loop_->now());
     std::optional<std::size_t> winner;
     std::vector<bool> winner_key;
@@ -420,6 +447,7 @@ void VirtualCanBus::arbitrate() {
     auto owner = event_loop_->useOwner(sim::shared_event_owner);
     timed_event_id_ = event_loop_->scheduleBuiltinAt(
         start + frame_duration, {&VirtualCanBus::completionEvent, this});
+    timed_state_ = TimedState::in_flight;
     trace(CanTraceRecord::Direction::transmit, start, in_flight_->sender_name, in_flight_->frame);
 }
 
@@ -428,6 +456,7 @@ void VirtualCanBus::completeInFlight() {
     if (!in_flight_) return;
     Transmission completed = std::move(*in_flight_);
     in_flight_.reset();
+    timed_state_ = TimedState::idle;
     const std::uint64_t at = event_loop_ != nullptr ? event_loop_->now() : next_start_ns_;
     if (delivery_barrier_) delivery_barrier_(at);
     deliver(completed.frame, at, completed.sender);
