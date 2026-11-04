@@ -6,18 +6,84 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      since:
+        description: 'Backfill every commit starting with this SHA (inclusive); blank tests HEAD'
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 jobs:
+  commits:
+    name: Find commits to test
+    runs-on: ubuntu-24.04
+    outputs:
+      shas: ${{ steps.commits.outputs.shas }}
+    steps:
+      - name: Check out history
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Enumerate commits
+        id: commits
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          SINCE: ${{ inputs.since }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          head = os.environ['HEAD']
+          base = os.environ['BASE'] if os.environ['EVENT_NAME'] == 'pull_request' else os.environ['BEFORE']
+          if os.environ['EVENT_NAME'] == 'workflow_dispatch':
+              since = os.environ['SINCE']
+              if since:
+                  since = subprocess.check_output(
+                      ['git', 'rev-parse', '--verify', '--end-of-options', f'{since}^{{commit}}'], text=True
+                  ).strip()
+                  subprocess.run(['git', 'merge-base', '--is-ancestor', since, head], check=True)
+                  revision = f'{since}^..{head}'
+              else:
+                  revision = f'{head}^..{head}'
+          elif base and set(base) != {'0'}:
+              # A force-push may leave the previous tip outside fetched history.
+              subprocess.run(['git', 'fetch', '--no-tags', 'origin', base], check=True)
+              revision = f'{base}..{head}'
+          else:
+              # A newly created main branch has no previous tip.
+              revision = head
+          shas = subprocess.check_output(
+              ['git', 'rev-list', '--reverse', revision], text=True
+          ).splitlines()
+          if not shas:
+              shas = [head]
+          # GitHub permits at most 256 matrix jobs (two architectures per SHA).
+          if len(shas) > 128:
+              raise SystemExit('More than 128 commits: split the push/PR to fit the 256-job matrix limit.')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'shas={json.dumps(shas)}\n')
+          PY
+
   build-test:
-    name: build+test (${{ matrix.arch }})
+    needs: commits
+    name: build+test (${{ matrix.arch }}, ${{ matrix.sha }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
+        sha: ${{ fromJSON(needs.commits.outputs.shas) }}
+        arch: [x86_64, aarch64]
         include:
           - runner: ubuntu-24.04
             arch: x86_64
@@ -30,6 +96,7 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
         with:
+          ref: ${{ matrix.sha }}
           fetch-depth: 1
 
       - name: Install dependencies
