@@ -338,11 +338,48 @@ run_network() {
                 sub(/[[:space:]]+$/, "", key)
                 sub(/^[[:space:]]+/, "", value)
                 sub(/[[:space:]]+$/, "", value)
-                if (leading != 2) next
+                # Original reports used unindented summary fields and
+                # "board NAME: stop=... instructions=... pc=..." rows.
+                if (leading == 0 && key ~ /^board /) {
+                    name = substr(key, 7)
+                    count = split(value, fields, /[[:space:]]+/)
+                    for (i = 1; i <= count; i++) {
+                        split(fields[i], pair, "=")
+                        if (pair[1] == "stop") board_stop[name] = pair[2]
+                        if (pair[1] == "instructions") board_instructions[name] = pair[2]
+                        if (pair[1] == "pc") board_pc[name] = pair[2]
+                    }
+                    next
+                }
+                if (leading == 0 && key == "clock") {
+                    count = split(value, fields, /[[:space:]]+/)
+                    name = ""; hz = ""
+                    for (i = 1; i <= count; i++) {
+                        split(fields[i], pair, "=")
+                        if (pair[1] == "board") name = pair[2]
+                        if (pair[1] == "hz") hz = pair[2]
+                    }
+                    if (name != "" && hz != "") board_clock[name] = hz
+                    next
+                }
+                # Intermediate reports put board fields on indented lines.
+                if (leading == 4 && active_board != "") {
+                    if (key == "stop") board_stop[active_board] = value
+                    if (key == "instructions") board_instructions[active_board] = value
+                    if (key == "pc") board_pc[active_board] = value
+                    if (key == "clock") {
+                        sub(/ Hz$/, "", value)
+                        board_clock[active_board] = value
+                    }
+                    next
+                }
+                if (leading != 0 && leading != 2) next
                 if (key == "board") {
+                    active_board = value
                     rest = value
                     name = rest
                     sub(/[ ].*$/, "", name)
+                    active_board = name
                     if (match(rest, /stop: [a-z-]+/)) {
                         board_stop[name] = substr(rest, RSTART + 6, RLENGTH - 6)
                     }
@@ -452,6 +489,8 @@ run_network() {
         cat "$raw_file" >&2
         cat "$validation_file" >&2
         if ((lenient)); then
+            printf 'stdout (tail):\n' >&2
+            tail -n 30 "$stdout_file" >&2
             printf 'stderr (tail):\n' >&2
             tail -n 20 "$stderr_file" >&2
         else
