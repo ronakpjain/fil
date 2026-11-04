@@ -18,6 +18,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -664,10 +665,45 @@ ExitCode disassembleWindowCommand(
     return ExitCode::success;
 }
 
+/** @brief Optional ANSI styling for the interactive run report. */
+class ReportStyle {
+public:
+    explicit ReportStyle(const bool enabled) noexcept : enabled_(enabled) {}
+
+    [[nodiscard]] std::string_view reset() const noexcept { return enabled_ ? "\x1b[0m" : ""; }
+    [[nodiscard]] std::string_view bold() const noexcept { return enabled_ ? "\x1b[1m" : ""; }
+    [[nodiscard]] std::string_view dim() const noexcept { return enabled_ ? "\x1b[2m" : ""; }
+    [[nodiscard]] std::string_view green() const noexcept { return enabled_ ? "\x1b[32m" : ""; }
+    [[nodiscard]] std::string_view yellow() const noexcept { return enabled_ ? "\x1b[33m" : ""; }
+    [[nodiscard]] std::string_view red() const noexcept { return enabled_ ? "\x1b[31m" : ""; }
+    [[nodiscard]] std::string_view cyan() const noexcept { return enabled_ ? "\x1b[36m" : ""; }
+
+private:
+    bool enabled_;
+};
+
+/**
+ * @brief Enables ANSI styling only for interactive stdout without NO_COLOR.
+ *
+ * Captured or redirected streams stay plain so tests, tools, and pipes keep
+ * byte-stable text.
+ *
+ * @param out Destination stream.
+ * @return Styling policy for this report.
+ */
+ReportStyle detectReportStyle(std::ostream& out) {
+    const bool interactive = &out == &std::cout && ::isatty(STDOUT_FILENO) != 0;
+    const char* const no_color = std::getenv("NO_COLOR");
+    const bool disabled = no_color != nullptr && *no_color != '\0';
+    return ReportStyle{interactive && !disabled};
+}
+
 /** @brief One report field; an empty value leaves the key bare as a section head. */
 struct ReportLine {
     std::string key;
     std::string value;
+    std::string_view key_color{};   ///< ANSI prefix around the key; empty for plain.
+    std::string_view value_color{}; ///< ANSI prefix around the value; empty for plain.
 };
 
 /**
@@ -676,18 +712,23 @@ struct ReportLine {
  * @param out Destination stream.
  * @param indent Leading spaces on every line.
  * @param lines Fields in print order.
+ * @param style ANSI policy for keys, values, and resets.
  */
 void printReportLines(
     std::ostream& out,
     const std::size_t indent,
-    const std::vector<ReportLine>& lines
+    const std::vector<ReportLine>& lines,
+    const ReportStyle& style
 ) {
     std::size_t width = 0U;
     for (const ReportLine& line : lines) width = std::max(width, line.key.size());
     for (const ReportLine& line : lines) {
-        out << std::string(indent, ' ') << line.key << ':';
+        out << std::string(indent, ' ') << line.key_color << line.key << ':';
+        if (!line.key_color.empty()) out << style.reset();
         if (!line.value.empty()) {
-            out << std::string(width - line.key.size() + 1U, ' ') << line.value;
+            out << std::string(width - line.key.size() + 1U, ' ')
+                << line.value_color << line.value;
+            if (!line.value_color.empty()) out << style.reset();
         }
         out << '\n';
     }
@@ -721,13 +762,14 @@ struct JitCounter {
  * @brief Groups nonzero JIT counters for the opt-in `--jit-stats` report.
  *
  * @param cpu CPU whose counters are read.
+ * @param style ANSI policy for the dim debug lines.
  * @return Named group lines in stable order; groups without nonzero counters
  *         are omitted so short runs report almost nothing.
  */
-std::vector<ReportLine> jitReportLines(const cpu::CortexM4& cpu) {
+std::vector<ReportLine> jitReportLines(const cpu::CortexM4& cpu, const ReportStyle& style) {
     const auto stats = cpu.jitStats();
     std::vector<ReportLine> groups;
-    const auto add = [&groups](
+    const auto add = [&groups, &style](
         const std::string_view group,
         const std::span<const JitCounter> counters
     ) {
@@ -740,7 +782,9 @@ std::vector<ReportLine> jitReportLines(const cpu::CortexM4& cpu) {
             value += std::to_string(counter.value);
         }
         if (!value.empty()) {
-            groups.push_back(ReportLine{std::string(group), std::move(value)});
+            groups.push_back(ReportLine{
+                std::string(group), std::move(value), style.dim(), style.dim()
+            });
         }
     };
     add("micro", std::array{
@@ -942,33 +986,41 @@ ExitCode runBoardCommand(
     }
 
     const sim::BoardRunResult result = board.value()->run(options);
+    const ReportStyle style = detectReportStyle(out);
+    const bool unexpected_breakpoint =
+        result.reason == sim::BoardStopReason::breakpoint && !allow_breakpoint;
+    const bool run_succeeded = result.succeeded() && !unexpected_breakpoint;
     const auto unknown = board.value()->peripherals().router().unknownAccesses();
     const std::vector<ReportLine> jit_groups = show_jit_stats
-        ? jitReportLines(board.value()->cpu()) : std::vector<ReportLine>{};
+        ? jitReportLines(board.value()->cpu(), style) : std::vector<ReportLine>{};
+    const std::string_view unknown_color = unknown.empty() ? std::string_view{} : style.red();
     std::vector<ReportLine> summary;
-    summary.push_back({"stop", std::string(sim::boardStopReasonName(result.reason))});
+    summary.push_back({"stop", std::string(sim::boardStopReasonName(result.reason)), {},
+        run_succeeded ? style.green() : style.red()});
     if (!result.message.empty()) summary.push_back({"message", result.message});
     summary.push_back({"instructions", std::to_string(result.instructions)});
     summary.push_back({"cycles", std::to_string(result.cycles)});
     summary.push_back({"time", formatSimTime(result.time_ns)});
-    summary.push_back({"pc", formatHexWord(result.diagnostic.next_pc)});
+    summary.push_back({"pc", formatHexWord(result.diagnostic.next_pc), {}, style.cyan()});
     if (!result.succeeded()) {
         const auto& state = board.value()->cpu().state();
-        summary.push_back({"msp", formatHexWord(state.msp)});
-        summary.push_back({"psp", formatHexWord(state.psp)});
-        summary.push_back({"lr", formatHexWord(state.r[14])});
-        summary.push_back({"xpsr", formatHexWord(state.xpsr)});
+        summary.push_back({"msp", formatHexWord(state.msp), {}, style.cyan()});
+        summary.push_back({"psp", formatHexWord(state.psp), {}, style.cyan()});
+        summary.push_back({"lr", formatHexWord(state.r[14]), {}, style.cyan()});
+        summary.push_back({"xpsr", formatHexWord(state.xpsr), {}, style.cyan()});
     }
-    summary.push_back({"unknown_mmio", std::to_string(unknown.size())});
+    summary.push_back({"unknown_mmio", std::to_string(unknown.size()), {}, unknown_color});
     if (show_jit_stats) {
-        summary.push_back({"jit", jit_groups.empty() ? "no recorded counters" : ""});
+        summary.push_back({"jit", jit_groups.empty() ? "no recorded counters" : "",
+            style.dim(), {}});
     }
-    out << "board: " << board_config.value().name << '\n';
-    printReportLines(out, 2U, summary);
-    if (!jit_groups.empty()) printReportLines(out, 4U, jit_groups);
+    out << style.bold() << "board: " << board_config.value().name << style.reset() << '\n';
+    printReportLines(out, 2U, summary, style);
+    if (!jit_groups.empty()) printReportLines(out, 4U, jit_groups, style);
     for (const auto& access : unknown) {
-        out << "    " << formatHexWord(access.address)
-            << "  reads=" << access.reads << " writes=" << access.writes << '\n';
+        out << "    " << style.red() << formatHexWord(access.address)
+            << "  reads=" << access.reads << " writes=" << access.writes
+            << style.reset() << '\n';
     }
     if (trace_path) {
         std::ofstream trace(*trace_path, std::ios::binary | std::ios::trunc);
@@ -982,8 +1034,6 @@ ExitCode runBoardCommand(
             return ExitCode::runtime_error;
         }
     }
-    const bool unexpected_breakpoint =
-        result.reason == sim::BoardStopReason::breakpoint && !allow_breakpoint;
     if (!result.succeeded() || unexpected_breakpoint) {
         err << "fil: run stopped with " << sim::boardStopReasonName(result.reason) << '\n';
         return ExitCode::runtime_error;
@@ -1352,8 +1402,28 @@ std::string summarizeExpectationRows(const std::vector<ExpectationRow>& rows) {
     return summary;
 }
 
+/** @brief Picks the header color for the expectation summary value. */
+std::string_view expectationSummaryColor(
+    const std::vector<ExpectationRow>& rows,
+    const ReportStyle& style
+) {
+    bool failed = false;
+    bool incomplete = false;
+    for (const ExpectationRow& row : rows) {
+        failed = failed || row.status == "fail";
+        incomplete = incomplete || row.status == "incomplete";
+    }
+    if (failed) return style.red();
+    if (incomplete) return style.yellow();
+    return style.green();
+}
+
 /** @brief Prints expectation rows in aligned columns, failures first. */
-void printExpectationRows(std::ostream& out, const std::vector<ExpectationRow>& rows) {
+void printExpectationRows(
+    std::ostream& out,
+    const std::vector<ExpectationRow>& rows,
+    const ReportStyle& style
+) {
     std::size_t marker_width = 0U, script_width = 0U, description_width = 0U;
     for (const ExpectationRow& row : rows) {
         marker_width = std::max(marker_width, row.marker.size());
@@ -1364,7 +1434,12 @@ void printExpectationRows(std::ostream& out, const std::vector<ExpectationRow>& 
         return text + std::string(width - text.size(), ' ');
     };
     for (const ExpectationRow& row : rows) {
-        out << "    " << padded(row.marker, marker_width) << "  "
+        std::string_view color = style.dim();
+        if (row.status == "fail") color = style.red();
+        else if (row.status == "incomplete") color = style.yellow();
+        else if (row.status == "pass") color = style.green();
+        out << "    " << color << row.marker << style.reset()
+            << std::string(marker_width - row.marker.size(), ' ') << "  "
             << padded(row.script, script_width) << "  "
             << padded(row.description, description_width) << "  "
             << row.window << '\n';
@@ -1600,8 +1675,26 @@ ExitCode runNetworkCommand(
 
     if (!expectations.empty()) expectation_evaluator.finish(result.value().end_time_ns);
 
+    const ReportStyle style = detectReportStyle(out);
+    bool unexpected_breakpoint = false;
+    if (!allow_breakpoint) {
+        for (const auto& board : result.value().boards) {
+            if (board.result.reason == sim::BoardStopReason::breakpoint) {
+                unexpected_breakpoint = true;
+                break;
+            }
+        }
+    }
+    const bool unmet_expectation = expectation_evaluator.hasFailures();
+    const bool run_succeeded =
+        result.value().succeeded() && !unexpected_breakpoint && !unmet_expectation;
+    std::vector<ExpectationRow> expectation_rows = buildExpectationRows(
+        expectations, expectation_evaluator
+    );
+
     std::vector<ReportLine> summary;
-    summary.push_back({"stop", std::string(sim::worldStopReasonName(result.value().reason))});
+    summary.push_back({"stop", std::string(sim::worldStopReasonName(result.value().reason)), {},
+        run_succeeded ? style.green() : style.red()});
     if (!result.value().message.empty()) summary.push_back({"message", result.value().message});
     summary.push_back({"boards", std::to_string(result.value().boards.size())});
     summary.push_back({"instructions", std::to_string(result.value().instructions)});
@@ -1626,29 +1719,30 @@ ExitCode runNetworkCommand(
         summary.push_back({"deferred_instructions", std::to_string(result.value().deferred_instructions)});
         summary.push_back({"deferred_truncations", std::to_string(result.value().deferred_truncations)});
     }
-    std::vector<ExpectationRow> expectation_rows = buildExpectationRows(
-        expectations, expectation_evaluator
-    );
     if (!expectation_rows.empty()) {
-        summary.push_back({"expectations", summarizeExpectationRows(expectation_rows)});
+        summary.push_back({"expectations", summarizeExpectationRows(expectation_rows), {},
+            expectationSummaryColor(expectation_rows, style)});
     }
-    out << "network: " << network_config.value().name << '\n';
-    printReportLines(out, 2U, summary);
-
-    const bool unmet_expectation = expectation_evaluator.hasFailures();
+    out << style.bold() << "network: " << network_config.value().name << style.reset() << '\n';
+    printReportLines(out, 2U, summary, style);
     if (!expectation_rows.empty()) {
         out << '\n';
-        printExpectationRows(out, expectation_rows);
+        printExpectationRows(out, expectation_rows, style);
     }
     for (const auto& board : result.value().boards) {
-        out << '\n' << "  board: " << board.name << '\n';
+        out << '\n' << style.bold() << "  board: " << board.name << style.reset() << '\n';
+        const bool board_breakpoint =
+            board.result.reason == sim::BoardStopReason::breakpoint && !allow_breakpoint;
+        const std::string_view stop_color = !board.result.succeeded()
+            ? style.red() : (board_breakpoint ? style.yellow() : style.green());
         std::vector<ReportLine> fields;
-        fields.push_back({"stop", std::string(sim::boardStopReasonName(board.result.reason))});
+        fields.push_back({"stop", std::string(sim::boardStopReasonName(board.result.reason)), {},
+            stop_color});
         if (!board.result.message.empty() && !board.result.succeeded()) {
-            fields.push_back({"message", board.result.message});
+            fields.push_back({"message", board.result.message, {}, style.yellow()});
         }
         fields.push_back({"instructions", std::to_string(board.result.instructions)});
-        fields.push_back({"pc", formatHexWord(board.result.diagnostic.next_pc)});
+        fields.push_back({"pc", formatHexWord(board.result.diagnostic.next_pc), {}, style.cyan()});
         if (enable_ram_capsules
             && (board.memoized_prefixes != 0U || board.memoized_instructions != 0U)) {
             fields.push_back({"memoized_ram", "prefixes=" + std::to_string(board.memoized_prefixes)
@@ -1656,23 +1750,26 @@ ExitCode runNetworkCommand(
         }
         sim::Board* instance = world.value()->board(board.name);
         const std::vector<ReportLine> jit_groups = show_jit_stats && instance != nullptr
-            ? jitReportLines(instance->cpu()) : std::vector<ReportLine>{};
+            ? jitReportLines(instance->cpu(), style) : std::vector<ReportLine>{};
         if (instance != nullptr) {
             fields.push_back({"clock", std::to_string(
                 instance->peripherals().rcc().systemClockHz()) + " Hz"});
         }
         if (show_jit_stats && instance != nullptr) {
-            fields.push_back({"jit", jit_groups.empty() ? "no recorded counters" : ""});
+            fields.push_back({"jit", jit_groups.empty() ? "no recorded counters" : "",
+                style.dim(), {}});
         }
-        printReportLines(out, 4U, fields);
-        if (!jit_groups.empty()) printReportLines(out, 6U, jit_groups);
+        printReportLines(out, 4U, fields, style);
+        if (!jit_groups.empty()) printReportLines(out, 6U, jit_groups, style);
         if (instance != nullptr) {
             const auto unknown = instance->peripherals().router().unknownAccesses();
             if (!unknown.empty()) {
-                out << "    unknown_mmio: " << unknown.size() << '\n';
+                out << "    " << style.red() << "unknown_mmio: " << unknown.size()
+                    << style.reset() << '\n';
                 for (const auto& access : unknown) {
-                    out << "      " << formatHexWord(access.address)
-                        << "  reads=" << access.reads << " writes=" << access.writes << '\n';
+                    out << "      " << style.red() << formatHexWord(access.address)
+                        << "  reads=" << access.reads << " writes=" << access.writes
+                        << style.reset() << '\n';
                 }
             }
         }
@@ -1688,15 +1785,6 @@ ExitCode runNetworkCommand(
         if (!trace) {
             err << "fil: failed while writing trace output\n";
             return ExitCode::runtime_error;
-        }
-    }
-    bool unexpected_breakpoint = false;
-    if (!allow_breakpoint) {
-        for (const auto& board : result.value().boards) {
-            if (board.result.reason == sim::BoardStopReason::breakpoint) {
-                unexpected_breakpoint = true;
-                break;
-            }
         }
     }
     if (!result.value().succeeded() || unexpected_breakpoint || unmet_expectation) {

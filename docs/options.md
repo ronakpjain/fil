@@ -35,6 +35,8 @@ network, summary fields are aligned underneath it, and each network board appear
 in its own `board:` section. Simulated time is shown with a unit and the exact
 nanosecond count. Stimulus expectations print as a dedicated block after the
 summary, with failures first; `--jit-stats` adds opt-in internal JIT counters.
+The report uses colors only when stdout is an interactive terminal; a non-empty
+`NO_COLOR` environment variable disables them.
 
 ```bash
 fil run board.json --duration 1s
