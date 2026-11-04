@@ -1636,16 +1636,6 @@ ExitCode runNetworkCommand(
     printReportLines(out, 2U, summary);
 
     const bool unmet_expectation = expectation_evaluator.hasFailures();
-    for (std::size_t index = 0; index < expectations.size(); ++index) {
-        const auto& check = expectations[index];
-        if (expectation_evaluator.status(index) == "fail"
-            || expectation_evaluator.status(index) == "incomplete") {
-            const std::string_view kind = std::holds_alternative<sim::CanExpectation>(check.expectation)
-                ? "CAN" : "GPIO";
-            err << "fil: unmet " << kind << " output expectation in stimulus '"
-                << check.script << "': " << describeExpectation(check.expectation) << '\n';
-        }
-    }
     if (!expectation_rows.empty()) {
         out << '\n';
         printExpectationRows(out, expectation_rows);

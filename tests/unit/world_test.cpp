@@ -689,7 +689,8 @@ TEST(WorldTest, NestedBusInjectionDoesNotSatisfyParentBusExpectation) {
     EXPECT_NE(out.str().find("[FAIL]"), std::string::npos);
     EXPECT_NE(out.str().find("CAN vehicle id=0x123 data=01"), std::string::npos);
     EXPECT_NE(out.str().find("[0, 0] ms"), std::string::npos);
-    EXPECT_NE(err.str().find("unmet CAN output expectation"), std::string::npos);
+    EXPECT_EQ(err.str().find("unmet"), std::string::npos)
+        << "expectation details stay on stdout, not stderr";
 }
 
 TEST(WorldTest, RunNetworkEvaluatesGpioExpectationWithParallelLanes) {
@@ -715,7 +716,8 @@ TEST(WorldTest, RunNetworkEvaluatesGpioExpectationWithParallelLanes) {
     EXPECT_NE(out.str().find("GPIO gpio-par-a.GPIOB pin 14 level 1"), std::string::npos);
     EXPECT_NE(out.str().find("[FAIL]"), std::string::npos);
     EXPECT_NE(out.str().find("[0, 0] ms"), std::string::npos);
-    EXPECT_NE(err.str().find("unmet GPIO output expectation"), std::string::npos);
+    EXPECT_EQ(err.str().find("unmet"), std::string::npos)
+        << "expectation details stay on stdout, not stderr";
 }
 
 TEST(WorldTest, CanOutputTraceCarriesExactBusAndFirmwareOrigin) {
