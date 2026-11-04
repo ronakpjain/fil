@@ -207,15 +207,25 @@ void UsartPeripheral::scheduleIdle() {
     if (eventLoop() == nullptr || rx_queue_.empty()) {
         return;
     }
-    static_cast<void>(idle_event_.scheduleAfter(idle_gap_ns_, [this]() {
+    const sim::EventId id = idle_event_.scheduleAfter(idle_gap_ns_, [this]() {
+        idle_event_.retireInvocation();
+        idle_state_ = IdleLineState::disarmed;
         setRegister(isr, registerValue(isr) | idle_flag);
         traceEvent("uart_idle");
         signalInterruptIfEnabled();
-    }));
+    });
+    idle_state_ = id != 0U ? IdleLineState::armed : IdleLineState::disarmed;
 }
 
 void UsartPeripheral::cancelIdle() noexcept {
-    idle_event_.cancel();
+    switch (idle_state_) {
+    case IdleLineState::armed:
+        idle_event_.cancel();
+        idle_state_ = IdleLineState::disarmed;
+        return;
+    case IdleLineState::disarmed:
+        return;
+    }
 }
 
 } // namespace fil::stm32g4

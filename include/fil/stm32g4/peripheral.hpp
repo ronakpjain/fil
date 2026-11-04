@@ -530,6 +530,12 @@ protected:
     void onReset() override;
 
 private:
+    /** @brief Explicit idle-line detector state for the receive path. */
+    enum class IdleLineState : std::uint8_t {
+        disarmed, ///< No idle-line completion event is scheduled.
+        armed,    ///< An idle-line completion event is scheduled.
+    };
+
     void refillRx();
     void updateStatus();
     void signalInterruptIfEnabled();
@@ -546,6 +552,7 @@ private:
     bool dma_suppress_{false};
     sim::SimTimeNs idle_gap_ns_{1000000};
     sim::ScheduledEvent idle_event_;
+    IdleLineState idle_state_{IdleLineState::disarmed};
 };
 
 struct TimerUpdate {
