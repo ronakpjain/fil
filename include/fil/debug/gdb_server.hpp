@@ -28,6 +28,7 @@ struct GdbServerOptions {
     std::uint16_t port{3333};                      ///< GDB TCP port; zero selects an ephemeral port.
     bool telnet_enabled{true};                     ///< Whether to serve the telnet monitor endpoint.
     std::uint16_t telnet_port{4444};               ///< Telnet port; zero selects an ephemeral port.
+    bool once{false};                              ///< Exit after the first GDB session ends.
     std::uint64_t slice_instructions{262'144};     ///< Instructions per interruptible run slice.
     std::uint64_t slice_time_ns{1'000'000};        ///< Simulated time per run slice; zero disables.
 };
@@ -106,11 +107,12 @@ private:
 };
 
 /**
- * @brief Listens on a TCP endpoint and serves one GDB session.
+ * @brief Listens on a TCP endpoint and serves GDB sessions.
  *
  * Prints the listening endpoint before blocking for a connection and reports
- * the connection and outcome on the supplied streams. Returns after the single
- * session ends.
+ * each connection and outcome on the supplied streams. Unless
+ * `options.once` is set, another debugger may attach after a session ends;
+ * the telnet monitor stays available throughout.
  * @param board Board controlled by the debugger.
  * @param options Endpoint and slice controls.
  * @param out Human-readable progress stream.

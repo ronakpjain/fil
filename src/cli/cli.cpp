@@ -1077,6 +1077,7 @@ ExitCode debugBoardCommand(
             if (option == "--telnet-port") options.telnet_port = static_cast<std::uint16_t>(parsed.value());
             else options.port = static_cast<std::uint16_t>(parsed.value());
         } else if (option == "--no-telnet") options.telnet_enabled = false;
+        else if (option == "--once") options.once = true;
         else if (option == "--strict-mmio") strict_mmio = true;
         else if (option == "--lenient-mmio") strict_mmio = false;
         else {
@@ -2579,6 +2580,8 @@ void printHelp(std::ostream& out) {
         << "  --telnet-port N (default 4444; 0 = ephemeral) | --no-telnet enables a\n"
         << "  telnet monitor: mdw/mdh/mdb, regs, info; reads never halt the target,\n"
         << "  and only RAM/ROM/flash is readable while it runs.\n"
+        << "  The server keeps accepting GDB connections after detach; --once exits\n"
+        << "  after the first session.\n"
         << "\nServe options:\n"
         << "  Binary protocol on stdin/stdout; stdio is the only transport (no --transport).\n"
         << "  --duration D --refresh-ms N --refresh-us N --instruction-budget N --quantum N\n"

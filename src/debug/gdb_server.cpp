@@ -946,32 +946,38 @@ Result<GdbSessionEnd> serveGdb(
             << '\n' << std::flush;
     }
 
-    int client = -1;
     for (;;) {
-        if (monitor != nullptr) monitor->service(false);
-        if (!waitForConnection(listener.value().descriptor(), monitor != nullptr)) continue;
-        client = ::accept(listener.value().descriptor(), nullptr, nullptr);
-        if (client >= 0) break;
-        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK
-            || errno == ECONNABORTED) {
-            continue;
+        int client = -1;
+        while (client < 0) {
+            if (monitor != nullptr) monitor->service(false);
+            if (!waitForConnection(listener.value().descriptor(), monitor != nullptr)) {
+                continue;
+            }
+            client = ::accept(listener.value().descriptor(), nullptr, nullptr);
+            if (client >= 0) break;
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK
+                || errno == ECONNABORTED) {
+                client = -1;
+                continue;
+            }
+            return Error{
+                ErrorCategory::io,
+                "GDB connection accept failed: " + std::string(std::strerror(errno)),
+                std::nullopt
+            };
         }
-        return Error{
-            ErrorCategory::io,
-            "GDB connection accept failed: " + std::string(std::strerror(errno)),
-            std::nullopt
-        };
-    }
-    static_cast<void>(detail::setBlocking(client));
-    out << "fil debug: GDB connected" << '\n' << std::flush;
+        static_cast<void>(detail::setBlocking(client));
+        out << "fil debug: GDB connected" << '\n' << std::flush;
 
-    SocketTransport transport(client);
-    GdbSession session(board, transport, options, monitor.get());
-    const auto result = session.run();
-    if (!result) return result.error();
-    out << "fil debug: GDB session ended (" << gdbSessionEndName(result.value()) << ")\n"
-        << std::flush;
-    return result.value();
+        SocketTransport transport(client);
+        GdbSession session(board, transport, options, monitor.get());
+        const auto result = session.run();
+        if (!result) return result.error();
+        out << "fil debug: GDB session ended (" << gdbSessionEndName(result.value()) << ")\n"
+            << std::flush;
+        if (options.once) return result.value();
+        out << "fil debug: waiting for the next GDB connection\n" << std::flush;
+    }
 }
 
 } // namespace fil::debug

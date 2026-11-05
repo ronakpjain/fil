@@ -114,11 +114,12 @@ arm-none-eabi-gdb path/to/firmware.elf
 ```
 
 `debug` loads one board config and serves the GDB Remote Serial Protocol on a
-TCP endpoint until a single debugger session ends (detach, kill, or
-disconnect). Connect any RSP-speaking GDB; GDB loads symbols, source, and
+TCP endpoint. Connect any RSP-speaking GDB; GDB loads symbols, source, and
 line information from the firmware ELF itself. A second endpoint serves an
 OpenOCD-style telnet monitor that can inspect memory and registers while the
-target keeps running.
+target keeps running. The server keeps accepting GDB connections as long as
+the process runs; `--once` exits after the first session ends (detach, kill,
+or disconnect).
 
 Execution is unlimited while debugging: configured board-run duration and
 instruction defaults do not apply, and the firmware runs until a breakpoint,
@@ -133,6 +134,7 @@ target memory map.
 | `--gdb-address ADDR` | Local listen address for both endpoints; default `127.0.0.1`. |
 | `--telnet-port N` | Telnet monitor port; default 4444. `0` selects an ephemeral port. |
 | `--no-telnet` | Disable the telnet monitor endpoint. |
+| `--once` | Exit after the first GDB session instead of waiting for another. |
 | `--strict-mmio` / `--lenient-mmio` | Fault on unmodeled MMIO or allow compatibility behavior; default lenient. |
 
 Behavior and boundaries:
@@ -183,7 +185,9 @@ fil monitor
 | `reset` | Reset the board; refused while the target is running. |
 | `quit` / `exit` | Close the connection. |
 
-Commands are serviced at instruction boundaries, so a running `continue`
+Detaching leaves the board exactly as it is; a later debugger attaches to the
+same state, and its breakpoints start empty. Commands are serviced at
+instruction boundaries, so a running `continue`
 answers within about one execution slice (1 ms of simulated time). While the
 target runs, only RAM/ROM/flash reads are allowed: those have no
 firmware-visible side effects, so live inspection stays deterministic. MMIO
