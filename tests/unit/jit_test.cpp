@@ -549,8 +549,9 @@ TEST(JitTest, WarmedNativeTraceStitchesRealBlBxLrAndMatchesCheckedCuts) {
             candidate.state().r[14] = 0U;
         }
         fil::cpu::CortexM4::ReversibleCycleBudget warm; warm.remaining_cycles = 1000U;
-        if (!candidate.tryStepBudgetedReversibleJitBlock(64U, warm))
+        if (!candidate.tryStepBudgetedReversibleJitBlock(64U, warm)) {
             ASSERT_EQ(candidate.stepFast().reason, fil::cpu::StopReason::step_complete);
+        }
     }
     ASSERT_GT(candidate.jitStats().trace_executions, 0U)
         << "trace compilations=" << candidate.jitStats().trace_compilations
@@ -651,8 +652,9 @@ TEST(JitTest, CheckedBlxSeedsObservedEdgeAndNativeTraceExecutesTheCall) {
         candidate.state().r[15] = call_pc;
         fil::cpu::CortexM4::ReversibleCycleBudget warm; warm.remaining_cycles = 1000U;
         const auto warmed = candidate.tryStepBudgetedReversibleJitBlock(64U, warm);
-        if (!warmed && candidate.state().r[15] == call_pc)
+        if (!warmed && candidate.state().r[15] == call_pc) {
             ASSERT_EQ(candidate.stepFast().reason, fil::cpu::StopReason::step_complete);
+        }
         if (candidate.state().r[15] == callee) {
             for (unsigned i = 0U; i < 9U; ++i)
                 ASSERT_EQ(candidate.stepFast().reason, fil::cpu::StopReason::step_complete);
@@ -738,8 +740,9 @@ TEST(JitTest, NativeTraceMatchesCheckedPrefixesBudgetsAndChangedBranchInputs) {
     for (unsigned i = 0U; i < 4000U && candidate.jitStats().trace_instructions == 0U; ++i) {
         fil::cpu::CortexM4::ReversibleCycleBudget warm;
         warm.remaining_cycles = 1000U;
-        if (!candidate.tryStepBudgetedReversibleJitBlock(64U, warm))
+        if (!candidate.tryStepBudgetedReversibleJitBlock(64U, warm)) {
             ASSERT_EQ(candidate.stepFast().reason, fil::cpu::StopReason::step_complete);
+        }
     }
     ASSERT_GT(candidate.jitStats().trace_instructions, 0U);
     fil::cpu::CpuState initial;
@@ -833,8 +836,9 @@ TEST(JitTest, NativeTraceCachesValidChargePrefixAcrossTimingKeys) {
     for (unsigned i = 0U; i < 4000U && candidate.jitStats().trace_instructions == 0U; ++i) {
         fil::cpu::CortexM4::ReversibleCycleBudget warm;
         warm.remaining_cycles = 1000U;
-        if (!candidate.tryStepCommittedRamSpan(64U, warm))
+        if (!candidate.tryStepCommittedRamSpan(64U, warm)) {
             ASSERT_EQ(candidate.stepFast().reason, fil::cpu::StopReason::step_complete);
+        }
     }
     ASSERT_GT(candidate.jitStats().trace_instructions, 0U);
 
@@ -953,8 +957,9 @@ TEST(JitTest, NativeTraceFirstFetchBiasMatchesCheckedCostsAcrossEntryModes) {
     for (unsigned i = 0U; i < 4000U; ++i) {
         fil::cpu::CortexM4::ReversibleCycleBudget warm;
         warm.remaining_cycles = 1000U;
-        if (!candidate.tryStepCommittedRamSpan(64U, warm))
+        if (!candidate.tryStepCommittedRamSpan(64U, warm)) {
             ASSERT_EQ(candidate.stepFast().reason, fil::cpu::StopReason::step_complete);
+        }
     }
     ASSERT_GT(candidate.jitStats().trace_instructions, 0U);
     for (const auto stalls : std::array<std::array<std::uint16_t, 2U>, 7U>{{
@@ -1014,7 +1019,9 @@ TEST(JitTest, NativeTraceFirstFetchBiasMatchesCheckedCostsAcrossEntryModes) {
                     if (result) {
                         EXPECT_EQ(result->instructions, count);
                         EXPECT_EQ(result->cycles, execution);
-                        if (detailed) EXPECT_EQ(budget.total_instruction_cycles[0], first_charge);
+                        if (detailed) {
+                            EXPECT_EQ(budget.total_instruction_cycles[0], first_charge);
+                        }
                     }
                     EXPECT_EQ(budget.remaining_cycles, credit - charged);
                     EXPECT_TRUE(fil::cpu::bitwiseEqual(candidate.state(), checked.state()));
@@ -1077,8 +1084,9 @@ TEST(JitTest, CompareBranchCommittedSpansMatchCheckedInstructionCycles) {
         prepare(candidate); candidate.state().r[1] = ram_base;
         for (unsigned i = 0; i < 4000U; ++i) {
             fil::cpu::CortexM4::ReversibleCycleBudget warm; warm.remaining_cycles = 128U;
-            if (!candidate.tryStepCommittedRamSpan(64U, warm))
+            if (!candidate.tryStepCommittedRamSpan(64U, warm)) {
                 ASSERT_EQ(candidate.stepFast().reason, fil::cpu::StopReason::step_complete);
+            }
         }
         ASSERT_GT(candidate.jitStats().trace_instructions, 0U);
         for (const auto value : {0U, 1U}) {
@@ -1121,8 +1129,9 @@ TEST(JitTest, CommittedRamSpanUnrollsLoopsWithEveryIterationRetired) {
     for (unsigned i = 0U; i < 4000U && candidate.jitStats().trace_instructions == 0U; ++i) {
         fil::cpu::CortexM4::ReversibleCycleBudget warm;
         warm.remaining_cycles = 1000U;
-        if (!candidate.tryStepCommittedRamSpan(64U, warm))
+        if (!candidate.tryStepCommittedRamSpan(64U, warm)) {
             ASSERT_EQ(candidate.stepFast().reason, fil::cpu::StopReason::step_complete);
+        }
     }
     ASSERT_GT(candidate.jitStats().trace_instructions, 0U);
     prepare(candidate);
@@ -1161,8 +1170,8 @@ TEST(JitTest, CommittedRamSpanUnrollsLoopsWithEveryIterationRetired) {
                         const auto step = checked.stepFast();
                         ASSERT_EQ(step.reason, fil::cpu::StopReason::step_complete);
                         cycles += step.cycles;
-                        charged_cycles += step.cycles + budget.fetch_timing.stall(
-                            pc, have_fetch && pc == fetch_end);
+                        charged_cycles += static_cast<std::uint64_t>(step.cycles)
+                            + budget.fetch_timing.stall(pc, have_fetch && pc == fetch_end);
                         have_fetch = true;
                         fetch_end = pc + step.instruction_size;
                     }
@@ -1354,15 +1363,17 @@ TEST(JitTest, CommittedRamSpanMatchesDetailedReversiblePrefixes) {
     for (unsigned i = 0U; i < 4000U && compact.jitStats().trace_instructions == 0U; ++i) {
         fil::cpu::CortexM4::ReversibleCycleBudget warm;
         warm.remaining_cycles = 1000U;
-        if (!compact.tryStepCommittedRamSpan(64U, warm))
+        if (!compact.tryStepCommittedRamSpan(64U, warm)) {
             ASSERT_EQ(compact.stepFast().reason, fil::cpu::StopReason::step_complete);
+        }
     }
     ASSERT_GT(compact.jitStats().trace_instructions, 0U);
     for (unsigned i = 0U; i < 4000U && detailed.jitStats().trace_instructions == 0U; ++i) {
         fil::cpu::CortexM4::ReversibleCycleBudget warm;
         warm.remaining_cycles = 1000U;
-        if (!detailed.tryStepBudgetedReversibleJitBlock(64U, warm))
+        if (!detailed.tryStepBudgetedReversibleJitBlock(64U, warm)) {
             ASSERT_EQ(detailed.stepFast().reason, fil::cpu::StopReason::step_complete);
+        }
     }
     ASSERT_GT(detailed.jitStats().trace_instructions, 0U);
 
@@ -1455,8 +1466,9 @@ TEST(JitTest, NativeStackCallTraceMatchesEveryCutAndArchitecturalStackMode) {
     for (unsigned i = 0U; i < 4000U && candidate.jitStats().trace_instructions == 0U; ++i) {
         fil::cpu::CortexM4::ReversibleCycleBudget warm;
         warm.remaining_cycles = 1000U;
-        if (!candidate.tryStepBudgetedReversibleJitBlock(64U, warm))
+        if (!candidate.tryStepBudgetedReversibleJitBlock(64U, warm)) {
             ASSERT_EQ(candidate.stepFast().reason, fil::cpu::StopReason::step_complete);
+        }
     }
     ASSERT_GT(candidate.jitStats().trace_instructions, 0U);
     fil::cpu::CpuState initial;
@@ -1544,8 +1556,9 @@ TEST(JitTest, NativeTraceDeclinesCallbacksPendingStateAndStaleCodeGenerations) {
     candidate.state().r[0] = 1U; candidate.state().r[1] = ram_base;
     for (unsigned i = 0U; i < 4000U && candidate.jitStats().trace_instructions == 0U; ++i) {
         fil::cpu::CortexM4::ReversibleCycleBudget budget; budget.remaining_cycles = 1000U;
-        if (!candidate.tryStepBudgetedReversibleJitBlock(64U, budget))
+        if (!candidate.tryStepBudgetedReversibleJitBlock(64U, budget)) {
             ASSERT_EQ(candidate.stepFast().reason, fil::cpu::StopReason::step_complete);
+        }
     }
     ASSERT_GT(candidate.jitStats().trace_instructions, 0U);
     const auto trace_calls = candidate.jitStats().trace_executions;

@@ -107,9 +107,12 @@ void SpiPeripheral::transferWord(const std::uint32_t value, const std::uint32_t 
     } else if (echo_) {
         received = transmitted;
     }
-    received.resize(byte_count, 0);
+    // Normalize the response to the transferred width, padding missing bytes.
+    while (received.size() < byte_count) {
+        received.push_back(0);
+    }
     if (received.size() > byte_count) {
-        received.resize(byte_count);
+        received.erase(received.begin() + static_cast<std::ptrdiff_t>(byte_count), received.end());
     }
     for (const std::uint8_t byte : received) {
         receive_bytes_.push_back(byte);

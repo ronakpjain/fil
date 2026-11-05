@@ -386,7 +386,9 @@ void checkIndexedTransfer(MicroJit& jit, std::uint16_t first, std::uint16_t seco
         std::uint16_t pipeline = 0U; ASSERT_TRUE(reference.peekPredictableCycles(pipeline));
         const auto charge = pipeline + stalls[1];
         const bool retires = limit != 0U && credit >= charge;
-        if (retires) ASSERT_EQ(reference.stepFast().reason, StopReason::step_complete);
+        if (retires) {
+            ASSERT_EQ(reference.stepFast().reason, StopReason::step_complete);
+        }
         function(&context);
         EXPECT_TRUE(bitwiseEqual(state, reference.state()))
             << std::hex << first << '/' << second << '/' << std::dec << bank << '/' << limit << '/' << credit;

@@ -1034,7 +1034,9 @@ TEST(WorldTimeTest, QueuedLaneWorkersJoinEveryConsumerBeforeTheNextWindow) {
             const auto coordinator = std::this_thread::get_id();
             fil::sim::detail::LaneWorkers workers(jobs, [&](const auto index) {
                 EXPECT_EQ(counts[index].fetch_add(1U, std::memory_order_relaxed), epoch);
-                if (background == 0U) EXPECT_EQ(std::this_thread::get_id(), coordinator);
+                if (background == 0U) {
+                    EXPECT_EQ(std::this_thread::get_id(), coordinator);
+                }
                 if (index + 1U == jobs && epoch % 31U == 0U)
                     std::this_thread::sleep_for(std::chrono::microseconds{100});
                 else if (epoch % 7U == 0U) std::this_thread::yield();
@@ -1110,7 +1112,9 @@ TEST(WorldTimeTest, QueuedLaneWorkersRestoreCoordinatorOwnerDomainsAfterExceptio
                 } else if (fail && index == 2U) throw std::runtime_error("coordinator owner failure");
             }, background);
             EXPECT_THROW(workers.run(), std::runtime_error);
-            if (background != 0U) EXPECT_TRUE(background_failed.load(std::memory_order_acquire));
+            if (background != 0U) {
+                EXPECT_TRUE(background_failed.load(std::memory_order_acquire));
+            }
             EXPECT_FALSE(fil::devices::DeferredCanScope::active());
             EXPECT_EQ(events.activeOwner(), fil::sim::shared_event_owner);
             EXPECT_NO_THROW(static_cast<void>(events.now()));
@@ -1149,7 +1153,9 @@ TEST(WorldTimeTest, ParallelOwnerWindowsMatchSerialOwnerExecution) {
         options.enable_parallel_lanes = false;
         const auto expected = serial.value()->run(options);
         ASSERT_TRUE(actual && expected);
-        if (std::thread::hardware_concurrency() > 1U) EXPECT_EQ(actual.value().parallel_lanes, 2U);
+        if (std::thread::hardware_concurrency() > 1U) {
+            EXPECT_EQ(actual.value().parallel_lanes, 2U);
+        }
         EXPECT_EQ(expected.value().parallel_lanes, 0U);
         EXPECT_EQ(actual.value().instructions, expected.value().instructions);
         EXPECT_EQ(actual.value().cycles, expected.value().cycles);
@@ -1379,9 +1385,10 @@ TEST(WorldTimeTest, OwnerMmioReadsKeepUnchangedEventHorizonAndExactClock) {
         EXPECT_EQ(a.cpu().state().r, b.cpu().state().r);
         EXPECT_EQ(a.cpu().state().xpsr, b.cpu().state().xpsr);
         const auto stats = a.cpu().jitStats();
-        if (stats.trace_executions != 0U)
+        if (stats.trace_executions != 0U) {
             EXPECT_GT(stats.trace_instructions, 8U * stats.trace_executions)
                 << "unchanged horizon allows traces across multiple MMIO reads";
+        }
     }
 }
 

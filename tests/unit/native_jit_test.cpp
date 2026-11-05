@@ -697,14 +697,30 @@ TEST(NativeJitTest, AllMemoryWidthsAndShortCostArraysRetirePreciselyAtEveryCut) 
                 : limit < count ? NativeExitReason::instruction_limit : NativeExitReason::none);
             EXPECT_EQ(state.r[15], pc + retired * 2U);
             EXPECT_EQ(state.xpsr, 0xf90f0000U);
-            if (retired >= 1U) EXPECT_EQ(memory.read32(ram).value(), 0x89abcdefU);
-            if (retired >= 2U) EXPECT_EQ(memory.read32(ram + 4U).value(), 0x808080efU);
-            if (retired >= 3U) EXPECT_EQ(memory.read16(ram + 8U).value(), 0xcdefU);
-            if (retired >= 4U) EXPECT_EQ(state.r[2], 0x89abcdefU);
-            if (retired >= 5U) EXPECT_EQ(state.r[3], 0xefU);
-            if (retired >= 6U) EXPECT_EQ(state.r[4], 0xcdefU);
-            if (retired >= 7U) EXPECT_EQ(state.r[5], 0xffffffefU);
-            if (retired >= 8U) EXPECT_EQ(state.r[7], 0xffff80efU);
+            if (retired >= 1U) {
+                EXPECT_EQ(memory.read32(ram).value(), 0x89abcdefU);
+            }
+            if (retired >= 2U) {
+                EXPECT_EQ(memory.read32(ram + 4U).value(), 0x808080efU);
+            }
+            if (retired >= 3U) {
+                EXPECT_EQ(memory.read16(ram + 8U).value(), 0xcdefU);
+            }
+            if (retired >= 4U) {
+                EXPECT_EQ(state.r[2], 0x89abcdefU);
+            }
+            if (retired >= 5U) {
+                EXPECT_EQ(state.r[3], 0xefU);
+            }
+            if (retired >= 6U) {
+                EXPECT_EQ(state.r[4], 0xcdefU);
+            }
+            if (retired >= 7U) {
+                EXPECT_EQ(state.r[5], 0xffffffefU);
+            }
+            if (retired >= 8U) {
+                EXPECT_EQ(state.r[7], 0xffff80efU);
+            }
         }
     }
 }
@@ -954,7 +970,9 @@ TEST(NativeJitTest, TraceLimitsAndCycleAdmissionRetireExactPrefixes) {
         const auto prefix = budget == 0U ? 0U : budget <= 2U ? 1U : budget < 5U ? 2U : 3U;
         EXPECT_EQ(ctx.retired_count, prefix) << budget;
         EXPECT_EQ(ctx.retired_cycles, prefix == 0U ? 0U : prefix == 1U ? 1U : prefix == 2U ? 3U : 5U);
-        if (budget < 5U) EXPECT_EQ(ctx.exit_reason, NativeExitReason::cycle_limit);
+        if (budget < 5U) {
+            EXPECT_EQ(ctx.exit_reason, NativeExitReason::cycle_limit);
+        }
     }
 }
 
@@ -1172,8 +1190,8 @@ TEST(NativeJitTest, TstAndRegisterFlagShiftMatchPortableAtEveryBoundary) {
         op.pc = pc + static_cast<std::uint32_t>(i * 2U);
         op.size = 2U; op.expected_taken = i == 3U;
         op.expected_next_pc = i == 3U ? pc : op.pc + 2U;
-        op.execution_cycles = basePipelineCycles(*decoded)
-            + (i == 3U ? takenBranchPenalty(decoded->kind) : 0U);
+        op.execution_cycles = static_cast<std::uint16_t>(basePipelineCycles(*decoded)
+            + (i == 3U ? takenBranchPenalty(decoded->kind) : 0U));
         costs[i] = op.execution_cycles;
         prefix[i + 1U] = prefix[i] + costs[i];
     }

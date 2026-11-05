@@ -337,7 +337,9 @@ TEST(BoardTest, ColdPeriodCertificationKeepsLongCheckedSpansAndExactCuts) {
             ASSERT_EQ(prefix->count, 128U);
             EXPECT_EQ(prefix->memoized_count, 0U);
             EXPECT_FALSE(prefix->whole_ram_neutral_period_certificate);
-            if (recurring_entry) EXPECT_GT(prefix->folded_instructions, 0U);
+            if (recurring_entry) {
+                EXPECT_GT(prefix->folded_instructions, 0U);
+            }
             options.max_instructions = cut;
             const auto expected = exact.value()->run(options);
             const auto actual = candidate.value()->materializeReversibleRamPrefix(*prefix, cut);
