@@ -17,6 +17,7 @@
 
 namespace fil::sim {
 class Board;
+class World;
 }
 
 namespace fil::debug {
@@ -29,7 +30,8 @@ struct GdbServerOptions {
     std::uint16_t telnet_port{4444};               ///< Telnet port; zero selects an ephemeral port.
     bool once{false};                              ///< Exit after the first GDB session ends.
     std::uint64_t slice_instructions{262'144};     ///< Instructions per interruptible run slice.
-    std::uint64_t slice_time_ns{1'000'000};        ///< Simulated time per run slice; zero disables.
+    std::uint64_t slice_time_ns{1'000'000};        ///< Simulated time per run slice; zero disables for standalone boards.
+    sim::World* world{nullptr};                    ///< Borrowed network owning the selected board; must outlive the session.
 };
 
 /** @brief Outcome of waiting for debugger input. */
@@ -72,9 +74,10 @@ public:
 /**
  * @brief One GDB Remote Serial Protocol session against a board.
  *
- * The session owns no thread and no socket; it drives the referenced board
- * directly. Continue and step requests execute through bounded board slices so
- * an interrupting `0x03` byte is observed promptly.
+ * The session owns no thread and no socket. Continue and step execute bounded
+ * board slices, or world slices when options.world is supplied, so an
+ * interrupting `0x03` byte is observed promptly. In a network, idle waits hold
+ * only the selected CPU; peers and peripheral events continue.
  */
 class GdbSession {
 public:

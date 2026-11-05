@@ -3,6 +3,7 @@
 #include "fil/cpu/cortex_m4.hpp"
 #include "fil/debug/monitor.hpp"
 #include "fil/sim/board.hpp"
+#include "fil/sim/world.hpp"
 
 #include "../fixture_support.hpp"
 
@@ -546,6 +547,47 @@ TEST(GdbServerTest, StepsOneInstruction) {
     ASSERT_GE(replies.size(), 2U);
     EXPECT_EQ(replies[0], "T05");
     EXPECT_EQ(board->cpu().state().r[15], next);
+}
+
+TEST(GdbServerTest, NetworkSessionStepsBreaksAndInspectsWhilePeersRun) {
+    fil::test::TemporaryDirectory files("fil-network-gdb");
+    const auto fixture = fil::test::fixtureBoardConfig();
+    fil::config::NetworkConfig network;
+    network.name = "debug-network";
+    for (const std::string name : {"alpha", "beta"}) {
+        const auto json = std::string("{\"schema_version\":1,\"name\":\"") + name
+            + "\",\"mcu\":\"" + fixture.mcu_path.string()
+            + "\",\"elf\":\"" + fixture.elf_path.string() + "\"}";
+        network.board_paths.push_back(files.write(name + ".json", json));
+    }
+    auto world = fil::sim::World::load(network);
+    ASSERT_TRUE(world);
+    auto& alpha = *world.value()->board("alpha");
+    auto& beta = *world.value()->board("beta");
+    const std::uint32_t start = alpha.cpu().state().r[15];
+    const std::vector<std::uint8_t> loop{0x01U, 0x30U, 0xfdU, 0xe7U};
+    ASSERT_TRUE(alpha.memory().loadBytes(start, loop));
+    ASSERT_TRUE(beta.memory().loadBytes(start, loop));
+    alpha.cpu().state().r[0] = beta.cpu().state().r[0] = 0U;
+    GdbServerOptions options;
+    options.world = world.value().get();
+    ScriptedTransport transport;
+    transport.send("s");
+    transport.send("Z1," + hexWord(start) + ",2");
+    transport.send("c");
+    transport.send("p0");
+    transport.send("D");
+    EXPECT_EQ(serve(alpha, transport, options), GdbSessionEnd::detached);
+    const auto replies = repliesOf(transport.output());
+    ASSERT_EQ(replies.size(), 5U);
+    EXPECT_EQ(replies[0], "T05");
+    EXPECT_EQ(replies[1], "OK");
+    EXPECT_EQ(replies[2], "T05hwbreak:;");
+    EXPECT_EQ(replies[3], "01000000");
+    EXPECT_EQ(alpha.cpu().state().r[15], start);
+    EXPECT_EQ(alpha.cpu().state().r[0], 1U);
+    EXPECT_GT(beta.cpu().state().r[0], 1U);
+    EXPECT_GT(world.value()->eventLoop().now(), 1'000'000U);
 }
 
 TEST(GdbServerTest, InterruptStopsRunningTarget) {

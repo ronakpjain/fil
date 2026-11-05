@@ -149,8 +149,11 @@ stepping, and Ctrl+C interrupts. The `Restart`/`Reset` buttons reuse
 - **SVD peripheral views** refresh while the target is stopped; peripheral
   reads are refused while it runs because reading device registers can apply
   side effects (read-to-clear flags, FIFO pops).
-- **Multi-core/chained configurations** are not supported: `fil debug` controls
-  one board, and network configs are rejected.
+- **Network debugging** selects one board with
+  `fil debug NETWORK.json --board NAME`. Set `executable` to that board's ELF
+  and pass the network path plus `--board NAME` in the server task. Other boards
+  and peripheral events keep advancing while the selected CPU is stopped.
+  Multi-core/chained debugger configurations are still not supported.
 - **Data watchpoints** stop exactly after the instruction that accessed the
   address. They are evaluated at instruction boundaries, so values are never
   torn and there is no hardware watchpoint-count limit.

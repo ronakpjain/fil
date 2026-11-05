@@ -63,6 +63,22 @@ void stopBoard(
     output.terminal = true;
 }
 
+// Debug access logging must not leak into peripherals or survive an exception.
+class DebugAccessWatchScope {
+public:
+    explicit DebugAccessWatchScope(mem::MemoryBus& memory)
+        : memory_(memory), previous_(memory.accessWatchLogEnabled()) {
+        memory_.clearAccessWatchLog();
+        memory_.setAccessWatchLog(true);
+    }
+    ~DebugAccessWatchScope() { memory_.setAccessWatchLog(previous_); }
+    DebugAccessWatchScope(const DebugAccessWatchScope&) = delete;
+    DebugAccessWatchScope& operator=(const DebugAccessWatchScope&) = delete;
+private:
+    mem::MemoryBus& memory_;
+    bool previous_;
+};
+
 // Marks the calling worker thread as executing one lane for trace routing and
 // clears it eagerly on exit, including when a lane throws.
 class LaneTraceScope {
@@ -453,6 +469,10 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
     // peripheral callbacks. Keep a non-aliased snapshot for the hot scheduler.
     const WorldRunOptions options = [&] {
         auto effective = requested_options;
+        if (effective.debug_board) {
+            effective.cross_board_window_ns = 0U;
+            effective.enable_ram_capsules = false;
+        }
         // Fast defaults must not turn diagnostic or alternative schedulers
         // into invalid combinations. Their exact paths retain full fidelity.
         effective.enable_ram_capsules = effective.enable_ram_capsules
@@ -460,6 +480,14 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
             && !effective.trace_instructions && !effective.detect_spin;
         return effective;
     }();
+    if (options.debug_board && std::none_of(boards_.begin(), boards_.end(), [&](const auto& entry) {
+            return entry->board.get() == options.debug_board;
+        })) {
+        return argumentError("debug board does not belong to this world");
+    }
+    if (options.debug_run && !options.debug_board) {
+        return argumentError("debug run requires a selected board");
+    }
     if (options.instruction_quantum == 0U) {
         return argumentError("world instruction quantum must be nonzero");
     }
@@ -488,7 +516,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
     output.end_time_ns = output.start_time_ns;
     output.boards.resize(boards_.size());
 
-    const bool exact_single_fast_path = boards_.size() <= 64U
+    const bool exact_single_fast_path = !options.debug_board && boards_.size() <= 64U
         && !options.detect_spin && !options.trace_instructions
         && !deferred_enabled;
     struct SchedulerState {
@@ -549,13 +577,16 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
         initializeSnapshot(output.boards[index], *boards_[index]->board, output.start_time_ns);
         boards_[index]->board->peripherals().setAdcDecimation(options.adc_decimation);
         if (!exact_single_fast_path) states[index].ready_time_ns = output.start_time_ns;
-        if (options.max_instructions_per_board == 0U) {
+        const bool debug_held = boards_[index]->board.get() == options.debug_board && !options.debug_run;
+        if (options.max_instructions_per_board == 0U || debug_held) {
             if (!exact_single_fast_path) states[index].apply(SchedulerState::Event::stop);
             stopBoard(
                 output.boards[index], *boards_[index]->board,
-                BoardStopReason::instruction_budget, "instruction budget exhausted",
+                debug_held ? BoardStopReason::halted : BoardStopReason::instruction_budget,
+                debug_held ? "CPU held by debugger" : "instruction budget exhausted",
                 output.start_time_ns
             );
+            if (debug_held) output.boards[index].terminal = false;
         }
     }
 
@@ -933,6 +964,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                 accumulate(board_output, slice);
                 state.apply(SchedulerState::Event::stop);
                 board_output.terminal = true;
+                if (&board == options.debug_board) stop_requested = true;
                 state.proven_loop.reset();
                 state.inside_proven_loop = false;
                 if (!slice.succeeded()) {
@@ -973,6 +1005,12 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                 if (deferred_enabled && stop_requested) {
                     materialize_deferred(now, true, states.size());
                 }
+                continue;
+            }
+            if (&board == options.debug_board && board_output.result.watchpoint) {
+                state.apply(SchedulerState::Event::stop);
+                board_output.result.reason = BoardStopReason::watchpoint;
+                stop_requested = true;
                 continue;
             }
             if (board.cpu().state().r[15] != pc_before_settle
@@ -1043,7 +1081,10 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                 time_exhausted = true;
                 continue;
             }
-            if (board_output.result.instructions >= options.max_instructions_per_board) {
+            const auto instruction_limit = &board == options.debug_board && options.debug_run
+                ? options.debug_run->max_instructions : options.max_instructions_per_board;
+            if (board_output.result.instructions >= instruction_limit) {
+                if (&board == options.debug_board) stop_requested = true;
                 state.apply(SchedulerState::Event::stop);
                 stopBoard(
                     board_output, board, BoardStopReason::instruction_budget,
@@ -1064,7 +1105,7 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
             }
         }
 
-        bool burst_eligible = !deferred_enabled && !options.trace_instructions && !options.detect_spin
+        bool burst_eligible = !options.debug_board && !deferred_enabled && !options.trace_instructions && !options.detect_spin
             && !stop_requested && !time_exhausted && !states.empty();
         bool all_lanes_proven = !states.empty();
         for (std::size_t index = 0; index < states.size(); ++index) {
@@ -1333,7 +1374,21 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
 
                 Board& board = *boards_[index]->board;
                 WorldBoardRunResult& board_output = output.boards[index];
-                if (board_output.result.instructions >= options.max_instructions_per_board) {
+                const auto* debug_run = &board == options.debug_board ? options.debug_run : nullptr;
+                if (debug_run && ((debug_run->stop_address
+                        && board.cpu().state().r[15] == (*debug_run->stop_address & ~1U))
+                    || std::find(debug_run->breakpoints.begin(), debug_run->breakpoints.end(),
+                                 board.cpu().state().r[15]) != debug_run->breakpoints.end())) {
+                    state.apply(SchedulerState::Event::stop);
+                    stopBoard(board_output, board, BoardStopReason::target_reached,
+                              "debug breakpoint reached", now);
+                    stop_requested = true;
+                    break;
+                }
+                const auto instruction_limit = debug_run ? debug_run->max_instructions
+                                                         : options.max_instructions_per_board;
+                if (board_output.result.instructions >= instruction_limit) {
+                    if (debug_run) stop_requested = true;
                     state.apply(SchedulerState::Event::stop);
                     stopBoard(
                         board_output, board, BoardStopReason::instruction_budget,
@@ -1401,8 +1456,16 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
                 // atomic; only the lockstep path may admit pure multi-op
                 // prefixes after proving every lane's common frontier.
                 DispatchScope dispatch_scope(current_dispatch_index, index);
-                state.step = board.beginConcurrentStep(
-                    options.trace_instructions, options.enable_jit);
+                {
+                    std::optional<DebugAccessWatchScope> access_watch;
+                    if (debug_run && !debug_run->watchpoints.empty()) access_watch.emplace(board.memory());
+                    state.step = board.beginConcurrentStep(
+                        options.trace_instructions, options.enable_jit);
+                    if (access_watch) {
+                        board_output.result.watchpoint = board.watchpointHit(
+                            debug_run->watchpoints, board.memory().accessWatchLog());
+                    }
+                }
                 state.ready_time_ns = saturatingAdd(now, state.step->elapsed_ns);
                 state.apply(SchedulerState::Event::start);
                 ++state.same_time_dispatches;
@@ -1425,7 +1488,15 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
             }
         );
         if (!any_in_flight) {
-            if (!any_runnable || stop_requested || time_exhausted) break;
+            if (!any_runnable || stop_requested || time_exhausted) {
+                if (options.debug_board && !stop_requested && !time_exhausted && deadline != 0U) {
+                    const auto events = event_loop_.runDueEvents(deadline);
+                    output.event_callbacks += events.events_executed;
+                    time_exhausted = event_loop_.now() >= deadline;
+                    if (!time_exhausted) continue;
+                }
+                break;
+            }
             // All runnable CPUs have zero-duration work and consumed their
             // same-time quantum. Begin the next deterministic fairness pass.
             for (SchedulerState& state : states) state.same_time_dispatches = 0;

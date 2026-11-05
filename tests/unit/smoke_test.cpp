@@ -29,7 +29,7 @@ TEST(SmokeTest, HelpIsSuccessful) {
     EXPECT_NE(out.str().find("trades fidelity for speed"), std::string::npos);
     EXPECT_EQ(out.str().find("--no-jit"), std::string::npos);
     EXPECT_NE(out.str().find("--jit-stats"), std::string::npos);
-    EXPECT_NE(out.str().find("debug <board.json>"), std::string::npos);
+    EXPECT_NE(out.str().find("debug <config.json>"), std::string::npos);
     EXPECT_NE(out.str().find("--telnet-port"), std::string::npos);
 }
 
@@ -76,7 +76,7 @@ TEST(SmokeTest, DebugCommandValidatesItsInputs) {
         std::ostringstream err;
         const std::string_view args[] = {"debug", network};
         EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::usage_error);
-        EXPECT_NE(err.str().find("network debugging is not implemented"), std::string::npos);
+        EXPECT_NE(err.str().find("network debug requires --board NAME"), std::string::npos);
     }
 }
 

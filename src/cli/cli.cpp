@@ -1042,20 +1042,33 @@ ExitCode runBoardCommand(
     return ExitCode::success;
 }
 
+Result<void> scheduleConfiguredStimuli(
+    const config::NetworkConfig& network, sim::World& world,
+    std::vector<sim::ExpectationCheck>& expectations
+);
+
 ExitCode debugBoardCommand(
     const std::span<const std::string_view> args,
     std::ostream& out,
     std::ostream& err
 ) {
     if (args.size() < 2U) {
-        err << "fil: debug requires a board config path\n";
+        err << "fil: debug requires a board config or network config path\n";
         return ExitCode::usage_error;
     }
     debug::GdbServerOptions options;
+    std::optional<std::string> debug_board_name;
     bool strict_mmio = false;
     for (std::size_t index = 2U; index < args.size(); ++index) {
         const std::string_view option = args[index];
-        if (option == "--gdb-port" || option == "--gdb-address" || option == "--telnet-port") {
+        if (option == "--board") {
+            const auto value = nextOptionValue(args, index);
+            if (!value || value->empty()) {
+                err << "fil: --board requires a board name\n";
+                return ExitCode::usage_error;
+            }
+            debug_board_name = std::string(*value);
+        } else if (option == "--gdb-port" || option == "--gdb-address" || option == "--telnet-port") {
             const auto value = nextOptionValue(args, index);
             if (!value) {
                 err << "fil: " << option << " requires a value\n";
@@ -1088,9 +1101,36 @@ ExitCode debugBoardCommand(
 
     auto board_config = config::loadBoardConfig(args[1]);
     if (!board_config) {
-        if (config::loadNetworkConfig(args[1])) {
-            err << "fil: debug controls one board; network debugging is not implemented\n";
-            return ExitCode::usage_error;
+        if (auto network_config = config::loadNetworkConfig(args[1]); network_config) {
+            if (!debug_board_name) {
+                err << "fil: network debug requires --board NAME\n";
+                return ExitCode::usage_error;
+            }
+            auto world = sim::World::load(network_config.value(), strict_mmio);
+            if (!world) {
+                err << "fil: " << formatError(world.error()) << '\n';
+                return ExitCode::runtime_error;
+            }
+            auto* selected = world.value()->board(*debug_board_name);
+            if (!selected) {
+                err << "fil: unknown debug board: " << *debug_board_name << '\n';
+                return ExitCode::usage_error;
+            }
+            world.value()->setDiagnosticsEnabled(false);
+            std::vector<sim::ExpectationCheck> expectations;
+            auto scheduled = scheduleConfiguredStimuli(network_config.value(), *world.value(), expectations);
+            if (!scheduled) {
+                err << "fil: " << formatError(scheduled.error()) << '\n';
+                return ExitCode::config_error;
+            }
+            sim::ExpectationEvaluator evaluator(world.value()->trace(), expectations);
+            options.world = world.value().get();
+            auto served = debug::serveGdb(*selected, options, out);
+            if (!served) {
+                err << "fil: " << formatError(served.error()) << '\n';
+                return ExitCode::runtime_error;
+            }
+            return ExitCode::success;
         }
         err << "fil: " << formatError(board_config.error()) << '\n';
         return ExitCode::config_error;
@@ -1102,6 +1142,10 @@ ExitCode debugBoardCommand(
             ? ExitCode::config_error : ExitCode::runtime_error;
     }
 
+    if (debug_board_name && *debug_board_name != board.value()->config().name) {
+        err << "fil: --board does not match board config\n";
+        return ExitCode::usage_error;
+    }
     auto served = debug::serveGdb(*board.value(), options, out);
     if (!served) {
         err << "fil: " << formatError(served.error()) << '\n';
@@ -2542,7 +2586,7 @@ void printHelp(std::ostream& out) {
         << "  run <config.json> [options]    Execute a board or network deterministically\n"
         << "  watch <config.json> [options]  Run a human-facing live network monitor\n"
         << "  serve <config.json> [options]  Serve binary stdio control and traces\n"
-        << "  debug <board.json> [options]   Serve GDB remote debugging on a TCP port\n"
+        << "  debug <config.json> [options]  Serve GDB; networks require --board NAME\n"
         << "  compare-stlink <board.json>    Compare emulator state with STM32G4 hardware\n\n"
         << "Defaults: unlimited simulated time and instruction budget (runs to completion),\n"
         << "JIT on, network RAM capsules on, ADC decimation 1.\n"
@@ -2573,6 +2617,7 @@ void printHelp(std::ostream& out) {
         << "  stdin: BUS:ID:HEXDATA, adc BOARD INSTANCE CHANNEL VALUE,\n"
         << "  gpio BOARD PORT PIN 0|1|release, quit, or exit\n"
         << "\nDebug options:\n"
+        << "  Networks require --board NAME; peers and peripherals continue while it stops.\n"
         << "  Unlimited execution while debugging; --gdb-port N (default 3333; 0 = ephemeral),\n"
         << "  --gdb-address ADDR (default 127.0.0.1), --strict-mmio | --lenient-mmio.\n"
         << "  Connect with 'target remote HOST:PORT'; breakpoints, stepping, registers,\n"

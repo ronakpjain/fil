@@ -153,6 +153,130 @@ private:
     std::int32_t original_{-1};
 };
 
+// A tiny flash loop keeps both CPUs runnable without external firmware.
+void installDebugLoop(fil::sim::Board& board) {
+    const std::vector<std::uint8_t> code{0x01U, 0x30U, 0xfdU, 0xe7U};
+    ASSERT_TRUE(board.memory().loadBytes(0x08000100U, code));
+    board.cpu().state().r[15] = 0x08000100U;
+    board.cpu().state().r[0] = 0U;
+    board.cpu().state().halted = false;
+}
+
+TEST(WorldTest, DebugHeldCpuDoesNotStopPeersOrSharedEvents) {
+    TempWorldConfigs files;
+    auto world = fil::sim::World::load(files.network({
+        files.writeBoard("alpha.json", "alpha"), files.writeBoard("beta.json", "beta")}));
+    ASSERT_TRUE(world);
+    auto& alpha = *world.value()->board("alpha");
+    auto& beta = *world.value()->board("beta");
+    installDebugLoop(alpha);
+    installDebugLoop(beta);
+    auto* bus = world.value()->canBus("vehicle");
+    unsigned received = 0;
+    ASSERT_TRUE(bus->attach("observer", false, [&](const auto&, const auto) { ++received; }));
+    fil::devices::CanFrame frame;
+    frame.id = 0x123U;
+    ASSERT_TRUE(bus->inject(frame, 0U));
+    fil::sim::WorldRunOptions options;
+    options.debug_board = &alpha;
+    options.duration_ns = 1'000'000U;
+    auto result = world.value()->run(options);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(alpha.cpu().state().r[0], 0U);
+    EXPECT_EQ(alpha.cpu().state().r[15], 0x08000100U);
+    EXPECT_GT(beta.cpu().state().r[0], 0U);
+    EXPECT_EQ(result.value().boards[0].result.instructions, 0U);
+    EXPECT_GE(world.value()->eventLoop().now(), 1'000'000U);
+    EXPECT_EQ(received, 1U);
+}
+
+TEST(WorldTest, DebugStepAndBreakpointOnlyControlSelectedCpu) {
+    TempWorldConfigs files;
+    auto world = fil::sim::World::load(files.network({
+        files.writeBoard("alpha.json", "alpha"), files.writeBoard("beta.json", "beta")}));
+    ASSERT_TRUE(world);
+    auto& alpha = *world.value()->board("alpha");
+    auto& beta = *world.value()->board("beta");
+    installDebugLoop(alpha);
+    installDebugLoop(beta);
+    fil::sim::BoardRunOptions run;
+    run.max_instructions = 1U;
+    fil::sim::WorldRunOptions options;
+    options.debug_board = &alpha;
+    options.debug_run = &run;
+    auto result = world.value()->run(options);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result.value().boards[0].result.instructions, 1U)
+        << fil::sim::boardStopReasonName(result.value().boards[0].result.reason)
+        << ": " << result.value().boards[0].result.message;
+    EXPECT_EQ(alpha.cpu().state().r[15], 0x08000102U);
+    EXPECT_EQ(alpha.cpu().state().r[0], 1U);
+    EXPECT_GT(result.value().boards[1].result.instructions, 0U);
+    const std::uint32_t stop = 0x08000100U;
+    run.max_instructions = 100U;
+    run.breakpoints = std::span(&stop, 1U);
+    result = world.value()->run(options);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result.value().boards[0].result.reason, fil::sim::BoardStopReason::target_reached);
+    EXPECT_EQ(alpha.cpu().state().r[15], stop);
+    const auto stopped_at = world.value()->eventLoop().now();
+    options.debug_run = nullptr;
+    options.duration_ns = 1'000'000U;
+    result = world.value()->run(options);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(alpha.cpu().state().r[0], 1U);
+    EXPECT_GE(world.value()->eventLoop().now(), stopped_at + 1'000'000U);
+    options.debug_run = &run;
+    run.breakpoints = {};
+    run.max_instructions = 1U;
+    result = world.value()->run(options);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result.value().boards[0].result.instructions, 1U);
+    EXPECT_EQ(alpha.cpu().state().r[0], 2U); // no CPU catch-up after the halt
+}
+
+TEST(WorldTest, DebugWatchpointStopsAfterSelectedInstruction) {
+    TempWorldConfigs files;
+    auto world = fil::sim::World::load(files.network({
+        files.writeBoard("alpha.json", "alpha"), files.writeBoard("beta.json", "beta")}));
+    ASSERT_TRUE(world);
+    auto& alpha = *world.value()->board("alpha");
+    installDebugLoop(alpha);
+    installDebugLoop(*world.value()->board("beta"));
+    const std::vector<std::uint8_t> store{0x08U, 0x60U}; // str r0, [r1]
+    ASSERT_TRUE(alpha.memory().loadBytes(0x08000100U, store));
+    alpha.cpu().state().r[0] = 42U;
+    alpha.cpu().state().r[1] = 0x20000000U;
+    const fil::sim::Watchpoint watch{0x20000000U, 4U, fil::sim::Watchpoint::Access::write};
+    fil::sim::BoardRunOptions run;
+    run.watchpoints = std::span(&watch, 1U);
+    fil::sim::WorldRunOptions options;
+    options.debug_board = &alpha;
+    options.debug_run = &run;
+    auto result = world.value()->run(options);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result.value().boards[0].result.reason, fil::sim::BoardStopReason::watchpoint);
+    EXPECT_EQ(result.value().boards[0].result.instructions, 1U);
+    ASSERT_TRUE(result.value().boards[0].result.watchpoint);
+    EXPECT_EQ(result.value().boards[0].result.watchpoint->address, 0x20000000U);
+    EXPECT_EQ(alpha.memory().read32(0x20000000U).value(), 42U);
+    EXPECT_EQ(alpha.cpu().state().r[15], 0x08000102U);
+    EXPECT_FALSE(alpha.memory().accessWatchLogEnabled());
+}
+
+TEST(WorldTest, DebugHoldAdvancesTimeEvenWhenAllOtherCpusStopped) {
+    TempWorldConfigs files;
+    auto world = fil::sim::World::load(files.network({files.writeBoard("alpha.json", "alpha")}));
+    ASSERT_TRUE(world);
+    fil::sim::WorldRunOptions options;
+    options.debug_board = world.value()->board("alpha");
+    options.duration_ns = 10'000U;
+    auto result = world.value()->run(options);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(world.value()->eventLoop().now(), 10'000U);
+    EXPECT_EQ(result.value().instructions, 0U);
+}
+
 TEST(WorldTest, LoadsSharedCanFabric) {
     TempWorldConfigs files;
     auto network = files.network({

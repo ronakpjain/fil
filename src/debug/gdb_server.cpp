@@ -5,6 +5,7 @@
 #include "fil/debug/monitor.hpp"
 #include "fil/mem/memory_bus.hpp"
 #include "fil/sim/board.hpp"
+#include "fil/sim/world.hpp"
 #include "memory_map.hpp"
 #include "registers.hpp"
 #include "rsp.hpp"
@@ -147,6 +148,7 @@ struct GdbSession::Implementation {
     [[nodiscard]] bool handleRegisterWrite(std::string_view text);
     [[nodiscard]] bool resume(std::string_view packet);
     [[nodiscard]] bool resumeTarget(bool step);
+    [[nodiscard]] sim::BoardRunResult runSlice(const sim::BoardRunOptions& run);
     [[nodiscard]] bool serviceSemihosting(std::string& console);
     void refreshCombinedBreakpoints();
 };
@@ -317,6 +319,62 @@ bool GdbSession::Implementation::resume(const std::string_view packet) {
     return resumeTarget(step);
 }
 
+namespace {
+
+Result<sim::WorldRunResult> advanceNetwork(
+    sim::World& world, sim::Board& board, const sim::BoardRunOptions* run
+) {
+    sim::WorldRunOptions options;
+    options.debug_board = &board;
+    options.debug_run = run;
+    options.duration_ns = run && run->duration_ns ? run->duration_ns : 1'000'000U;
+    options.max_instructions_per_board = std::numeric_limits<std::uint64_t>::max();
+    options.stop_on_board_failure = false;
+    return world.run(options);
+}
+
+/** Keeps network clocks running even during fragmented packets and ACK waits. */
+class NetworkTransport final : public RspTransport {
+public:
+    NetworkTransport(RspTransport& transport, sim::World& world, sim::Board& board)
+        : transport_(transport), world_(world), board_(board) {}
+
+    std::optional<std::uint8_t> readByte() override {
+        for (;;) {
+            const auto ready = transport_.waitForInput(std::chrono::milliseconds(1));
+            if (ready == TransportWait::ready) return transport_.readByte();
+            if (ready == TransportWait::closed) return std::nullopt;
+            if (!advanceNetwork(world_, board_, nullptr)) return std::nullopt;
+        }
+    }
+    bool inputPending() override { return transport_.inputPending(); }
+    TransportWait waitForInput(std::chrono::milliseconds timeout) override {
+        return transport_.waitForInput(timeout);
+    }
+    bool write(std::string_view bytes) override { return transport_.write(bytes); }
+
+private:
+    RspTransport& transport_;
+    sim::World& world_;
+    sim::Board& board_;
+};
+
+} // namespace
+
+sim::BoardRunResult GdbSession::Implementation::runSlice(const sim::BoardRunOptions& run) {
+    if (!options.world) return board.run(run);
+    auto result = advanceNetwork(*options.world, board, &run);
+    if (result) {
+        for (const auto& lane : result.value().boards) {
+            if (lane.name == board.config().name) return lane.result;
+        }
+    }
+    sim::BoardRunResult failure;
+    failure.reason = sim::BoardStopReason::host_error;
+    failure.message = result ? "debug board missing from world" : result.error().message;
+    return failure;
+}
+
 bool GdbSession::Implementation::resumeTarget(const bool step) {
     cpu::CpuState& state = board.cpu().state();
     // A resume request clears the modeled halt left by BKPT/faults.
@@ -348,7 +406,7 @@ bool GdbSession::Implementation::resumeTarget(const bool step) {
         }
         run.breakpoints = stops;
         run.watchpoints = std::span<const sim::Watchpoint>{watchpoints};
-        const sim::BoardRunResult result = board.run(run);
+        const sim::BoardRunResult result = runSlice(run);
         switch (result.reason) {
         case sim::BoardStopReason::target_reached: {
             const std::uint32_t pc = board.cpu().state().r[pc_register_index];
@@ -662,7 +720,11 @@ Result<GdbSessionEnd> GdbSession::run() {
     Implementation& self = *implementation_;
     while (!self.end) {
         self.serviceEndpoints(false);
-        const auto wait = self.transport.waitForInput(std::chrono::milliseconds(20));
+        if (self.options.world) {
+            const auto advanced = advanceNetwork(*self.options.world, self.board, nullptr);
+            if (!advanced) return advanced.error();
+        }
+        const auto wait = self.transport.waitForInput(std::chrono::milliseconds(self.options.world ? 1 : 20));
         if (wait == TransportWait::timeout) continue;
         if (wait == TransportWait::closed) {
             if (self.end) break;
@@ -681,9 +743,9 @@ Result<GdbSessionEnd> GdbSession::run() {
 namespace {
 
 /** @brief Waits briefly for one acceptable pending GDB connection. */
-bool waitForConnection(const int listener, const bool monitor_active) {
+bool waitForConnection(const int listener, const bool monitor_active, const bool network = false) {
     pollfd pending{listener, POLLIN, 0};
-    const int timeout_ms = monitor_active ? 20 : 200;
+    const int timeout_ms = network ? 1 : monitor_active ? 20 : 200;
     const int ready = ::poll(&pending, 1, timeout_ms);
     return ready > 0 && (pending.revents & POLLIN) != 0;
 }
@@ -717,7 +779,11 @@ Result<GdbSessionEnd> serveGdb(
         int client = -1;
         while (client < 0) {
             if (monitor != nullptr) monitor->service(false);
-            if (!waitForConnection(listener.value().descriptor(), monitor != nullptr)) {
+            if (options.world) {
+                const auto advanced = advanceNetwork(*options.world, board, nullptr);
+                if (!advanced) return advanced.error();
+            }
+            if (!waitForConnection(listener.value().descriptor(), monitor != nullptr, options.world != nullptr)) {
                 continue;
             }
             client = ::accept(listener.value().descriptor(), nullptr, nullptr);
@@ -740,7 +806,13 @@ Result<GdbSessionEnd> serveGdb(
         // this same port; the primary session services it at slice boundaries.
         auto live = createLiveGdbServer(board, listener.value().descriptor());
         SocketTransport transport(client);
-        GdbSession session(board, transport, options, monitor.get(), live.get());
+        std::unique_ptr<NetworkTransport> network_transport;
+        if (options.world) {
+            network_transport = std::make_unique<NetworkTransport>(transport, *options.world, board);
+        }
+        GdbSession session(board, network_transport ? static_cast<RspTransport&>(*network_transport)
+                                                   : static_cast<RspTransport&>(transport),
+                           options, monitor.get(), live.get());
         const auto result = session.run();
         if (!result) return result.error();
         out << "fil debug: GDB session ended (" << gdbSessionEndName(result.value()) << ")\n"

@@ -51,6 +51,10 @@ struct WorldRunOptions {
     /// merge and shared delivery. Return false to yield with a time-budget stop.
     /// Workers are parked; reentrant run/event dispatch is unsupported.
     std::function<bool(SimTimeNs)> window_control;
+    /// Selected CPU under debugger control. Other CPUs and all events keep running.
+    Board* debug_board{nullptr};
+    /// Null holds the selected CPU; otherwise supplies its slice budget and stops.
+    const BoardRunOptions* debug_run{nullptr};
 };
 
 /** @brief Accumulated outcome for one board in a world run. */

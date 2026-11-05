@@ -41,7 +41,8 @@ controls. `serve` is the interprocess counterpart: stdin/stdout carry a document
 versioned binary protocol and stdout contains no human-readable output. Stdio is
 its only transport. See [Live monitoring](docs/watch_network.md) and [the stdio
 protocol](docs/serve_network.md). `debug` serves the GDB remote serial
-protocol over TCP for one board, so `arm-none-eabi-gdb` can attach with
+protocol over TCP for one board (including `debug NETWORK --board NAME`), so
+`arm-none-eabi-gdb` can attach with
 `target remote`, set breakpoints, step, and inspect registers and memory; it
 also serves an OpenOCD-style telnet monitor (`mdw`/`mdh`/`mdb`, `regs`,
 `info`) that reads memory without halting or perturbing a running target.
