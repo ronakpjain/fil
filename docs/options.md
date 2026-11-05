@@ -134,6 +134,7 @@ target memory map.
 | Option | Purpose / default |
 | --- | --- |
 | `--board NAME` | Select the board to debug within a network (required for network configs). |
+| `--cross-board-window-ns N` | Cross-board observation window while debugging a network; default 100000 (the scheduler default). `0` selects the exact serial debug scheduler. |
 | `--gdb-port N` | GDB TCP port; default 3333. `0` selects an ephemeral port and prints it. |
 | `--gdb-address ADDR` | Local listen address for both endpoints; default `127.0.0.1`. |
 | `--telnet-port N` | Telnet monitor port; default 4444. `0` selects an ephemeral port. |
@@ -169,15 +170,27 @@ Behavior and boundaries:
   `target extended-remote`, `vRun` starts a fresh inferior from reset state, so
   `(gdb) run` restarts the selected firmware. `D` and `k` end the session.
 - Network debugging selects one CPU; it does **not** pause the world. Other
-  CPUs, peripheral events, and CAN delivery continue while that CPU is stopped,
-  before GDB connects, and between sessions. Step executes one selected-CPU
-  instruction; continue resumes at current world time, without CPU catch-up.
-  Reset commands reset only the selected board. Network stimuli are scheduled
-  normally. Use the selected board's ELF for GDB symbols.
-- Debug networks use the serial exact scheduler without RAM capsules or
-  multi-instruction batching. There is no modeled hardware debug-freeze policy:
-  scheduled peripherals continue and pending CPU-boundary work settles when
-  execution resumes. This is not an emulation of STM32 DBGMCU freeze registers.
+  CPUs keep their normal parallel lanes and the bounded cross-board window,
+  and peripheral events and CAN delivery continue while the selected CPU is
+  stopped, before GDB connects, and between sessions. Step executes one
+  selected-CPU instruction; continue resumes at current world time, without CPU
+  catch-up. Reset commands reset only the selected board. Network stimuli are
+  scheduled normally. Use the selected board's ELF for GDB symbols.
+- Stops are exact for the selected CPU. A non-empty stop set (breakpoint,
+  watchpoint, or step) makes that board's owner slice single-step, so a
+  prepared block can never run past a requested address. While a stop set is
+  active that board's exact stepping, not its peers, bounds session speed. With
+  no active stop set the selected CPU uses the same bounded owner slices as a
+  normal run, so a free-running `continue` runs near production speed.
+- A debugger stop is reported at the next window boundary, after every lane
+  parks, so peers can be at most one window ahead — the same bounded-skew
+  observation the default network scheduler already provides. Pass
+  `--cross-board-window-ns 0` for the exact serial scheduler, which also
+  disables RAM capsules; it stops every board at the same frontier and is the
+  reference for comparing traces.
+- There is no modeled hardware debug-freeze policy: scheduled peripherals
+  continue and pending CPU-boundary work settles when execution resumes. This
+  is not an emulation of STM32 DBGMCU freeze registers.
 - VS Code users can drive the server through the cortex-debug extension; see
   [cortex-debug integration](vscode.md).
 - The hardware debug transport (DHCSR, DWT, hardware breakpoint units) is not

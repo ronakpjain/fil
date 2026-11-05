@@ -103,6 +103,7 @@ void accumulate(
     aggregate.result.time_ns = slice.time_ns;
     aggregate.result.diagnostic = slice.diagnostic;
     aggregate.result.message = slice.message;
+    aggregate.result.watchpoint = slice.watchpoint;
 }
 
 } // namespace
@@ -312,6 +313,27 @@ Result<WorldRunResult> World::runIndependent(const WorldRunOptions& options) {
         initializeSnapshot(output.boards[i], *boards_[i]->board, output.start_time_ns);
         boards_[i]->board->peripherals().setAdcDecimation(options.adc_decimation);
     }
+    // A debug-selected board runs its owner slice with the debugger's exact
+    // stop set, or is CPU-held when no run budget is supplied. Holding it stops
+    // its instruction stream only: its owned events still drain every window,
+    // and every other lane keeps its normal parallel slice.
+    std::size_t debug_index = boards_.size();
+    for (std::size_t i = 0U; i < boards_.size(); ++i) {
+        if (boards_[i]->board.get() == options.debug_board) {
+            debug_index = i;
+            break;
+        }
+    }
+    const bool debug_held = debug_index != boards_.size() && options.debug_run == nullptr;
+    if (debug_held) {
+        runnable.set(debug_index, false);
+        auto& held = output.boards[debug_index];
+        held.result.reason = BoardStopReason::halted;
+        held.result.message = "CPU held by debugger";
+        held.result.time_ns = output.start_time_ns;
+        boards_[debug_index]->board->cpu().captureDiagnostic(held.result.diagnostic);
+        held.terminal = false;
+    }
     const auto deadline = options.duration_ns == 0U ? 0U
         : saturatingAdd(output.start_time_ns, options.duration_ns);
     bool failed = false;
@@ -341,11 +363,22 @@ Result<WorldRunResult> World::runIndependent(const WorldRunOptions& options) {
             }
             if (local_now >= end) return; // An in-flight instruction crossed the preceding window.
             BoardRunOptions slice;
-            slice.max_instructions = options.max_instructions_per_board
-                - output.boards[i].result.instructions;
+            const bool debug_budget = i == debug_index && options.debug_run != nullptr;
+            const std::uint64_t lane_budget = debug_budget
+                ? options.debug_run->max_instructions
+                : options.max_instructions_per_board;
+            const std::uint64_t lane_executed = output.boards[i].result.instructions;
+            slice.max_instructions = lane_executed < lane_budget ? lane_budget - lane_executed : 0U;
             slice.duration_ns = end - local_now;
             slice.enable_jit = options.enable_jit;
             slice.adc_decimation = options.adc_decimation;
+            if (debug_budget) {
+                // A non-empty stop set forces exact single-instruction stepping,
+                // so a prepared block can never run past a debugger stop.
+                slice.stop_address = options.debug_run->stop_address;
+                slice.breakpoints = options.debug_run->breakpoints;
+                slice.watchpoints = options.debug_run->watchpoints;
+            }
             auto result = board.runOwnerSlice(slice);
             accumulate(output.boards[i], result);
             ++lane_dispatches[i];
@@ -365,8 +398,13 @@ Result<WorldRunResult> World::runIndependent(const WorldRunOptions& options) {
         if (events.same_time_limit_hit) throw std::runtime_error("shared event livelock");
     };
     for (;;) {
-        if (!runnable.any()) break;
-        if (deadline != 0U && now >= deadline) break;
+        if (!runnable.any()) {
+            // A CPU held by the debugger must not stall shared time: when every
+            // board is stopped, an event-only window still advances the clock.
+            if (!debug_held || deadline == 0U || now >= deadline) break;
+        } else if (deadline != 0U && now >= deadline) {
+            break;
+        }
         end = saturatingAdd(now, options.cross_board_window_ns);
         if (deadline != 0U) end = std::min(end, deadline);
         if (end == now) return argumentError("independent scheduler clock overflow");
@@ -419,6 +457,10 @@ Result<WorldRunResult> World::runIndependent(const WorldRunOptions& options) {
         drain_shared(end);
         now = end;
         output.end_time_ns = now;
+        // A debugger stop returns control after every lane parks, so GDB sees a
+        // coherent window boundary and peers are at most one window ahead.
+        if (debug_index != boards_.size() && !debug_held
+            && output.boards[debug_index].result.reason != BoardStopReason::time_budget) break;
         if (failed && options.stop_on_board_failure) break;
         if (options.window_control && !options.window_control(now)) {
             control_yield = true;
@@ -469,8 +511,8 @@ Result<WorldRunResult> World::run(const WorldRunOptions& requested_options) {
     // peripheral callbacks. Keep a non-aliased snapshot for the hot scheduler.
     const WorldRunOptions options = [&] {
         auto effective = requested_options;
-        if (effective.debug_board) {
-            effective.cross_board_window_ns = 0U;
+        if (effective.debug_board && effective.cross_board_window_ns == 0U) {
+            // Exact serial debugging: capsules skip per-instruction stop checks.
             effective.enable_ram_capsules = false;
         }
         // Fast defaults must not turn diagnostic or alternative schedulers

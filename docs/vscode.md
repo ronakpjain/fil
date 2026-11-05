@@ -152,8 +152,9 @@ stepping, and Ctrl+C interrupts. The `Restart`/`Reset` buttons reuse
 - **Network debugging** selects one board with
   `fil debug NETWORK.json --board NAME`. Set `executable` to that board's ELF
   and pass the network path plus `--board NAME` in the server task. Other boards
-  and peripheral events keep advancing while the selected CPU is stopped.
-  Multi-core/chained debugger configurations are still not supported.
+  keep their parallel lanes and peripheral events keep advancing while the
+  selected CPU is stopped; add `--cross-board-window-ns 0` for the exact serial
+  scheduler. Multi-core/chained debugger configurations are still not supported.
 - **Data watchpoints** stop exactly after the instruction that accessed the
   address. They are evaluated at instruction boundaries, so values are never
   torn and there is no hardware watchpoint-count limit.

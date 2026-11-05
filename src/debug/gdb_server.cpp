@@ -322,7 +322,8 @@ bool GdbSession::Implementation::resume(const std::string_view packet) {
 namespace {
 
 Result<sim::WorldRunResult> advanceNetwork(
-    sim::World& world, sim::Board& board, const sim::BoardRunOptions* run
+    sim::World& world, sim::Board& board, const sim::BoardRunOptions* run,
+    const std::uint64_t window_ns
 ) {
     sim::WorldRunOptions options;
     options.debug_board = &board;
@@ -330,21 +331,25 @@ Result<sim::WorldRunResult> advanceNetwork(
     options.duration_ns = run && run->duration_ns ? run->duration_ns : 1'000'000U;
     options.max_instructions_per_board = std::numeric_limits<std::uint64_t>::max();
     options.stop_on_board_failure = false;
+    // A nonzero window keeps every other board on its parallel lane; the
+    // selected board's owner slice still stops exactly at debugger stops.
+    options.cross_board_window_ns = window_ns;
     return world.run(options);
 }
 
 /** Keeps network clocks running even during fragmented packets and ACK waits. */
 class NetworkTransport final : public RspTransport {
 public:
-    NetworkTransport(RspTransport& transport, sim::World& world, sim::Board& board)
-        : transport_(transport), world_(world), board_(board) {}
+    NetworkTransport(RspTransport& transport, sim::World& world, sim::Board& board,
+                     const std::uint64_t window_ns)
+        : transport_(transport), world_(world), board_(board), window_ns_(window_ns) {}
 
     std::optional<std::uint8_t> readByte() override {
         for (;;) {
             const auto ready = transport_.waitForInput(std::chrono::milliseconds(1));
             if (ready == TransportWait::ready) return transport_.readByte();
             if (ready == TransportWait::closed) return std::nullopt;
-            if (!advanceNetwork(world_, board_, nullptr)) return std::nullopt;
+            if (!advanceNetwork(world_, board_, nullptr, window_ns_)) return std::nullopt;
         }
     }
     bool inputPending() override { return transport_.inputPending(); }
@@ -357,13 +362,14 @@ private:
     RspTransport& transport_;
     sim::World& world_;
     sim::Board& board_;
+    std::uint64_t window_ns_;
 };
 
 } // namespace
 
 sim::BoardRunResult GdbSession::Implementation::runSlice(const sim::BoardRunOptions& run) {
     if (!options.world) return board.run(run);
-    auto result = advanceNetwork(*options.world, board, &run);
+    auto result = advanceNetwork(*options.world, board, &run, options.cross_board_window_ns);
     if (result) {
         for (const auto& lane : result.value().boards) {
             if (lane.name == board.config().name) return lane.result;
@@ -721,7 +727,9 @@ Result<GdbSessionEnd> GdbSession::run() {
     while (!self.end) {
         self.serviceEndpoints(false);
         if (self.options.world) {
-            const auto advanced = advanceNetwork(*self.options.world, self.board, nullptr);
+            const auto advanced = advanceNetwork(
+                *self.options.world, self.board, nullptr, self.options.cross_board_window_ns
+            );
             if (!advanced) return advanced.error();
         }
         const auto wait = self.transport.waitForInput(std::chrono::milliseconds(self.options.world ? 1 : 20));
@@ -780,7 +788,9 @@ Result<GdbSessionEnd> serveGdb(
         while (client < 0) {
             if (monitor != nullptr) monitor->service(false);
             if (options.world) {
-                const auto advanced = advanceNetwork(*options.world, board, nullptr);
+                const auto advanced = advanceNetwork(
+                    *options.world, board, nullptr, options.cross_board_window_ns
+                );
                 if (!advanced) return advanced.error();
             }
             if (!waitForConnection(listener.value().descriptor(), monitor != nullptr, options.world != nullptr)) {
@@ -808,7 +818,9 @@ Result<GdbSessionEnd> serveGdb(
         SocketTransport transport(client);
         std::unique_ptr<NetworkTransport> network_transport;
         if (options.world) {
-            network_transport = std::make_unique<NetworkTransport>(transport, *options.world, board);
+            network_transport = std::make_unique<NetworkTransport>(
+                transport, *options.world, board, options.cross_board_window_ns
+            );
         }
         GdbSession session(board, network_transport ? static_cast<RspTransport&>(*network_transport)
                                                    : static_cast<RspTransport&>(transport),

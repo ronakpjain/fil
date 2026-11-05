@@ -32,6 +32,9 @@ struct GdbServerOptions {
     std::uint64_t slice_instructions{262'144};     ///< Instructions per interruptible run slice.
     std::uint64_t slice_time_ns{1'000'000};        ///< Simulated time per run slice; zero disables for standalone boards.
     sim::World* world{nullptr};                    ///< Borrowed network owning the selected board; must outlive the session.
+    /// Cross-board window for network debugging; defaults to the network
+    /// scheduler's window. Zero selects exact serial single-instruction debugging.
+    std::uint64_t cross_board_window_ns{100'000};
 };
 
 /** @brief Outcome of waiting for debugger input. */

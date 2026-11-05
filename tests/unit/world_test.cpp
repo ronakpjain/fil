@@ -180,6 +180,7 @@ TEST(WorldTest, DebugHeldCpuDoesNotStopPeersOrSharedEvents) {
     fil::sim::WorldRunOptions options;
     options.debug_board = &alpha;
     options.duration_ns = 1'000'000U;
+    options.cross_board_window_ns = 0U; // exact serial debug oracle
     auto result = world.value()->run(options);
     ASSERT_TRUE(result);
     EXPECT_EQ(alpha.cpu().state().r[0], 0U);
@@ -204,6 +205,7 @@ TEST(WorldTest, DebugStepAndBreakpointOnlyControlSelectedCpu) {
     fil::sim::WorldRunOptions options;
     options.debug_board = &alpha;
     options.debug_run = &run;
+    options.cross_board_window_ns = 0U; // exact serial debug oracle
     auto result = world.value()->run(options);
     ASSERT_TRUE(result);
     ASSERT_EQ(result.value().boards[0].result.instructions, 1U)
@@ -253,6 +255,7 @@ TEST(WorldTest, DebugWatchpointStopsAfterSelectedInstruction) {
     fil::sim::WorldRunOptions options;
     options.debug_board = &alpha;
     options.debug_run = &run;
+    options.cross_board_window_ns = 0U; // exact serial debug oracle
     auto result = world.value()->run(options);
     ASSERT_TRUE(result);
     EXPECT_EQ(result.value().boards[0].result.reason, fil::sim::BoardStopReason::watchpoint);
@@ -264,6 +267,111 @@ TEST(WorldTest, DebugWatchpointStopsAfterSelectedInstruction) {
     EXPECT_FALSE(alpha.memory().accessWatchLogEnabled());
 }
 
+// Windowed debugging keeps peers on parallel lanes; only the selected CPU is exact.
+const fil::sim::SimTimeNs debug_window_ns = fil::sim::WorldRunOptions{}.cross_board_window_ns;
+
+TEST(WorldTest, WindowedDebugHoldRunsPeersInParallelLanes) {
+    TempWorldConfigs files;
+    auto world = fil::sim::World::load(files.network({
+        files.writeBoard("alpha.json", "alpha"), files.writeBoard("beta.json", "beta")}));
+    ASSERT_TRUE(world);
+    auto& alpha = *world.value()->board("alpha");
+    auto& beta = *world.value()->board("beta");
+    installDebugLoop(alpha);
+    installDebugLoop(beta);
+    fil::sim::WorldRunOptions options;
+    options.debug_board = &alpha;
+    options.duration_ns = 1'000'000U;
+    options.cross_board_window_ns = debug_window_ns;
+    auto result = world.value()->run(options);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(alpha.cpu().state().r[0], 0U);
+    EXPECT_EQ(alpha.cpu().state().r[15], 0x08000100U);
+    EXPECT_GT(beta.cpu().state().r[0], 0U);
+    EXPECT_EQ(result.value().boards[0].result.instructions, 0U);
+    EXPECT_EQ(result.value().boards[0].result.reason, fil::sim::BoardStopReason::halted);
+    EXPECT_GE(world.value()->eventLoop().now(), 1'000'000U);
+    if (std::thread::hardware_concurrency() > 1U) {
+        EXPECT_GT(result.value().parallel_lanes, 0U) << "peers use parallel lanes";
+    }
+}
+
+TEST(WorldTest, WindowedDebugStepAndBreakpointStopExactly) {
+    TempWorldConfigs files;
+    auto world = fil::sim::World::load(files.network({
+        files.writeBoard("alpha.json", "alpha"), files.writeBoard("beta.json", "beta")}));
+    ASSERT_TRUE(world);
+    auto& alpha = *world.value()->board("alpha");
+    installDebugLoop(alpha);
+    installDebugLoop(*world.value()->board("beta"));
+    fil::sim::BoardRunOptions run;
+    run.max_instructions = 1U;
+    fil::sim::WorldRunOptions options;
+    options.debug_board = &alpha;
+    options.debug_run = &run;
+    options.cross_board_window_ns = debug_window_ns;
+    auto result = world.value()->run(options);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result.value().boards[0].result.instructions, 1U)
+        << fil::sim::boardStopReasonName(result.value().boards[0].result.reason)
+        << ": " << result.value().boards[0].result.message;
+    EXPECT_EQ(alpha.cpu().state().r[0], 1U);
+    EXPECT_EQ(alpha.cpu().state().r[15], 0x08000102U);
+    EXPECT_GT(result.value().boards[1].result.instructions, 0U);
+    const std::uint32_t stop = 0x08000100U;
+    run.max_instructions = 100U;
+    run.breakpoints = std::span(&stop, 1U);
+    result = world.value()->run(options);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result.value().boards[0].result.reason, fil::sim::BoardStopReason::target_reached);
+    EXPECT_EQ(alpha.cpu().state().r[0], 1U); // CPU catch-up happened only up to the breakpoint
+    EXPECT_EQ(alpha.cpu().state().r[15], stop);
+}
+
+TEST(WorldTest, WindowedDebugWatchpointStopsExactly) {
+    TempWorldConfigs files;
+    auto world = fil::sim::World::load(files.network({
+        files.writeBoard("alpha.json", "alpha"), files.writeBoard("beta.json", "beta")}));
+    ASSERT_TRUE(world);
+    auto& alpha = *world.value()->board("alpha");
+    installDebugLoop(alpha);
+    installDebugLoop(*world.value()->board("beta"));
+    const std::vector<std::uint8_t> store{0x08U, 0x60U}; // str r0, [r1]
+    ASSERT_TRUE(alpha.memory().loadBytes(0x08000100U, store));
+    alpha.cpu().state().r[0] = 42U;
+    alpha.cpu().state().r[1] = 0x20000000U;
+    const fil::sim::Watchpoint watch{0x20000000U, 4U, fil::sim::Watchpoint::Access::write};
+    fil::sim::BoardRunOptions run;
+    run.max_instructions = 1'000U;
+    run.watchpoints = std::span(&watch, 1U);
+    fil::sim::WorldRunOptions options;
+    options.debug_board = &alpha;
+    options.debug_run = &run;
+    options.cross_board_window_ns = debug_window_ns;
+    auto result = world.value()->run(options);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result.value().boards[0].result.reason, fil::sim::BoardStopReason::watchpoint);
+    EXPECT_EQ(result.value().boards[0].result.instructions, 1U);
+    ASSERT_TRUE(result.value().boards[0].result.watchpoint);
+    EXPECT_EQ(result.value().boards[0].result.watchpoint->address, 0x20000000U);
+    EXPECT_EQ(alpha.memory().read32(0x20000000U).value(), 42U);
+    EXPECT_FALSE(alpha.memory().accessWatchLogEnabled());
+}
+
+TEST(WorldTest, WindowedDebugHoldAdvancesTimeWhenAllCpusStopped) {
+    TempWorldConfigs files;
+    auto world = fil::sim::World::load(files.network({files.writeBoard("alpha.json", "alpha")}));
+    ASSERT_TRUE(world);
+    fil::sim::WorldRunOptions options;
+    options.debug_board = world.value()->board("alpha");
+    options.duration_ns = 10'000U;
+    options.cross_board_window_ns = debug_window_ns;
+    auto result = world.value()->run(options);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(world.value()->eventLoop().now(), 10'000U);
+    EXPECT_EQ(result.value().instructions, 0U);
+}
+
 TEST(WorldTest, DebugHoldAdvancesTimeEvenWhenAllOtherCpusStopped) {
     TempWorldConfigs files;
     auto world = fil::sim::World::load(files.network({files.writeBoard("alpha.json", "alpha")}));
@@ -271,6 +379,7 @@ TEST(WorldTest, DebugHoldAdvancesTimeEvenWhenAllOtherCpusStopped) {
     fil::sim::WorldRunOptions options;
     options.debug_board = world.value()->board("alpha");
     options.duration_ns = 10'000U;
+    options.cross_board_window_ns = 0U; // exact serial debug oracle
     auto result = world.value()->run(options);
     ASSERT_TRUE(result);
     EXPECT_EQ(world.value()->eventLoop().now(), 10'000U);

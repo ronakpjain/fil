@@ -52,6 +52,10 @@ struct WorldRunOptions {
     /// Workers are parked; reentrant run/event dispatch is unsupported.
     std::function<bool(SimTimeNs)> window_control;
     /// Selected CPU under debugger control. Other CPUs and all events keep running.
+    /// With a nonzero window it runs in the independent scheduler: its owner
+    /// slice uses the exact stop set below, peers keep parallel lanes, and a
+    /// debugger stop returns after the current window (peers at most one window
+    /// ahead), mirroring the documented cross-board observation window.
     Board* debug_board{nullptr};
     /// Null holds the selected CPU; otherwise supplies its slice budget and stops.
     const BoardRunOptions* debug_run{nullptr};

@@ -1061,7 +1061,19 @@ ExitCode debugBoardCommand(
     bool strict_mmio = false;
     for (std::size_t index = 2U; index < args.size(); ++index) {
         const std::string_view option = args[index];
-        if (option == "--board") {
+        if (option == "--cross-board-window-ns") {
+            const auto value = nextOptionValue(args, index);
+            if (!value) {
+                err << "fil: --cross-board-window-ns requires a value\n";
+                return ExitCode::usage_error;
+            }
+            const auto parsed = config::parseUnsigned(*value);
+            if (!parsed) {
+                err << "fil: --cross-board-window-ns requires a non-negative nanosecond value\n";
+                return ExitCode::usage_error;
+            }
+            options.cross_board_window_ns = parsed.value();
+        } else if (option == "--board") {
             const auto value = nextOptionValue(args, index);
             if (!value || value->empty()) {
                 err << "fil: --board requires a board name\n";
@@ -2618,6 +2630,8 @@ void printHelp(std::ostream& out) {
         << "  gpio BOARD PORT PIN 0|1|release, quit, or exit\n"
         << "\nDebug options:\n"
         << "  Networks require --board NAME; peers and peripherals continue while it stops.\n"
+        << "  --cross-board-window-ns N keeps peers on parallel lanes (default 100000;\n"
+        << "  0 selects exact serial single-instruction debugging).\n"
         << "  Unlimited execution while debugging; --gdb-port N (default 3333; 0 = ephemeral),\n"
         << "  --gdb-address ADDR (default 127.0.0.1), --strict-mmio | --lenient-mmio.\n"
         << "  Connect with 'target remote HOST:PORT'; breakpoints, stepping, registers,\n"
