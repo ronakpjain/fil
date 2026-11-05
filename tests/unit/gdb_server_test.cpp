@@ -297,6 +297,32 @@ TEST(GdbServerTest, ReadsAndWritesMemory) {
     EXPECT_EQ(replies[5], "E01");
 }
 
+TEST(GdbServerTest, WritesLargeBinaryBlocks) {
+    auto board = loadFixture();
+    ASSERT_NE(board, nullptr);
+    std::string data(16U * 1024U, '\0');
+    data.front() = 'A';
+    data.back() = 'Z';
+    ScriptedTransport transport;
+    transport.send("X20000000,4000:" + data); // 16 KiB, as GDB's load sends.
+    transport.send("m20000000,1");
+    transport.send("m20003fff,1");
+    transport.send("D");
+
+    EXPECT_EQ(serve(*board, transport), GdbSessionEnd::detached);
+    const auto replies = repliesOf(transport.output());
+    ASSERT_GE(replies.size(), 4U);
+    EXPECT_EQ(replies[0], "OK");
+    EXPECT_EQ(replies[1], "41");
+    EXPECT_EQ(replies[2], "5a");
+    const auto first = board->memory().read8(0x20000000U);
+    const auto last = board->memory().read8(0x20003fffU);
+    ASSERT_TRUE(first.hasValue());
+    ASSERT_TRUE(last.hasValue());
+    EXPECT_EQ(first.value(), 'A');
+    EXPECT_EQ(last.value(), 'Z');
+}
+
 TEST(GdbServerTest, StopsAtSoftwareAndHardwareBreakpoints) {
     auto probe = loadFixture();
     ASSERT_NE(probe, nullptr);

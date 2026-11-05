@@ -28,8 +28,11 @@ constexpr std::uint8_t signal_trap = 5U;
 constexpr std::uint8_t signal_abort = 6U;
 constexpr std::uint8_t signal_segmentation = 11U;
 
-constexpr std::size_t maximum_packet_bytes = 16U * 1024U;
-constexpr std::size_t maximum_memory_request = 4U * 1024U;
+constexpr std::size_t maximum_packet_bytes = 64U * 1024U;
+// GDB's binary-download path (used by `load`) writes roughly 16 KiB per
+// packet even when a smaller PacketSize was advertised, so accept generously
+// more than the advertised packet size.
+constexpr std::size_t maximum_memory_request = 32U * 1024U;
 
 // Register order shared by target.xml, `g`, `p`, and `P`.
 constexpr std::size_t sp_register_index = 13U;
