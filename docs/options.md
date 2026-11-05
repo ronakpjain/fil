@@ -149,6 +149,11 @@ Behavior and boundaries:
 - Debugger memory reads and writes are real bus accesses: reading an MMIO
   register applies that device's modeled read side effects (for example
   read-to-clear flags), and writing flash or RAM invalidates prepared code.
+- The GDB port also accepts concurrent **read-only live sessions**, used by
+  cortex-debug's Live Watch. They are serviced between execution slices and
+  never halt the target; while it runs they may read RAM/ROM/flash and register
+  snapshots, and every write, resume, breakpoint, or monitor request is
+  refused.
 - `monitor reset` and the `R` packet restore reset state. With
   `target extended-remote`, `vRun` starts a fresh inferior from reset state, so
   `(gdb) run` restarts the firmware. `D` and `k` end the session. Watchpoints

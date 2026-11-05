@@ -5,6 +5,7 @@
  */
 
 #include "fil/common/result.hpp"
+#include "fil/debug/endpoint.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -43,16 +44,8 @@ struct MonitorReply {
     bool running
 );
 
-/** @brief Servicing seam for an optional monitor endpoint; tests supply fakes. */
-class MonitorEndpoint {
-public:
-    virtual ~MonitorEndpoint() = default;
-
-    /** @brief Accepts clients and answers pending commands without blocking. */
-    virtual void service(bool running) = 0;
-    /** @brief Whether a listener or connected client needs periodic servicing. */
-    [[nodiscard]] virtual bool active() const noexcept = 0;
-};
+/** @brief Telnet monitor endpoint serviced by the debug session. */
+class MonitorEndpoint : public DebugEndpoint {};
 
 /**
  * @brief Creates and binds the TCP telnet monitor endpoint.

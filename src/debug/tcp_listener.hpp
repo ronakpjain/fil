@@ -5,9 +5,13 @@
  */
 
 #include "fil/common/result.hpp"
+#include "fil/debug/gdb_server.hpp"
 
+#include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <string_view>
 
 namespace fil::debug::detail {
 
@@ -63,5 +67,26 @@ void setNoSigPipe(int descriptor) noexcept;
     return 0;
 #endif
 }
+
+/** @brief Blocking TCP byte transport owned by one accepted connection. */
+class SocketTransport final : public RspTransport {
+public:
+    explicit SocketTransport(int descriptor);
+    ~SocketTransport() override;
+    SocketTransport(const SocketTransport&) = delete;
+    SocketTransport& operator=(const SocketTransport&) = delete;
+
+    /** @brief Reads the next byte, blocking; empty signals orderly end of input. */
+    [[nodiscard]] std::optional<std::uint8_t> readByte() override;
+    /** @brief Reports whether unread peer input is ready without consuming it. */
+    [[nodiscard]] bool inputPending() override;
+    /** @brief Blocks until input is readable, the timeout elapses, or the peer closes. */
+    [[nodiscard]] TransportWait waitForInput(std::chrono::milliseconds timeout) override;
+    /** @brief Writes one complete frame. @return False on transport failure. */
+    [[nodiscard]] bool write(std::string_view bytes) override;
+
+private:
+    int descriptor_{-1};
+};
 
 } // namespace fil::debug::detail

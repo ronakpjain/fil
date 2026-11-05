@@ -5,6 +5,7 @@
  */
 
 #include "fil/common/result.hpp"
+#include "fil/debug/endpoint.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -19,8 +20,6 @@ class Board;
 }
 
 namespace fil::debug {
-
-class MonitorEndpoint;
 
 /** @brief TCP endpoints and execution-slice controls for one debug session. */
 struct GdbServerOptions {
@@ -84,13 +83,15 @@ public:
      * @param board Board controlled by the debugger.
      * @param transport Byte transport that stays alive for the session.
      * @param options Endpoint and slice controls.
-     * @param monitor Optional monitor endpoint serviced while idle and running.
+     * @param monitor Optional telnet monitor serviced while idle and running.
+     * @param live Optional read-only live-session endpoint on the same port.
      */
     GdbSession(
         sim::Board& board,
         RspTransport& transport,
         GdbServerOptions options = {},
-        MonitorEndpoint* monitor = nullptr
+        DebugEndpoint* monitor = nullptr,
+        DebugEndpoint* live = nullptr
     );
     ~GdbSession();
     GdbSession(const GdbSession&) = delete;

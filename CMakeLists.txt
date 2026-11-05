@@ -276,7 +276,10 @@ add_library(fil_core STATIC
     src/cortexm/exceptions.cpp
     src/cortexm/system_control.cpp
     src/debug/gdb_server.cpp
+    src/debug/live_gdb.cpp
     src/debug/monitor.cpp
+    src/debug/registers.cpp
+    src/debug/rsp.cpp
     src/debug/tcp_listener.cpp
     src/devices/can_bus.cpp
     src/elf/elf_loader.cpp

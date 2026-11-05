@@ -47,6 +47,7 @@ Useful additional keys:
 | Key | Purpose |
 | --- | --- |
 | `svdFile` | Peripheral register view (SVD decoding happens in the extension, reading memory over GDB). |
+| `liveWatch` | `{"enabled": true, "samplesPerSecond": 4}` refreshes watched variables while the firmware runs. |
 | `armToolchainPath` / `objdumpPath` | Toolchain lookup when the ARM tools are not on `PATH`. |
 | `loadFiles` | Program `.hex`/`.bin` files instead of the executable. |
 | `preLaunchCommands` / `postLaunchCommands` | Extra GDB commands around the launch sequence. |
@@ -110,13 +111,20 @@ stepping, and Ctrl+C interrupts. The `Restart`/`Reset` buttons reuse
 
 ## Boundaries
 
-- **Live Watch, SWO, and RTT** are not available: they need probe-specific
-  transport or extra ports that do not exist in an emulator. For reading
-  memory while the firmware runs, use the telnet monitor instead
-  (`nc 127.0.0.1 4444`, then `mdw`, `mdb`, `regs`). It never halts the target.
-- **SVD peripheral views** work while the target is stopped; GDB cannot serve
-  memory reads while it is running, so live register refresh is limited the
-  same way it is with a hardware probe.
+- **Live Watch works**, including with `"servertype": "external"`. cortex-debug
+  opens a second GDB session on the same port; fil serves it as a read-only
+  session between execution slices, so `liveWatch` variables refresh while the
+  firmware keeps running. Nothing is halted and the firmware trace is
+  unchanged. While running, only RAM/ROM/flash expressions refresh: peripheral
+  (MMIO) reads and every write or control request are refused, because they
+  could change firmware-visible state. Reads happen at instruction boundaries,
+  so values are exact rather than torn.
+- **SWO and RTT** are not available: they need probe-specific transports or
+  extra ports that do not exist in an emulator. For ad-hoc live inspection use
+  the telnet monitor instead (`nc 127.0.0.1 4444`, then `mdw`, `mdb`, `regs`).
+- **SVD peripheral views** refresh while the target is stopped; peripheral
+  reads are refused while it runs because reading device registers can apply
+  side effects (read-to-clear flags, FIFO pops).
 - **Multi-core/chained configurations** are not supported: `fil debug` controls
   one board, and network configs are rejected.
 - Hardware watchpoints (`Z2`–`Z4`) are not implemented; GDB falls back to

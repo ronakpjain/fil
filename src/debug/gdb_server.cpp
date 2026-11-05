@@ -1,10 +1,13 @@
 #include "fil/debug/gdb_server.hpp"
 
 #include "fil/cpu/cortex_m4.hpp"
+#include "fil/debug/live_gdb.hpp"
 #include "fil/debug/monitor.hpp"
-#include "tcp_listener.hpp"
 #include "fil/mem/memory_bus.hpp"
 #include "fil/sim/board.hpp"
+#include "registers.hpp"
+#include "rsp.hpp"
+#include "tcp_listener.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -12,8 +15,11 @@
 #include <chrono>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <poll.h>
 #include <span>
+#include <string>
+#include <string_view>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <utility>
@@ -22,247 +28,30 @@
 namespace fil::debug {
 namespace {
 
+using detail::RspConnection;
+using detail::SocketTransport;
+using detail::double_register_nibbles;
+using detail::double_register_count;
+using detail::decodeBinaryBytes;
+using detail::decodeHexBytes;
+using detail::parseHex;
+using detail::parseHex32;
+using detail::parseLittleEndianHex;
+using detail::register_count;
+using detail::pc_register_index;
+using detail::single_register_nibbles;
+using detail::sp_register_index;
+
 constexpr std::uint8_t signal_interrupt = 2U;
 constexpr std::uint8_t signal_illegal_instruction = 4U;
 constexpr std::uint8_t signal_trap = 5U;
 constexpr std::uint8_t signal_abort = 6U;
 constexpr std::uint8_t signal_segmentation = 11U;
 
-constexpr std::size_t maximum_packet_bytes = 64U * 1024U;
 // GDB's binary-download path (used by `load`) writes roughly 16 KiB per
 // packet even when a smaller PacketSize was advertised, so accept generously
 // more than the advertised packet size.
 constexpr std::size_t maximum_memory_request = 32U * 1024U;
-
-// Register order shared by target.xml, `g`, `p`, and `P`.
-constexpr std::size_t sp_register_index = 13U;
-constexpr std::size_t lr_register_index = 14U;
-constexpr std::size_t pc_register_index = 15U;
-constexpr std::size_t xpsr_register_index = 16U;
-constexpr std::size_t msp_register_index = 17U;
-constexpr std::size_t psp_register_index = 18U;
-constexpr std::size_t control_register_index = 19U;
-constexpr std::size_t primask_register_index = 20U;
-constexpr std::size_t basepri_register_index = 21U;
-constexpr std::size_t faultmask_register_index = 22U;
-constexpr std::size_t double_register_base = 23U;
-constexpr std::size_t double_register_count = 16U;
-constexpr std::size_t fpscr_register_index = 39U;
-constexpr std::size_t register_count = 40U;
-constexpr std::size_t double_register_nibbles = 16U;
-constexpr std::size_t single_register_nibbles = 8U;
-
-/** @brief GDB target description: core integer, system, and FPv4-SP registers. */
-constexpr std::string_view target_description = R"XML(<?xml version="1.0"?>
-<!DOCTYPE target SYSTEM "gdb-target.dtd">
-<target>
-  <architecture>arm</architecture>
-  <feature name="org.gnu.gdb.arm.m-profile">
-    <reg name="r0" bitsize="32" type="uint32"/>
-    <reg name="r1" bitsize="32" type="uint32"/>
-    <reg name="r2" bitsize="32" type="uint32"/>
-    <reg name="r3" bitsize="32" type="uint32"/>
-    <reg name="r4" bitsize="32" type="uint32"/>
-    <reg name="r5" bitsize="32" type="uint32"/>
-    <reg name="r6" bitsize="32" type="uint32"/>
-    <reg name="r7" bitsize="32" type="uint32"/>
-    <reg name="r8" bitsize="32" type="uint32"/>
-    <reg name="r9" bitsize="32" type="uint32"/>
-    <reg name="r10" bitsize="32" type="uint32"/>
-    <reg name="r11" bitsize="32" type="uint32"/>
-    <reg name="r12" bitsize="32" type="uint32"/>
-    <reg name="sp" bitsize="32" type="data_ptr"/>
-    <reg name="lr" bitsize="32" type="uint32"/>
-    <reg name="pc" bitsize="32" type="code_ptr"/>
-    <reg name="xpsr" bitsize="32" type="uint32"/>
-    <reg name="msp" bitsize="32" type="data_ptr"/>
-    <reg name="psp" bitsize="32" type="data_ptr"/>
-    <reg name="control" bitsize="32" type="uint32"/>
-    <reg name="primask" bitsize="32" type="uint32"/>
-    <reg name="basepri" bitsize="32" type="uint32"/>
-    <reg name="faultmask" bitsize="32" type="uint32"/>
-  </feature>
-  <feature name="org.gnu.gdb.arm.vfp">
-    <reg name="d0" bitsize="64" type="ieee_double"/>
-    <reg name="d1" bitsize="64" type="ieee_double"/>
-    <reg name="d2" bitsize="64" type="ieee_double"/>
-    <reg name="d3" bitsize="64" type="ieee_double"/>
-    <reg name="d4" bitsize="64" type="ieee_double"/>
-    <reg name="d5" bitsize="64" type="ieee_double"/>
-    <reg name="d6" bitsize="64" type="ieee_double"/>
-    <reg name="d7" bitsize="64" type="ieee_double"/>
-    <reg name="d8" bitsize="64" type="ieee_double"/>
-    <reg name="d9" bitsize="64" type="ieee_double"/>
-    <reg name="d10" bitsize="64" type="ieee_double"/>
-    <reg name="d11" bitsize="64" type="ieee_double"/>
-    <reg name="d12" bitsize="64" type="ieee_double"/>
-    <reg name="d13" bitsize="64" type="ieee_double"/>
-    <reg name="d14" bitsize="64" type="ieee_double"/>
-    <reg name="d15" bitsize="64" type="ieee_double"/>
-    <reg name="fpscr" bitsize="32" type="int"/>
-  </feature>
-</target>
-)XML";
-
-/** @brief Value of one hexadecimal digit, or -1 when the character is not one. */
-int hexDigitValue(const char character) noexcept {
-    if (character >= '0' && character <= '9') return character - '0';
-    if (character >= 'a' && character <= 'f') return character - 'a' + 10;
-    if (character >= 'A' && character <= 'F') return character - 'A' + 10;
-    return -1;
-}
-
-/** @brief Renders a little-endian value as `bytes` hexadecimal digits. */
-std::string hexValue(const std::uint64_t value, const std::size_t bytes) {
-    std::string text(bytes * 2U, '0');
-    for (std::size_t index = 0U; index < bytes; ++index) {
-        const auto digit = static_cast<std::uint8_t>((value >> (index * 8U)) & 0xffU);
-        text[index * 2U] = "0123456789abcdef"[digit >> 4U];
-        text[index * 2U + 1U] = "0123456789abcdef"[digit & 0x0fU];
-    }
-    return text;
-}
-
-/** @brief Parses up to sixteen hexadecimal digits without sign or prefixes. */
-std::optional<std::uint64_t> parseHex(const std::string_view text) {
-    if (text.empty() || text.size() > 16U) return std::nullopt;
-    std::uint64_t value = 0U;
-    for (const char character : text) {
-        const int digit = hexDigitValue(character);
-        if (digit < 0) return std::nullopt;
-        value = (value << 4U) | static_cast<std::uint64_t>(digit);
-    }
-    return value;
-}
-
-/**
- * @brief Parses a little-endian hexadecimal byte string into one value.
- *
- * RSP `g`, `G`, `p`, and `P` payloads carry register bytes in target order,
- * so `deadbeef` is the value 0xefbeadde.
- */
-std::optional<std::uint64_t> parseLittleEndianHex(const std::string_view text) {
-    if (text.empty() || text.size() % 2U != 0U || text.size() > 16U) return std::nullopt;
-    std::uint64_t value = 0U;
-    for (std::size_t position = 0U; position < text.size(); position += 2U) {
-        const int high = hexDigitValue(text[position]);
-        const int low = hexDigitValue(text[position + 1U]);
-        if (high < 0 || low < 0) return std::nullopt;
-        value |= static_cast<std::uint64_t>((high << 4) | low) << (position * 4U);
-    }
-    return value;
-}
-
-/** @brief Parses a hexadecimal value that must fit the 32-bit target address space. */
-std::optional<std::uint32_t> parseHex32(const std::string_view text) {
-    const auto value = parseHex(text);
-    if (!value || *value > std::numeric_limits<std::uint32_t>::max()) return std::nullopt;
-    return static_cast<std::uint32_t>(*value);
-}
-
-/** @brief Decodes an even-length hexadecimal byte string into raw bytes. */
-std::optional<std::vector<std::uint8_t>> decodeHexBytes(const std::string_view text) {
-    if (text.size() % 2U != 0U) return std::nullopt;
-    std::vector<std::uint8_t> bytes;
-    bytes.reserve(text.size() / 2U);
-    for (std::size_t index = 0U; index < text.size(); index += 2U) {
-        const int high = hexDigitValue(text[index]);
-        const int low = hexDigitValue(text[index + 1U]);
-        if (high < 0 || low < 0) return std::nullopt;
-        bytes.push_back(static_cast<std::uint8_t>((high << 4) | low));
-    }
-    return bytes;
-}
-
-/** @brief Decodes the `X` packet's `}`-escaped binary payload. */
-std::optional<std::vector<std::uint8_t>> decodeBinaryBytes(const std::string_view text) {
-    std::vector<std::uint8_t> bytes;
-    bytes.reserve(text.size());
-    for (std::size_t index = 0U; index < text.size(); ++index) {
-        auto byte = static_cast<std::uint8_t>(text[index]);
-        if (byte == static_cast<std::uint8_t>('}')) {
-            if (++index >= text.size()) return std::nullopt;
-            byte = static_cast<std::uint8_t>(
-                static_cast<std::uint8_t>(text[index]) ^ 0x20U
-            );
-        }
-        bytes.push_back(byte);
-    }
-    return bytes;
-}
-
-/** @brief Blocking TCP byte transport owned by one accepted connection. */
-class SocketTransport final : public RspTransport {
-public:
-    explicit SocketTransport(const int descriptor) : descriptor_(descriptor) {
-        detail::setNoSigPipe(descriptor);
-    }
-
-    ~SocketTransport() override {
-        if (descriptor_ >= 0) static_cast<void>(::close(descriptor_));
-    }
-
-    SocketTransport(const SocketTransport&) = delete;
-    SocketTransport& operator=(const SocketTransport&) = delete;
-
-    [[nodiscard]] std::optional<std::uint8_t> readByte() override {
-        std::uint8_t byte = 0U;
-        for (;;) {
-            const auto received = ::recv(descriptor_, &byte, 1U, 0);
-            if (received == 1) return byte;
-            if (received == 0) return std::nullopt;
-            if (errno == EINTR) continue;
-            // A non-blocking descriptor (Darwin inherits the listener's mode)
-            // is polled instead of being reported as end of input.
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                pollfd pending{descriptor_, POLLIN, 0};
-                if (::poll(&pending, 1, 1000) > 0) continue;
-                return std::nullopt;
-            }
-            return std::nullopt;
-        }
-    }
-
-    [[nodiscard]] bool inputPending() override {
-        pollfd pending{descriptor_, POLLIN, 0};
-        const int ready = ::poll(&pending, 1, 0);
-        return ready > 0
-            && (pending.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0;
-    }
-
-    [[nodiscard]] TransportWait waitForInput(
-        const std::chrono::milliseconds timeout
-    ) override {
-        pollfd pending{descriptor_, POLLIN, 0};
-        const int ready = ::poll(&pending, 1, static_cast<int>(timeout.count()));
-        if (ready == 0) return TransportWait::timeout;
-        if (ready < 0) {
-            return errno == EINTR ? TransportWait::timeout : TransportWait::closed;
-        }
-        if ((pending.revents & POLLIN) != 0) return TransportWait::ready;
-        return TransportWait::closed;
-    }
-
-    [[nodiscard]] bool write(const std::string_view bytes) override {
-        std::size_t written = 0U;
-        while (written < bytes.size()) {
-            const auto sent = ::send(
-                descriptor_, bytes.data() + written, bytes.size() - written,
-                detail::socketSendFlags()
-            );
-            if (sent > 0) {
-                written += static_cast<std::size_t>(sent);
-                continue;
-            }
-            if (sent < 0 && errno == EINTR) continue;
-            return false;
-        }
-        return true;
-    }
-
-private:
-    int descriptor_{-1};
-};
 
 } // namespace
 
@@ -280,27 +69,49 @@ struct GdbSession::Implementation {
         sim::Board& board_value,
         RspTransport& transport_value,
         GdbServerOptions options_value,
-        MonitorEndpoint* monitor_value
-    ) : board(board_value), transport(transport_value),
-        options(std::move(options_value)), monitor(monitor_value) {}
+        DebugEndpoint* monitor_value,
+        DebugEndpoint* live_value
+    ) : board(board_value), transport(transport_value), connection(transport_value),
+        options(std::move(options_value)), monitor(monitor_value), live(live_value) {}
 
     sim::Board& board;
     RspTransport& transport;
+    RspConnection connection;
     GdbServerOptions options;
-    MonitorEndpoint* monitor{nullptr};
+    DebugEndpoint* monitor{nullptr};
+    DebugEndpoint* live{nullptr};
     std::vector<std::uint32_t> breakpoints;
     std::vector<std::uint32_t> hardware_breakpoints;
     std::vector<std::uint32_t> combined_breakpoints;
     std::string last_stop{"S05"};
-    std::string last_frame;
     std::optional<GdbSessionEnd> end;
-    bool have_last_frame{false};
-    bool no_ack{false};
 
-    [[nodiscard]] std::optional<std::string> readPacket();
-    [[nodiscard]] bool sendPacket(std::string_view payload);
-    [[nodiscard]] bool sendStopReply(std::uint8_t signal, std::string_view reason = {});
-    [[nodiscard]] bool sendMonitor(std::string_view text);
+    /** @brief Services the telnet monitor and live read-only sessions. */
+    void serviceEndpoints(const bool running) {
+        if (monitor != nullptr) monitor->service(running);
+        if (live != nullptr) live->service(running);
+    }
+
+    [[nodiscard]] std::optional<std::string> readPacket() { return connection.readPacket(); }
+    [[nodiscard]] bool sendPacket(const std::string_view payload) {
+        return connection.sendPacket(payload);
+    }
+    [[nodiscard]] bool sendMonitor(const std::string_view text) {
+        return connection.sendConsole(text);
+    }
+    [[nodiscard]] bool sendStopReply(
+        const std::uint8_t signal,
+        const std::string_view reason = {}
+    ) {
+        std::string payload = "T";
+        payload += detail::hexValue(signal, 1U);
+        if (!reason.empty()) {
+            payload.append(reason);
+            payload += ":;";
+        }
+        last_stop = payload;
+        return sendPacket(payload);
+    }
     [[nodiscard]] bool replyError() { return sendPacket("E01"); }
     [[nodiscard]] bool replyUnsupported() { return sendPacket(""); }
 
@@ -317,110 +128,8 @@ struct GdbSession::Implementation {
     [[nodiscard]] bool handleRegisterWrite(std::string_view text);
     [[nodiscard]] bool resume(std::string_view packet);
     [[nodiscard]] bool resumeTarget(bool step);
-
-    [[nodiscard]] std::string readAllRegisters() const;
-    [[nodiscard]] std::optional<std::string> readSingleRegister(std::uint32_t index) const;
-    [[nodiscard]] bool writeAllRegisters(std::string_view text);
-    [[nodiscard]] bool writeSingleRegister(std::uint32_t index, std::uint64_t value);
-    void refreshActiveSpMirror();
     void refreshCombinedBreakpoints();
 };
-
-std::optional<std::string> GdbSession::Implementation::readPacket() {
-    for (;;) {
-        const auto byte = transport.readByte();
-        if (!byte) return std::nullopt;
-        if (*byte == static_cast<std::uint8_t>('+')) continue;
-        if (*byte == static_cast<std::uint8_t>('-')) {
-            // The peer rejected the previous frame; resend it once.
-            if (have_last_frame && !transport.write(last_frame)) return std::nullopt;
-            continue;
-        }
-        if (*byte != static_cast<std::uint8_t>('$')) continue; // Stray interrupt or noise.
-        std::string payload;
-        for (;;) {
-            const auto next = transport.readByte();
-            if (!next) return std::nullopt;
-            if (*next == static_cast<std::uint8_t>('#')) break;
-            if (payload.size() >= maximum_packet_bytes) return std::nullopt;
-            payload.push_back(static_cast<char>(*next));
-        }
-        const auto high = transport.readByte();
-        const auto low = transport.readByte();
-        if (!high || !low) return std::nullopt;
-        std::uint8_t checksum = 0U;
-        for (const char character : payload) {
-            checksum = static_cast<std::uint8_t>(
-                checksum + static_cast<std::uint8_t>(character)
-            );
-        }
-        const int high_digit = hexDigitValue(static_cast<char>(*high));
-        const int low_digit = hexDigitValue(static_cast<char>(*low));
-        const auto expected = static_cast<std::uint8_t>(
-            ((high_digit < 0 ? 0 : high_digit) << 4) | (low_digit < 0 ? 0 : low_digit)
-        );
-        if (checksum != expected) {
-            if (!no_ack && !transport.write("-")) return std::nullopt;
-            continue;
-        }
-        if (!no_ack && !transport.write("+")) return std::nullopt;
-        return payload;
-    }
-}
-
-bool GdbSession::Implementation::sendPacket(const std::string_view payload) {
-    std::string frame;
-    frame.reserve(payload.size() + 4U);
-    frame.push_back('$');
-    frame.append(payload);
-    frame.push_back('#');
-    std::uint8_t checksum = 0U;
-    for (const char character : payload) {
-        checksum = static_cast<std::uint8_t>(
-            checksum + static_cast<std::uint8_t>(character)
-        );
-    }
-    frame += hexValue(checksum, 1U);
-    last_frame = frame;
-    have_last_frame = true;
-    if (!transport.write(frame)) return false;
-    if (no_ack) return true;
-    for (;;) {
-        const auto byte = transport.readByte();
-        if (!byte) return false;
-        if (*byte == static_cast<std::uint8_t>('+')) return true;
-        if (*byte == static_cast<std::uint8_t>('-')) {
-            if (!transport.write(frame)) return false;
-        }
-    }
-}
-
-bool GdbSession::Implementation::sendStopReply(
-    const std::uint8_t signal,
-    const std::string_view reason
-) {
-    std::string payload = "T";
-    payload += hexValue(signal, 1U);
-    if (!reason.empty()) {
-        payload.append(reason);
-        payload += ":;";
-    }
-    last_stop = payload;
-    return sendPacket(payload);
-}
-
-bool GdbSession::Implementation::sendMonitor(const std::string_view text) {
-    std::string payload = "O";
-    for (const char character : text) {
-        payload += hexValue(static_cast<std::uint8_t>(character), 1U);
-    }
-    return sendPacket(payload);
-}
-
-void GdbSession::Implementation::refreshActiveSpMirror() {
-    cpu::CpuState& state = board.cpu().state();
-    state.r[13] = state.activeSp();
-}
 
 void GdbSession::Implementation::refreshCombinedBreakpoints() {
     combined_breakpoints.clear();
@@ -438,147 +147,12 @@ void GdbSession::Implementation::refreshCombinedBreakpoints() {
     );
 }
 
-std::string GdbSession::Implementation::readAllRegisters() const {
-    const cpu::CpuState& state = board.cpu().state();
-    std::string text;
-    text.reserve(register_count * single_register_nibbles);
-    for (std::size_t index = 0U; index < sp_register_index; ++index) {
-        text += hexValue(state.r[index], 4U);
-    }
-    text += hexValue(state.readRegister(static_cast<std::uint8_t>(sp_register_index)), 4U);
-    text += hexValue(state.r[lr_register_index], 4U);
-    text += hexValue(state.r[pc_register_index] & ~std::uint32_t{1U}, 4U);
-    text += hexValue(state.xpsr, 4U);
-    text += hexValue(state.msp, 4U);
-    text += hexValue(state.psp, 4U);
-    text += hexValue(state.control, 4U);
-    text += hexValue(state.primask, 4U);
-    text += hexValue(state.basepri, 4U);
-    text += hexValue(state.faultmask, 4U);
-    for (std::size_t index = 0U; index < double_register_count; ++index) {
-        const std::uint32_t low = std::bit_cast<std::uint32_t>(state.s[index * 2U]);
-        const std::uint32_t high = std::bit_cast<std::uint32_t>(state.s[index * 2U + 1U]);
-        text += hexValue(
-            static_cast<std::uint64_t>(low) | (static_cast<std::uint64_t>(high) << 32U), 8U
-        );
-    }
-    text += hexValue(state.fpscr, 4U);
-    return text;
-}
-
-std::optional<std::string> GdbSession::Implementation::readSingleRegister(
-    const std::uint32_t index
-) const {
-    const cpu::CpuState& state = board.cpu().state();
-    if (index < sp_register_index) return hexValue(state.r[index], 4U);
-    switch (index) {
-    case sp_register_index:
-        return hexValue(state.readRegister(static_cast<std::uint8_t>(index)), 4U);
-    case lr_register_index: return hexValue(state.r[lr_register_index], 4U);
-    case pc_register_index:
-        return hexValue(state.r[pc_register_index] & ~std::uint32_t{1U}, 4U);
-    case xpsr_register_index: return hexValue(state.xpsr, 4U);
-    case msp_register_index: return hexValue(state.msp, 4U);
-    case psp_register_index: return hexValue(state.psp, 4U);
-    case control_register_index: return hexValue(state.control, 4U);
-    case primask_register_index: return hexValue(state.primask, 4U);
-    case basepri_register_index: return hexValue(state.basepri, 4U);
-    case faultmask_register_index: return hexValue(state.faultmask, 4U);
-    case fpscr_register_index: return hexValue(state.fpscr, 4U);
-    default: break;
-    }
-    if (index >= double_register_base && index < double_register_base + double_register_count) {
-        const std::size_t pair = index - double_register_base;
-        const std::uint32_t low = std::bit_cast<std::uint32_t>(state.s[pair * 2U]);
-        const std::uint32_t high = std::bit_cast<std::uint32_t>(state.s[pair * 2U + 1U]);
-        return hexValue(
-            static_cast<std::uint64_t>(low) | (static_cast<std::uint64_t>(high) << 32U), 8U
-        );
-    }
-    return std::nullopt;
-}
-
-bool GdbSession::Implementation::writeSingleRegister(
-    const std::uint32_t index,
-    const std::uint64_t value
-) {
-    cpu::CpuState& state = board.cpu().state();
-    const auto word = static_cast<std::uint32_t>(value);
-    if (index < sp_register_index) {
-        state.r[index] = word;
-        return true;
-    }
-    switch (index) {
-    case sp_register_index:
-        state.writeRegister(static_cast<std::uint8_t>(index), word);
-        return true;
-    case lr_register_index:
-        state.r[lr_register_index] = word;
-        return true;
-    case pc_register_index:
-        state.r[pc_register_index] = word & ~std::uint32_t{1U};
-        return true;
-    case xpsr_register_index:
-        state.xpsr = word;
-        state.thumb = (word & cpu::xpsr_t) != 0U;
-        state.it_state = static_cast<std::uint8_t>(
-            ((word >> 25U) & 0x3U) | (((word >> 10U) & 0x3fU) << 2U)
-        );
-        refreshActiveSpMirror();
-        return true;
-    case msp_register_index:
-        state.msp = word;
-        refreshActiveSpMirror();
-        return true;
-    case psp_register_index:
-        state.psp = word;
-        refreshActiveSpMirror();
-        return true;
-    case control_register_index:
-        state.control = word;
-        refreshActiveSpMirror();
-        return true;
-    case primask_register_index:
-        state.primask = word;
-        return true;
-    case basepri_register_index:
-        state.basepri = word;
-        return true;
-    case faultmask_register_index:
-        state.faultmask = word;
-        return true;
-    case fpscr_register_index:
-        state.fpscr = word;
-        return true;
-    default: break;
-    }
-    if (index >= double_register_base && index < double_register_base + double_register_count) {
-        const std::size_t pair = index - double_register_base;
-        state.s[pair * 2U] = std::bit_cast<float>(word);
-        state.s[pair * 2U + 1U] = std::bit_cast<float>(static_cast<std::uint32_t>(value >> 32U));
-        return true;
-    }
-    return false;
-}
-
-bool GdbSession::Implementation::writeAllRegisters(const std::string_view text) {
-    std::size_t position = 0U;
-    for (std::uint32_t index = 0U; index < register_count; ++index) {
-        const bool wide = index >= double_register_base
-            && index < double_register_base + double_register_count;
-        const std::size_t nibbles = wide ? double_register_nibbles : single_register_nibbles;
-        if (position + nibbles > text.size()) return false;
-        const auto value = parseLittleEndianHex(text.substr(position, nibbles));
-        if (!value || !writeSingleRegister(index, *value)) return false;
-        position += nibbles;
-    }
-    return position == text.size();
-}
-
 bool GdbSession::Implementation::handleRegisterRead(const std::string_view text) {
     const auto index = parseHex(text);
     if (!index || *index >= register_count) return replyError();
-    const auto value = readSingleRegister(static_cast<std::uint32_t>(*index));
+    const auto value = detail::readSingleRegister(
+        board, static_cast<std::uint32_t>(*index)
+    );
     if (!value) return replyError();
     return sendPacket(*value);
 }
@@ -589,7 +163,8 @@ bool GdbSession::Implementation::handleRegisterWrite(const std::string_view text
     const auto index = parseHex(text.substr(0U, equals));
     const auto value = parseLittleEndianHex(text.substr(equals + 1U));
     if (!index || !value || *index >= register_count) return replyError();
-    if (!writeSingleRegister(static_cast<std::uint32_t>(*index), *value)) return replyError();
+    if (!detail::writeSingleRegister(
+            board, static_cast<std::uint32_t>(*index), *value)) return replyError();
     return sendPacket("OK");
 }
 
@@ -611,7 +186,7 @@ bool GdbSession::Implementation::handleMemoryRead(const std::string_view packet)
             mem::AccessContext{mem::AccessType::debug, 0U}
         );
         if (!byte) return replyError();
-        text += hexValue(byte.value(), 1U);
+        text += detail::hexValue(byte.value(), 1U);
     }
     return sendPacket(text);
 }
@@ -716,9 +291,10 @@ bool GdbSession::Implementation::resumeTarget(const bool step) {
         ? std::span<const std::uint32_t>{} : std::span<const std::uint32_t>{combined_breakpoints};
 
     for (;;) {
-        // Service monitor clients at instruction boundaries; reads never halt
-        // the running target and side-effecting MMIO stays refused.
-        if (monitor != nullptr) monitor->service(true);
+        // Service monitor and live-session clients at instruction boundaries;
+        // reads never halt the running target and side-effecting MMIO stays
+        // refused.
+        serviceEndpoints(true);
         if (!step && transport.inputPending()) {
             return sendStopReply(signal_interrupt);
         }
@@ -791,26 +367,8 @@ bool GdbSession::Implementation::handleQuery(const std::string_view packet) {
     }
     constexpr std::string_view feature_prefix = "qXfer:features:read:";
     if (packet.starts_with(feature_prefix)) {
-        const std::string_view spec = packet.substr(feature_prefix.size());
-        const auto colon = spec.rfind(':');
-        if (colon == std::string_view::npos) return replyError();
-        const std::string_view annex = spec.substr(0U, colon);
-        const std::string_view range = spec.substr(colon + 1U);
-        const auto comma = range.find(',');
-        if (annex != "target.xml" || comma == std::string_view::npos) return replyUnsupported();
-        const auto offset = parseHex(range.substr(0U, comma));
-        const auto length = parseHex(range.substr(comma + 1U));
-        if (!offset || !length) return replyError();
-        if (*offset >= target_description.size()) return sendPacket("l");
-        const std::size_t available = target_description.size() - static_cast<std::size_t>(*offset);
-        const std::size_t count = std::min<std::size_t>(
-            static_cast<std::size_t>(*length), available
-        );
-        std::string reply;
-        reply.reserve(count + 1U);
-        reply.push_back(count < available ? 'm' : 'l');
-        reply.append(target_description.substr(static_cast<std::size_t>(*offset), count));
-        return sendPacket(reply);
+        const auto feature = detail::readFeaturePacket(packet);
+        return feature ? sendPacket(*feature) : replyUnsupported();
     }
     if (packet == "qfThreadInfo") return sendPacket("m1");
     if (packet == "qsThreadInfo") return sendPacket("l");
@@ -824,7 +382,7 @@ bool GdbSession::Implementation::handleQuery(const std::string_view packet) {
 bool GdbSession::Implementation::handleSet(const std::string_view packet) {
     if (packet == "QStartNoAckMode") {
         if (!sendPacket("OK")) return false;
-        no_ack = true;
+        connection.setNoAck(true);
         return true;
     }
     return replyUnsupported();
@@ -849,8 +407,9 @@ bool GdbSession::Implementation::dispatch(const std::string_view packet) {
     if (packet.empty()) return replyUnsupported();
     switch (packet.front()) {
     case '?': return sendPacket(last_stop);
-    case 'g': return sendPacket(readAllRegisters());
-    case 'G': return writeAllRegisters(packet.substr(1U)) ? sendPacket("OK") : replyError();
+    case 'g': return sendPacket(detail::readAllRegisters(board));
+    case 'G': return detail::writeAllRegisters(board, packet.substr(1U))
+        ? sendPacket("OK") : replyError();
     case 'p': return handleRegisterRead(packet.substr(1U));
     case 'P': return handleRegisterWrite(packet.substr(1U));
     case 'm': return handleMemoryRead(packet);
@@ -887,9 +446,10 @@ GdbSession::GdbSession(
     sim::Board& board,
     RspTransport& transport,
     GdbServerOptions options,
-    MonitorEndpoint* monitor
+    DebugEndpoint* monitor,
+    DebugEndpoint* live
 ) : implementation_(std::make_unique<Implementation>(
-        board, transport, std::move(options), monitor
+        board, transport, std::move(options), monitor, live
     )) {}
 
 GdbSession::~GdbSession() = default;
@@ -897,7 +457,7 @@ GdbSession::~GdbSession() = default;
 Result<GdbSessionEnd> GdbSession::run() {
     Implementation& self = *implementation_;
     while (!self.end) {
-        if (self.monitor != nullptr) self.monitor->service(false);
+        self.serviceEndpoints(false);
         const auto wait = self.transport.waitForInput(std::chrono::milliseconds(20));
         if (wait == TransportWait::timeout) continue;
         if (wait == TransportWait::closed) {
@@ -972,8 +532,11 @@ Result<GdbSessionEnd> serveGdb(
         static_cast<void>(detail::setBlocking(client));
         out << "fil debug: GDB connected" << '\n' << std::flush;
 
+        // Live watch (cortex-debug) opens a second read-only connection on
+        // this same port; the primary session services it at slice boundaries.
+        auto live = createLiveGdbServer(board, listener.value().descriptor());
         SocketTransport transport(client);
-        GdbSession session(board, transport, options, monitor.get());
+        GdbSession session(board, transport, options, monitor.get(), live.get());
         const auto result = session.run();
         if (!result) return result.error();
         out << "fil debug: GDB session ended (" << gdbSessionEndName(result.value()) << ")\n"

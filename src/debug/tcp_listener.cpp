@@ -4,8 +4,10 @@
 #include <cstring>
 #include <fcntl.h>
 #include <memory>
+#include <chrono>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -118,6 +120,71 @@ Result<TcpListener> openTcpListener(
         "unable to listen on " + bind_address + ":" + service + ": " + last_error,
         std::nullopt
     };
+}
+
+} // namespace fil::debug::detail
+
+namespace fil::debug::detail {
+
+SocketTransport::SocketTransport(const int descriptor) : descriptor_(descriptor) {
+    setNoSigPipe(descriptor);
+}
+
+SocketTransport::~SocketTransport() {
+    if (descriptor_ >= 0) static_cast<void>(::close(descriptor_));
+}
+
+std::optional<std::uint8_t> SocketTransport::readByte() {
+    std::uint8_t byte = 0U;
+    for (;;) {
+        const auto received = ::recv(descriptor_, &byte, 1U, 0);
+        if (received == 1) return byte;
+        if (received == 0) return std::nullopt;
+        if (errno == EINTR) continue;
+        // A non-blocking descriptor (Darwin inherits the listener's mode)
+        // is polled instead of being reported as end of input.
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            pollfd pending{descriptor_, POLLIN, 0};
+            if (::poll(&pending, 1, 1000) > 0) continue;
+            return std::nullopt;
+        }
+        return std::nullopt;
+    }
+}
+
+bool SocketTransport::inputPending() {
+    pollfd pending{descriptor_, POLLIN, 0};
+    const int ready = ::poll(&pending, 1, 0);
+    return ready > 0
+        && (pending.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0;
+}
+
+TransportWait SocketTransport::waitForInput(const std::chrono::milliseconds timeout) {
+    pollfd pending{descriptor_, POLLIN, 0};
+    const int ready = ::poll(&pending, 1, static_cast<int>(timeout.count()));
+    if (ready == 0) return TransportWait::timeout;
+    if (ready < 0) {
+        return errno == EINTR ? TransportWait::timeout : TransportWait::closed;
+    }
+    if ((pending.revents & POLLIN) != 0) return TransportWait::ready;
+    return TransportWait::closed;
+}
+
+bool SocketTransport::write(const std::string_view bytes) {
+    std::size_t written = 0U;
+    while (written < bytes.size()) {
+        const auto sent = ::send(
+            descriptor_, bytes.data() + written, bytes.size() - written,
+            socketSendFlags()
+        );
+        if (sent > 0) {
+            written += static_cast<std::size_t>(sent);
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) continue;
+        return false;
+    }
+    return true;
 }
 
 } // namespace fil::debug::detail

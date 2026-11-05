@@ -138,9 +138,10 @@ GdbSessionEnd serve(
     fil::sim::Board& board,
     ScriptedTransport& transport,
     const GdbServerOptions& options = {},
-    fil::debug::MonitorEndpoint* monitor = nullptr
+    fil::debug::DebugEndpoint* monitor = nullptr,
+    fil::debug::DebugEndpoint* live = nullptr
 ) {
-    GdbSession session(board, transport, options, monitor);
+    GdbSession session(board, transport, options, monitor, live);
     const auto result = session.run();
     EXPECT_TRUE(result.hasValue());
     return result.hasValue() ? result.value() : GdbSessionEnd::disconnected;
@@ -167,6 +168,17 @@ private:
     std::string command_;
     fil::debug::MonitorReply reply_;
     bool executed_{false};
+};
+
+/** @brief Stand-in live endpoint that counts servicing while the target runs. */
+class FakeLiveEndpoint final : public fil::debug::DebugEndpoint {
+public:
+    void service(const bool running) override {
+        if (running) ++running_services;
+    }
+
+    [[nodiscard]] bool active() const noexcept override { return true; }
+    int running_services{0};
 };
 
 } // namespace
@@ -381,6 +393,29 @@ TEST(GdbServerTest, MonitorReadsDoNotHaltRunningTarget) {
     EXPECT_NE(monitor.reply().find("11223344"), std::string::npos);
     EXPECT_EQ(board->cpu().state().r[15], target)
         << "a monitor read cannot halt or advance the target";
+}
+
+TEST(GdbServerTest, ServicesLiveEndpointWhileRunning) {
+    auto probe = loadFixture();
+    ASSERT_NE(probe, nullptr);
+    fil::sim::BoardRunOptions probe_options;
+    probe_options.max_instructions = 2U;
+    probe_options.duration_ns = 0U;
+    probe_options.detect_spin = false;
+    static_cast<void>(probe->run(probe_options));
+    const std::uint32_t target = probe->cpu().state().r[15];
+
+    auto board = loadFixture();
+    ASSERT_NE(board, nullptr);
+    ScriptedTransport transport;
+    FakeLiveEndpoint live;
+    transport.send("Z0," + hexWord(target) + ",2");
+    transport.send("c");
+    transport.send("D");
+
+    EXPECT_EQ(serve(*board, transport, {}, nullptr, &live), GdbSessionEnd::detached);
+    EXPECT_GT(live.running_services, 0) << "live sessions are serviced during continue";
+    EXPECT_EQ(board->cpu().state().r[15], target);
 }
 
 TEST(GdbServerTest, StepsOneInstruction) {
