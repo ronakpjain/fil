@@ -203,6 +203,25 @@ if(FIL_ENABLE_NATIVE)
     endif()
 endif()
 
+# GCC enables -Wimplicit-fallthrough (through -Wextra), -Wnull-dereference, and
+# -Wmaybe-uninitialized (through -Wall); Clang leaves those off, so name them
+# explicitly to report the same diagnostic classes. GCC's -Wconversion also
+# depends on optimization, so compare Clang and GCC output in a Release build.
+set(FIL_WARNING_FLAGS
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Wconversion
+    -Wsign-conversion
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    list(APPEND FIL_WARNING_FLAGS
+        -Wimplicit-fallthrough
+        -Wconditional-uninitialized
+        -Wnull-dereference
+    )
+endif()
+
 function(fil_set_project_options target)
     target_compile_features(${target} PUBLIC cxx_std_20)
     set_target_properties(${target} PROPERTIES
@@ -221,13 +240,7 @@ function(fil_set_project_options target)
     if(MSVC)
         target_compile_options(${target} PRIVATE /W4 /permissive-)
     else()
-        target_compile_options(${target} PRIVATE
-            -Wall
-            -Wextra
-            -Wpedantic
-            -Wconversion
-            -Wsign-conversion
-        )
+        target_compile_options(${target} PRIVATE ${FIL_WARNING_FLAGS})
     endif()
 
     if(FIL_ENABLE_ASAN OR FIL_ENABLE_UBSAN)
