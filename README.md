@@ -40,7 +40,12 @@ device's behavior, usage, and limitations.
 controls. `serve` is the interprocess counterpart: stdin/stdout carry a documented,
 versioned binary protocol and stdout contains no human-readable output. Stdio is
 its only transport. See [Live monitoring](docs/watch_network.md) and [the stdio
-protocol](docs/serve_network.md). `--trace FILE` writes JSONL events for `run`;
+protocol](docs/serve_network.md). `debug` serves the GDB remote serial
+protocol over TCP for one board, so `arm-none-eabi-gdb` can attach with
+`target remote`, set breakpoints, step, and inspect registers and memory; it
+also serves an OpenOCD-style telnet monitor (`mdw`/`mdh`/`mdb`, `regs`,
+`info`) that reads memory without halting or perturbing a running target.
+`--trace FILE` writes JSONL events for `run`;
 `--trace-instr` records individual instructions. `inspect-config`, `inspect-elf`, and
 `disasm-window` inspect inputs.
 `compare-stlink` requires an attached ST-Link and controls/resets the physical

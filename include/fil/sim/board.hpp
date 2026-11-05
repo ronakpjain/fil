@@ -18,6 +18,7 @@
 #include <memory>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string>
 
 namespace fil::cortexm {
@@ -52,6 +53,14 @@ struct BoardRunOptions {
     std::uint64_t max_instructions{50'000'000}; ///< Zero means no instructions may execute.
     SimTimeNs duration_ns{1'000'000'000};       ///< Zero disables simulated-time limiting.
     std::optional<std::uint32_t> stop_address;  ///< Stop before executing this even Thumb address.
+    /**
+     * @brief Additional even Thumb stop addresses checked before each instruction.
+     *
+     * A non-empty list forces exact single-instruction stepping so a prepared
+     * block can never run past a requested stop address. The caller owns the
+     * referenced storage for the duration of the run.
+     */
+    std::span<const std::uint32_t> breakpoints;
     bool trace_instructions{false};              ///< Emit one trace record per instruction.
     bool detect_spin{false};                     ///< Stop on a proven exact-state loop.
     std::uint64_t spin_threshold{1'000'000};     ///< Logical instructions in a repeated exact-state loop.

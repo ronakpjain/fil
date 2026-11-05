@@ -275,6 +275,9 @@ add_library(fil_core STATIC
     src/cpu/native_region.cpp
     src/cortexm/exceptions.cpp
     src/cortexm/system_control.cpp
+    src/debug/gdb_server.cpp
+    src/debug/monitor.cpp
+    src/debug/tcp_listener.cpp
     src/devices/can_bus.cpp
     src/elf/elf_loader.cpp
     src/hardware/comparison.cpp

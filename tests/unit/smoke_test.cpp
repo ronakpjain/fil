@@ -29,6 +29,55 @@ TEST(SmokeTest, HelpIsSuccessful) {
     EXPECT_NE(out.str().find("trades fidelity for speed"), std::string::npos);
     EXPECT_EQ(out.str().find("--no-jit"), std::string::npos);
     EXPECT_NE(out.str().find("--jit-stats"), std::string::npos);
+    EXPECT_NE(out.str().find("debug <board.json>"), std::string::npos);
+    EXPECT_NE(out.str().find("--telnet-port"), std::string::npos);
+}
+
+/// @brief Verifies debug command argument validation before any I/O starts.
+TEST(SmokeTest, DebugCommandValidatesItsInputs) {
+    {
+        std::ostringstream out;
+        std::ostringstream err;
+        const std::string_view args[] = {"debug"};
+        EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::usage_error);
+        EXPECT_NE(err.str().find("requires a board config"), std::string::npos);
+    }
+    {
+        std::ostringstream out;
+        std::ostringstream err;
+        const std::string_view args[] = {"debug", "missing-board.json", "--bogus"};
+        EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::usage_error);
+        EXPECT_NE(err.str().find("unknown debug option"), std::string::npos);
+    }
+    {
+        std::ostringstream out;
+        std::ostringstream err;
+        const std::string_view args[] = {"debug", "missing-board.json", "--gdb-port", "70000"};
+        EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::usage_error);
+        EXPECT_NE(err.str().find("--gdb-port requires a TCP port"), std::string::npos);
+    }
+    {
+        std::ostringstream out;
+        std::ostringstream err;
+        const std::string_view args[] = {"debug", "missing-board.json", "--telnet-port", "70000"};
+        EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::usage_error);
+        EXPECT_NE(err.str().find("--telnet-port requires a TCP port"), std::string::npos);
+    }
+    {
+        std::ostringstream out;
+        std::ostringstream err;
+        const std::string_view args[] = {"debug", "missing-board.json", "--no-telnet"};
+        EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::config_error);
+    }
+    {
+        const std::string network = (std::filesystem::path(FIL_SOURCE_DIR)
+            / "configs/networks/per_vehicle.json").string();
+        std::ostringstream out;
+        std::ostringstream err;
+        const std::string_view args[] = {"debug", network};
+        EXPECT_EQ(fil::cli::run(args, out, err), fil::cli::ExitCode::usage_error);
+        EXPECT_NE(err.str().find("network debugging is not implemented"), std::string::npos);
+    }
 }
 
 /// @brief Verifies unknown commands produce a usage error.

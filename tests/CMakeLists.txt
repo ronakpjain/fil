@@ -20,6 +20,7 @@ add_executable(fil_tests
     unit/fdcan_test.cpp
     unit/crc_test.cpp
     unit/flash_test.cpp
+    unit/gdb_server_test.cpp
     unit/hard_float_firmware_test.cpp
     unit/hardware_comparison_test.cpp
     unit/jit_test.cpp
@@ -29,6 +30,7 @@ add_executable(fil_tests
     unit/native_jit_test.cpp
     unit/native_region_test.cpp
     unit/memory_bus_test.cpp
+    unit/monitor_test.cpp
     unit/network_protocol_test.cpp
     unit/peripheral_test.cpp
     unit/scheduler_tick_test.cpp

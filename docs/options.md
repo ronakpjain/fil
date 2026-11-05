@@ -9,7 +9,8 @@ and `make help`.
 JIT is automatic. Run, watch, and serve
 have unlimited simulated time and instruction budgets by default. A board config's
 nonzero `run.default_duration_ms` and `run.max_instructions` override those
-unlimited defaults; network configs use unlimited defaults. Network commands use
+unlimited defaults; network configs use unlimited defaults. `debug` sessions
+are always unlimited and ignore those configured run defaults. Network commands use
 independent board slices with a **1000 ns cross-board synchronization window**.
 This is a bounded-skew communication model, not exact cross-board instruction
 ordering. ADC, timers, DMA and interrupts still execute locally at full fidelity.
@@ -103,6 +104,93 @@ Control is always active; `--control-stdin` is an optional watch-only
 compatibility marker. Unlimited runs stop on clean EOF; finite runs do not.
 See [Live monitoring](watch_network.md) for text commands and
 [Binary network service](serve_network.md) for the protocol.
+
+## GDB remote debugging
+
+```bash
+fil debug board.json --gdb-port 3333
+arm-none-eabi-gdb path/to/firmware.elf
+(gdb) target remote 127.0.0.1:3333
+```
+
+`debug` loads one board config and serves the GDB Remote Serial Protocol on a
+TCP endpoint until a single debugger session ends (detach, kill, or
+disconnect). Connect any RSP-speaking GDB; GDB loads symbols, source, and
+line information from the firmware ELF itself. A second endpoint serves an
+OpenOCD-style telnet monitor that can inspect memory and registers while the
+target keeps running.
+
+Execution is unlimited while debugging: configured board-run duration and
+instruction defaults do not apply, and the firmware runs until a breakpoint,
+trap, fault, or interrupt (Ctrl+C). The server exposes the Cortex-M4 core
+registers, FPv4-SP FPU registers (`s0`–`s31` via `d0`–`d15`), system registers
+(`msp`, `psp`, `control`, `primask`, `basepri`, `faultmask`), and the complete
+target memory map.
+
+| Option | Purpose / default |
+| --- | --- |
+| `--gdb-port N` | GDB TCP port; default 3333. `0` selects an ephemeral port and prints it. |
+| `--gdb-address ADDR` | Local listen address for both endpoints; default `127.0.0.1`. |
+| `--telnet-port N` | Telnet monitor port; default 4444. `0` selects an ephemeral port. |
+| `--no-telnet` | Disable the telnet monitor endpoint. |
+| `--strict-mmio` / `--lenient-mmio` | Fault on unmodeled MMIO or allow compatibility behavior; default lenient. |
+
+Behavior and boundaries:
+
+- Software (`Z0`) and hardware (`Z1`) breakpoints are emulator-side host
+  breakpoints, so firmware memory is never patched. While any breakpoint is
+  set, execution uses exact single-instruction stepping so a prepared block can
+  never run past a requested address.
+- Debugger memory reads and writes are real bus accesses: reading an MMIO
+  register applies that device's modeled read side effects (for example
+  read-to-clear flags), and writing flash or RAM invalidates prepared code.
+- `monitor reset` and the `R` packet restore reset state. With
+  `target extended-remote`, `vRun` starts a fresh inferior from reset state, so
+  `(gdb) run` restarts the firmware. `D` and `k` end the session. Watchpoints
+  (`Z2`–`Z4`) are not implemented; GDB hardware watchpoints report unsupported,
+  while GDB software watchpoints still work by single-stepping.
+- One board is debugged. Network configs are rejected; network debugging is
+  not implemented.
+- The hardware debug transport (DHCSR, DWT, hardware breakpoint units) is not
+  modeled; stops, stepping, and breakpoints are host-side operations on the
+  deterministic emulator.
+
+## Telnet monitor
+
+The monitor endpoint is served for the whole `fil debug` lifetime, including
+before GDB connects, and it never halts or otherwise perturbs the target. It
+is line-based and works with `nc` or any telnet client:
+
+```bash
+nc 127.0.0.1 4444
+fil monitor
+> info
+> mdw 0x20000000 4
+> regs
+> reg r0
+> quit
+```
+
+| Command | Purpose |
+| --- | --- |
+| `help` | List commands. |
+| `info` | Board name, run state, PC, simulated time, and clock. |
+| `regs` | Dump core and system registers. |
+| `reg NAME` | Read one register (`r0`–`r15`, `sp`, `lr`, `pc`, `xpsr`, `msp`, `psp`, `control`, `primask`, `basepri`, `faultmask`, `fpscr`, `s0`–`s31`, `d0`–`d15`). |
+| `mdw ADDR [COUNT]` | Read 32-bit words (default 16, max 1024). |
+| `mdh ADDR [COUNT]` | Read 16-bit halfwords. |
+| `mdb ADDR [COUNT]` | Read bytes. |
+| `reset` | Reset the board; refused while the target is running. |
+| `quit` / `exit` | Close the connection. |
+
+Commands are serviced at instruction boundaries, so a running `continue`
+answers within about one execution slice (1 ms of simulated time). While the
+target runs, only RAM/ROM/flash reads are allowed: those have no
+firmware-visible side effects, so live inspection stays deterministic. MMIO
+reads and `reset` are refused with `error: target is running` until the target
+stops. While stopped, MMIO reads are permitted and behave like any other bus
+access (including read-to-clear side effects). Several monitor clients may be
+connected at once.
 
 ## Inspect inputs
 

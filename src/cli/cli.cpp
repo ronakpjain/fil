@@ -3,6 +3,7 @@
 
 #include "fil/common/error.hpp"
 #include "fil/config/config.hpp"
+#include "fil/debug/gdb_server.hpp"
 #include "fil/devices/can_bus.hpp"
 #include "fil/cpu/decoder.hpp"
 #include "fil/elf/elf_loader.hpp"
@@ -1036,6 +1037,73 @@ ExitCode runBoardCommand(
     }
     if (!result.succeeded() || unexpected_breakpoint) {
         err << "fil: run stopped with " << sim::boardStopReasonName(result.reason) << '\n';
+        return ExitCode::runtime_error;
+    }
+    return ExitCode::success;
+}
+
+ExitCode debugBoardCommand(
+    const std::span<const std::string_view> args,
+    std::ostream& out,
+    std::ostream& err
+) {
+    if (args.size() < 2U) {
+        err << "fil: debug requires a board config path\n";
+        return ExitCode::usage_error;
+    }
+    debug::GdbServerOptions options;
+    bool strict_mmio = false;
+    for (std::size_t index = 2U; index < args.size(); ++index) {
+        const std::string_view option = args[index];
+        if (option == "--gdb-port" || option == "--gdb-address" || option == "--telnet-port") {
+            const auto value = nextOptionValue(args, index);
+            if (!value) {
+                err << "fil: " << option << " requires a value\n";
+                return ExitCode::usage_error;
+            }
+            if (option == "--gdb-address") {
+                if (value->empty()) {
+                    err << "fil: --gdb-address requires a non-empty address\n";
+                    return ExitCode::usage_error;
+                }
+                options.bind_address = std::string(*value);
+                continue;
+            }
+            const auto parsed = config::parseUnsigned(*value);
+            if (!parsed || parsed.value() > 65535U) {
+                err << "fil: " << option << " requires a TCP port in [0, 65535]\n";
+                return ExitCode::usage_error;
+            }
+            if (option == "--telnet-port") options.telnet_port = static_cast<std::uint16_t>(parsed.value());
+            else options.port = static_cast<std::uint16_t>(parsed.value());
+        } else if (option == "--no-telnet") options.telnet_enabled = false;
+        else if (option == "--strict-mmio") strict_mmio = true;
+        else if (option == "--lenient-mmio") strict_mmio = false;
+        else {
+            err << "fil: unknown debug option: " << option << '\n';
+            return ExitCode::usage_error;
+        }
+    }
+
+    auto board_config = config::loadBoardConfig(args[1]);
+    if (!board_config) {
+        if (config::loadNetworkConfig(args[1])) {
+            err << "fil: debug controls one board; network debugging is not implemented\n";
+            return ExitCode::usage_error;
+        }
+        err << "fil: " << formatError(board_config.error()) << '\n';
+        return ExitCode::config_error;
+    }
+    auto board = sim::Board::load(board_config.value(), strict_mmio);
+    if (!board) {
+        err << "fil: " << formatError(board.error()) << '\n';
+        return board.error().category == ErrorCategory::config
+            ? ExitCode::config_error : ExitCode::runtime_error;
+    }
+
+    auto served = debug::serveGdb(*board.value(), options, out);
+    if (!served) {
+        err << "fil: " << formatError(served.error()) << '\n';
         return ExitCode::runtime_error;
     }
     return ExitCode::success;
@@ -2473,6 +2541,7 @@ void printHelp(std::ostream& out) {
         << "  run <config.json> [options]    Execute a board or network deterministically\n"
         << "  watch <config.json> [options]  Run a human-facing live network monitor\n"
         << "  serve <config.json> [options]  Serve binary stdio control and traces\n"
+        << "  debug <board.json> [options]   Serve GDB remote debugging on a TCP port\n"
         << "  compare-stlink <board.json>    Compare emulator state with STM32G4 hardware\n\n"
         << "Defaults: unlimited simulated time and instruction budget (runs to completion),\n"
         << "JIT on, network RAM capsules on, ADC decimation 1.\n"
@@ -2502,6 +2571,14 @@ void printHelp(std::ostream& out) {
         << "  watch also stops early when all boards reach terminal CPU boundaries\n"
         << "  stdin: BUS:ID:HEXDATA, adc BOARD INSTANCE CHANNEL VALUE,\n"
         << "  gpio BOARD PORT PIN 0|1|release, quit, or exit\n"
+        << "\nDebug options:\n"
+        << "  Unlimited execution while debugging; --gdb-port N (default 3333; 0 = ephemeral),\n"
+        << "  --gdb-address ADDR (default 127.0.0.1), --strict-mmio | --lenient-mmio.\n"
+        << "  Connect with 'target remote HOST:PORT'; breakpoints, stepping, registers,\n"
+        << "  and memory access are supported.\n"
+        << "  --telnet-port N (default 4444; 0 = ephemeral) | --no-telnet enables a\n"
+        << "  telnet monitor: mdw/mdh/mdb, regs, info; reads never halt the target,\n"
+        << "  and only RAM/ROM/flash is readable while it runs.\n"
         << "\nServe options:\n"
         << "  Binary protocol on stdin/stdout; stdio is the only transport (no --transport).\n"
         << "  --duration D --refresh-ms N --refresh-us N --instruction-budget N --quantum N\n"
@@ -2591,6 +2668,10 @@ ExitCode run(
 
     if (args.front() == "serve") {
         return serveNetworkCommand(args, out, err);
+    }
+
+    if (args.front() == "debug") {
+        return debugBoardCommand(args, out, err);
     }
 
     if (args.front() == "compare-stlink") {

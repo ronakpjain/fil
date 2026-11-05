@@ -2233,15 +2233,23 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
             aggregate.message = "target address reached at " + hex32(pc);
             break;
         }
+        if (std::find(options.breakpoints.begin(), options.breakpoints.end(), pc)
+            != options.breakpoints.end()) {
+            aggregate.reason = BoardStopReason::target_reached;
+            aggregate.message = "breakpoint address reached at " + hex32(pc);
+            break;
+        }
         if (deadline != 0U && event_loop_->now() >= deadline) {
             aggregate.reason = BoardStopReason::time_budget;
             aggregate.message = "simulated-time budget exhausted";
             break;
         }
         const bool jit_ok = !options.trace_instructions && options.enable_jit;
-        // Spin diagnosis is exact single-step work, so skip block
-        // preparation and preview admission for it.
-        const std::size_t jit_limit = options.stop_address || options.detect_spin
+        // Spin diagnosis and requested stop addresses are exact single-step
+        // work, so skip block preparation and preview admission for them.
+        const bool exact_stops = options.stop_address.has_value()
+            || !options.breakpoints.empty() || options.detect_spin;
+        const std::size_t jit_limit = exact_stops
             ? 1U : static_cast<std::size_t>(std::min<std::uint64_t>(
                 options.max_instructions - aggregate.instructions,
                 owner_slice_active_ ? cpu::NativeTracePlan::max_ops
@@ -2249,8 +2257,7 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
         const auto limit_time = deadline == 0U
             ? std::nullopt : std::optional<SimTimeNs>{deadline};
         span_accounted_cycles_ = 0U;
-        const bool native_owner = owner_slice_active_ && jit_ok
-            && !options.stop_address && !options.detect_spin;
+        const bool native_owner = owner_slice_active_ && jit_ok && !exact_stops;
         const auto native = native_owner
             ? stepNativeLocal(static_cast<std::size_t>(std::min<std::uint64_t>(
                 options.max_instructions - aggregate.instructions, UINT32_MAX)), limit_time)

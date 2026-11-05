@@ -61,6 +61,32 @@ bool installAndWarmJitLoop(fil::sim::Board& board, const bool mmio = false) {
     return board.cpu().jitBlockReady();
 }
 
+TEST(BoardTest, StopsAtRequestedBreakpointInsidePreparedBlock) {
+    auto board = fil::sim::Board::load(fixtureBoard());
+    EXPECT_TRUE(board.hasValue()) << "loads integrated fixture board";
+    if (!board) return;
+    if (!installAndWarmJitLoop(*board.value())) {
+        GTEST_SKIP() << "micro-JIT block is unavailable on this host";
+    }
+    const std::uint32_t start = board.value()->cpu().state().r[15];
+    const std::uint32_t stop = start + 4U; // Third instruction of the warmed block.
+    const std::uint32_t base = board.value()->cpu().state().r[0];
+
+    fil::sim::BoardRunOptions options;
+    options.max_instructions = 1000U;
+    options.duration_ns = 0U;
+    options.detect_spin = false;
+    const std::uint32_t breakpoints[]{stop};
+    options.breakpoints = breakpoints;
+    const auto result = board.value()->run(options);
+
+    EXPECT_EQ(result.reason, fil::sim::BoardStopReason::target_reached)
+        << "stops before the requested address";
+    EXPECT_EQ(result.instructions, 2U) << "prepared block cannot skip a breakpoint";
+    EXPECT_EQ(board.value()->cpu().state().r[15], stop);
+    EXPECT_EQ(board.value()->cpu().state().r[0], base + 2U);
+}
+
 bool warmIdempotentPeriodCache(fil::sim::Board& board) {
     const std::vector<std::uint8_t> code{
         0x08U,0xb5U, 0x00U,0xf0U,0x05U,0xf8U, 0x07U,0x4bU,
