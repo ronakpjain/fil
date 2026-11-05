@@ -277,6 +277,7 @@ add_library(fil_core STATIC
     src/cortexm/system_control.cpp
     src/debug/gdb_server.cpp
     src/debug/live_gdb.cpp
+    src/debug/memory_map.cpp
     src/debug/monitor.cpp
     src/debug/registers.cpp
     src/debug/rsp.cpp

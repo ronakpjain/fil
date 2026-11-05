@@ -49,6 +49,9 @@ constexpr std::string_view help_text =
     "  mdh ADDR [COUNT]     Read COUNT 16-bit halfwords (default 16, max 1024).\n"
     "  mdb ADDR [COUNT]     Read COUNT bytes (default 16, max 1024).\n"
     "  halt                 Halt the target; a no-op between execution slices.\n"
+    "  mww/mwh/mwb ADDR VALUE\n"
+    "                       Write a 32/16/8-bit value; refused while running.\n"
+    "  gdb_sync             OpenOCD compatibility no-op (accepted).\n"
     "  reset [halt|init]    Reset the board; refused while the target is running.\n"
     "  quit | exit          Close this connection.\n"
     "Addresses accept 0x-prefixed hex. While the target is running, only\n"
@@ -554,6 +557,36 @@ MonitorReply executeMonitorCommand(
     }
     if (command == "mdw" || command == "mdh" || command == "mdb") {
         return {memoryText(board, command, tokens, running)};
+    }
+    if (command == "mww" || command == "mwh" || command == "mwb") {
+        if (running) return {"error: target is running; writes require a stopped target\n"};
+        if (tokens.size() < 3U) {
+            return {"error: " + std::string(command) + " requires an address and a value\n"};
+        }
+        const auto parsed_address = config::parseUnsigned(tokens[1]);
+        const auto parsed_value = config::parseUnsigned(tokens[2]);
+        if (!parsed_address
+            || parsed_address.value() > std::numeric_limits<std::uint32_t>::max()
+            || !parsed_value) {
+            return {"error: invalid address or value\n"};
+        }
+        const auto address = static_cast<std::uint32_t>(parsed_address.value());
+        const mem::AccessContext context{mem::AccessType::debug, 0U};
+        const bool ok = command == "mww"
+            ? static_cast<bool>(board.memory().write32(
+                  address, static_cast<std::uint32_t>(parsed_value.value()), context))
+            : command == "mwh"
+            ? static_cast<bool>(board.memory().write16(
+                  address, static_cast<std::uint16_t>(parsed_value.value()), context))
+            : static_cast<bool>(board.memory().write8(
+                  address, static_cast<std::uint8_t>(parsed_value.value()), context));
+        if (!ok) return {"error: write failed at " + hex32(address) + "\n"};
+        return {std::string(command) + " " + hex32(address) + " complete\n"};
+    }
+    if (command == "gdb_sync") {
+        // OpenOCD-only synchronization aid; fil stops at instruction
+        // boundaries, so there is nothing to resynchronize.
+        return {};
     }
     if (command == "halt") {
         // The board is already stopped whenever a command is serviced: monitor

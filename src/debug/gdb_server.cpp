@@ -5,6 +5,7 @@
 #include "fil/debug/monitor.hpp"
 #include "fil/mem/memory_bus.hpp"
 #include "fil/sim/board.hpp"
+#include "memory_map.hpp"
 #include "registers.hpp"
 #include "rsp.hpp"
 #include "tcp_listener.hpp"
@@ -83,7 +84,9 @@ struct GdbSession::Implementation {
     std::vector<std::uint32_t> breakpoints;
     std::vector<std::uint32_t> hardware_breakpoints;
     std::vector<std::uint32_t> combined_breakpoints;
+    std::vector<sim::Watchpoint> watchpoints;
     std::string last_stop{"S05"};
+    bool semihosting{false};
     std::optional<GdbSessionEnd> end;
 
     /** @brief Services the telnet monitor and live read-only sessions. */
@@ -112,6 +115,20 @@ struct GdbSession::Implementation {
         last_stop = payload;
         return sendPacket(payload);
     }
+    [[nodiscard]] bool sendStopReply(
+        const std::uint8_t signal,
+        const std::string_view key,
+        const std::uint32_t value
+    ) {
+        std::string payload = "T";
+        payload += detail::hexValue(signal, 1U);
+        payload.append(key);
+        payload += ':';
+        payload += detail::hexNumber(value, 8U);
+        payload += ';';
+        last_stop = payload;
+        return sendPacket(payload);
+    }
     [[nodiscard]] bool replyError() { return sendPacket("E01"); }
     [[nodiscard]] bool replyUnsupported() { return sendPacket(""); }
 
@@ -122,12 +139,15 @@ struct GdbSession::Implementation {
     [[nodiscard]] bool handleVCont(std::string_view packet);
     [[nodiscard]] bool handleMonitor(std::string_view hex);
     [[nodiscard]] bool handleBreakpoint(std::string_view packet, bool insert);
+    [[nodiscard]] bool handleFlashErase(std::string_view packet);
+    [[nodiscard]] bool handleFlashWrite(std::string_view packet);
     [[nodiscard]] bool handleMemoryRead(std::string_view packet);
     [[nodiscard]] bool handleMemoryWrite(std::string_view packet, bool binary);
     [[nodiscard]] bool handleRegisterRead(std::string_view text);
     [[nodiscard]] bool handleRegisterWrite(std::string_view text);
     [[nodiscard]] bool resume(std::string_view packet);
     [[nodiscard]] bool resumeTarget(bool step);
+    [[nodiscard]] bool serviceSemihosting(std::string& console);
     void refreshCombinedBreakpoints();
 };
 
@@ -228,7 +248,6 @@ bool GdbSession::Implementation::handleBreakpoint(
     if (packet.size() < 2U) return replyError();
     const char type = packet[1U];
     if (type < '0' || type > '4') return replyError();
-    if (type >= '2') return replyUnsupported(); // Watchpoints are not modeled yet.
     const auto comma = packet.find(',');
     if (comma == std::string_view::npos) return replyError();
     const auto kind = packet.find(',', comma + 1U);
@@ -236,18 +255,47 @@ bool GdbSession::Implementation::handleBreakpoint(
         ? packet.substr(comma + 1U)
         : packet.substr(comma + 1U, kind - comma - 1U));
     if (!address) return replyError();
-    std::vector<std::uint32_t>& list = type == '1' ? hardware_breakpoints : breakpoints;
-    const std::uint32_t target = *address & ~std::uint32_t{1U};
-    const auto position = std::find(list.begin(), list.end(), target);
-    if (insert) {
-        if (position == list.end()) {
-            list.push_back(target);
-            std::sort(list.begin(), list.end());
-        }
-    } else if (position != list.end()) {
-        list.erase(position);
+    std::uint32_t kind_value = 4U;
+    if (kind != std::string_view::npos) {
+        const auto parsed = parseHex(packet.substr(kind + 1U));
+        if (!parsed || *parsed == 0U || *parsed > 8U) return replyError();
+        kind_value = static_cast<std::uint32_t>(*parsed);
     }
-    refreshCombinedBreakpoints();
+    if (type <= '1') {
+        // Instruction breakpoints compare even Thumb addresses.
+        std::vector<std::uint32_t>& list = type == '1' ? hardware_breakpoints : breakpoints;
+        const std::uint32_t target = *address & ~std::uint32_t{1U};
+        const auto position = std::find(list.begin(), list.end(), target);
+        if (insert) {
+            if (position == list.end()) {
+                list.push_back(target);
+                std::sort(list.begin(), list.end());
+            }
+        } else if (position != list.end()) {
+            list.erase(position);
+        }
+        refreshCombinedBreakpoints();
+        return sendPacket("OK");
+    }
+    // Data watchpoints: Z2 write, Z3 read, Z4 access.
+    const sim::Watchpoint watchpoint{
+        *address,
+        kind_value,
+        type == '2' ? sim::Watchpoint::Access::write
+            : type == '3' ? sim::Watchpoint::Access::read
+                          : sim::Watchpoint::Access::access
+    };
+    const auto same = [&watchpoint](const sim::Watchpoint& candidate) {
+        return candidate.address == watchpoint.address
+            && candidate.length == watchpoint.length
+            && candidate.access == watchpoint.access;
+    };
+    const auto position = std::find_if(watchpoints.begin(), watchpoints.end(), same);
+    if (insert) {
+        if (position == watchpoints.end()) watchpoints.push_back(watchpoint);
+    } else if (position != watchpoints.end()) {
+        watchpoints.erase(position);
+    }
     return sendPacket("OK");
 }
 
@@ -299,6 +347,7 @@ bool GdbSession::Implementation::resumeTarget(const bool step) {
             return sendStopReply(signal_interrupt);
         }
         run.breakpoints = stops;
+        run.watchpoints = std::span<const sim::Watchpoint>{watchpoints};
         const sim::BoardRunResult result = board.run(run);
         switch (result.reason) {
         case sim::BoardStopReason::target_reached: {
@@ -312,9 +361,29 @@ bool GdbSession::Implementation::resumeTarget(const bool step) {
         case sim::BoardStopReason::time_budget:
             if (step) return sendStopReply(signal_trap);
             break;
-        case sim::BoardStopReason::breakpoint:
+        case sim::BoardStopReason::breakpoint: {
+            if (semihosting && result.diagnostic.raw == 0xbeabU
+                && result.diagnostic.instruction_size == 2U) {
+                cpu::CpuState& state = board.cpu().state();
+                state.halted = false;
+                const bool exit_requested = state.r[0] == 0x18U;
+                std::string console;
+                if (!serviceSemihosting(console)) return sendStopReply(signal_trap);
+                if (!console.empty() && !sendMonitor(console)) return false;
+                // On continue, keep running after a serviced call; SYS_EXIT
+                // leaves the target stopped for inspection.
+                if (!step && !exit_requested) continue;
+                return sendStopReply(signal_trap);
+            }
+            return sendStopReply(signal_trap);
+        }
         case sim::BoardStopReason::halted:
             return sendStopReply(signal_trap);
+        case sim::BoardStopReason::watchpoint:
+            // GDB identifies the triggering watchpoint from this address and
+            // its own breakpoint table; the protocol key is always `watch`.
+            if (!result.watchpoint) return sendStopReply(signal_trap);
+            return sendStopReply(signal_trap, "watch", result.watchpoint->address);
         case sim::BoardStopReason::unimplemented_instruction:
             return sendStopReply(signal_illegal_instruction);
         case sim::BoardStopReason::architectural_fault:
@@ -345,15 +414,83 @@ bool GdbSession::Implementation::handleVCont(const std::string_view packet) {
     return resumeTarget(lead == 's' || lead == 'S');
 }
 
+bool GdbSession::Implementation::serviceSemihosting(std::string& console) {
+    cpu::CpuState& state = board.cpu().state();
+    const auto readByte = [this](const std::uint32_t address) {
+        return board.memory().read8(
+            address, mem::AccessContext{mem::AccessType::debug, 0U}
+        );
+    };
+    const std::uint32_t operation = state.r[0];
+    switch (operation) {
+    case 0x04U: { // SYS_WRITE0: NUL-terminated string at r1.
+        console.clear();
+        for (std::uint32_t index = 0U; index < 8192U; ++index) {
+            const std::uint32_t address = state.r[1] + index;
+            if (address < state.r[1]) break;
+            const auto byte = readByte(address);
+            if (!byte || byte.value() == 0U) break;
+            console.push_back(static_cast<char>(byte.value()));
+        }
+        state.r[0] = 0U;
+        return true;
+    }
+    case 0x05U: { // SYS_WRITE: handle, buffer, length.
+        const std::uint32_t buffer = state.r[2];
+        const std::uint32_t length = state.r[3];
+        const std::uint32_t capped = std::min<std::uint32_t>(length, 8192U);
+        console.clear();
+        console.reserve(capped);
+        for (std::uint32_t index = 0U; index < capped; ++index) {
+            const std::uint32_t address = buffer + index;
+            if (address < buffer) break;
+            const auto byte = readByte(address);
+            if (!byte) break;
+            console.push_back(static_cast<char>(byte.value()));
+        }
+        state.r[0] = length;
+        return true;
+    }
+    case 0x07U: // SYS_READC: no interactive console input.
+        state.r[0] = 0U;
+        return true;
+    case 0x09U: // SYS_ISTTY: stdout/stderr handles are terminals.
+        state.r[0] = state.r[1] == 1U || state.r[1] == 2U ? 1U : 0U;
+        return true;
+    case 0x18U: // SYS_EXIT.
+        console = "semihosting exit: reason " + std::to_string(state.r[1]) + "\n";
+        state.r[0] = 0U;
+        return true;
+    default:
+        state.r[0] = std::numeric_limits<std::uint32_t>::max(); // -1: unsupported
+        return true;
+    }
+}
+
 bool GdbSession::Implementation::handleMonitor(const std::string_view hex) {
     const auto bytes = decodeHexBytes(hex);
     if (!bytes) return replyError();
+    const std::string_view command(
+        reinterpret_cast<const char*>(bytes->data()), bytes->size()
+    );
+    if (command == "arm semihosting enable") {
+        semihosting = true;
+        return sendPacket("OK");
+    }
+    if (command == "arm semihosting disable") {
+        semihosting = false;
+        return sendPacket("OK");
+    }
+    if (command == "arm semihosting") {
+        if (!sendMonitor(semihosting ? "semihosting is enabled\n"
+                                     : "semihosting is disabled\n")) {
+            return false;
+        }
+        return sendPacket("OK");
+    }
     // Share the telnet monitor command layer so `monitor reset halt`,
     // `monitor halt`, `monitor mdw ...`, and friends behave identically.
-    const MonitorReply reply = executeMonitorCommand(
-        board, std::string_view(reinterpret_cast<const char*>(bytes->data()), bytes->size()),
-        false
-    );
+    const MonitorReply reply = executeMonitorCommand(board, command, false);
     if (!reply.output.empty() && !sendMonitor(reply.output)) return false;
     return sendPacket("OK");
 }
@@ -361,14 +498,17 @@ bool GdbSession::Implementation::handleMonitor(const std::string_view hex) {
 bool GdbSession::Implementation::handleQuery(const std::string_view packet) {
     if (packet == "qSupported" || packet.starts_with("qSupported:")) {
         return sendPacket(
-            "PacketSize=4000;qXfer:features:read+;QStartNoAckMode+;"
-            "swbreak+;hwbreak+;vContSupported+"
+            "PacketSize=4000;qXfer:features:read+;qXfer:memory-map:read+;"
+            "QStartNoAckMode+;swbreak+;hwbreak+;vContSupported+"
         );
     }
     constexpr std::string_view feature_prefix = "qXfer:features:read:";
     if (packet.starts_with(feature_prefix)) {
         const auto feature = detail::readFeaturePacket(packet);
         return feature ? sendPacket(*feature) : replyUnsupported();
+    }
+    if (const auto memory_map = detail::readMemoryMapPacket(board, packet)) {
+        return sendPacket(*memory_map);
     }
     if (packet == "qfThreadInfo") return sendPacket("m1");
     if (packet == "qsThreadInfo") return sendPacket("l");
@@ -388,9 +528,73 @@ bool GdbSession::Implementation::handleSet(const std::string_view packet) {
     return replyUnsupported();
 }
 
+bool GdbSession::Implementation::handleFlashErase(const std::string_view packet) {
+    const std::string_view args = packet.substr(std::string_view{"vFlashErase:"}.size());
+    const auto comma = args.find(',');
+    if (comma == std::string_view::npos) return replyError();
+    const auto address = parseHex32(args.substr(0U, comma));
+    const auto length = parseHex(args.substr(comma + 1U));
+    if (!address || !length || *length == 0U) return replyError();
+    if (*length > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())
+            - *address + 1U) {
+        return replyError();
+    }
+    // Modeled flash erases to 0xFF, like the real part.
+    const auto base = static_cast<std::uint32_t>(*address);
+    std::uint64_t offset = 0U;
+    while (offset < *length && ((base + offset) & 3U) != 0U) {
+        const auto written = board.memory().write8(
+            static_cast<std::uint32_t>(base + offset), 0xffU,
+            mem::AccessContext{mem::AccessType::debug, 0U}
+        );
+        if (!written) return replyError();
+        ++offset;
+    }
+    for (; offset + 4U <= *length; offset += 4U) {
+        const auto written = board.memory().write32(
+            static_cast<std::uint32_t>(base + offset), 0xffffffffU,
+            mem::AccessContext{mem::AccessType::debug, 0U}
+        );
+        if (!written) return replyError();
+    }
+    for (; offset < *length; ++offset) {
+        const auto written = board.memory().write8(
+            static_cast<std::uint32_t>(base + offset), 0xffU,
+            mem::AccessContext{mem::AccessType::debug, 0U}
+        );
+        if (!written) return replyError();
+    }
+    return sendPacket("OK");
+}
+
+bool GdbSession::Implementation::handleFlashWrite(const std::string_view packet) {
+    const std::string_view args = packet.substr(std::string_view{"vFlashWrite:"}.size());
+    const auto colon = args.find(':');
+    if (colon == std::string_view::npos) return replyError();
+    const auto address = parseHex32(args.substr(0U, colon));
+    if (!address) return replyError();
+    const auto bytes = decodeBinaryBytes(args.substr(colon + 1U));
+    if (!bytes || bytes->size() > maximum_memory_request) return replyError();
+    if (bytes->size() > static_cast<std::size_t>(
+            std::numeric_limits<std::uint32_t>::max() - *address) + 1U) {
+        return replyError();
+    }
+    for (std::size_t index = 0U; index < bytes->size(); ++index) {
+        const auto written = board.memory().write8(
+            static_cast<std::uint32_t>(*address + index), (*bytes)[index],
+            mem::AccessContext{mem::AccessType::debug, 0U}
+        );
+        if (!written) return replyError();
+    }
+    return sendPacket("OK");
+}
+
 bool GdbSession::Implementation::handleV(const std::string_view packet) {
     if (packet == "vCont?") return sendPacket("vCont;c;C;s;S");
     if (packet.starts_with("vCont;")) return handleVCont(packet);
+    if (packet.starts_with("vFlashErase:")) return handleFlashErase(packet);
+    if (packet.starts_with("vFlashWrite:")) return handleFlashWrite(packet);
+    if (packet == "vFlashDone") return sendPacket("OK");
     // Extended-mode process management: killing an inferior keeps the debug
     // connection, and starting one restores reset state and reports a stop.
     if (packet.starts_with("vKill")) return sendPacket("OK");

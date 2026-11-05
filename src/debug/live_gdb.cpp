@@ -3,6 +3,7 @@
 #include "fil/debug/gdb_server.hpp"
 #include "fil/mem/memory_bus.hpp"
 #include "fil/sim/board.hpp"
+#include "memory_map.hpp"
 #include "registers.hpp"
 #include "rsp.hpp"
 #include "tcp_listener.hpp"
@@ -112,11 +113,17 @@ bool LiveGdbSession::Implementation::handle(
 
 bool LiveGdbSession::Implementation::handleQuery(const std::string_view packet) {
     if (packet == "qSupported" || packet.starts_with("qSupported:")) {
-        return reply("PacketSize=4000;qXfer:features:read+;QStartNoAckMode+");
+        return reply(
+            "PacketSize=4000;qXfer:features:read+;qXfer:memory-map:read+;"
+            "QStartNoAckMode+"
+        );
     }
     if (packet.starts_with("qXfer:features:read:")) {
         const auto feature = detail::readFeaturePacket(packet);
         return reply(feature ? *feature : "");
+    }
+    if (const auto memory_map = detail::readMemoryMapPacket(board, packet)) {
+        return reply(*memory_map);
     }
     if (packet == "qfThreadInfo") return reply("m1");
     if (packet == "qsThreadInfo") return reply("l");

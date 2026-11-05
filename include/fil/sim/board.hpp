@@ -33,10 +33,24 @@ namespace fil::sim {
 
 class World;
 
+/** @brief One host-side data watchpoint checked after each guest instruction. */
+struct Watchpoint {
+    /** @brief Kind of data access that fires this watchpoint. */
+    enum class Access : std::uint8_t {
+        write,  ///< Fire on stores.
+        read,   ///< Fire on loads.
+        access, ///< Fire on loads and stores.
+    };
+    std::uint32_t address{0};               ///< First watched target address.
+    std::uint32_t length{1};                ///< Watched byte count.
+    Access access{Access::write};           ///< Observed access kind.
+};
+
 /** @brief Stable board-level reason a bounded simulation stopped. */
 enum class BoardStopReason : std::uint8_t {
     target_reached,
     breakpoint,
+    watchpoint,
     halted,
     instruction_budget,
     time_budget,
@@ -61,6 +75,14 @@ struct BoardRunOptions {
      * referenced storage for the duration of the run.
      */
     std::span<const std::uint32_t> breakpoints;
+    /**
+     * @brief Host-side data watchpoints checked after every instruction.
+     *
+     * A non-empty list forces exact single-instruction stepping and exact
+     * guest-access logging. The run stops after the instruction whose load or
+     * store matched, with the PC already advanced.
+     */
+    std::span<const Watchpoint> watchpoints;
     bool trace_instructions{false};              ///< Emit one trace record per instruction.
     bool detect_spin{false};                     ///< Stop on a proven exact-state loop.
     std::uint64_t spin_threshold{1'000'000};     ///< Logical instructions in a repeated exact-state loop.
@@ -68,9 +90,16 @@ struct BoardRunOptions {
     std::uint32_t adc_decimation{1}; ///< Keep 1 of N continuous ADC scans; higher skips side effects.
 };
 
+/** @brief Matched data access reported by a watchpoint stop. */
+struct WatchpointStop {
+    std::uint32_t address{0}; ///< Watched start address.
+    bool write{false};        ///< True when a store fired it.
+};
+
 /** @brief Aggregate result and final CPU diagnostic for a board run. */
 struct BoardRunResult {
     BoardStopReason reason{BoardStopReason::instruction_budget};
+    std::optional<WatchpointStop> watchpoint; ///< Set when reason is watchpoint.
     std::uint64_t instructions{0};
     std::uint64_t cycles{0};
     SimTimeNs time_ns{0};
@@ -449,6 +478,9 @@ private:
      * blocks) or take an exception early, so batching past them is exact.
      */
     [[nodiscard]] bool blockBoundaryPending() const noexcept;
+    [[nodiscard]] std::optional<WatchpointStop> watchpointHit(
+        std::span<const Watchpoint> watchpoints,
+        std::span<const mem::MemoryBus::AccessWatchEntry> accesses) const;
     [[nodiscard]] std::optional<BoundaryStop> settleInstructionBoundary();
     [[nodiscard]] std::optional<BoundaryStop> settleInstructionBoundarySlow();
     [[nodiscard]] std::optional<ProvenLoop> observeLoopBoundary(

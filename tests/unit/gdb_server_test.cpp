@@ -335,6 +335,113 @@ TEST(GdbServerTest, WritesLargeBinaryBlocks) {
     EXPECT_EQ(last.value(), 'Z');
 }
 
+TEST(GdbServerTest, ServesMemoryMap) {
+    auto board = loadFixture();
+    ASSERT_NE(board, nullptr);
+    ScriptedTransport transport;
+    transport.send("qXfer:memory-map:read::0,1000");
+    transport.send("D");
+
+    EXPECT_EQ(serve(*board, transport), GdbSessionEnd::detached);
+    const auto replies = repliesOf(transport.output());
+    ASSERT_GE(replies.size(), 2U);
+    EXPECT_EQ(replies[0].front(), 'l');
+    EXPECT_NE(replies[0].find("<memory type=\"flash\""), std::string::npos);
+    EXPECT_NE(replies[0].find("<property name=\"blocksize\">"), std::string::npos);
+    EXPECT_NE(replies[0].find("<memory type=\"ram\""), std::string::npos);
+    EXPECT_EQ(replies[1], "OK");
+}
+
+TEST(GdbServerTest, ErasesAndWritesFlash) {
+    auto board = loadFixture();
+    ASSERT_NE(board, nullptr);
+    ScriptedTransport transport;
+    transport.send("vFlashErase:8000000,10");
+    transport.send("m8000000,4");
+    transport.send("vFlashWrite:8000000:ABCD");
+    transport.send("m8000000,4");
+    transport.send("m8000004,4");
+    transport.send("vFlashDone");
+    transport.send("D");
+
+    EXPECT_EQ(serve(*board, transport), GdbSessionEnd::detached);
+    const auto replies = repliesOf(transport.output());
+    ASSERT_GE(replies.size(), 7U);
+    EXPECT_EQ(replies[0], "OK");
+    EXPECT_EQ(replies[1], "ffffffff") << "erased flash reads as 0xff";
+    EXPECT_EQ(replies[2], "OK");
+    EXPECT_EQ(replies[3], "41424344");
+    EXPECT_EQ(replies[4], "ffffffff");
+    EXPECT_EQ(replies[5], "OK");
+}
+
+TEST(GdbServerTest, SemihostingWritesThroughTheConsole) {
+    auto board = loadFixture();
+    ASSERT_NE(board, nullptr);
+    const std::string message = "hello";
+    ASSERT_TRUE(board->memory().loadBytes(0x20000000U,
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(message.data()), message.size()
+        )).hasValue());
+    const std::uint32_t pc = board->cpu().state().r[15];
+    // bkpt 0xab
+    ASSERT_TRUE(board->memory().loadBytes(pc, std::array<std::uint8_t, 2>{0xabU, 0xbeU})
+        .hasValue());
+    board->cpu().state().r[0] = 0x04U; // SYS_WRITE0
+    board->cpu().state().r[1] = 0x20000000U;
+
+    ScriptedTransport transport;
+    transport.send("qRcmd,61726d2073656d69686f7374696e6720656e61626c65");
+    transport.send("s");
+    transport.send("D");
+
+    EXPECT_EQ(serve(*board, transport), GdbSessionEnd::detached);
+    const auto replies = repliesOf(transport.output());
+    ASSERT_GE(replies.size(), 3U);
+    EXPECT_EQ(replies[0], "OK");
+    EXPECT_EQ(replies[1].front(), 'O');
+    EXPECT_EQ(decodeMonitorOutput(replies[1]), "hello");
+    EXPECT_EQ(replies[2], "T05");
+}
+
+TEST(GdbServerTest, SemihostingRequiresOptIn) {
+    auto board = loadFixture();
+    ASSERT_NE(board, nullptr);
+    const std::uint32_t pc = board->cpu().state().r[15];
+    ASSERT_TRUE(board->memory().loadBytes(pc, std::array<std::uint8_t, 2>{0xabU, 0xbeU})
+        .hasValue());
+    board->cpu().state().r[0] = 0x04U;
+    board->cpu().state().r[1] = 0x20000000U;
+
+    ScriptedTransport transport;
+    transport.send("s");
+    transport.send("D");
+
+    EXPECT_EQ(serve(*board, transport), GdbSessionEnd::detached);
+    const auto replies = repliesOf(transport.output());
+    ASSERT_GE(replies.size(), 2U);
+    EXPECT_EQ(replies[0], "T05") << "a plain BKPT is reported, not serviced";
+}
+
+TEST(GdbServerTest, MonitorSupportsOpenOcdCommands) {
+    auto board = loadFixture();
+    ASSERT_NE(board, nullptr);
+    board->cpu().state().r[0] = 0x1234U;
+    ScriptedTransport transport;
+    transport.send("qRcmd,6764625f73796e63"); // gdb_sync
+    transport.send("qRcmd,6d777720307832303030303030302030786465616462656566"); // mww ...
+    transport.send("m20000000,4");
+    transport.send("D");
+
+    EXPECT_EQ(serve(*board, transport), GdbSessionEnd::detached);
+    const auto replies = repliesOf(transport.output());
+    ASSERT_GE(replies.size(), 5U);
+    EXPECT_EQ(replies[0], "OK") << "gdb_sync is a no-op";
+    EXPECT_EQ(replies[1].front(), 'O');
+    EXPECT_EQ(replies[2], "OK");
+    EXPECT_EQ(replies[3], "efbeadde");
+}
+
 TEST(GdbServerTest, StopsAtSoftwareAndHardwareBreakpoints) {
     auto probe = loadFixture();
     ASSERT_NE(probe, nullptr);

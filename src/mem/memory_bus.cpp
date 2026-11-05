@@ -107,6 +107,11 @@ void MemoryBus::setReadFootprintTracking(const bool enabled) noexcept {
     read_footprint_.complete = enabled;
 }
 
+void MemoryBus::setAccessWatchLog(const bool enabled) noexcept {
+    access_watch_log_enabled_ = enabled;
+    access_watch_log_.clear();
+}
+
 void MemoryBus::setWriteJournalTracking(const bool enabled) noexcept {
     if (write_journal_tracking_ == enabled) return;
     write_journal_tracking_ = enabled;
@@ -419,6 +424,11 @@ MemoryResult<std::uint64_t> MemoryBus::read(
                 region->info.name, "MMIO access requires coordinator synchronization"
             );
         }
+        if (access_watch_log_enabled_ && context.pc != 0U) {
+            access_watch_log_.push_back(
+                {address, static_cast<std::uint8_t>(width), false}
+            );
+        }
         ++side_effect_generation_;
         ++mmio_generation_;
         auto result = region->device->read(offset, size, context);
@@ -496,6 +506,11 @@ MemoryResult<std::uint64_t> MemoryBus::write(
             return makeFault(
                 BusFaultReason::synchronization_required, address, size, context,
                 region->info.name, "MMIO access requires coordinator synchronization"
+            );
+        }
+        if (access_watch_log_enabled_ && context.pc != 0U) {
+            access_watch_log_.push_back(
+                {address, static_cast<std::uint8_t>(width), true}
             );
         }
         ++side_effect_generation_;
@@ -818,15 +833,17 @@ bool MemoryBus::tryFastReadWords(
     }
     const bool footprint = read_footprint_tracking_
         && context.type == AccessType::data_read && context.pc != 0U;
+    const bool log_reads = access_watch_log_enabled_
+        && context.type == AccessType::data_read && context.pc != 0U;
     const std::size_t base = address - region->info.base;
     if constexpr (std::endian::native == std::endian::little) {
-        if (!footprint) {
+        if (!footprint && !log_reads) {
             std::memcpy(values_out, region->bytes.data() + base, static_cast<std::size_t>(span));
             return true;
         }
     }
     for (std::uint32_t w = 0U; w < count; ++w) {
-        if (footprint) addAccessFootprint(address + w * 4U, 4U);
+        if (footprint || log_reads) addAccessFootprint(address + w * 4U, 4U);
         std::uint32_t value = 0U;
         std::memcpy(&value, region->bytes.data() + base + w * 4U, sizeof(value));
         if constexpr (std::endian::native == std::endian::big) {
@@ -979,6 +996,11 @@ void MemoryBus::addReadFootprint(
 void MemoryBus::addAccessFootprint(
     const std::uint32_t address, const std::uint32_t width
 ) const noexcept {
+    if (access_watch_log_enabled_ && width != 0U) {
+        access_watch_log_.push_back(
+            {address, static_cast<std::uint8_t>(std::min<std::uint32_t>(width, 8U)), false}
+        );
+    }
     if (!read_footprint_tracking_ || width == 0U) return;
     // Dominant case: an aligned access within one word marks only that
     // word, skipping the span loop and 64-bit end arithmetic.
@@ -997,7 +1019,13 @@ void MemoryBus::addStoreFootprint(
     const std::uint32_t address, const std::uint32_t width,
     const AccessContext& context
 ) noexcept {
-    if (!store_footprint_tracking_ || context.pc == 0U || width == 0U) return;
+    if (context.pc == 0U || width == 0U) return;
+    if (access_watch_log_enabled_) {
+        access_watch_log_.push_back(
+            {address, static_cast<std::uint8_t>(std::min<std::uint32_t>(width, 8U)), true}
+        );
+    }
+    if (!store_footprint_tracking_) return;
     const std::uint32_t first_word = address & ~std::uint32_t{3U};
     const std::uint64_t end = static_cast<std::uint64_t>(address) + width;
     for (std::uint64_t word = first_word; word < end; word += 4U) {

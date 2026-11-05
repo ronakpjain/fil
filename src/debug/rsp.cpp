@@ -1,6 +1,7 @@
 #include "rsp.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <limits>
 
 namespace fil::debug::detail {
@@ -22,6 +23,20 @@ std::string hexValue(const std::uint64_t value, const std::size_t bytes) {
         text[index * 2U + 1U] = hex_digits[digit & 0x0fU];
     }
     return text;
+}
+
+std::string hexNumber(const std::uint64_t value, const std::size_t minimum_digits) {
+    std::string digits(16U, '0');
+    std::uint64_t remaining = value;
+    for (std::size_t index = 0U; index < 16U; ++index) {
+        digits[15U - index] = hex_digits[remaining & 0xfU];
+        remaining >>= 4U;
+    }
+    const std::size_t leading_zero_digits =
+        static_cast<std::size_t>(std::countl_zero(value)) / 4U;
+    const std::size_t significant = std::max<std::size_t>(1U, 16U - leading_zero_digits);
+    const std::size_t length = std::max(minimum_digits, significant);
+    return digits.substr(16U - length);
 }
 
 std::optional<std::uint64_t> parseHex(const std::string_view text) {

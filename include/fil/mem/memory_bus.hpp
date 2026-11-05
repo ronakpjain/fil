@@ -517,6 +517,29 @@ public:
     /** @brief True when no MMIO occurred and all changed backed bytes were restored. */
     [[nodiscard]] bool sideEffectsRestoredSince(SideEffectCheckpoint checkpoint) const;
 
+    /** @brief One exact guest data access captured for debugger watchpoints. */
+    struct AccessWatchEntry {
+        std::uint32_t address{0}; ///< First accessed byte.
+        std::uint8_t width{0};    ///< Access width in bytes.
+        bool write{false};        ///< True for stores, false for loads.
+    };
+
+    /**
+     * @brief Enables exact guest data-access logging for debugger watchpoints.
+     *
+     * Disabled by default and cleared on every change. While enabled, every
+     * guest read and store -- including MMIO -- appends to the log, which the
+     * caller normally consumes after each instruction.
+     */
+    void setAccessWatchLog(bool enabled) noexcept;
+    [[nodiscard]] bool accessWatchLogEnabled() const noexcept {
+        return access_watch_log_enabled_;
+    }
+    [[nodiscard]] std::span<const AccessWatchEntry> accessWatchLog() const noexcept {
+        return access_watch_log_;
+    }
+    void clearAccessWatchLog() noexcept { access_watch_log_.clear(); }
+
     /** @brief Returns and clears CPU backed-memory reads since the previous take. */
     [[nodiscard]] ReadFootprint takeReadFootprint() noexcept;
     [[nodiscard]] ReadFootprint readFootprint() const noexcept { return read_footprint_; }
@@ -682,6 +705,8 @@ private:
     std::array<BackedMutation, mutation_journal_capacity> mutation_journal_{};
     mutable ReadFootprint read_footprint_{};
     bool read_footprint_tracking_{true};
+    mutable std::vector<AccessWatchEntry> access_watch_log_;
+    bool access_watch_log_enabled_{false};
     bool store_footprint_tracking_{false};
     bool trap_shared_mmio_{false};
     bool trap_all_mmio_{false};

@@ -22,6 +22,9 @@ int hexDigitValue(char character) noexcept;
 /** @brief Renders a little-endian value as exactly `bytes` hexadecimal digits. */
 std::string hexValue(std::uint64_t value, std::size_t bytes);
 
+/** @brief Renders a plain hexadecimal number, zero-padded to `minimum_digits`. */
+std::string hexNumber(std::uint64_t value, std::size_t minimum_digits = 0U);
+
 /** @brief Parses up to sixteen hexadecimal digits as a plain value. */
 std::optional<std::uint64_t> parseHex(std::string_view text);
 

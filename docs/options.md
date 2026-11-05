@@ -149,6 +149,16 @@ Behavior and boundaries:
 - Debugger memory reads and writes are real bus accesses: reading an MMIO
   register applies that device's modeled read side effects (for example
   read-to-clear flags), and writing flash or RAM invalidates prepared code.
+- Data watchpoints (`watch`, `rwatch`, `awatch`) are evaluated exactly at
+  instruction boundaries: the run stops after the instruction whose load or
+  store matched. There is no hardware watchpoint-count limit.
+- GDB receives a memory map for flash/RAM/CCM regions, so `load` programs flash
+  through `vFlashErase`/`vFlashWrite`/`vFlashDone` instead of raw writes. With
+  a flash region mapped, GDB refuses direct `set {…}` writes to flash; use
+  `monitor mww`/`mwh`/`mwb` to patch flash during a debug session.
+- Semihosting is opt-in: `monitor arm semihosting enable` services `BKPT 0xAB`
+  and prints `SYS_WRITE0`/`SYS_WRITE` output to the GDB console while execution
+  continues.
 - The GDB port also accepts concurrent **read-only live sessions**, used by
   cortex-debug's Live Watch. They are serviced between execution slices and
   never halt the target; while it runs they may read RAM/ROM/flash and register
@@ -192,7 +202,9 @@ fil monitor
 | `mdw ADDR [COUNT]` | Read 32-bit words (default 16, max 1024). |
 | `mdh ADDR [COUNT]` | Read 16-bit halfwords. |
 | `mdb ADDR [COUNT]` | Read bytes. |
-| `reset` | Reset the board; refused while the target is running. |
+| `mww/mwh/mwb ADDR VALUE` | Write a 32/16/8-bit value; refused while the target runs. |
+| `gdb_sync` | OpenOCD compatibility no-op. |
+| `reset [halt\|init]` | Reset the board; refused while the target is running. |
 | `quit` / `exit` | Close the connection. |
 
 Detaching leaves the board exactly as it is; a later debugger attaches to the

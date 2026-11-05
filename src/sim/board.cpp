@@ -32,6 +32,18 @@ SimTimeNs cycleTimeQuotient(const std::uint64_t numerator, const std::uint64_t f
 }
 
 
+struct AccessWatchGuard {
+    mem::MemoryBus& memory;
+    bool previous;
+    AccessWatchGuard(mem::MemoryBus& bus, const bool enabled)
+        : memory(bus), previous(bus.accessWatchLogEnabled()) {
+        memory.setAccessWatchLog(enabled);
+    }
+    ~AccessWatchGuard() { memory.setAccessWatchLog(previous); }
+    AccessWatchGuard(const AccessWatchGuard&) = delete;
+    AccessWatchGuard& operator=(const AccessWatchGuard&) = delete;
+};
+
 struct ReversibleMemoryGuard {
     mem::MemoryBus& memory;
     bool all_trapping;
@@ -1789,6 +1801,28 @@ bool Board::blockBoundaryPending() const noexcept {
             .has_value();
 }
 
+std::optional<WatchpointStop> Board::watchpointHit(
+    const std::span<const Watchpoint> watchpoints,
+    const std::span<const mem::MemoryBus::AccessWatchEntry> accesses
+) const {
+    for (const auto& access : accesses) {
+        const std::uint64_t access_end =
+            static_cast<std::uint64_t>(access.address) + access.width;
+        for (const auto& watchpoint : watchpoints) {
+            const std::uint64_t watch_end =
+                static_cast<std::uint64_t>(watchpoint.address) + watchpoint.length;
+            if (watchpoint.length == 0U
+                || access.address >= watch_end || watchpoint.address >= access_end) {
+                continue;
+            }
+            if (watchpoint.access == Watchpoint::Access::write && !access.write) continue;
+            if (watchpoint.access == Watchpoint::Access::read && access.write) continue;
+            return WatchpointStop{watchpoint.address, access.write};
+        }
+    }
+    return std::nullopt;
+}
+
 std::optional<Board::BoundaryStop> Board::settleInstructionBoundary() {
     if (!boundaryWorkPending()) [[likely]] return std::nullopt;
     return settleInstructionBoundarySlow();
@@ -2226,6 +2260,7 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
     const SimTimeNs deadline = options.duration_ns == 0U
         ? 0U : saturatingAdd(event_loop_->now(), options.duration_ns);
 
+    AccessWatchGuard access_watch(memory_, !options.watchpoints.empty());
     while (aggregate.instructions < options.max_instructions) {
         const std::uint32_t pc = cpu_->state().r[15];
         if (options.stop_address && pc == (*options.stop_address & ~1U)) {
@@ -2248,7 +2283,8 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
         // Spin diagnosis and requested stop addresses are exact single-step
         // work, so skip block preparation and preview admission for them.
         const bool exact_stops = options.stop_address.has_value()
-            || !options.breakpoints.empty() || options.detect_spin;
+            || !options.breakpoints.empty() || !options.watchpoints.empty()
+            || options.detect_spin;
         const std::size_t jit_limit = exact_stops
             ? 1U : static_cast<std::size_t>(std::min<std::uint64_t>(
                 options.max_instructions - aggregate.instructions,
@@ -2256,6 +2292,7 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
                                     : cpu::CortexM4::JitStepOutcome::max_block));
         const auto limit_time = deadline == 0U
             ? std::nullopt : std::optional<SimTimeNs>{deadline};
+        if (!options.watchpoints.empty()) memory_.clearAccessWatchLog();
         span_accounted_cycles_ = 0U;
         const bool native_owner = owner_slice_active_ && jit_ok && !exact_stops;
         const auto native = native_owner
@@ -2289,10 +2326,28 @@ BoardRunResult Board::run(const BoardRunOptions& options) {
             return failure;
         }
 
+        // Entries before this point belong to the retired instruction; any
+        // later entries come from exception entry/return settling and must not
+        // fire a watchpoint.
+        const auto watch_accesses = options.watchpoints.empty()
+            ? std::span<const mem::MemoryBus::AccessWatchEntry>{}
+            : std::span<const mem::MemoryBus::AccessWatchEntry>{
+                memory_.accessWatchLog().data(),
+                memory_.accessWatchLog().size()
+            };
         if (auto boundary = settleInstructionBoundary()) {
             aggregate.reason = boundary->reason;
             aggregate.message = std::move(boundary->message);
             break;
+        }
+        if (!options.watchpoints.empty()) {
+            if (const auto hit = watchpointHit(options.watchpoints, watch_accesses)) {
+                aggregate.reason = BoardStopReason::watchpoint;
+                aggregate.watchpoint = *hit;
+                aggregate.message = std::string("watchpoint hit at ")
+                    + hex32(hit->address) + (hit->write ? " (write)" : " (read)");
+                break;
+            }
         }
 
         // Exact-state loop observation exists for spin detection only.
@@ -2336,6 +2391,7 @@ std::string_view boardStopReasonName(const BoardStopReason reason) noexcept {
     switch (reason) {
     case BoardStopReason::target_reached: return "target-reached";
     case BoardStopReason::breakpoint: return "breakpoint";
+    case BoardStopReason::watchpoint: return "watchpoint";
     case BoardStopReason::halted: return "halted";
     case BoardStopReason::instruction_budget: return "instruction-budget";
     case BoardStopReason::time_budget: return "time-budget";

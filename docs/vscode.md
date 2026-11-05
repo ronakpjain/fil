@@ -42,11 +42,35 @@ debug-session lifetime. Omit it to keep the server and its telnet monitor
 }
 ```
 
+## Feature parity with OpenOCD
+
+cortex-debug drives an OpenOCD target and an `external` server through the same
+GDB Remote Serial Protocol, so the backend implements what the extension can
+reach:
+
+| Feature | fil |
+| --- | --- |
+| Launch, attach, restart, reset (`monitor reset halt`), `breakAfterReset` | yes |
+| `load`, flash erase/program (`vFlashErase`/`vFlashWrite`/`vFlashDone`), memory map | yes |
+| Software and hardware breakpoints, run to entry point | yes |
+| Data watchpoints (`watch`/`rwatch`/`awatch`, `Z2`-`Z4`), any count | yes |
+| Stepping, pause/interrupt, register and memory access | yes |
+| Target description, disassembly, variables | yes |
+| SVD peripheral view | extension-side; refreshes while stopped |
+| Live Watch | yes, via a second read-only session |
+| Semihosting (`monitor arm semihosting enable`) | yes: `SYS_WRITE0`/`SYS_WRITE`/`SYS_EXIT` and friends print to the debug console |
+| Monitor commands | `reset [halt\|init]`, `halt`, `gdb_sync`, `mdw`/`mdh`/`mdb`, `mww`/`mwh`/`mwb`, `reg`, `regs`, `arm semihosting` |
+| RTT | no: cortex-debug cannot attach RTT to `servertype: "external"` |
+| SWO/ITM trace stream | no: there is no TPIU/ITM wire model |
+| Multi-core / chained configurations | no: one board per server |
+| Hardware debug transport (DHCSR, DWT, breakpoint units) | not modeled; replaced by host-side breakpoints/watchpoints |
+
 Useful additional keys:
 
 | Key | Purpose |
 | --- | --- |
 | `svdFile` | Peripheral register view (SVD decoding happens in the extension, reading memory over GDB). |
+| `preLaunchCommands` | e.g. `["monitor arm semihosting enable"]` to route semihosting output to the debug console. |
 | `liveWatch` | `{"enabled": true, "samplesPerSecond": 4}` refreshes watched variables while the firmware runs. |
 | `armToolchainPath` / `objdumpPath` | Toolchain lookup when the ARM tools are not on `PATH`. |
 | `loadFiles` | Program `.hex`/`.bin` files instead of the executable. |
@@ -127,5 +151,9 @@ stepping, and Ctrl+C interrupts. The `Restart`/`Reset` buttons reuse
   side effects (read-to-clear flags, FIFO pops).
 - **Multi-core/chained configurations** are not supported: `fil debug` controls
   one board, and network configs are rejected.
-- Hardware watchpoints (`Z2`–`Z4`) are not implemented; GDB falls back to
-  software watchpoints, which single-step through fil.
+- **Data watchpoints** stop exactly after the instruction that accessed the
+  address. They are evaluated at instruction boundaries, so values are never
+  torn and there is no hardware watchpoint-count limit.
+- Because GDB receives a flash memory map, it refuses ad-hoc writes to flash
+  with `set {…}` (as it does with OpenOCD). Use `load`, or `monitor mww` /
+  `mwh` / `mwb` to patch flash for an experiment.

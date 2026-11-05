@@ -134,6 +134,26 @@ TEST(MonitorTest, AcceptsOpenOcdStyleResetAndHalt) {
     EXPECT_EQ(board->cpu().state().r[15], reset_pc);
 }
 
+TEST(MonitorTest, WritesMemoryWithOpenOcdCommands) {
+    auto board = loadFixture();
+    ASSERT_NE(board, nullptr);
+
+    EXPECT_NE(run(*board, "mww 0x20000000 0xdeadbeef").output.find("complete"),
+        std::string::npos);
+    EXPECT_EQ(board->memory().read32(0x20000000U).value(), 0xdeadbeefU);
+    EXPECT_NE(run(*board, "mwh 0x20000004 0x1234").output.find("complete"),
+        std::string::npos);
+    EXPECT_EQ(board->memory().read16(0x20000004U).value(), 0x1234U);
+    EXPECT_NE(run(*board, "mwb 0x20000006 0x5a").output.find("complete"),
+        std::string::npos);
+    EXPECT_EQ(board->memory().read8(0x20000006U).value(), 0x5aU);
+
+    EXPECT_NE(run(*board, "mww 0x20000008 0x1", true).output.find("target is running"),
+        std::string::npos);
+    EXPECT_EQ(board->memory().read32(0x20000008U).value(), 0U);
+    EXPECT_TRUE(run(*board, "gdb_sync").output.empty());
+}
+
 TEST(MonitorTest, ReportsUnknownAndMalformedCommands) {
     auto board = loadFixture();
     ASSERT_NE(board, nullptr);
