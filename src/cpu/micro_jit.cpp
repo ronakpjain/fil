@@ -1100,8 +1100,9 @@ MicroFunction MicroJit::compile(const MicroBlock& block, std::string& error) {
     std::array<std::uint16_t, MicroBlock::max_ops + 1U> cumulative_write_masks{};
     std::size_t write_prefix_count = 0U;
     const auto reg_bit = [](std::uint8_t reg) -> std::uint16_t {
-        return reg <= 12U ? static_cast<std::uint16_t>(1U << reg)
-            : reg == 14U ? static_cast<std::uint16_t>(1U << 13U) : 0U;
+        return static_cast<std::uint16_t>(
+            reg <= 12U ? 1U << reg : reg == 14U ? 1U << 13U : 0U
+        );
     };
     for (const auto& op : block.ops) {
         std::uint16_t op_write_mask = 0U;
