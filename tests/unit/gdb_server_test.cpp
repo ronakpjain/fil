@@ -107,6 +107,17 @@ std::vector<std::string> repliesOf(const std::string& output) {
     return replies;
 }
 
+/** @brief Decodes one monitor `O` packet payload into its console text. */
+std::string decodeMonitorOutput(const std::string& payload) {
+    std::string text;
+    for (std::size_t index = 1U; index + 1U < payload.size(); index += 2U) {
+        text.push_back(static_cast<char>(
+            std::stoi(payload.substr(index, 2U), nullptr, 16)
+        ));
+    }
+    return text;
+}
+
 /** @brief Renders an address as a bare hexadecimal RSP field. */
 std::string hexWord(const std::uint32_t value) {
     std::string text(8U, '0');
@@ -422,11 +433,13 @@ TEST(GdbServerTest, ResetMonitorCommandRestoresResetState) {
 
     EXPECT_EQ(serve(*board, transport), GdbSessionEnd::detached);
     const auto replies = repliesOf(transport.output());
-    ASSERT_GE(replies.size(), 4U);
-    EXPECT_EQ(replies[0], "OK");
-    EXPECT_EQ(replies[1].front(), 'O');
-    EXPECT_EQ(replies[2], "OK");
+    ASSERT_GE(replies.size(), 5U);
+    EXPECT_EQ(decodeMonitorOutput(replies[0]), "reset complete\n");
+    EXPECT_EQ(replies[1], "OK");
+    EXPECT_NE(decodeMonitorOutput(replies[2]).find("unknown command 'nope'"),
+        std::string::npos);
     EXPECT_EQ(replies[3], "OK");
+    EXPECT_EQ(replies[4], "OK");
     EXPECT_EQ(board->cpu().state().r[15], reset_pc);
     EXPECT_EQ(board->cpu().state().r[0], 0U);
 }
@@ -451,6 +464,29 @@ TEST(GdbServerTest, ExtendedRunRestartsFromResetState) {
     EXPECT_EQ(board->cpu().state().r[15], reset_pc);
     EXPECT_EQ(board->cpu().state().r[0], 0U);
     EXPECT_EQ(replies[2], "OK");
+}
+
+TEST(GdbServerTest, MonitorCommandsShareTheTelnetLayer) {
+    auto board = loadFixture();
+    ASSERT_NE(board, nullptr);
+    board->cpu().state().r[0] = 0xfeedfaceU;
+    ScriptedTransport transport;
+    transport.send("qRcmd,72657365742068616c74"); // reset halt
+    transport.send("qRcmd,68616c74");             // halt
+    transport.send("qRcmd,6d647720307832303030303030302031"); // mdw 0x20000000 1
+    transport.send("D");
+
+    EXPECT_EQ(serve(*board, transport), GdbSessionEnd::detached);
+    const auto replies = repliesOf(transport.output());
+    ASSERT_GE(replies.size(), 7U);
+    EXPECT_EQ(decodeMonitorOutput(replies[0]), "reset complete\n");
+    EXPECT_EQ(replies[1], "OK");
+    EXPECT_EQ(board->cpu().state().r[0], 0U);
+    EXPECT_EQ(decodeMonitorOutput(replies[2]), "target halted\n");
+    EXPECT_EQ(replies[3], "OK");
+    EXPECT_NE(decodeMonitorOutput(replies[4]).find("0x20000000:"), std::string::npos);
+    EXPECT_EQ(replies[5], "OK");
+    EXPECT_EQ(replies[6], "OK");
 }
 
 TEST(GdbServerTest, NoAckModeSuppressesAcknowledgements) {

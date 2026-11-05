@@ -769,13 +769,13 @@ bool GdbSession::Implementation::handleVCont(const std::string_view packet) {
 bool GdbSession::Implementation::handleMonitor(const std::string_view hex) {
     const auto bytes = decodeHexBytes(hex);
     if (!bytes) return replyError();
-    const std::string command(bytes->begin(), bytes->end());
-    if (command == "reset") {
-        const auto result = board.reset();
-        if (!result) return replyError();
-        return sendPacket("OK");
-    }
-    if (!sendMonitor("fil: unsupported monitor command: " + command + "\n")) return false;
+    // Share the telnet monitor command layer so `monitor reset halt`,
+    // `monitor halt`, `monitor mdw ...`, and friends behave identically.
+    const MonitorReply reply = executeMonitorCommand(
+        board, std::string_view(reinterpret_cast<const char*>(bytes->data()), bytes->size()),
+        false
+    );
+    if (!reply.output.empty() && !sendMonitor(reply.output)) return false;
     return sendPacket("OK");
 }
 

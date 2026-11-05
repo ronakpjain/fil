@@ -21,6 +21,9 @@ exact scheduling fallbacks.
 1–1024; values above 1 trade fidelity for speed by skipping continuous ADC scans
 and their sample, DMA, and interrupt effects.
 
+For VS Code, see [cortex-debug integration](vscode.md): `fil debug` works as an
+external GDB server (`"servertype": "external"`).
+
 ## Run a board or network
 
 | Command | Input / behavior |
@@ -153,6 +156,8 @@ Behavior and boundaries:
   while GDB software watchpoints still work by single-stepping.
 - One board is debugged. Network configs are rejected; network debugging is
   not implemented.
+- VS Code users can drive the server through the cortex-debug extension; see
+  [cortex-debug integration](vscode.md).
 - The hardware debug transport (DHCSR, DWT, hardware breakpoint units) is not
   modeled; stops, stepping, and breakpoints are host-side operations on the
   deterministic emulator.

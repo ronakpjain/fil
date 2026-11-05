@@ -112,6 +112,28 @@ TEST(MonitorTest, ResetsOnlyWhileStopped) {
     EXPECT_EQ(board->cpu().state().r[15], reset_pc);
 }
 
+TEST(MonitorTest, AcceptsOpenOcdStyleResetAndHalt) {
+    auto board = loadFixture();
+    ASSERT_NE(board, nullptr);
+    const std::uint32_t reset_pc = board->cpu().state().r[15];
+    board->cpu().state().r[0] = 0xfeedfaceU;
+
+    const auto halted = run(*board, "halt", true);
+    EXPECT_NE(halted.output.find("target halted"), std::string::npos);
+    EXPECT_EQ(board->cpu().state().r[0], 0xfeedfaceU);
+
+    const auto refused = run(*board, "reset halt", true);
+    EXPECT_NE(refused.output.find("target is running"), std::string::npos);
+    EXPECT_EQ(board->cpu().state().r[0], 0xfeedfaceU);
+
+    EXPECT_NE(run(*board, "reset halt").output.find("reset complete"), std::string::npos);
+    EXPECT_EQ(board->cpu().state().r[0], 0U);
+    EXPECT_NE(run(*board, "reset init").output.find("reset complete"), std::string::npos);
+    EXPECT_NE(run(*board, "reset run").output.find("accepts 'halt' or 'init'"),
+        std::string::npos);
+    EXPECT_EQ(board->cpu().state().r[15], reset_pc);
+}
+
 TEST(MonitorTest, ReportsUnknownAndMalformedCommands) {
     auto board = loadFixture();
     ASSERT_NE(board, nullptr);

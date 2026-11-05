@@ -48,7 +48,8 @@ constexpr std::string_view help_text =
     "  mdw ADDR [COUNT]     Read COUNT 32-bit words (default 16, max 1024).\n"
     "  mdh ADDR [COUNT]     Read COUNT 16-bit halfwords (default 16, max 1024).\n"
     "  mdb ADDR [COUNT]     Read COUNT bytes (default 16, max 1024).\n"
-    "  reset                Reset the board; refused while the target is running.\n"
+    "  halt                 Halt the target; a no-op between execution slices.\n"
+    "  reset [halt|init]    Reset the board; refused while the target is running.\n"
     "  quit | exit          Close this connection.\n"
     "Addresses accept 0x-prefixed hex. While the target is running, only\n"
     "RAM/ROM/flash reads are allowed: inspecting them never changes state.\n";
@@ -554,7 +555,15 @@ MonitorReply executeMonitorCommand(
     if (command == "mdw" || command == "mdh" || command == "mdb") {
         return {memoryText(board, command, tokens, running)};
     }
+    if (command == "halt") {
+        // The board is already stopped whenever a command is serviced: monitor
+        // access happens at instruction boundaries, never mid-instruction.
+        return {"target halted\n"};
+    }
     if (command == "reset") {
+        if (tokens.size() >= 2U && tokens[1] != "halt" && tokens[1] != "init") {
+            return {"error: reset accepts 'halt' or 'init'\n"};
+        }
         if (running) return {"error: target is running; reset requires a stopped target\n"};
         const auto result = board.reset();
         if (!result) {
